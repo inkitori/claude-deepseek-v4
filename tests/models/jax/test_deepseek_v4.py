@@ -60,7 +60,7 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     rms_norm, hc_split_sinkhorn, precompute_freqs_cis, apply_rotary_emb,
     sparse_attn, splice_rope, compressor_prefill, indexer_prefill,
     get_window_topk_idxs_prefill, get_compress_topk_idxs_prefill,
-    CompressorParams, IndexerParams,
+    attention_prefill, CompressorParams, IndexerParams, AttentionParams,
 )
 
 
@@ -293,6 +293,62 @@ class TestIndexerComponent:
                 set_a = set(int(v) for v in a[bi, si] if v != -1)
                 set_b = set(int(v) for v in b[bi, si] if v != -1)
                 assert set_a == set_b, f"({bi},{si}) {set_a} vs {set_b}"
+
+
+def _torch_attention_to_jax_params(attn: TorchAttention, args: TorchArgs) -> AttentionParams:
+    compressor = None
+    indexer = None
+    if attn.compress_ratio:
+        compressor = _torch_compressor_to_jax_params(attn.compressor)
+        if attn.indexer is not None:
+            indexer = _torch_indexer_to_jax_params(attn.indexer, args)
+    return AttentionParams(
+        attn_sink=t2j(attn.attn_sink).astype(jnp.float32),
+        wq_a=t2j(attn.wq_a.weight),
+        q_norm_w=t2j(attn.q_norm.weight).astype(jnp.float32),
+        wq_b=t2j(attn.wq_b.weight),
+        wkv=t2j(attn.wkv.weight),
+        kv_norm_w=t2j(attn.kv_norm.weight).astype(jnp.float32),
+        wo_a=t2j(attn.wo_a.weight),
+        wo_b=t2j(attn.wo_b.weight),
+        n_heads=attn.n_heads,
+        head_dim=attn.head_dim,
+        rope_head_dim=attn.rope_head_dim,
+        n_groups=attn.n_groups,
+        o_lora_rank=attn.o_lora_rank,
+        window_size=attn.window_size,
+        compress_ratio=attn.compress_ratio,
+        norm_eps=args.norm_eps,
+        softmax_scale=attn.softmax_scale,
+        compressor=compressor,
+        indexer=indexer,
+    )
+
+
+class TestAttentionComponent:
+    @pytest.mark.parametrize("compress_ratio,layer_id", [(0, 0), (4, 2), (128, 3)])
+    def test_attention_prefill_matches_torch(self, compress_ratio, layer_id):
+        torch.manual_seed(0)
+        args = make_tiny_args(max_seq_len=128)
+        attn = TorchAttention(layer_id, args)
+        # Init params.
+        for n, p in attn.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        S = 32
+        x = torch.randn(1, S, args.dim, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            y_t = attn(x, start_pos=0)
+        params = _torch_attention_to_jax_params(attn, args)
+        fc_full = t2j(attn.freqs_cis).astype(jnp.complex64)
+        y_j = attention_prefill(t2j(x), params, fc_full)
+        # bf16 tolerance per tier-1 spec: atol=1e-2, rtol=1e-2.
+        # Attention output passes through several matmul + accumulation chains
+        # so values can be ~0.5 magnitude; rtol of 1e-2 is the binding bound.
+        max_diff = maxabs(y_j, y_t)
+        max_rel = float(np.abs(np.asarray(y_j).astype(np.float32) - y_t.float().numpy()).max() /
+                         max(1e-6, float(np.abs(y_t.float().numpy()).max())))
+        assert max_diff <= 5e-2, f"compress_ratio={compress_ratio}: max abs diff {max_diff}"
 
 
 # =============================================================

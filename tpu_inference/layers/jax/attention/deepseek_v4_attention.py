@@ -254,6 +254,9 @@ def compressor_prefill(
     coff = 2 if overlap else 1
     d = params.head_dim
     rd = params.rope_head_dim
+    if S < ratio:
+        # Nothing to compress yet; return an empty [B, 0, head_dim] tensor.
+        return jnp.zeros((B, 0, d), dtype=x.dtype)
     xf = x.astype(jnp.float32)
     # Linear (no bias). wkv stored as [out, in], so x @ wkv.T.
     kv = xf @ params.wkv.T
@@ -378,3 +381,119 @@ def indexer_prefill(
         topk_invalid = topk_idxs >= ((s_arange + 1)[None, :, None] // ratio)
         topk_idxs = jnp.where(topk_invalid, -1, topk_idxs + offset)
     return topk_idxs.astype(jnp.int32), kv
+
+
+# --------------------- attention (PREFILL ONLY) ---------------------
+
+@dataclass
+class AttentionParams:
+    # core projections
+    attn_sink: jnp.ndarray   # [n_heads] fp32
+    wq_a: jnp.ndarray        # [q_lora_rank, dim] bf16
+    q_norm_w: jnp.ndarray    # [q_lora_rank] fp32
+    wq_b: jnp.ndarray        # [n_heads*head_dim, q_lora_rank] bf16
+    wkv: jnp.ndarray         # [head_dim, dim] bf16
+    kv_norm_w: jnp.ndarray   # [head_dim] fp32
+    wo_a: jnp.ndarray        # [n_groups*o_lora_rank, n_heads*head_dim/n_groups] bf16
+    wo_b: jnp.ndarray        # [dim, n_groups*o_lora_rank] bf16
+
+    # config
+    n_heads: int
+    head_dim: int
+    rope_head_dim: int
+    n_groups: int
+    o_lora_rank: int
+    window_size: int
+    compress_ratio: int       # 0 / 4 / 128
+    norm_eps: float
+    softmax_scale: float
+
+    # optional sub-modules
+    compressor: object = None  # CompressorParams | None
+    indexer: object = None     # IndexerParams | None
+
+
+def _linear(x, w):
+    """Convenience: x @ w.T using w's dtype-aware path. We always upcast to fp32
+    for accumulation here, then cast back. Matches the PyTorch reference's
+    behavior (F.linear in bf16 typically uses fp32 accumulation under the hood
+    but the input/output are bf16)."""
+    return (x.astype(jnp.float32) @ w.astype(jnp.float32).T).astype(x.dtype)
+
+
+def attention_prefill(
+    x: jnp.ndarray,                # [B, S, dim]
+    params: AttentionParams,
+    freqs_cis_full: jnp.ndarray,  # [max_seq_len, rope_head_dim/2] complex64 — for current layer's rope
+) -> jnp.ndarray:
+    """Full attention forward for prefill (start_pos=0). Returns [B, S, dim].
+
+    Implements the prefill path of `Attention.forward` from
+    `/mnt/scratch/v4_pro/inference/model.py`, including all three flavors
+    (SWA / CSA / HCA) selected via `params.compress_ratio`.
+    """
+    B, S, _ = x.shape
+    H = params.n_heads
+    Dh = params.head_dim
+    rd = params.rope_head_dim
+    win = params.window_size
+    ratio = params.compress_ratio
+    eps = params.norm_eps
+    fc = freqs_cis_full[:S]
+
+    # q
+    qr = _linear(x, params.wq_a)
+    qr = rms_norm(qr, params.q_norm_w, eps)  # q_norm
+    q = _linear(qr, params.wq_b).reshape(B, S, H, Dh)
+    # second RMS-style scaling on q (no learnable weight): q *= rsqrt(mean(q^2)+eps)
+    q_f = q.astype(jnp.float32)
+    q = (q_f * lax.rsqrt(jnp.square(q_f).mean(-1, keepdims=True) + eps)).astype(q.dtype)
+    q = splice_rope(q, rd, fc, inverse=False)
+
+    # kv (single shared head)
+    kv = _linear(x, params.wkv)
+    kv = rms_norm(kv, params.kv_norm_w, eps)  # kv_norm
+    kv = splice_rope(kv, rd, fc, inverse=False)
+    # act_quant on kv[..., :-rd] is no-op (DECISIONS.md D2)
+
+    # window topk indices
+    topk_idxs = get_window_topk_idxs_prefill(win, B, S)
+
+    # compressed kv + compress topk indices (CSA / HCA only)
+    if ratio > 0:
+        offset = S  # kv.size(1) at concat time is S (before adding compressed)
+        if params.indexer is not None:
+            compress_topk, _indexer_kv = indexer_prefill(x, qr, params.indexer, freqs_cis_full, offset)
+        else:
+            compress_topk = get_compress_topk_idxs_prefill(ratio, B, S, offset)
+        topk_idxs = jnp.concatenate([topk_idxs, compress_topk], axis=-1)
+    topk_idxs = topk_idxs.astype(jnp.int32)
+
+    # build kv buffer: for prefill, kv_cache[:bsz, :S] = current kv; for compress,
+    # the compressed kv is appended after position S. (The PyTorch reference
+    # writes to kv_cache + concats the compressor output to a temp tensor;
+    # we just use the temp tensor directly since there is no decode follow-up.)
+    if ratio > 0:
+        kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full)
+        # kv_compressed: [B, S//ratio, head_dim]. Append.
+        kv_full = jnp.concatenate([kv, kv_compressed], axis=1)
+    else:
+        kv_full = kv
+
+    o = sparse_attn(q, kv_full, params.attn_sink, topk_idxs, params.softmax_scale)
+
+    # inverse RoPE on rope dims of o
+    o = splice_rope(o, rd, fc, inverse=True)
+
+    # grouped low-rank output projection
+    G = params.n_groups
+    R = params.o_lora_rank
+    o_grouped = o.reshape(B, S, G, -1)
+    # wo_a: [G*R, n_heads*Dh/G] -> view as [G, R, ...]. NOTE: PyTorch stores
+    # weights as [out, in] where out=G*R and in=n_heads*Dh/G. .view(G, R, in)
+    # treats the [out] axis as [G, R].
+    in_per_group = (H * Dh) // G
+    wo_a_view = params.wo_a.reshape(G, R, in_per_group).astype(jnp.float32)
+    o_proj = jnp.einsum("bsgd,grd->bsgr", o_grouped.astype(jnp.float32), wo_a_view)
+    o_flat = o_proj.reshape(B, S, G * R).astype(x.dtype)
+    return _linear(o_flat, params.wo_b)
