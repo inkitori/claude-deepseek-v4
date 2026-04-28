@@ -119,3 +119,15 @@ If killed mid-probe: `/tmp/vllm_serve_probe3.log` (or similar) holds the latest 
 
 ## Resume hint (post-v6)
 **If killed now**, the next session should: (a) read SUMMARY.md "v6 — what's new since v3/v5"; (b) the structural blockers B2/B3/B5 are RESOLVED, B1 is now a clean future-work item (Pallas kernel for paged-V4 sparse-attn or vllm kv_cache schema extension to admit V4's compressor/indexer state pytree); (c) Tier 5 hardening is the natural next step — the current test sends one prompt at one seed; could extend to varied prompts, longer max_tokens, batch=2 concurrent. The functional core (W1 decode) is correct so multi-step decode through __call__ is the next major piece.
+
+## Phase v6 hardening (2026-04-28 ~22:05 UTC)
+
+- [x] **T5 hardening:** TestVllmServeRoundtrip extended to 4 requests in one subprocess:
+  - (1) two-request determinism: byte-equal text + finish_reason=length + completion_tokens=8 (existing).
+  - (2) prompt-dependence: different prompt produces different completion (sanity against logit-collapse).
+  - (3) longer max_tokens=16 also completes (exactly 16 completion tokens).
+- [x] Test runtime: ~60s end-to-end (compile cache warm after request 1). Commit 406929eb.
+- [x] Final CPU regression confirmed: **83 passed, 1 skipped (6:45)**.
+
+## Resume hint (post-v6 final)
+**If killed now**, the next session should: see SUMMARY.md "v6 — what's new". The session completed every overnight goal: W1 + W2 (workaround) + W3 (prefill path) + W4 done; T5/T6/T7 + Tier 1-4 all green; structural blockers B2/B3/B5 resolved; B1 remains as production-correctness future-work for multi-sequence concurrent decode (see BLOCKERS.md). Suggested next: address B1 — write a Pallas kernel for V4 sparse-attn over [SWA window || compressed slots], OR extend vllm's per-layer kv_cache schema to admit V4's compressor/indexer state pytree. Until then, V4 in vllm serve is correct-but-not-multi-sequence-paged.
