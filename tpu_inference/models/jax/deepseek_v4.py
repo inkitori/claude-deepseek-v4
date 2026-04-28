@@ -760,6 +760,64 @@ _HF_TO_JAX_RULES = [
 _QUANT_SUFFIXES = {".scale"}
 
 
+# ------------------------------------------------------------
+# vLLM model registry wrapper
+# ------------------------------------------------------------
+#
+# This class makes `DeepseekV4ForCausalLM` discoverable via the
+# tpu_inference model registry. It is intentionally a thin shim — the
+# math is in the functional core above (block_forward / attention_prefill /
+# moe_forward). The class exists primarily so that vLLM dispatch on the
+# `DeepseekV4ForCausalLM` architecture string finds *something* registered
+# and does NOT fall back to the vLLM-native PyTorch path. Full runtime
+# integration (paged-KV plumbing, sharded weight loading with FP4/FP8
+# dequantization, mesh-aware sharding annotations) is documented as
+# Phase 7+ work in PROD_TOPOLOGY_RISKS.md item 7.
+
+class DeepseekV4ForCausalLM:
+    """Stub wrapper class for vLLM dispatch. Holds a parsed
+    `DeepseekV4Config` and the abstract param tree for shape verification.
+
+    The class is intentionally lightweight: it does NOT subclass `JaxModule`
+    or own `nnx.Variable`s. Until the full vLLM-runtime integration lands,
+    this class lives only to be importable + registry-discoverable.
+    """
+    def __init__(self, vllm_config, rng_key=None, mesh=None):
+        self.vllm_config = vllm_config
+        self.mesh = mesh
+        # Build the V4 config from the HF config dict if available.
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        cfg_dict = None
+        if hf_config is not None:
+            # vLLM may store config either as a dict or as a HuggingFace
+            # PretrainedConfig instance — try both.
+            cfg_dict = (hf_config.to_dict() if hasattr(hf_config, "to_dict")
+                        else dict(hf_config))
+        if cfg_dict is None:
+            raise ValueError("DeepseekV4ForCausalLM needs a model_config.hf_config")
+        self.config = DeepseekV4Config.from_hf_dict(cfg_dict)
+        # Abstract param tree — useful for shape probes and the weight-name
+        # mapping. Real (allocated) params would be too large; we defer that
+        # to a future weight loader.
+        self.params = make_abstract_transformer_params(self.config)
+
+    def map_weight_name(self, hf_name: str):
+        """Returns the JAX param-tree path for an HF param name, or None."""
+        return map_hf_name_to_jax_path(hf_name)
+
+    def __call__(self, *args, **kwargs):
+        # Defer to the functional forward. This signature would need to
+        # match the rest of the tpu-inference runtime; for now it raises a
+        # clear error so callers know what's missing.
+        raise NotImplementedError(
+            "DeepseekV4ForCausalLM.__call__ is not yet wired into the "
+            "tpu_inference runtime. The functional forward path "
+            "(`deepseek_v4_forward_prefill`) is fully tested and can be "
+            "called directly with a TransformerParams pytree. See "
+            "tests/models/jax/test_deepseek_v4.py for usage."
+        )
+
+
 def map_hf_name_to_jax_path(name: str) -> Optional[str]:
     """Returns the JAX param-tree path string for an HF parameter name, or
     None if no rule matches.
