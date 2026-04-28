@@ -12,8 +12,8 @@ Started 2026-04-28 ~08:36 UTC. Single autonomous overnight session.
 - [x] Confirmed JAX runs on CPU with `XLA_FLAGS=--xla_force_host_platform_device_count=N`. TPU unavailable on this host (mmap EAGAIN); see DECISIONS.md.
 
 ## Phase 1 — Reference oracle
-- [ ] Write a CPU-only PyTorch reference based on inference/model.py with sparse_attn / hc_split_sinkhorn / act_quant / fp4_act_quant / rotate_activation replaced by pure-PyTorch equivalents.
-- [ ] Verify forward pass on tiny config + random weights produces a logits tensor of expected shape.
+- [x] Wrote `tests/models/jax/_deepseek_v4_reference/{__init__.py, model.py, kernel_stubs.py}`.
+- [x] Smoke-tested: tiny-config forward returns `[B, S, vocab_size]` fp32 logits; prefill, decode (with KV state), multi-batch, and MTP all produce the right shape. Reproducible across reset+rerun.
 
 ## Phase 2 — Components + Tier 1
 TBD.
