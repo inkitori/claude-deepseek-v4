@@ -1,9 +1,41 @@
-# DeepSeek V4 implementation — autonomous overnight session summary (v3)
+# DeepSeek V4 implementation — autonomous overnight session summary (v6)
 
-**Branch:** `deepseek-v4`. Three autonomous sessions on 2026-04-28:
+**Branch:** `deepseek-v4`. Six autonomous sessions on 2026-04-28:
 v1 (08:36–09:46 UTC, prefill-only),
 v2 (17:14–17:50 UTC, +decode +dequant +TPU smoke),
-v3 (19:03 UTC onward, +vllm-serve probe characterization +decode hardening).
+v3 (19:03 UTC, +vllm-serve probe characterization +decode hardening),
+v4/v5 (20:09–21:21 UTC, nnx.Module port of DeepseekV4ForCausalLM),
+v6 (21:39 UTC onward, **W2 unblock + W3 wiring + Tier 5 GREEN**).
+
+## v6 — what's new since v3/v5
+
+**Headline:** Tier 5 (`vllm serve` curl round-trip) is GREEN end-to-end on real TPU.
+The structural blockers B2 / B3 / B5 are RESOLVED.
+
+| Area | v5 state | v6 state |
+|---|---|---|
+| Tier 5 (vllm serve curl) | blocked behind B2/B3/B5 (probed-and-characterized) | **PASSING.** `pytest TestVllmServeRoundtrip` spawns vllm serve, sends two seed=0 `/v1/completions`, asserts 200/200 + non-empty + byte-equal text. Observed completion: `" \" ab oideable<unk>子"` (8 tokens, deterministic). |
+| KVCacheManager V4 path | `AttributeError: kv_lora_rank` (B5) | **fixed via use_mla=False override for `model_type=="deepseek_v4"`.** Routes V4 through the existing non-MLA spec branch (head_dim + num_key_value_heads, both of which V4 has). V3 unaffected. |
+| `DeepseekV4ForCausalLM.load_weights` | zero-fill placeholder (B2 helper) | **routes to `load_weights_from_dir`** via `self.vllm_config.model_config.model`, dispatching to the W4 deepseek_v4_loader. Falls back to zero-fill if the path is non-local-loadable. |
+| Total tests | 82 passing, 1 skipped | **83 passing, 1 skipped** (+1 Tier 5; 0 regressions) |
+| W1 / W4 | done (v2) | unchanged |
+| W2 (paged-KV) | structural blocker (B1) | **workaround landed** — V4's per-layer state lives in the model params tree; vllm kv_caches passed through unchanged. The proper paged-KV adapter (Pallas kernel or vllm kv_cache schema extension) is now a clean future-work item, no longer T5-blocking. |
+| W3 (`__call__`) | partial (helpers + nnx.Module shell) | **done for the prefill path.** `__call__` returns `(kv_caches, hidden_TD, [])`; `compute_logits(hidden_TD)` runs the V4 head; load_weights wired to real safetensors. Multi-sequence concurrent decode with start_pos>0 is still B1-residual. |
+| Invariants | I1–I31 | **+I32–I35** — vllm MLA mis-classification, B4 workaround, kv_caches passthrough, load_weights routing. |
+
+The v6 unblock path (in order, each step verified by re-probing `vllm serve`):
+
+  1. **v5's nnx port already committed** (commits de951e6a + 469920a3) made `DeepseekV4ForCausalLM` an `nnx.Module` subclass. v6 re-probed vllm serve and confirmed `nnx.eval_shape` advances past B2.
+  2. **Capture next failure (v6 probe 1):** `AttributeError: 'DeepseekV4Config' object has no attribute 'kv_lora_rank'` at `tpu_inference/runner/kv_cache_manager.py:365`. Root cause: vllm's `is_deepseek_mla` classifier marks V4 as MLA based on architecture-name + `compress_ratios` + `head_dim`.
+  3. **Fix (commit 20c56c61):** `KVCacheManager.__init__` detects `model_type=="deepseek_v4"` and forces `self.use_mla = False`. V3 unchanged.
+  4. **Re-probe (v6 probe 2):** `/v1/models` returns 200, `/v1/completions` returns 200 with `text=""` because `load_weights` was zero-filling weights (load_weights_from_dir helper existed but was not wired through vllm's load path).
+  5. **Fix (commit d2d02dfa):** `load_weights(rng)` reads `self.vllm_config.model_config.model`; if it's a local-readable directory, dispatches to `load_weights_from_dir(path)` so the W4 deepseek_v4_loader produces real bf16 arrays.
+  6. **Re-probe (v6 probe 3):** Both `/v1/completions` return 200 with `text=" \" ab oideable<unk>子"`, byte-equal across two identical seed=0 requests. Tier 5 GREEN.
+  7. **Add `TestVllmServeRoundtrip` pytest test** (commit d2d02dfa) — runs the curl round-trip in pytest. Skips on hosts without `/mnt/scratch/tiny_v4_bf16`, no TPU per preflight log, or no `vllm` binary on PATH. Reads preflight log (does NOT call `jax.devices("tpu")` in the parent — that would starve the subprocess).
+
+What v6 deliberately did NOT attempt:
+  * **Real V4-aware paged-KV adapter / Pallas kernel.** Per BLOCKERS B1, the production-correct paged-KV path requires either a new Pallas kernel fusing sparse_attn over `[SWA window || compressed slots]`, or a vllm kv_cache schema extension to admit V4's compressor/indexer state pytree. Tier 5 with single-sequence prefill works without it because V4's state lives in the model params tree; multi-sequence concurrent decode that depends on vllm's block-table would need this work.
+  * **Multi-step decode dispatch through `__call__`.** The `__call__` body handles single-sequence prefill (positions [0, T)). Multi-step decode with start_pos > 0 reading per-layer state across calls requires B1's per-layer state plumbing through vllm. The functional core (`attention_decode_step` + W1) has the math; what's missing is the runtime contract.
 
 ## v3 — what's new since v2
 
@@ -50,39 +82,47 @@ What is **still residual risk** in v2:
   * **TPU vs CPU per-element parity.** JAX cannot host both backends in one process, so Tier 6 only does compile+sanity. A side-by-side parity test would require a subprocess.
   * **mHC math direction.** Same residual risk as v1 — see v1 §4 item 2 below.
 
-## How to run all tests
+## How to run all tests (v6)
 
 ```bash
-# CPU suite (45 v1 + 25 new v2 + 11 v3 = 81 expected, 1 skipped):
+# CPU suite (83 expected passing, 1 skipped TPU-only):
 JAX_PLATFORMS=cpu \
 XLA_FLAGS="--xla_force_host_platform_device_count=32" \
 pytest tests/models/test_deepseek_v4.py -v
+# → includes TestVllmServeRoundtrip (Tier 5 — spawns vllm subprocess on TPU,
+#   skips if /mnt/scratch/tiny_v4_bf16 missing or preflight reports no TPU)
 
-# Tier 6 (real TPU):
+# Tier 6 (real TPU compile + forward):
 JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward -v
 ```
 
-## How to reproduce the vLLM-serve probe (v3 finding)
+## How to reproduce the vLLM-serve round-trip (v6 result)
 
-Reproduces the two concrete failure modes characterized in v3:
+This is now a passing test. To run manually:
 
 ```bash
-# B4 (first gate): vllm classifies V4 as MLA, demands new flags.
-JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
-    --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
-    --port 18080 --seed 0 --trust-remote-code --dtype bfloat16
-#   → pydantic_core.ValidationError: 'MLA models require NEW_MODEL_DESIGN=1
-#     and DP attention via additional_config'
-
-# B2 (second gate): with the required flags, vllm reaches nnx.eval_shape
-# and fails because DeepseekV4ForCausalLM isn't an nnx.Module.
 NEW_MODEL_DESIGN=1 JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
     --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
     --port 18080 --seed 0 --trust-remote-code --dtype bfloat16 \
-    --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'
-#   → TypeError: function create_abstract_model ... returned a value of type
-#     <class '...DeepseekV4ForCausalLM'> ... which is not a valid JAX type
+    --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}' &
+SERVE_PID=$!
+# Wait ~60s for compile to finish
+for i in $(seq 1 120); do
+    curl -sf http://localhost:18080/v1/models >/dev/null && break
+    sleep 2
+done
+# Two identical deterministic completions
+curl -s http://localhost:18080/v1/completions -H "Content-Type: application/json" \
+    -d '{"model":"/mnt/scratch/tiny_v4_bf16","prompt":"abc","max_tokens":8,"temperature":0,"seed":0}'
+# → both responses have choices[0].text == " \" ab oideable<unk>子"
+kill $SERVE_PID
 ```
+
+The two B4 flags (`NEW_MODEL_DESIGN=1` + `enable_dp_attention`) are still
+required because vllm's `is_deepseek_mla` classifier name-matches V4. They
+remain documented in BLOCKERS B4 even though Tier 5 is GREEN — a clean
+upstream fix would remove this requirement, but for V4 enable_dp_attention
+is also the correct production-shaped setting (see B4).
 
 Use `--xla_force_host_platform_device_count=32` to enable the v6e-32 mesh simulation; with 8 the v6e-32 budget tests will skip (they assert ≥32 devices are present).
 

@@ -97,3 +97,25 @@ RESUMED at 2026-04-28 20:09 UTC (v4 — paged-KV+nnx attempt) — baseline recon
 ---
 
 RESUMED at 2026-04-28 21:21 UTC (v5 — continue from W3 nnx port) — baseline reconfirmed `82 passed, 1 skipped in 5:43` (v3 had 81; +1 new test_eval_shape_makes_abstract_module from prior commit's W3 port). TPU preflight ok (4 v4 chips). Pending uncommitted refinement: compute_logits collapses HC mix into __call__ to match V3's (T,D)→logits convention; load_weights now materializes ShapeDtypeStruct→zeros (so vllm's eval_shape→load_weights flow has concrete arrays to operate on). Plan: (1) commit refinement, (2) re-probe vllm serve with new port to capture the next failure mode after B2/B4, (3) attempt minimum-viable kv_caches passthrough + load_weights_from_dir wiring so T5's curl could in principle reach a 200, (4) document any new blockers.
+
+---
+
+RESUMED at 2026-04-28 21:39 UTC (v6 — continue from v5 nnx port). Baseline reconfirmed: `82 passed, 1 skipped in 5:40` (matches v5 final count). TPU preflight ok (4 v4 chips). v5's W3 refinement is committed at HEAD (469920a3). Plan: (1) re-probe `vllm serve /mnt/scratch/tiny_v4_bf16` with the now-committed nnx port to capture failure mode that surfaces *after* `nnx.eval_shape(create_abstract_model)` (which we expect to now succeed because `DeepseekV4ForCausalLM` subclasses `nnx.Module`), (2) document the next failure surface in BLOCKERS.md as B5 (or extend B2/B3), (3) if the next failure is in `__call__`'s kv_cache schema (B1 territory), attempt a minimum-viable adapter path or document precisely; (4) if we can reach load_weights, attempt T5 curl. Fallback if structural blockers persist: tighten T6/T7 tolerances with measurement evidence, add more decode parity points at sp ∈ {300, 500} (long-context).
+
+If killed mid-probe: `/tmp/vllm_serve_probe3.log` (or similar) holds the latest probe output; diff against B3's recorded traceback to identify the new failure surface.
+
+## Phase v6 (2026-04-28 21:39 UTC onward)
+
+- [x] Baseline reconfirmed clean: `82 passed, 1 skipped` (5:40).
+- [x] **Re-probe v5 nnx port** — vllm serve advances past B2 (nnx.eval_shape OK), hits new failure at `tpu_inference/runner/kv_cache_manager.py:365` reading `kv_lora_rank` on the V4 config. Documented as B5.
+- [x] **B5 fix (W2 minimum-viable):** `KVCacheManager.__init__` detects `model_type=="deepseek_v4"` and forces `self.use_mla = False`. V3 unaffected. Commit 20c56c61.
+- [x] **Re-probe with B5 fix** — `/v1/models` returns 200, `/v1/completions` returns 200 but `text=""` (load_weights was zero-filling).
+- [x] **W3 wiring (load_weights → load_weights_from_dir):** `load_weights(rng)` reads `self.vllm_config.model_config.model`; if it's a local-readable directory containing `config.json`, dispatches to `load_weights_from_dir(path)`. Falls back to zero-fill on error. Commit d2d02dfa.
+- [x] **Re-probe with W3 wiring** — both `/v1/completions` return 200 with `text=" \" ab oideable<unk>子"` (8 tokens, byte-equal across two seed=0 requests). **TIER 5 GREEN.**
+- [x] **TestVllmServeRoundtrip pytest test** added — spawns vllm serve subprocess, sends 2 curl /v1/completions requests, asserts 200/200 + non-empty + byte-equal text. Skips on missing fixture / no TPU per preflight log / no vllm binary. ~110s end-to-end. Commit d2d02dfa.
+- [x] **Full CPU regression: 83 passed, 1 skipped (6:52).** Was 82+1 in v5; +1 Tier 5; 0 regressions.
+- [x] **TPU run: T6 still passes.** `JAX_PLATFORMS=tpu pytest TestRealTpuTinyForward` → 1 passed in ~14s.
+- [x] **STATUS.md / SUMMARY.md / BLOCKERS.md / INVARIANTS.md / TOLERANCE_LOG.md** updated for v6.
+
+## Resume hint (post-v6)
+**If killed now**, the next session should: (a) read SUMMARY.md "v6 — what's new since v3/v5"; (b) the structural blockers B2/B3/B5 are RESOLVED, B1 is now a clean future-work item (Pallas kernel for paged-V4 sparse-attn or vllm kv_cache schema extension to admit V4's compressor/indexer state pytree); (c) Tier 5 hardening is the natural next step — the current test sends one prompt at one seed; could extend to varied prompts, longer max_tokens, batch=2 concurrent. The functional core (W1 decode) is correct so multi-step decode through __call__ is the next major piece.
