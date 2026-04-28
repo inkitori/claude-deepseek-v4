@@ -93,3 +93,7 @@ RESUMED at 2026-04-28 19:03 UTC (v3 final) — baseline reconfirmed `70 passed, 
 
 
 RESUMED at 2026-04-28 20:09 UTC (v4 — paged-KV+nnx attempt) — baseline reconfirmed 81 passed / 1 skipped (5:35). TPU preflight ok (4 v4 chips). Plan: this session reverses prior B1+B2 deferrals — attempt W3 (nnx.Module port of DeepseekV4ForCausalLM) and W2 (paged-KV adapter) to unblock T5. Approach: (1) read V3 nnx structure as template, (2) make minimum-viable nnx port that passes nnx.eval_shape, (3) wire __call__ to existing functional core for prefill, decode via per-layer kv_caches, (4) Tier 5 curl. If structural blockers emerge again, document and add Tier 4b/decode hardening as fallback.
+
+---
+
+RESUMED at 2026-04-28 21:21 UTC (v5 — continue from W3 nnx port) — baseline reconfirmed `82 passed, 1 skipped in 5:43` (v3 had 81; +1 new test_eval_shape_makes_abstract_module from prior commit's W3 port). TPU preflight ok (4 v4 chips). Pending uncommitted refinement: compute_logits collapses HC mix into __call__ to match V3's (T,D)→logits convention; load_weights now materializes ShapeDtypeStruct→zeros (so vllm's eval_shape→load_weights flow has concrete arrays to operate on). Plan: (1) commit refinement, (2) re-probe vllm serve with new port to capture the next failure mode after B2/B4, (3) attempt minimum-viable kv_caches passthrough + load_weights_from_dir wiring so T5's curl could in principle reach a 200, (4) document any new blockers.

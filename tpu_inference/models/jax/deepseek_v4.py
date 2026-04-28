@@ -966,35 +966,64 @@ def _build_class():
                 self._freqs_compressed_v.get_value(),
                 self.config,
             )
-            # h: [B, S, hc, D]. vLLM expects (T, M) where T = B*S.
-            B, S, hc, D = h.shape
-            hidden_TM = h.reshape(B * S, hc * D)
-            return kv_caches, hidden_TM, []
-
-        def compute_logits(self, hidden_states):
-            """Apply the V4 head to hidden states. hidden_states is [T, hc*D]
-            (output of __call__) or [T_sampled, hc*D] (sampled subset)."""
-            params = self.params_v.get_value()
-            T = hidden_states.shape[0]
-            hc = self.config.hc_mult
-            D = self.config.hidden_size
-            assert hidden_states.shape[-1] == hc * D, (
-                f"compute_logits expected last dim {hc*D}, got {hidden_states.shape[-1]}"
-            )
-            h = hidden_states.reshape(1, T, hc, D)
-            logits_BSV = head_forward(
-                h, params.head_w, params.final_norm_w,
-                params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+            # h: [B, S, hc, D]. We collapse hc into D here (via the HC head
+            # mix) so vLLM's compute_logits gets per-token (T, D) hidden —
+            # the convention that compilation_manager._precompile_compute_logits
+            # bakes in for all flax_nnx models.
+            h_BSD = head_hc(
+                h, params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
                 self.config.rms_norm_eps, self.config.hc_eps,
             )
-            return logits_BSV.reshape(T, -1)
+            B, S, D = h_BSD.shape
+            hidden_TD = h_BSD.reshape(B * S, D)
+            return kv_caches, hidden_TD, []
 
-        def load_weights(self, weights=None, *args, **kwargs):
-            """vLLM weight-loading entry. Streamed weights iterators are
-            handled by the v4 loader — for now this method stays a no-op
-            stub for callers that pass dummy/random weights. Real
-            HF-streamer integration is BLOCKERS B5 (new in v4)."""
-            # No-op: dummy / random init is already in place via __init__.
+        def compute_logits(self, hidden_states):
+            """Apply the head matmul to per-token hidden. `hidden_states` is
+            shape `(T, D)` — already HC-mixed by `__call__`. We apply the
+            final RMSNorm and matmul against `head_w` (vocab proj)."""
+            params = self.params_v.get_value()
+            D = self.config.hidden_size
+            assert hidden_states.shape[-1] == D, (
+                f"compute_logits expected last dim {D}, got {hidden_states.shape[-1]}"
+            )
+            x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
+            return (x.astype(jnp.float32) @ params.head_w.T)
+
+        def load_weights(self, rng=None, *args, **kwargs):
+            """vLLM weight-loading entry.
+
+            After `nnx.eval_shape(create_abstract_model)`, every leaf in
+            this module is a `jax.ShapeDtypeStruct`. This method walks
+            those abstract leaves and replaces them with concrete
+            `jnp.zeros` arrays (a stand-in for real weight loading; safe
+            for the smoke-test path because the wrapper does not depend on
+            random init for correctness — it depends on weights being
+            concrete arrays). For real-weight loading, call
+            `load_weights_from_dir(checkpoint_dir)` separately.
+
+            The HF safetensors streamer integration (mirroring V3's
+            `JaxAutoWeightsLoader` flow) is deferred to BLOCKERS B5.
+            """
+            def _materialize(leaf):
+                if isinstance(leaf, jax.ShapeDtypeStruct):
+                    return jnp.zeros(leaf.shape, dtype=leaf.dtype)
+                return leaf
+
+            # Walk the params pytree.
+            current = self.params_v.get_value()
+            new_params = jax.tree_util.tree_map(
+                _materialize, current,
+                is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+            )
+            self.params_v = nnx.Param(new_params)
+
+            # Materialize freqs by recomputing — they're a pure function
+            # of the static config, so the values won't depend on whether
+            # we got an abstract or concrete model.
+            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            self._freqs_swa_v = nnx.Variable(swa)
+            self._freqs_compressed_v = nnx.Variable(comp)
             return set()
 
     return DeepseekV4ForCausalLM

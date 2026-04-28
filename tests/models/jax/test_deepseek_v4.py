@@ -1348,13 +1348,18 @@ class TestDeepseekV4ForCausalLMHelpers:
         T = 16
         ids = (jnp.arange(T, dtype=jnp.int32) % model.config.vocab_size)
         kv_caches_in = []
-        kv_caches_out, hidden_TM, extra = model(kv_caches_in, ids, None)
-        assert hidden_TM.shape == (T, model.config.hc_mult * model.config.hidden_size)
+        kv_caches_out, hidden_TD, extra = model(kv_caches_in, ids, None)
+        # vLLM's compute_logits convention: __call__ returns (T, D) per-token
+        # hidden, so the HC head mix must be folded into __call__ (not
+        # compute_logits). compute_logits then applies only the final
+        # RMSNorm + matmul against head_w to yield logits.
+        assert hidden_TD.shape == (T, model.config.hidden_size)
         assert kv_caches_out is kv_caches_in
         assert extra == []
-        logits = model.compute_logits(hidden_TM)
+        logits = model.compute_logits(hidden_TD)
         assert logits.shape == (T, model.config.vocab_size)
         ref = model.forward_prefill(ids.reshape(1, T)).reshape(T, -1)
+        # Same math, recombined — should be bit-identical.
         assert jnp.max(jnp.abs(logits - ref)) == 0.0
 
     def test_eval_shape_makes_abstract_module(self):
