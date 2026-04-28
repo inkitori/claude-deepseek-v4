@@ -16,7 +16,7 @@ W3 __call__:  partial — forward_prefill + load_weights_from_dir helpers work; 
 W4 dequant:   done — bit-equal vs groundtruth on all 355 tiny_v4_quant tensors
 
 Full CPU run: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py`
-  → 68 passed, 1 skipped (TPU-only test) in 5:25.
+  → 70 passed, 1 skipped (TPU-only test) in 5:28.
 TPU run: `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward`
   → 1 passed in ~22s (compile + 1×16-token prefill on real V4 chip 0).
 

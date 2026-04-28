@@ -29,7 +29,7 @@ What is **still residual risk** in v2:
 ## How to run all tests
 
 ```bash
-# CPU suite (45 v1 tests + 23 new v2 tests = 68 expected, 1 skipped):
+# CPU suite (45 v1 + 25 new v2 = 70 expected, 1 skipped):
 JAX_PLATFORMS=cpu \
 XLA_FLAGS="--xla_force_host_platform_device_count=32" \
 pytest tests/models/test_deepseek_v4.py -v
