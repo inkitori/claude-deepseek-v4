@@ -1,13 +1,41 @@
-# DeepSeek V4 implementation — autonomous overnight session summary
+# DeepSeek V4 implementation — autonomous overnight session summary (v2)
 
-**Branch:** `deepseek-v4`. Single autonomous session, started 2026-04-28 ~08:36 UTC.
+**Branch:** `deepseek-v4`. Two autonomous sessions: v1 (08:36–09:46 UTC, prefill-only)
+and v2 (17:14–17:50 UTC, +decode +dequant +TPU smoke).
+
+## v2 — what's new since v1
+
+| Area | v1 state | v2 state |
+|---|---|---|
+| Prefill JAX core | ✅ correct | unchanged (no regression) |
+| **Decode path** | ❌ NotImplemented | ✅ `compressor_decode_step` / `indexer_decode_step` / `attention_decode_step` implemented; 20 new tests pass against torch reference |
+| **FP4/FP8 weight loader** | ❌ name-only | ✅ `tpu_inference/models/jax/deepseek_v4_loader.py` dequants e4m3fn + e8m0fnu block-scale (block 32) and packed-int8 FP4 + e8m0fnu block-scale (block 8). Bit-equal vs groundtruth on 355 tensors. |
+| **Real-TPU compile** | ❌ CPU sim only | ✅ `TestRealTpuTinyForward` jit-compiles + forwards on real TPU (1×16 tokens, sane logits) |
+| **Tier 4b (real-shard bf16 round-trip)** | ❌ shape-only | ✅ byte-equal against direct `safetensors.torch.load_file` read |
+| **Tier 7 (quant ≡ groundtruth logit parity)** | ❌ | ✅ atol=0.1, argmax≥95% |
+| **DeepseekV4ForCausalLM** | stub raising NotImplementedError | partial — `load_weights_from_dir(...)` + `forward_prefill(...)` work; full vllm `__call__` still NotImplementedError pending BLOCKERS B1+B2 |
+| **W2 paged-KV / Tier 5 vllm serve** | not in scope | deferred — BLOCKERS.md documents why (V4 sparse attention shape doesn't fit `ragged_paged_attention.v3`; nnx.Module port required) |
+
+What is now verified that wasn't before:
+  * Decode-time numerics are bit-similar to the reference at every layer flavor (SWA / CSA / HCA), including the ratio==4 overlap-window state-shift logic and ratio==128 indexer-less compressed top-k.
+  * The dequantization recipe used by DeepSeek's `convert.py` (FP4_TABLE + per-block ue8m0 scaling) reproduces bf16 weights exactly. The same loader works on the real V4-Flash bf16 path (Tier 4b).
+  * The model lowers and runs on real TPU silicon (no CPU emulation).
+
+What is **still residual risk** in v2:
+  * **W2 / W3 / T5 not delivered.** The functional decode + dequant code is correct, but plumbing it into vLLM's paged-KV runtime is unfinished. See BLOCKERS.md for the structural reasons (V4's sparse attention + per-layer compressor/indexer state buffers don't fit vLLM's per-layer `kv_caches[i]: jax.Array` schema without new infrastructure).
+  * **TPU vs CPU per-element parity.** JAX cannot host both backends in one process, so Tier 6 only does compile+sanity. A side-by-side parity test would require a subprocess.
+  * **mHC math direction.** Same residual risk as v1 — see v1 §4 item 2 below.
 
 ## How to run all tests
 
 ```bash
+# CPU suite (45 v1 tests + 23 new v2 tests = 68 expected, 1 skipped):
 JAX_PLATFORMS=cpu \
 XLA_FLAGS="--xla_force_host_platform_device_count=32" \
 pytest tests/models/test_deepseek_v4.py -v
+
+# Tier 6 (real TPU):
+JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward -v
 ```
 
 Use `--xla_force_host_platform_device_count=32` to enable the v6e-32 mesh simulation; with 8 the v6e-32 budget tests will skip (they assert ≥32 devices are present).
