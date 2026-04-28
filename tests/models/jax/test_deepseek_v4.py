@@ -1182,6 +1182,141 @@ class TestDecodeRollingParity:
             assert diff <= 5e-2, f"step k={k} (sp={sp}): rolling decode diff {diff}"
 
 
+# =============================================================
+# W4 / Tier 4b / Tier 7 — FP4/FP8 weight loader & dequant
+# =============================================================
+
+
+class TestFp8Dequant:
+    """Unit-level FP8 dequant: loader produces bit-identical bf16 to a
+    pre-staged groundtruth on the tiny synthetic fixture."""
+
+    QUANT = "/mnt/scratch/tiny_v4_quant"
+    GT = "/mnt/scratch/tiny_v4_groundtruth"
+
+    def _skip_if_missing(self):
+        if not (os.path.exists(self.QUANT) and os.path.exists(self.GT)):
+            pytest.skip("tiny_v4_quant/tiny_v4_groundtruth not present")
+
+    def test_full_loader_matches_groundtruth(self):
+        """All 355 tensors load to bit-identical bf16 against groundtruth."""
+        self._skip_if_missing()
+        from tpu_inference.models.jax.deepseek_v4_loader import \
+            load_v4_safetensors_to_dict
+        wq = load_v4_safetensors_to_dict(self.QUANT)
+        wgt = load_v4_safetensors_to_dict(self.GT)
+        assert set(wq.keys()) == set(wgt.keys()), "key set mismatch"
+        max_diff = 0.0
+        n = 0
+        for k in wq:
+            a = np.asarray(wq[k]).astype(np.float32)
+            b = np.asarray(wgt[k]).astype(np.float32)
+            assert a.shape == b.shape, f"shape mismatch {k}: {a.shape} vs {b.shape}"
+            d = float(np.abs(a - b).max())
+            if d > max_diff:
+                max_diff = d
+            n += 1
+        # Bit-identical: dequant of (e4m3fn * e8m0) must produce the same bf16
+        # bytes as the pre-dequantized groundtruth (which used the same recipe).
+        assert max_diff == 0.0, f"max diff {max_diff} across {n} tensors"
+
+
+class TestRealShardRoundTrip:
+    """Tier 4b: round-trip the staged real V4-Flash bf16 shard through the
+    loader. embed.weight is bf16 with no scale, so byte-equality against the
+    direct safetensors read validates the bf16 path end-to-end."""
+
+    SHARD = "/mnt/scratch/v4_flash/model-00001-of-00046.safetensors"
+    CHECKPOINT_DIR = "/mnt/scratch/v4_flash"
+
+    def test_real_bf16_shard_byte_equal(self):
+        if not os.path.exists(self.SHARD):
+            pytest.skip("V4-Flash shard not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import to_jax_bf16
+        with safe_open(self.SHARD, framework="pt") as f:
+            t_direct = f.get_tensor("embed.weight")
+        # Loader path (without going through dequant): just convert.
+        jax_arr = to_jax_bf16(t_direct)
+        # Spot-check: a few (i, j) elements must equal direct read.
+        np_direct = t_direct.float().numpy()
+        np_jax = np.asarray(jax_arr).astype(np.float32)
+        # Spot-check first row, last row, and a deterministic random one.
+        rng = np.random.default_rng(0)
+        for _ in range(10):
+            i = int(rng.integers(0, np_direct.shape[0]))
+            j = int(rng.integers(0, np_direct.shape[1]))
+            assert np_jax[i, j] == np_direct[i, j], \
+                f"({i},{j}): JAX={np_jax[i, j]} torch={np_direct[i, j]}"
+        # Full byte-equality (bf16 → fp32 cast is exact).
+        np.testing.assert_array_equal(np_jax, np_direct)
+
+
+class TestQuantToParamsApply:
+    """Tier 7 prep: apply dequantized tiny_v4_quant weights into the abstract
+    DeepseekV4 param tree, run forward on a fixed input, and compare logits
+    against the same forward run on tiny_v4_groundtruth weights.
+
+    This test isolates the LOADER's correctness from quant arithmetic — both
+    sides go through the same JAX forward, so any logit divergence is the
+    loader's fault.
+    """
+
+    QUANT = "/mnt/scratch/tiny_v4_quant"
+    GT = "/mnt/scratch/tiny_v4_groundtruth"
+
+    def _skip_if_missing(self):
+        if not (os.path.exists(self.QUANT) and os.path.exists(self.GT)):
+            pytest.skip("tiny_v4_quant/tiny_v4_groundtruth not present")
+
+    @staticmethod
+    def _build_params(checkpoint_dir):
+        """Returns (params, cfg, swa_freqs, comp_freqs, weights_dict)."""
+        import json
+        from tpu_inference.models.jax.deepseek_v4 import (
+            DeepseekV4Config, make_abstract_transformer_params, make_freqs_cis,
+        )
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            apply_weights_to_param_tree, load_v4_safetensors_to_dict,
+        )
+        with open(os.path.join(checkpoint_dir, "config.json")) as f:
+            hf_config = json.load(f)
+        cfg = DeepseekV4Config.from_hf_dict(hf_config)
+        params = make_abstract_transformer_params(cfg)
+        # Materialize abstract leaves to zero arrays.
+        params = jax.tree_util.tree_map(
+            lambda x: jnp.zeros(x.shape, dtype=x.dtype),
+            params,
+            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+        )
+        weights = load_v4_safetensors_to_dict(checkpoint_dir)
+        params = apply_weights_to_param_tree(params, weights, cfg)
+        swa, comp = make_freqs_cis(cfg, cfg.max_position_embeddings)
+        return params, cfg, swa, comp, weights
+
+    def test_forward_logits_quant_vs_groundtruth(self):
+        self._skip_if_missing()
+        from tpu_inference.models.jax.deepseek_v4 import \
+            deepseek_v4_forward_prefill
+        p_q, cfg, swa_q, comp_q, _ = self._build_params(self.QUANT)
+        p_gt, cfg2, swa_gt, comp_gt, _ = self._build_params(self.GT)
+        # Build a deterministic input.
+        ids = jnp.zeros((1, 16), dtype=jnp.int32) + jnp.arange(16, dtype=jnp.int32) % cfg.vocab_size
+        l_q = deepseek_v4_forward_prefill(ids, p_q, swa_q, comp_q, cfg)
+        l_gt = deepseek_v4_forward_prefill(ids, p_gt, swa_gt, comp_gt, cfg)
+        # Since dequant is bit-exact, logits should also be bit-exact.
+        # We allow a tiny floor for fp32 accumulation order if any.
+        diff = float(np.abs(np.asarray(l_q) - np.asarray(l_gt)).max())
+        # Tier 7 spec said atol=0.1 — but since loader bit-equality is
+        # achieved, the difference should be ~0 modulo fp32 reduction order.
+        assert diff <= 0.1, f"Tier 7: max logits diff {diff} (atol 0.1)"
+        # Stronger: argmax must match.
+        argmax_q = np.asarray(l_q.argmax(axis=-1))
+        argmax_gt = np.asarray(l_gt.argmax(axis=-1))
+        agree = float((argmax_q == argmax_gt).mean())
+        assert agree >= 0.95, f"argmax agreement {agree} < 0.95"
+
+
 class TestCompressorDecodeStep:
     """Per-step compressor parity. The torch Compressor's prefill populates
     its kv_state/score_state; we snapshot, then run a decode step on both
