@@ -1,7 +1,31 @@
-# DeepSeek V4 implementation — autonomous overnight session summary (v2)
+# DeepSeek V4 implementation — autonomous overnight session summary (v3)
 
-**Branch:** `deepseek-v4`. Two autonomous sessions: v1 (08:36–09:46 UTC, prefill-only)
-and v2 (17:14–17:50 UTC, +decode +dequant +TPU smoke).
+**Branch:** `deepseek-v4`. Three autonomous sessions on 2026-04-28:
+v1 (08:36–09:46 UTC, prefill-only),
+v2 (17:14–17:50 UTC, +decode +dequant +TPU smoke),
+v3 (19:03 UTC onward, +vllm-serve probe characterization +decode hardening).
+
+## v3 — what's new since v2
+
+| Area | v2 state | v3 state |
+|---|---|---|
+| Decode parity test coverage | 20 tests at sp ∈ {1, 8, 9, 16, 32} | **+11 tests** at sp ∈ {64, 128, 192, 255}; 32-step rolling-decode equivalence to bulk prefill (T8); CSA second-window + HCA second-compression compressor parity |
+| vLLM serve failure surface | speculative ("requires nnx.Module port") | **probed twice and characterized**: B4 = `VllmConfig` pydantic gate demands `NEW_MODEL_DESIGN=1` + `enable_dp_attention` (V4 is MLA-classified by name); with those flags, vllm advances to `nnx.eval_shape(create_abstract_model)` which fails with `TypeError: ... not a valid JAX type` exactly as BLOCKERS B2 hypothesized |
+| Tolerance log | T1, T2, T3, T6, T7, T4 | **+T8** — 32-step decode-state ≡ bulk-prefill-state at atol=2e-2, with measurement evidence (~1.0e-2 observed, 2e-2 budget) |
+| Total tests | 70 passing, 1 skipped (TPU) | **81 passing, 1 skipped** (still 0 regressions; +11 hardening) |
+
+What was deliberately **not** attempted in v3:
+  * No new W-items finished. The v3 vllm-probe characterized B2/B4 with
+    a recorded traceback. Actually fixing B1 (paged-KV adapter or
+    Pallas kernel for V4 sparse-attn over [SWA || compressed]) and B2
+    (full nnx.Module port of `DeepseekV4ForCausalLM`) is structural
+    refactoring at a scope larger than an overnight session can deliver
+    safely.
+  * No tightening of T5/T6/T7 atol bounds. Existing values are
+    measurement-justified; tightening without evidence would violate
+    the "Never fake correctness" rule.
+
+## v2 — what's new since v1
 
 ## v2 — what's new since v1
 
@@ -29,13 +53,35 @@ What is **still residual risk** in v2:
 ## How to run all tests
 
 ```bash
-# CPU suite (45 v1 + 25 new v2 = 70 expected, 1 skipped):
+# CPU suite (45 v1 + 25 new v2 + 11 v3 = 81 expected, 1 skipped):
 JAX_PLATFORMS=cpu \
 XLA_FLAGS="--xla_force_host_platform_device_count=32" \
 pytest tests/models/test_deepseek_v4.py -v
 
 # Tier 6 (real TPU):
 JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward -v
+```
+
+## How to reproduce the vLLM-serve probe (v3 finding)
+
+Reproduces the two concrete failure modes characterized in v3:
+
+```bash
+# B4 (first gate): vllm classifies V4 as MLA, demands new flags.
+JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
+    --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
+    --port 18080 --seed 0 --trust-remote-code --dtype bfloat16
+#   → pydantic_core.ValidationError: 'MLA models require NEW_MODEL_DESIGN=1
+#     and DP attention via additional_config'
+
+# B2 (second gate): with the required flags, vllm reaches nnx.eval_shape
+# and fails because DeepseekV4ForCausalLM isn't an nnx.Module.
+NEW_MODEL_DESIGN=1 JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
+    --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
+    --port 18080 --seed 0 --trust-remote-code --dtype bfloat16 \
+    --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'
+#   → TypeError: function create_abstract_model ... returned a value of type
+#     <class '...DeepseekV4ForCausalLM'> ... which is not a valid JAX type
 ```
 
 Use `--xla_force_host_platform_device_count=32` to enable the v6e-32 mesh simulation; with 8 the v6e-32 budget tests will skip (they assert ≥32 devices are present).

@@ -83,4 +83,11 @@ RESUMED at 2026-04-28 19:03 UTC (v3 final) — baseline reconfirmed `70 passed, 
 
 - [x] Baseline reconfirmed clean: `70 passed, 1 skipped` (5:28).
 - [x] `vllm serve` probe captures first concrete failure: pydantic VllmConfig validation rejects DeepseekV4ForCausalLM unless NEW_MODEL_DESIGN=1 + enable_dp_attention. Documented in BLOCKERS.md B4. This is upstream of B1/B2/B3 — vllm errors before it even reaches our model class.
+- [x] `vllm serve` probe with workaround flags captures second failure: at `tpu_inference/models/common/model_loader.py:244`, `nnx.eval_shape(create_abstract_model)` raises `TypeError: ... not a valid JAX type` because `DeepseekV4ForCausalLM` is a plain Python class. This characterizes B2 with the exact traceback (previously a structural prediction, now a captured failure). Both probes' tracebacks recorded in BLOCKERS.md.
+- [x] **Tier 2 hardening — +11 decode parity tests** added (TestDecodeAttentionParityExtended, TestDecodeRollingEquivalenceWithPrefill, TestCompressorDecodeStepExtended, TestDecodeRollingParityLong). Spec called for decode parity at start_pos ∈ {1, 8, 9, 64, 256} — v2 covered {1, 8, 9, 16, 32}; v3 fills in the remainder with 64, 128, 192, 255 across all three layer flavors. Plus the 32-step rolling-decode-state ≡ bulk-prefill-state invariant (TOLERANCE_LOG.md T8, atol=2e-2).
+- [x] Final CPU regression: **81 passed, 1 skipped (TPU-only) in 5:39**. v2's 70 still pass; +11; 0 regressions.
+- [ ] **W2, W3, T5 — STILL deferred** to BLOCKERS.md B1/B2/B3/B4. v3's contribution is to *characterize* B2/B4 with concrete tracebacks rather than fix them.
+
+## Resume hint (post-v3)
+**If I died right now**, the next session should: (a) read BLOCKERS.md B1/B2/B3/B4 — B4 is new and gates B2; (b) write a minimal `nnx.Module`-subclassing version of `DeepseekV4ForCausalLM` that can pass `nnx.eval_shape` (this addresses B2's symptom — the actual W3 work of wiring the body still requires solving B1 first); (c) decide between option (i) custom Pallas kernel vs (ii) extend vLLM's per-layer kv_cache schema for V4's compressor/indexer state pytrees. Prior `RESUMED at 17:14` PROGRESS hint still applies for the deeper structural work.
 
