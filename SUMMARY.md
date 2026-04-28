@@ -2,6 +2,23 @@
 
 **Branch:** `deepseek-v4`. Single autonomous session, started 2026-04-28 ~08:36 UTC.
 
+## How to run all tests
+
+```bash
+JAX_PLATFORMS=cpu \
+XLA_FLAGS="--xla_force_host_platform_device_count=8" \
+pytest tests/models/test_deepseek_v4.py -v
+```
+
+The first time the V4-Pro `test_compile_first_two_layers_only` test runs, XLA compilation can take several minutes. If you want a faster smoke pass, use:
+
+```bash
+pytest tests/models/test_deepseek_v4.py -v \
+    --deselect "tests/models/jax/test_deepseek_v4.py::TestRealConfigCompile::test_compile_first_two_layers_only"
+```
+
+Both `pytest tests/models/jax/test_deepseek_v4.py` (the original location) and `pytest tests/models/test_deepseek_v4.py` (the spec-required path) collect the same 45 tests via the shim file at the latter location.
+
 ## TL;DR
 
 A **mathematically-correct, end-to-end JAX implementation of DeepSeek-V4** is committed on `deepseek-v4`. The forward pass matches a CPU-runnable PyTorch reference (built from DeepSeek's official `inference/model.py`) at bf16 tolerance on every code path — sliding-window attention (SWA), Compressed Sparse Attention (CSA + DSA indexer), Heavily Compressed Attention (HCA), the manifold-constrained Hyper-Connections residual stream (mHC + Sinkhorn), the sqrtsoftplus + hash-routed MoE, and the MTP block. The real V4-Flash (43L) and V4-Pro (61L) configs `eval_shape` cleanly on both v4-8 and simulated v6e-32 meshes, and a 2-layer truncation of each compiles via `jit().lower().compile()` and runs a forward pass without error. The HF-name → JAX-param-tree mapping covers all 69,187 V4-Flash safetensors entries.
