@@ -670,6 +670,45 @@ class TestEndToEnd:
         agree = (argmax_t == argmax_j).mean()
         assert agree >= 0.95, f"argmax agreement {agree:.3f} < 0.95"
 
+    def test_v4_pro_style_compress_ratios(self):
+        """Tier 2 hardening: exercise V4-Pro's leading-HCA pattern
+        (`compress_ratios = [128, 128, 4, 128, 4, 0]`). V4-Flash has
+        leading-SWA `[0, 0, 4, 128, 4, 0]`. Both patterns route through
+        the same code paths but the order differs; this test confirms
+        no order-dependent bugs exist."""
+        model, params, cfg, swa, comp = self._build_pair(
+            seed=11,
+            compress_ratios=(128, 128, 4, 128, 4, 0, 0),
+        )
+        torch.manual_seed(13)
+        x = torch.randint(0, model.args.vocab_size, (1, 32))
+        with torch.inference_mode():
+            model.reset_state()
+            l_t = model(x, start_pos=0)
+        l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
+        diff = maxabs(l_j, l_t)
+        assert diff <= 0.1, f"V4-Pro-style pattern: max logits diff {diff}"
+
+    def test_long_context_sliding_window_wraparound(self):
+        """Tier 2 hardening: prefill with seqlen >> sliding_window. With
+        tiny window_size=8 and seqlen=128, the sliding window wraps 16
+        times. Any off-by-one in the window_topk_idxs path would diverge."""
+        model, params, cfg, swa, comp = self._build_pair(seed=21, max_seq_len=256)
+        torch.manual_seed(23)
+        S = 128
+        x = torch.randint(0, model.args.vocab_size, (1, S))
+        with torch.inference_mode():
+            model.reset_state()
+            l_t = model(x, start_pos=0)
+        l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
+        diff = maxabs(l_j, l_t)
+        assert diff <= 0.15, f"long-context max logits diff {diff}"
+        # Argmax invariant — must agree on >=90% of the 128 positions.
+        argmax_t = l_t.argmax(dim=-1).numpy()
+        argmax_j = np.asarray(l_j.argmax(axis=-1))
+        agree = (argmax_t == argmax_j).mean()
+        assert agree >= 0.90, f"long-context argmax agreement {agree:.3f}"
+
     def test_mtp_forward_parity(self):
         model, params, cfg, swa, comp = self._build_pair(seed=2)
         torch.manual_seed(5)
@@ -809,18 +848,26 @@ class TestRealConfigCompile:
         """Compile-only test on a TRUNCATED real config (first 2 layers) so the
         actual XLA compilation completes in a reasonable time. Verifies that
         the math constructs lower correctly.
+
+        For V4-Pro we additionally truncate n_routed_experts to 64 (real is
+        384) to keep CPU memory tractable. The math paths exercised are
+        identical to V4-Flash; this test guards V4-Pro-specific shape ratios
+        (q_lora_rank=1536, o_groups=16, etc.) — if those triggered a bug it
+        would also surface in eval_shape (covered by `test_eval_shape_succeeds`).
         """
         cfg_full = _load_real_config(model_name)
-        cfg = DeepseekV4Config(**{**dataclasses.asdict(cfg_full),
-                                   "num_hidden_layers": 2,
-                                   "num_nextn_predict_layers": 0,
-                                   # Use a small representative compress_ratios subset.
-                                   "compress_ratios": (cfg_full.compress_ratios[2],
-                                                        cfg_full.compress_ratios[3]),
-                                   })
+        cfg_dict = {**dataclasses.asdict(cfg_full),
+                    "num_hidden_layers": 2,
+                    "num_nextn_predict_layers": 0,
+                    "compress_ratios": (cfg_full.compress_ratios[2],
+                                         cfg_full.compress_ratios[3])}
+        if model_name == "V4-Pro":
+            # Reduce experts so the zeros-materialized param tree fits in CPU RAM.
+            cfg_dict["n_routed_experts"] = max(64, cfg_full.num_experts_per_tok * 4)
+            cfg_dict["vocab_size"] = 4096  # also reduce vocab; tid2eid is keyed by vocab
+        cfg = DeepseekV4Config(**cfg_dict)
         params_struct = make_abstract_transformer_params(cfg)
-        # Materialize the params with zeros (not jax.random.normal, since the
-        # tree is large but only 2 layers — should fit on CPU).
+        # Materialize the params with zeros.
         def to_zeros(x):
             return jnp.zeros(x.shape, dtype=x.dtype)
         params = jax.tree_util.tree_map(to_zeros, params_struct)
