@@ -35,6 +35,12 @@
 **Decision:** Tiny config has 6 hidden layers with `compress_ratios = [0, 0, 4, 128, 4, 0]` so we exercise (a) pure sliding-window attention, (b) CSA with indexer, (c) HCA without indexer, (d) the trailing pure-SWA layer that V4-Pro and V4-Flash both have at the very end.
 **Why:** Each compress_ratio category triggers a different code path inside `Attention.forward`. Missing one would leave a code path untested.
 
+## D8 — V4-Pro compile-only test uses a truncated config (64 experts instead of 384)
+**When:** 2026-04-28 09:35 UTC.
+**Decision:** `test_compile_first_two_layers_only[V4-Pro]` truncates `n_routed_experts` from 384 to 64 and `vocab_size` from 129280 to 4096, in addition to the existing 2-layer truncation. The V4-Flash version of the same test runs at full config (no expert truncation needed; it has 256 experts).
+**Why:** Materializing the full V4-Pro 2-layer param tree as `jnp.zeros` requires ~7 TB of fp32 (or ~3.5 TB at bf16) on a CPU host. The host has ~150 GB RAM. With 64 experts, the per-test footprint drops to ~1 GB.
+**Implications:** This test verifies that V4-Pro-specific shape ratios (`q_lora_rank=1536`, `o_groups=16`, larger `hidden_size=7168`, `moe_intermediate_size=3072`) lower correctly. Bugs that depend on exactly 384 experts (vs any other count) would NOT be caught by this test, but `test_eval_shape_succeeds` runs on the FULL config and would detect those.
+
 ## D7 — MTP layer included in tiny config, tested separately
 **When:** 2026-04-28 09:17 UTC.
 **Decision:** Tiny config has `n_mtp_layers=1` (matching V4-Pro and V4-Flash). The MTP block uses the parent embedding and head, so it is tested by feeding `(h, start_pos, input_ids)` to `model.mtp[0]` and comparing logits.
