@@ -1258,6 +1258,154 @@ class TestRealTpuTinyForward:
 
 
 # =============================================================
+# Tier 5 — vLLM serve curl round-trip (TPU-only)
+# =============================================================
+
+
+class TestVllmServeRoundtrip:
+    """Tier 5: spawn `vllm serve` against /mnt/scratch/tiny_v4_bf16, send
+    two identical /v1/completions, assert HTTP 200 + non-empty text +
+    byte-equal `choices` (deterministic with seed=0).
+
+    Skips when TPU unavailable, fixture missing, or `vllm` binary not on
+    PATH. Per the v6 SUMMARY this round-trip exercises the entire
+    integration: pydantic VllmConfig gate (B4 workaround), the V4 nnx
+    port (B2 fix), the KVCacheManager use_mla override (B5 fix), and
+    the deepseek_v4_loader path through DeepseekV4ForCausalLM.load_weights.
+    """
+
+    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+    PORT = 18080
+    READY_TIMEOUT_S = 240
+    PREFLIGHT_LOG = "/workspace/logs/tpu-preflight.log"
+
+    def _has_tpu(self):
+        # We deliberately do NOT call `jax.devices("tpu")` here — that
+        # initializes the TPU backend in the *parent* pytest process and
+        # makes the TPU unavailable to the subprocess we spawn. Instead
+        # read the host-side preflight log written before the agent was
+        # invoked.
+        try:
+            with open(self.PREFLIGHT_LOG) as f:
+                first_line = f.readline().strip()
+        except FileNotFoundError:
+            return False
+        try:
+            import json
+            d = json.loads(first_line)
+            return bool(d.get("ok")) and int(d.get("n_tpu", 0)) >= 1
+        except Exception:
+            return False
+
+    def _has_vllm_binary(self):
+        import shutil
+        return shutil.which("vllm") is not None
+
+    def test_curl_roundtrip(self):
+        if not os.path.exists(self.BF16_DIR):
+            pytest.skip(f"{self.BF16_DIR} missing")
+        if not self._has_tpu():
+            pytest.skip("No TPU devices available")
+        if not self._has_vllm_binary():
+            pytest.skip("vllm binary not on PATH")
+
+        import json
+        import subprocess
+        import time
+        import urllib.request
+        import urllib.error
+
+        env = dict(os.environ)
+        env["NEW_MODEL_DESIGN"] = "1"
+        env["JAX_PLATFORMS"] = "tpu"
+        # Avoid inheriting the test process's CPU-mesh XLA flags.
+        env.pop("XLA_FLAGS", None)
+
+        cmd = [
+            "vllm", "serve", self.BF16_DIR,
+            "--tensor-parallel-size", "4",
+            "--max-model-len", "256",
+            "--max-num-seqs", "2",
+            "--port", str(self.PORT),
+            "--seed", "0",
+            "--trust-remote-code",
+            "--dtype", "bfloat16",
+            "--additional_config",
+            '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}',
+        ]
+        log_path = f"/tmp/vllm_serve_t5_pytest.log"
+        log_f = open(log_path, "w")
+        proc = subprocess.Popen(
+            cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT,
+        )
+        try:
+            ready = False
+            deadline = time.monotonic() + self.READY_TIMEOUT_S
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    log_f.flush()
+                    log_tail = open(log_path).read()[-4000:]
+                    pytest.fail(
+                        f"vllm serve died during init "
+                        f"(rc={proc.returncode}); log tail:\n{log_tail}"
+                    )
+                try:
+                    with urllib.request.urlopen(
+                        f"http://localhost:{self.PORT}/v1/models",
+                        timeout=2,
+                    ) as resp:
+                        if resp.status == 200:
+                            ready = True
+                            break
+                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+                    pass
+                time.sleep(2)
+
+            if not ready:
+                pytest.fail(f"vllm serve did not become ready in {self.READY_TIMEOUT_S}s")
+
+            body = json.dumps({
+                "model": self.BF16_DIR,
+                "prompt": "abc",
+                "max_tokens": 8,
+                "temperature": 0,
+                "seed": 0,
+            }).encode("utf-8")
+
+            def _post():
+                req = urllib.request.Request(
+                    f"http://localhost:{self.PORT}/v1/completions",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    return r.status, r.read()
+
+            s1, b1 = _post()
+            s2, b2 = _post()
+            assert s1 == 200 and s2 == 200, (s1, s2)
+
+            j1 = json.loads(b1)
+            j2 = json.loads(b2)
+            text1 = j1["choices"][0]["text"]
+            text2 = j2["choices"][0]["text"]
+            assert text1 != "", f"resp1 text was empty: {j1!r}"
+            assert text2 != "", f"resp2 text was empty: {j2!r}"
+            # Determinism: text + finish_reason + usage are byte-equal.
+            assert text1 == text2, (text1, text2)
+            assert j1["choices"][0]["finish_reason"] == j2["choices"][0]["finish_reason"]
+            assert j1["usage"] == j2["usage"]
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            log_f.close()
+
+
+# =============================================================
 # W4 / Tier 4b / Tier 7 — FP4/FP8 weight loader & dequant
 # =============================================================
 
