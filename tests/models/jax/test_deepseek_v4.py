@@ -1364,37 +1364,77 @@ class TestVllmServeRoundtrip:
             if not ready:
                 pytest.fail(f"vllm serve did not become ready in {self.READY_TIMEOUT_S}s")
 
-            body = json.dumps({
-                "model": self.BF16_DIR,
-                "prompt": "abc",
-                "max_tokens": 8,
-                "temperature": 0,
-                "seed": 0,
-            }).encode("utf-8")
-
-            def _post():
+            def _post(prompt, max_tokens=8, seed=0):
+                payload = json.dumps({
+                    "model": self.BF16_DIR,
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                    "seed": seed,
+                }).encode("utf-8")
                 req = urllib.request.Request(
                     f"http://localhost:{self.PORT}/v1/completions",
-                    data=body,
+                    data=payload,
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(req, timeout=60) as r:
                     return r.status, r.read()
 
-            s1, b1 = _post()
-            s2, b2 = _post()
+            # (1) Spec assertions: two identical seed=0 requests are
+            # byte-equal in their generation-relevant fields, and produce
+            # non-empty completion text.
+            s1, b1 = _post("abc")
+            s2, b2 = _post("abc")
             assert s1 == 200 and s2 == 200, (s1, s2)
-
             j1 = json.loads(b1)
             j2 = json.loads(b2)
             text1 = j1["choices"][0]["text"]
             text2 = j2["choices"][0]["text"]
             assert text1 != "", f"resp1 text was empty: {j1!r}"
             assert text2 != "", f"resp2 text was empty: {j2!r}"
-            # Determinism: text + finish_reason + usage are byte-equal.
             assert text1 == text2, (text1, text2)
             assert j1["choices"][0]["finish_reason"] == j2["choices"][0]["finish_reason"]
             assert j1["usage"] == j2["usage"]
+            assert j1["choices"][0]["finish_reason"] == "length", (
+                f"expected finish_reason=length (max_tokens=8), got "
+                f"{j1['choices'][0]['finish_reason']}"
+            )
+            assert j1["usage"]["completion_tokens"] == 8, j1["usage"]
+
+            # (2) Sanity: prompt-dependence. A *different* prompt should
+            # produce different completion text than "abc". This is a
+            # weak sanity check — the only ways this fails are: (a) the
+            # model is collapsing all prompts to the same logits (bug),
+            # (b) by accident the two prompts happen to argmax-tie. We
+            # use a longer prompt that shares no characters to maximize
+            # the chance of divergence.
+            s3, b3 = _post("hello world this is a longer prompt")
+            assert s3 == 200, s3
+            j3 = json.loads(b3)
+            text3 = j3["choices"][0]["text"]
+            assert text3 != "", f"resp3 text was empty: {j3!r}"
+            assert text3 != text1, (
+                f"different prompt produced same completion as 'abc' — "
+                f"prompt-independent output is a bug.\n"
+                f"  text1={text1!r}\n  text3={text3!r}"
+            )
+
+            # (3) Longer generation: max_tokens=16 still completes
+            # without error and produces 16 completion tokens (or hits
+            # finish_reason=stop, but the tiny synthetic config has no
+            # natural stop tokens so we expect length).
+            s4, b4 = _post("abc", max_tokens=16)
+            assert s4 == 200, s4
+            j4 = json.loads(b4)
+            text4 = j4["choices"][0]["text"]
+            assert text4 != "", f"resp4 text was empty: {j4!r}"
+            assert j4["usage"]["completion_tokens"] == 16, j4["usage"]
+            # The first 8 tokens should match the 8-token completion
+            # because temperature=0 makes the model deterministic at
+            # each step regardless of remaining max_tokens budget.
+            # (Caveat: vllm's continuous-batching scheduler can
+            # interleave with other requests, but at temp=0 the
+            # per-position argmax is independent of batch.)
         finally:
             proc.terminate()
             try:
