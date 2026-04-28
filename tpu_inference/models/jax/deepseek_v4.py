@@ -797,24 +797,66 @@ class DeepseekV4ForCausalLM:
             raise ValueError("DeepseekV4ForCausalLM needs a model_config.hf_config")
         self.config = DeepseekV4Config.from_hf_dict(cfg_dict)
         # Abstract param tree — useful for shape probes and the weight-name
-        # mapping. Real (allocated) params would be too large; we defer that
-        # to a future weight loader.
+        # mapping.
         self.params = make_abstract_transformer_params(self.config)
+        # Pre-computed RoPE freq tables. Populated lazily on first forward.
+        self._freqs_cis_swa = None
+        self._freqs_cis_compressed = None
 
     def map_weight_name(self, hf_name: str):
         """Returns the JAX param-tree path for an HF param name, or None."""
         return map_hf_name_to_jax_path(hf_name)
 
+    def load_weights_from_dir(self, checkpoint_dir: str):
+        """Load real weights from a V4 checkpoint directory using the W4
+        loader. Replaces `self.params` with a TransformerParams pytree of
+        real bf16 / fp32 arrays."""
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            apply_weights_to_param_tree, load_v4_safetensors_to_dict,
+        )
+        # Materialize abstract leaves to zero arrays first (so apply_*
+        # operates on real arrays we can reshape if needed).
+        self.params = jax.tree_util.tree_map(
+            lambda x: jnp.zeros(x.shape, dtype=x.dtype),
+            self.params,
+            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+        )
+        weights = load_v4_safetensors_to_dict(checkpoint_dir)
+        self.params = apply_weights_to_param_tree(self.params, weights, self.config)
+        # Pre-build freqs.
+        self._freqs_cis_swa, self._freqs_cis_compressed = make_freqs_cis(
+            self.config, self.config.max_position_embeddings,
+        )
+
+    def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:
+        """Functional prefill — returns logits [B, S, vocab].
+
+        This is a thin wrapper around `deepseek_v4_forward_prefill` for
+        callers that already hold a `DeepseekV4ForCausalLM`. Real vllm
+        integration (paged-KV plumbing, mesh sharding) is the work of
+        BLOCKERS.md B1+B2.
+        """
+        if self._freqs_cis_swa is None:
+            self._freqs_cis_swa, self._freqs_cis_compressed = make_freqs_cis(
+                self.config, self.config.max_position_embeddings,
+            )
+        return deepseek_v4_forward_prefill(
+            input_ids, self.params,
+            self._freqs_cis_swa, self._freqs_cis_compressed, self.config,
+        )
+
     def __call__(self, *args, **kwargs):
-        # Defer to the functional forward. This signature would need to
-        # match the rest of the tpu-inference runtime; for now it raises a
-        # clear error so callers know what's missing.
+        # vLLM's runtime calls __call__(kv_caches, input_ids, attention_metadata, ...).
+        # Full integration (paged KV + decode-state plumbing) is documented in
+        # BLOCKERS.md B1+B2. As a useful intermediate state we expose
+        # `forward_prefill(input_ids)` and `load_weights_from_dir(path)` so
+        # downstream test code can drive the model without needing the
+        # paged-KV adapter.
         raise NotImplementedError(
-            "DeepseekV4ForCausalLM.__call__ is not yet wired into the "
-            "tpu_inference runtime. The functional forward path "
-            "(`deepseek_v4_forward_prefill`) is fully tested and can be "
-            "called directly with a TransformerParams pytree. See "
-            "tests/models/jax/test_deepseek_v4.py for usage."
+            "DeepseekV4ForCausalLM.__call__ requires a paged-KV adapter and a "
+            "decode-state pytree per layer (see BLOCKERS.md B1+B2). For "
+            "non-vllm prefill use `instance.forward_prefill(input_ids)` after "
+            "calling `load_weights_from_dir(checkpoint_dir)`."
         )
 
 

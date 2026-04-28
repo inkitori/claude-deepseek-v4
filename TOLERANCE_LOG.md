@@ -27,6 +27,30 @@ Every place where a numerical tolerance was loosened from the default (fp32 1e-5
 - The argmax agreement test (`test_argmax_token_agreement`) requires ≥95% of token positions to have the same argmax — a discrete invariant that bf16 rounding generally cannot break.
 - The 0.1 bound is conservative enough that a real bug (any per-layer math error) would push the diff well above it.
 
+## T6 — Real-TPU compile + sanity check (no per-element atol)
+**Where:** `TestRealTpuTinyForward::test_tiny_tpu_compile_and_forward`.
+**Default:** N/A (no per-element tolerance).
+**Looser bound:** sanity-only — `np.all(np.isfinite(logits))` plus
+`logits.std() > 0.01` (logits non-trivially varied).
+**Evidence:** JAX cannot initialize both TPU and CPU backends in the same
+process, so a per-element TPU-vs-CPU comparison would need to span two
+subprocesses. The CPU forward is validated against torch reference at
+atol=0.1 in Tier 2; the TPU forward goes through the same `jax.jit` lowering
+of the same Python source. Bugs that would manifest only on TPU (e.g. dtype
+lowering quirks, sharding-axis name mismatches) are documented as residual
+risk in PROD_TOPOLOGY_RISKS.md item 1.
+
+## T7 — Quant vs groundtruth logit parity (`TestQuantToParamsApply`): `atol=0.1`
+**Where:** `tests/models/jax/test_deepseek_v4.py::TestQuantToParamsApply::test_forward_logits_quant_vs_groundtruth`.
+**Default:** bf16 atol/rtol = 1e-2.
+**Looser bound:** atol=0.1.
+**Evidence:** The loader's bit-exact output (`max_diff == 0.0` across 355
+tensors, see `TestFp8Dequant`) means the bf16 weight tensors are byte-equal
+on both quant and groundtruth paths. Forward-pass logits should therefore be
+identical modulo fp32 reduction order in matmuls. The atol=0.1 budget is the
+same as Tier 2's end-to-end logits parity bound, providing a safety margin
+that would catch any non-trivial loader bug.
+
 ## T4 — Indexer top-k SET equality (Tier 1, `TestIndexerComponent`)
 **Where:** `TestIndexerComponent::test_indexer_prefill_matches_torch_topk`.
 **Default:** exact int equality.

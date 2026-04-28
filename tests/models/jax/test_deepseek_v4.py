@@ -1296,6 +1296,51 @@ class TestFp8Dequant:
         assert max_diff == 0.0, f"max diff {max_diff} across {n} tensors"
 
 
+class TestDeepseekV4ForCausalLMHelpers:
+    """Sanity test that the partial __call__ helpers
+    (load_weights_from_dir + forward_prefill) work end-to-end on
+    tiny_v4_bf16. Full vllm-runtime __call__ is blocked on B1+B2."""
+
+    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+
+    def test_forward_prefill_helper(self):
+        if not os.path.exists(self.BF16_DIR):
+            pytest.skip(f"{self.BF16_DIR} not present")
+        from types import SimpleNamespace
+        from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
+        with open(os.path.join(self.BF16_DIR, "config.json")) as f:
+            import json
+            hf_dict = json.load(f)
+        # Fake vllm_config: must expose model_config.hf_config either as a
+        # dict or with a .to_dict method.
+        fake_hf = SimpleNamespace(**hf_dict)
+        fake_hf.to_dict = lambda: hf_dict
+        fake_vc = SimpleNamespace(model_config=SimpleNamespace(hf_config=fake_hf))
+        model = DeepseekV4ForCausalLM(fake_vc)
+        model.load_weights_from_dir(self.BF16_DIR)
+        S = 16
+        ids = (jnp.arange(S, dtype=jnp.int32) % model.config.vocab_size).reshape(1, S)
+        logits = model.forward_prefill(ids)
+        assert logits.shape == (1, S, model.config.vocab_size)
+        assert logits.dtype == jnp.float32
+        np_logits = np.asarray(logits).astype(np.float32)
+        assert np.all(np.isfinite(np_logits))
+        assert np_logits.std() > 0.01
+
+    def test_call_raises_until_runtime_lands(self):
+        from types import SimpleNamespace
+        from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
+        with open(os.path.join(self.BF16_DIR, "config.json")) as f:
+            import json
+            hf_dict = json.load(f)
+        fake_hf = SimpleNamespace(**hf_dict)
+        fake_hf.to_dict = lambda: hf_dict
+        fake_vc = SimpleNamespace(model_config=SimpleNamespace(hf_config=fake_hf))
+        model = DeepseekV4ForCausalLM(fake_vc)
+        with pytest.raises(NotImplementedError):
+            model([], jnp.zeros((1, 4), dtype=jnp.int32), None)
+
+
 class TestRealShardRoundTrip:
     """Tier 4b: round-trip the staged real V4-Flash bf16 shard through the
     loader. embed.weight is bf16 with no scale, so byte-equality against the
