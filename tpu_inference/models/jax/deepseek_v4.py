@@ -330,6 +330,25 @@ def head_forward(
 # Top-level prefill
 # ------------------------------------------------------------
 
+def transformer_body_forward(
+    input_ids: jnp.ndarray,        # [B, S] int32
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+) -> jnp.ndarray:
+    """Body-only prefill: embed → all layers → return [B, S, hc, D] residual stream.
+    No final HC mix, no norm, no lm_head. Used by the nnx wrapper so it can
+    return hidden states from __call__ and apply the head in compute_logits."""
+    h = params.embed_w[input_ids]  # [B, S, D]
+    h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
+    for layer in params.layers:
+        cr = layer.attn.compress_ratio
+        fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
+        h = block_forward(h, input_ids, layer, fc)
+    return h
+
+
 def deepseek_v4_forward_prefill(
     input_ids: jnp.ndarray,        # [B, S] int32
     params: TransformerParams,
@@ -338,13 +357,9 @@ def deepseek_v4_forward_prefill(
     cfg: DeepseekV4Config,
 ) -> jnp.ndarray:
     """Returns logits [B, S, vocab_size]."""
-    h = params.embed_w[input_ids]  # [B, S, D]
-    h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
-    for li, layer in enumerate(params.layers):
-        # Attention layer's freqs depends on its compress_ratio.
-        cr = layer.attn.compress_ratio
-        fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
-        h = block_forward(h, input_ids, layer, fc)
+    h = transformer_body_forward(
+        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+    )
     return head_forward(
         h, params.head_w, params.final_norm_w,
         params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
@@ -774,90 +789,218 @@ _QUANT_SUFFIXES = {".scale"}
 # dequantization, mesh-aware sharding annotations) is documented as
 # Phase 7+ work in PROD_TOPOLOGY_RISKS.md item 7.
 
-class DeepseekV4ForCausalLM:
-    """Stub wrapper class for vLLM dispatch. Holds a parsed
-    `DeepseekV4Config` and the abstract param tree for shape verification.
+def _materialize_param_tree(abstract_tree):
+    """Replace every ShapeDtypeStruct leaf with jnp.zeros(shape, dtype)."""
+    return jax.tree_util.tree_map(
+        lambda x: jnp.zeros(x.shape, dtype=x.dtype),
+        abstract_tree,
+        is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+    )
 
-    The class is intentionally lightweight: it does NOT subclass `JaxModule`
-    or own `nnx.Variable`s. Until the full vLLM-runtime integration lands,
-    this class lives only to be importable + registry-discoverable.
-    """
-    def __init__(self, vllm_config, rng_key=None, mesh=None):
-        self.vllm_config = vllm_config
-        self.mesh = mesh
-        # Build the V4 config from the HF config dict if available.
-        hf_config = getattr(vllm_config.model_config, "hf_config", None)
-        cfg_dict = None
-        if hf_config is not None:
-            # vLLM may store config either as a dict or as a HuggingFace
-            # PretrainedConfig instance — try both.
-            cfg_dict = (hf_config.to_dict() if hasattr(hf_config, "to_dict")
-                        else dict(hf_config))
-        if cfg_dict is None:
-            raise ValueError("DeepseekV4ForCausalLM needs a model_config.hf_config")
-        self.config = DeepseekV4Config.from_hf_dict(cfg_dict)
-        # Abstract param tree — useful for shape probes and the weight-name
-        # mapping.
-        self.params = make_abstract_transformer_params(self.config)
-        # Pre-computed RoPE freq tables. Populated lazily on first forward.
-        self._freqs_cis_swa = None
-        self._freqs_cis_compressed = None
 
-    def map_weight_name(self, hf_name: str):
-        """Returns the JAX param-tree path for an HF param name, or None."""
-        return map_hf_name_to_jax_path(hf_name)
+def _extract_hf_config_dict(vllm_config):
+    """vLLM stores hf_config as either a PretrainedConfig or a SimpleNamespace.
+    Both expose `.to_dict()` in our test harness. Real vllm uses
+    PretrainedConfig.to_dict() too."""
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    if hf_config is None:
+        raise ValueError("DeepseekV4ForCausalLM needs vllm_config.model_config.hf_config")
+    if hasattr(hf_config, "to_dict"):
+        return hf_config.to_dict()
+    return dict(hf_config)
 
-    def load_weights_from_dir(self, checkpoint_dir: str):
-        """Load real weights from a V4 checkpoint directory using the W4
-        loader. Replaces `self.params` with a TransformerParams pytree of
-        real bf16 / fp32 arrays."""
-        from tpu_inference.models.jax.deepseek_v4_loader import (
-            apply_weights_to_param_tree, load_v4_safetensors_to_dict,
-        )
-        # Materialize abstract leaves to zero arrays first (so apply_*
-        # operates on real arrays we can reshape if needed).
-        self.params = jax.tree_util.tree_map(
-            lambda x: jnp.zeros(x.shape, dtype=x.dtype),
-            self.params,
-            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
-        )
-        weights = load_v4_safetensors_to_dict(checkpoint_dir)
-        self.params = apply_weights_to_param_tree(self.params, weights, self.config)
-        # Pre-build freqs.
-        self._freqs_cis_swa, self._freqs_cis_compressed = make_freqs_cis(
-            self.config, self.config.max_position_embeddings,
-        )
 
-    def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:
-        """Functional prefill — returns logits [B, S, vocab].
+# Lazy nnx import — the wrapper class is created at import time but nnx
+# initialization touches JAX which we want to defer behind the tpu_inference
+# import path.
+def _build_class():
+    from flax import nnx
+    from tpu_inference.layers.jax import JaxModule
 
-        This is a thin wrapper around `deepseek_v4_forward_prefill` for
-        callers that already hold a `DeepseekV4ForCausalLM`. Real vllm
-        integration (paged-KV plumbing, mesh sharding) is the work of
-        BLOCKERS.md B1+B2.
+    class DeepseekV4ForCausalLM(JaxModule):
+        """Minimum-viable nnx.Module wrapper for vLLM dispatch.
+
+        Subclasses `JaxModule` (== `nnx.Module`) so it survives
+        `nnx.eval_shape(create_abstract_model)` in
+        `tpu_inference/models/common/model_loader.py:244` (BLOCKERS B2).
+
+        Storage strategy: the entire V4 parameter pytree
+        (`TransformerParams` registered as a pytree above) is held inside a
+        single `nnx.Param` whose `.value` is the dataclass tree. This
+        sidesteps the V3-style "every weight is its own JaxEinsum/JaxRmsNorm"
+        ceremony — V4's math runs through the existing functional core
+        (`transformer_body_forward` / `head_forward`), which only needs the
+        raw arrays. JaxAutoWeightsLoader-compatible per-weight Modules are
+        deferred (see PROD_TOPOLOGY_RISKS item 7).
+
+        Forward contract:
+          * `__call__(kv_caches, input_ids, attention_metadata, ...)` runs
+            the transformer body for the prefill case where there is exactly
+            ONE sequence in the batch and `attention_metadata` describes a
+            full prefill (every token is a new query at its own position).
+            Returns `(kv_caches, hidden_TM, [])` with `hidden_TM` of shape
+            `[T, hc * D]` (T = total tokens; M = hc*D).
+          * `compute_logits(hidden_states)` reshapes back to `[T, hc, D]`
+            and runs the V4 head (HC mix → final norm → matmul against
+            `head_w`).
+
+        What this wrapper INTENTIONALLY does NOT do:
+          * Multi-sequence concurrent decode (per-batch state plumbing
+            requires kv-cache schema changes — BLOCKERS B1).
+          * paged-KV interoperation: `kv_caches` is passed through unchanged.
+            V4's per-layer state lives in the model dataclass tree (no
+            mutation across __call__ invocations).
+          * Sharding annotations on individual params (V3 has them; V4
+            does not yet — see PROD_TOPOLOGY_RISKS item 1).
         """
-        if self._freqs_cis_swa is None:
-            self._freqs_cis_swa, self._freqs_cis_compressed = make_freqs_cis(
-                self.config, self.config.max_position_embeddings,
-            )
-        return deepseek_v4_forward_prefill(
-            input_ids, self.params,
-            self._freqs_cis_swa, self._freqs_cis_compressed, self.config,
-        )
 
-    def __call__(self, *args, **kwargs):
-        # vLLM's runtime calls __call__(kv_caches, input_ids, attention_metadata, ...).
-        # Full integration (paged KV + decode-state plumbing) is documented in
-        # BLOCKERS.md B1+B2. As a useful intermediate state we expose
-        # `forward_prefill(input_ids)` and `load_weights_from_dir(path)` so
-        # downstream test code can drive the model without needing the
-        # paged-KV adapter.
-        raise NotImplementedError(
-            "DeepseekV4ForCausalLM.__call__ requires a paged-KV adapter and a "
-            "decode-state pytree per layer (see BLOCKERS.md B1+B2). For "
-            "non-vllm prefill use `instance.forward_prefill(input_ids)` after "
-            "calling `load_weights_from_dir(checkpoint_dir)`."
-        )
+        def __init__(self, vllm_config, rng_key=None, mesh=None):
+            cfg_dict = _extract_hf_config_dict(vllm_config)
+            self.config = DeepseekV4Config.from_hf_dict(cfg_dict)
+            self.vllm_config = vllm_config
+            self.mesh = mesh
+            # Build abstract param tree, then materialize each leaf as a
+            # zero array. `nnx.eval_shape` will trace these to
+            # `ShapeDtypeStruct` automatically.
+            abs_tree = make_abstract_transformer_params(self.config)
+            real_tree = _materialize_param_tree(abs_tree)
+            # Holding the full tree inside one nnx.Param lets nnx walk the
+            # registered TransformerParams pytree (see _register_pytree
+            # block above) when computing state / partition specs.
+            self.params_v = nnx.Param(real_tree)
+            # Freqs are fp32 lookup tables; build them up-front so the
+            # attribute slot is registered as data (an nnx.Variable) and
+            # later mutations don't trip nnx's static/data sentinel.
+            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            self._freqs_swa_v = nnx.Variable(swa)
+            self._freqs_compressed_v = nnx.Variable(comp)
+
+        # -- nnx housekeeping ----------------------------------------------
+
+        def initialize_cache(self):
+            """Pre-compute RoPE freq tables. Called by the loader after
+            weights are populated. Idempotent."""
+            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            self._freqs_swa_v = nnx.Variable(swa)
+            self._freqs_compressed_v = nnx.Variable(comp)
+
+        # -- public helpers (back-compat with v2 forward_prefill API) ------
+
+        @property
+        def params(self):
+            """Convenience accessor — returns the underlying TransformerParams
+            tree. Useful for tests that expect the v2 API."""
+            return self.params_v.get_value()
+
+        @params.setter
+        def params(self, new_tree):
+            self.params_v = nnx.Param(new_tree)
+
+        def map_weight_name(self, hf_name: str):
+            """Returns the JAX param-tree path for an HF param name, or None."""
+            return map_hf_name_to_jax_path(hf_name)
+
+        def load_weights_from_dir(self, checkpoint_dir: str):
+            """Load real V4 weights from a checkpoint directory."""
+            from tpu_inference.models.jax.deepseek_v4_loader import (
+                apply_weights_to_param_tree, load_v4_safetensors_to_dict,
+            )
+            current = self.params_v.get_value()
+            current = jax.tree_util.tree_map(
+                lambda x: jnp.zeros(x.shape, dtype=x.dtype) if isinstance(x, jax.ShapeDtypeStruct) else x,
+                current,
+                is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+            )
+            weights = load_v4_safetensors_to_dict(checkpoint_dir)
+            new_tree = apply_weights_to_param_tree(current, weights, self.config)
+            self.params_v = nnx.Param(new_tree)
+            self.initialize_cache()
+
+        def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:
+            """Functional prefill helper — returns logits [B, S, vocab]."""
+            return deepseek_v4_forward_prefill(
+                input_ids, self.params_v.get_value(),
+                self._freqs_swa_v.get_value(),
+                self._freqs_compressed_v.get_value(),
+                self.config,
+            )
+
+        # -- vLLM-runtime contract -----------------------------------------
+
+        def __call__(
+            self,
+            kv_caches,
+            input_ids,
+            attention_metadata=None,
+            inputs_embeds=None,
+            _input_positions=None,
+            _layer_name_to_kv_cache=None,
+            _lora_metadata=None,
+            intermediate_tensors=None,
+            is_first_rank: bool = True,
+            is_last_rank: bool = True,
+            *args,
+            **kwargs,
+        ):
+            """vLLM-runtime forward.
+
+            Returns `(kv_caches, hidden_TM, [])`.
+
+            For now this only correctly supports the **single-sequence
+            prefill** case: input_ids is treated as one contiguous sequence
+            of T tokens at positions [0, T). Multi-sequence batches and
+            decode steps with start_pos>0 require the per-layer V4 state
+            plumbing tracked in BLOCKERS B1.
+            """
+            ids = jnp.asarray(input_ids)
+            if ids.ndim == 1:
+                ids_2d = ids.reshape(1, -1)
+            elif ids.ndim == 2:
+                ids_2d = ids
+            else:
+                raise ValueError(f"input_ids must be 1D or 2D, got shape {ids.shape}")
+            params = self.params_v.get_value()
+            h = transformer_body_forward(
+                ids_2d, params,
+                self._freqs_swa_v.get_value(),
+                self._freqs_compressed_v.get_value(),
+                self.config,
+            )
+            # h: [B, S, hc, D]. vLLM expects (T, M) where T = B*S.
+            B, S, hc, D = h.shape
+            hidden_TM = h.reshape(B * S, hc * D)
+            return kv_caches, hidden_TM, []
+
+        def compute_logits(self, hidden_states):
+            """Apply the V4 head to hidden states. hidden_states is [T, hc*D]
+            (output of __call__) or [T_sampled, hc*D] (sampled subset)."""
+            params = self.params_v.get_value()
+            T = hidden_states.shape[0]
+            hc = self.config.hc_mult
+            D = self.config.hidden_size
+            assert hidden_states.shape[-1] == hc * D, (
+                f"compute_logits expected last dim {hc*D}, got {hidden_states.shape[-1]}"
+            )
+            h = hidden_states.reshape(1, T, hc, D)
+            logits_BSV = head_forward(
+                h, params.head_w, params.final_norm_w,
+                params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+                self.config.rms_norm_eps, self.config.hc_eps,
+            )
+            return logits_BSV.reshape(T, -1)
+
+        def load_weights(self, weights=None, *args, **kwargs):
+            """vLLM weight-loading entry. Streamed weights iterators are
+            handled by the v4 loader — for now this method stays a no-op
+            stub for callers that pass dummy/random weights. Real
+            HF-streamer integration is BLOCKERS B5 (new in v4)."""
+            # No-op: dummy / random init is already in place via __init__.
+            return set()
+
+    return DeepseekV4ForCausalLM
+
+
+DeepseekV4ForCausalLM = _build_class()
 
 
 def map_hf_name_to_jax_path(name: str) -> Optional[str]:

@@ -1327,7 +1327,14 @@ class TestDeepseekV4ForCausalLMHelpers:
         assert np.all(np.isfinite(np_logits))
         assert np_logits.std() > 0.01
 
-    def test_call_raises_until_runtime_lands(self):
+    def test_call_runs_and_compute_logits_matches_forward_prefill(self):
+        """v4 W3: __call__ + compute_logits must match the legacy
+        forward_prefill helper exactly. The two paths share the same
+        transformer body and head, so this is a near-tautology — its real
+        purpose is to catch reshape/order-of-axes regressions in the new
+        nnx wrapper."""
+        if not os.path.exists(self.BF16_DIR):
+            pytest.skip(f"{self.BF16_DIR} not present")
         from types import SimpleNamespace
         from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
         with open(os.path.join(self.BF16_DIR, "config.json")) as f:
@@ -1337,8 +1344,39 @@ class TestDeepseekV4ForCausalLMHelpers:
         fake_hf.to_dict = lambda: hf_dict
         fake_vc = SimpleNamespace(model_config=SimpleNamespace(hf_config=fake_hf))
         model = DeepseekV4ForCausalLM(fake_vc)
-        with pytest.raises(NotImplementedError):
-            model([], jnp.zeros((1, 4), dtype=jnp.int32), None)
+        model.load_weights_from_dir(self.BF16_DIR)
+        T = 16
+        ids = (jnp.arange(T, dtype=jnp.int32) % model.config.vocab_size)
+        kv_caches_in = []
+        kv_caches_out, hidden_TM, extra = model(kv_caches_in, ids, None)
+        assert hidden_TM.shape == (T, model.config.hc_mult * model.config.hidden_size)
+        assert kv_caches_out is kv_caches_in
+        assert extra == []
+        logits = model.compute_logits(hidden_TM)
+        assert logits.shape == (T, model.config.vocab_size)
+        ref = model.forward_prefill(ids.reshape(1, T)).reshape(T, -1)
+        assert jnp.max(jnp.abs(logits - ref)) == 0.0
+
+    def test_eval_shape_makes_abstract_module(self):
+        """v4 W3 — must pass `nnx.eval_shape(lambda: DeepseekV4ForCausalLM(...))`.
+        This is the exact gate that vllm hits at
+        tpu_inference/models/common/model_loader.py:244 and that v3 captured
+        as BLOCKERS B2."""
+        from types import SimpleNamespace
+        from flax import nnx
+        from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
+        with open(os.path.join(self.BF16_DIR, "config.json")) as f:
+            import json
+            hf_dict = json.load(f)
+        fake_hf = SimpleNamespace(**hf_dict)
+        fake_hf.to_dict = lambda: hf_dict
+        fake_vc = SimpleNamespace(model_config=SimpleNamespace(hf_config=fake_hf))
+        m_abs = nnx.eval_shape(lambda: DeepseekV4ForCausalLM(fake_vc))
+        assert isinstance(m_abs, nnx.Module)
+        # Inner param tree should be abstracted to ShapeDtypeStructs.
+        embed = m_abs.params_v.get_value().embed_w
+        assert isinstance(embed, jax.ShapeDtypeStruct)
+        assert embed.dtype == jnp.bfloat16
 
 
 class TestRealShardRoundTrip:
