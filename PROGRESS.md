@@ -36,16 +36,17 @@ Started 2026-04-28 ~08:36 UTC. Single autonomous overnight session.
 - [x] HF→JAX name mapping covers all 69,187 parameter names in V4-Flash safetensors index. No unmapped names.
 - [x] Downloaded shard 1 (~1 GB) and verified each tensor's shape matches the abstract param tree.
 
-## Phase 5 — Weight loader smoke test
-TBD.
-
 ## Phase 6 — Registration
-TBD.
+- [x] `DeepseekV4ForCausalLM` registered in `tpu_inference/models/common/model_loader.py`. The class is a thin shim — vLLM dispatch finds it, and it raises a clear `NotImplementedError` from `__call__` until full runtime integration lands.
+- [x] No regression in V3 import path (V3 model file is unchanged; registry lookup still resolves V3).
+- [x] Note: `tests/models/jax/test_deepseek_v3.py` is broken on `main` *prior* to this branch — it imports a `DeepSeekV3WeightLoader` symbol that does not exist. Verified by `git stash` + `git checkout main` test attempt; same failure. Documented in SUMMARY.md §6 row 3.
 
 ## Phase 7 — Hardening + SUMMARY
-TBD.
+- [x] SUMMARY.md written.
+- [x] All markdown files present.
+- [ ] Decode path is the single biggest open item. See SUMMARY.md §4.
 
 ---
 
 ## Resume hint
-**If I died right now**, the next session should: read V3_TO_V4_DIFF.md, then run `git log --oneline` to see committed work, then continue Phase 1 (write the PyTorch reference oracle at `tests/models/_v4_reference.py`).
+**If I died right now**, the next session should: read SUMMARY.md, then port the decode path from `tests/models/jax/_deepseek_v4_reference/model.py` to JAX (write `attention_decode`, `compressor_decode_step`, `indexer_decode_step` mirroring the `start_pos > 0` branches). Without decode, the model can't generate tokens — which is the highest-impact next deliverable.
