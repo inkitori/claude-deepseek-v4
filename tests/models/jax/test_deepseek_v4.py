@@ -62,6 +62,10 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     get_window_topk_idxs_prefill, get_compress_topk_idxs_prefill,
     attention_prefill, CompressorParams, IndexerParams, AttentionParams,
 )
+from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
+    gate_forward, expert_forward, moe_forward,
+    GateParams, ExpertParams, MoEParams,
+)
 
 
 # ---------------- helpers ----------------
@@ -349,6 +353,114 @@ class TestAttentionComponent:
         max_rel = float(np.abs(np.asarray(y_j).astype(np.float32) - y_t.float().numpy()).max() /
                          max(1e-6, float(np.abs(y_t.float().numpy()).max())))
         assert max_diff <= 5e-2, f"compress_ratio={compress_ratio}: max abs diff {max_diff}"
+
+
+# =============================================================
+# MoE component tests
+# =============================================================
+
+
+def _torch_gate_to_jax_params(gate: TorchGate) -> GateParams:
+    bias = t2j(gate.bias).astype(jnp.float32) if gate.bias is not None else None
+    tid2eid = t2j(gate.tid2eid) if gate.hash else None
+    return GateParams(
+        weight=t2j(gate.weight).astype(jnp.float32),
+        bias=bias,
+        tid2eid=tid2eid,
+        score_func=gate.score_func,
+        route_scale=gate.route_scale,
+        top_k=gate.topk,
+    )
+
+
+def _torch_expert_to_jax_params(expert) -> ExpertParams:
+    return ExpertParams(
+        w1=t2j(expert.w1.weight),
+        w2=t2j(expert.w2.weight),
+        w3=t2j(expert.w3.weight),
+        swiglu_limit=expert.swiglu_limit,
+    )
+
+
+def _torch_moe_to_jax_params(moe: TorchMoE) -> MoEParams:
+    return MoEParams(
+        gate=_torch_gate_to_jax_params(moe.gate),
+        experts=[_torch_expert_to_jax_params(e) for e in moe.experts],
+        shared_expert=_torch_expert_to_jax_params(moe.shared_experts),
+        n_routed_experts=moe.n_routed_experts,
+        dim=moe.dim,
+    )
+
+
+class TestMoEComponent:
+    @pytest.mark.parametrize("layer_id", [0, 1])  # 0 is hash (n_hash_layers=1), 1 is non-hash
+    def test_gate_matches_torch(self, layer_id):
+        torch.manual_seed(layer_id + 1)
+        args = make_tiny_args()
+        gate = TorchGate(layer_id, args)
+        for n, p in gate.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        if gate.hash:
+            gate.tid2eid.data.copy_(torch.randint(0, args.n_routed_experts, gate.tid2eid.shape, dtype=torch.int32))
+        x = torch.randn(20, args.dim, dtype=torch.bfloat16)
+        ids = torch.randint(0, args.vocab_size, (20,))
+        with torch.inference_mode():
+            w_t, i_t = gate(x, ids)
+        params = _torch_gate_to_jax_params(gate)
+        w_j, i_j = gate_forward(t2j(x).astype(jnp.float32), t2j(ids).astype(jnp.int32), params)
+        # indices: must be exactly equal (same routing decisions).
+        assert np.array_equal(np.asarray(i_j), i_t.detach().numpy()), \
+            f"Gate selected different experts (hash={gate.hash})"
+        # weights: bf16 tolerance.
+        assert maxabs(w_j.astype(jnp.bfloat16), w_t) <= 1e-2
+
+    def test_expert_matches_torch(self):
+        torch.manual_seed(0)
+        args = make_tiny_args()
+        from _deepseek_v4_reference.model import Expert as TorchExpert
+        e = TorchExpert(args.dim, args.moe_inter_dim, dtype=None, swiglu_limit=args.swiglu_limit)
+        for n, p in e.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        x = torch.randn(8, args.dim, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            y_t = e(x)
+        params = _torch_expert_to_jax_params(e)
+        y_j = expert_forward(t2j(x), None, params)
+        assert maxabs(y_j, y_t) <= 1e-2
+
+    def test_moe_matches_torch(self):
+        torch.manual_seed(0)
+        args = make_tiny_args()
+        moe = TorchMoE(layer_id=1, args=args)  # non-hash layer for first test
+        for n, p in moe.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        # Tiny seq for clarity.
+        x = torch.randn(1, 6, args.dim, dtype=torch.bfloat16)
+        ids = torch.randint(0, args.vocab_size, (1, 6))
+        with torch.inference_mode():
+            y_t = moe(x, ids)
+        params = _torch_moe_to_jax_params(moe)
+        y_j = moe_forward(t2j(x), t2j(ids).astype(jnp.int32), params)
+        assert maxabs(y_j, y_t) <= 5e-2
+
+    def test_moe_hash_layer_matches_torch(self):
+        torch.manual_seed(0)
+        args = make_tiny_args(n_hash_layers=1)
+        moe = TorchMoE(layer_id=0, args=args)  # hash layer
+        for n, p in moe.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        moe.gate.tid2eid.data.copy_(torch.randint(0, args.n_routed_experts, moe.gate.tid2eid.shape, dtype=torch.int32))
+        x = torch.randn(1, 6, args.dim, dtype=torch.bfloat16)
+        ids = torch.randint(0, args.vocab_size, (1, 6))
+        with torch.inference_mode():
+            y_t = moe(x, ids)
+        params = _torch_moe_to_jax_params(moe)
+        y_j = moe_forward(t2j(x), t2j(ids).astype(jnp.int32), params)
+        assert maxabs(y_j, y_t) <= 5e-2
 
 
 # =============================================================
