@@ -1183,6 +1183,81 @@ class TestDecodeRollingParity:
 
 
 # =============================================================
+# Tier 6 — Real-TPU compile + tiny forward
+# =============================================================
+
+
+class TestRealTpuTinyForward:
+    """Tier 6: compile + run a tiny forward on real TPU using the
+    pre-staged tiny_v4_bf16 fixture. Skips when TPU is unavailable."""
+
+    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+
+    def _get_tpu_devices(self):
+        try:
+            return jax.devices("tpu")
+        except (RuntimeError, ValueError):
+            return []
+
+    def test_tiny_tpu_compile_and_forward(self):
+        if not os.path.exists(self.BF16_DIR):
+            pytest.skip(f"{self.BF16_DIR} missing")
+        tpu_devs = self._get_tpu_devices()
+        if len(tpu_devs) < 1:
+            pytest.skip("No TPU devices available")
+
+        # We deliberately do NOT compare against the CPU result here — Tier 6
+        # only verifies that compile succeeds and the forward runs without
+        # error. Logits dtype/shape are checked.
+        import json
+        from tpu_inference.models.jax.deepseek_v4 import (
+            DeepseekV4Config, deepseek_v4_forward_prefill,
+            make_abstract_transformer_params, make_freqs_cis,
+        )
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            apply_weights_to_param_tree, load_v4_safetensors_to_dict,
+        )
+        with open(os.path.join(self.BF16_DIR, "config.json")) as f:
+            hf_config = json.load(f)
+        cfg = DeepseekV4Config.from_hf_dict(hf_config)
+        params = make_abstract_transformer_params(cfg)
+        # Materialize abstract params with zeros (we only need shapes for
+        # compile — for the forward we'll substitute the real loader output).
+        params = jax.tree_util.tree_map(
+            lambda x: jnp.zeros(x.shape, dtype=x.dtype),
+            params,
+            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+        )
+        weights = load_v4_safetensors_to_dict(self.BF16_DIR)
+        params = apply_weights_to_param_tree(params, weights, cfg)
+        S = 16
+        ids = (jnp.arange(S, dtype=jnp.int32) % cfg.vocab_size).reshape(1, S)
+        swa, comp = make_freqs_cis(cfg, cfg.max_position_embeddings)
+
+        @jax.jit
+        def fwd(ids, p, sw, cp):
+            return deepseek_v4_forward_prefill(ids, p, sw, cp, cfg)
+
+        # Move to TPU.
+        with jax.default_device(tpu_devs[0]):
+            ids = jax.device_put(ids)
+            params = jax.device_put(params)
+            swa = jax.device_put(swa)
+            comp = jax.device_put(comp)
+            logits = fwd(ids, params, swa, comp).block_until_ready()
+        assert logits.shape == (1, S, cfg.vocab_size)
+        assert logits.dtype == jnp.float32
+        np_logits = np.asarray(logits).astype(np.float32)
+        # Sanity: finite, non-zero, varied (not a constant).
+        assert np.all(np.isfinite(np_logits)), "non-finite TPU logits"
+        assert np_logits.std() > 0.01, f"TPU logits std too low: {np_logits.std()}"
+        # CPU comparison happens in TestRealTpuVsCpuLogitsParity (separate
+        # session) — JAX cannot host both TPU and CPU backends in the same
+        # process. The CPU forward correctness is already covered by every
+        # CPU-default test in this file.
+
+
+# =============================================================
 # W4 / Tier 4b / Tier 7 — FP4/FP8 weight loader & dequant
 # =============================================================
 
