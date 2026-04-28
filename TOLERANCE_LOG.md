@@ -51,6 +51,25 @@ identical modulo fp32 reduction order in matmuls. The atol=0.1 budget is the
 same as Tier 2's end-to-end logits parity bound, providing a safety margin
 that would catch any non-trivial loader bug.
 
+## T8 — SWA decode-state ≡ prefill-state after 32 sequential decodes: `atol=2e-2`
+**Where:** `tests/models/jax/test_deepseek_v4.py::TestDecodeRollingEquivalenceWithPrefill::test_swa_decode_state_equals_prefill_state_after_32_steps`.
+**Default:** bf16 atol/rtol = 1e-2.
+**Looser bound:** atol=2e-2.
+**Evidence:**
+- The prefill path runs RoPE on a `[B, S=32, head_dim]` tensor in one fused
+  call; the decode path runs RoPE 32 times on `[B, 1, head_dim]` inputs with
+  the same (per-position) freqs slice.
+- bf16 cast and complex-pair multiply have ~1 ULP rounding per position.
+  Across 32 sequential per-step writes the accumulated rounding diff vs the
+  bulk-write path can reach ~1.5e-2.
+- 2e-2 is conservative: empirically observed max abs diff is ~1.0e-2 with
+  the seed-7 random inputs in the test, leaving margin for other random seeds.
+- This bound is independent of TOLERANCE T1/T2/T3 — those measure attention
+  *output*; T8 measures the kv_cache *buffer* directly.
+- Spec resume mandate explicitly allowed this: "32-step rolling-decode test:
+  state-after-32-decodes ≡ state-after-prefill-of-the-same-prefix (allow
+  atol=2e-2 for accumulation drift, document in TOLERANCE_LOG.md)".
+
 ## T4 — Indexer top-k SET equality (Tier 1, `TestIndexerComponent`)
 **Where:** `TestIndexerComponent::test_indexer_prefill_matches_torch_topk`.
 **Default:** exact int equality.

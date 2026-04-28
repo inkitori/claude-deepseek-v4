@@ -92,18 +92,89 @@ indexer state plumbing.
 
 ## B3 — T5 (vLLM serve smoke test) — BLOCKED ON B1 + B2
 
-**Status:** Not attempted.
+**Status:** Probed in v3 (2026-04-28 19:03 UTC). Two concrete failure
+modes captured. Logs at `/tmp/vllm_serve_probe.log` and
+`/tmp/vllm_serve_probe2.log` (note: `/tmp` is ephemeral; failures are
+reproduced verbatim under B4 and below).
 
-**Why blocked:** Tier 5 sends two `/v1/completions` requests through
-`vllm serve /mnt/scratch/tiny_v4_bf16` and asserts both return non-empty,
-deterministic-with-seed outputs. This requires the full vLLM scheduling
-pipeline: tokenize → schedule into batches → call
-`DeepseekV4ForCausalLM.__call__` (B2) → write to paged kv_cache (B1) →
-generate next token → repeat. With B1 and B2 unimplemented, the serve will
-either (a) fail at registry time, (b) raise `NotImplementedError` from
-`__call__`, or (c) hang.
+**First gate (B4, see below):** `vllm serve /mnt/scratch/tiny_v4_bf16` —
+no flags — fails at `pydantic.ValidationError` for `VllmConfig`. vLLM
+classifies `DeepseekV4ForCausalLM` as an MLA model (presumably by
+architecture-name pattern matching) and demands
+`NEW_MODEL_DESIGN=1` + `--additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'`.
+This is upstream of our model class — we never get a chance to run.
 
-**Confirmed pre-flight:** the fixtures `/mnt/scratch/tiny_v4_bf16` (and
-`tiny_v4_quant`, `tiny_v4_groundtruth`) exist and are loadable by our W4
-loader. So once B1+B2 land, the only remaining T5 work is the curl
-round-trip itself.
+**Second gate (matches B2):** with the required flags set, vllm advances
+through engine init and reaches `tpu_inference/models/common/model_loader.py:244`
+where it calls `nnx.eval_shape(create_abstract_model)` to construct the
+abstract param tree. This fails with:
+
+```
+TypeError: function create_abstract_model at .../model_loader.py:117 traced
+for jit returned a value of type
+<class 'tpu_inference.models.jax.deepseek_v4.DeepseekV4ForCausalLM'> at
+output component jit, which is not a valid JAX type
+```
+
+This **confirms B2 verbatim**: `DeepseekV4ForCausalLM` MUST subclass
+`nnx.Module` (and `JaxModule, LoadableWithIterator` per V3 precedent at
+`tpu_inference/models/jax/deepseek_v3.py:1347`). Today it's a plain
+Python class wrapping a non-pytree param dict, which `nnx.eval_shape`
+cannot trace.
+
+The fix path (W3 in spec terms) is non-trivial because it requires
+re-expressing every V4 parameter (≥256 leaves in tiny config, ≈70k in
+real V4-Flash) as `nnx.Param` with sharding annotations, and rewriting
+the functional helpers to read from `self.<...>.value` instead of a
+dict. We have the math — what's missing is the nnx ceremony and the
+per-layer compressor/indexer state plumbing through the kv_cache (B1).
+
+**Confirmed pre-flight (still valid in v3):** the fixtures
+`/mnt/scratch/tiny_v4_bf16` (and `tiny_v4_quant`,
+`tiny_v4_groundtruth`) exist and are loadable by our W4 loader. So once
+B1+B2+B4 land, the only remaining T5 work is the curl round-trip
+itself.
+
+## B4 — vLLM `VllmConfig` validation rejects `DeepseekV4ForCausalLM` without MLA-specific flags
+
+**Status:** Captured 2026-04-28 19:03 UTC during v3 vllm-serve probe.
+
+**Symptom:**
+```
+pydantic_core._pydantic_core.ValidationError: 1 validation error for VllmConfig
+  Value error, MLA models require both the NEW_MODEL_DESIGN=1 environment
+  variable to be set and DP attention set via:
+    --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'
+```
+
+**Triggered by:**
+```
+JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
+    --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
+    --port 18080 --seed 0 --trust-remote-code --dtype bfloat16
+```
+
+**Cause:** vllm matches `DeepseekV4` against an MLA-name pattern. V4 is
+NOT an MLA model (it's CSA/HCA/SWA hybrid sparse attention) but
+inherits the gate because of the architecture-name prefix. The
+workaround is to set the two required flags, which only get us as far
+as B2 (eval_shape failure). For real production use, the user should
+either (a) update vllm's MLA classifier so V4 is not gated by it, or
+(b) keep these flags as the documented run-line until V4 has its own
+classification path.
+
+**Workaround command (gets past B4, hits B2 next):**
+```
+NEW_MODEL_DESIGN=1 JAX_PLATFORMS=tpu vllm serve /mnt/scratch/tiny_v4_bf16 \
+    --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
+    --port 18080 --seed 0 --trust-remote-code --dtype bfloat16 \
+    --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'
+```
+
+**Note on enable_dp_attention:** vLLM's DP-attention path replicates
+attention computation across data-parallel devices and shards only the
+expert/MoE work. For V4 this is the right default — V4's
+sliding-window-128 + compressed-buffer KV does not benefit from
+intra-attention TP, since each token attends to a small static window.
+This decision matches the recommendation buried in the validation
+message.

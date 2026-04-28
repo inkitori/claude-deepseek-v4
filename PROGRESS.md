@@ -71,3 +71,16 @@ RESUMED at 2026-04-28 17:14 UTC — picking up from W1 (decode path). Pre-flight
 ## Resume hint
 **If I died right now**, the next session should: tackle the BLOCKERS.md items (B1 → V4 paged-KV adapter, B2 → V4 nnx.Module port, B3 → T5 curl). The functional core (prefill + decode + dequant + helpers) is correct and tested; what remains is integrating it with vLLM's runtime.
 
+---
+
+RESUMED at 2026-04-28 18:29 UTC (v3 attempt) — picking up from BLOCKERS B1/B2/B3. Confirmed test suite still passes: `70 passed, 1 skipped in 323.21s`. TPU pre-flight ok (4 v4 chips). Plan: probe `vllm serve /mnt/scratch/tiny_v4_bf16` to capture the actual failure surface; this tells us whether the next-most-actionable work is W3 (nnx.Module port) or W2 (paged-KV plumbing) or both. Then attempt minimum-viable W3 with the existing functional core.
+
+---
+
+RESUMED at 2026-04-28 19:03 UTC (v3 final) — baseline reconfirmed `70 passed, 1 skipped in 328.09s`. TPU preflight ok. v3-attempt plan executed: probed `vllm serve /mnt/scratch/tiny_v4_bf16` and captured the FIRST concrete failure mode at `pydantic_core._pydantic_core.ValidationError`: vLLM's `VllmConfig.__init__` rejects DeepseekV4 because vLLM's pydantic gate classifies `DeepseekV4ForCausalLM` as an MLA model and requires `NEW_MODEL_DESIGN=1` plus `--additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'`. This is a NEW data point not in BLOCKERS.md as of v2, and it is the gate to even reaching `__call__`. Documenting in BLOCKERS as B4. Plan: capture the next failure with the required flags set, document, then add Tier-2 hardening (extra decode parity) per the spec's "finish early" guidance — W2/W3 remain out of overnight scope per BLOCKERS B1+B2.
+
+## Phase v3 (2026-04-28 19:03 UTC onward)
+
+- [x] Baseline reconfirmed clean: `70 passed, 1 skipped` (5:28).
+- [x] `vllm serve` probe captures first concrete failure: pydantic VllmConfig validation rejects DeepseekV4ForCausalLM unless NEW_MODEL_DESIGN=1 + enable_dp_attention. Documented in BLOCKERS.md B4. This is upstream of B1/B2/B3 — vllm errors before it even reaches our model class.
+

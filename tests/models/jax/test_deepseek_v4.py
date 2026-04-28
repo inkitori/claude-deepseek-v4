@@ -1503,3 +1503,236 @@ class TestCompressorDecodeStep:
         assert diff_kvst <= 5e-2, f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
         assert diff_sc <= 5e-2, f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
 
+
+# =============================================================
+# v3 hardening — extended decode parity coverage
+# =============================================================
+#
+# The original W1 (v2) parity tests covered start_pos ∈ {1, 8, 9, 16, 32}
+# and rolling decodes up to length 16+16=32. The spec calls for points at
+# 64 and 256, plus a 32-step rolling-decode equivalence test against
+# prefill-of-the-same-prefix. These tests are added here in v3.
+#
+# Tolerances follow TOLERANCE_LOG.md T8 — atol=5e-2 for per-step output,
+# atol=2e-2 for state-equivalence (per the spec's allowance for
+# accumulation drift across 32 sequential decode steps).
+
+
+class TestDecodeAttentionParityExtended:
+    """Extra start_pos points called for in the v3 spec resume mandate
+    ({1, 8, 9, 64, 256}). Layer-by-layer like TestDecodeAttentionParity."""
+
+    @pytest.mark.parametrize("layer_id,start_pos,max_seq_len", [
+        # SWA, multiple wraparounds past window=8.
+        (0, 64, 256),
+        # CSA (ratio=4): 16 compressions accumulated by sp=64.
+        (2, 64, 256),
+        # HCA (ratio=128): exact first compression event at sp+1==128, so
+        # sp=128 is the first decode step where the compressed pool is
+        # non-empty.
+        (3, 128, 512),
+        # HCA deep — past the first compression event.
+        (3, 192, 512),
+    ])
+    def test_decode_step_parity_extended(self, layer_id, start_pos, max_seq_len):
+        attn, args = _build_attn_for_decode(
+            layer_id, seed=0, max_seq_len=max_seq_len)
+        bsz = 1
+        with torch.inference_mode():
+            prefill_x = torch.randn(bsz, start_pos, args.dim, dtype=torch.bfloat16)
+            _ = attn(prefill_x, start_pos=0)
+            x_step = torch.randn(bsz, 1, args.dim, dtype=torch.bfloat16)
+            o_t = attn(x_step, start_pos=start_pos)
+
+        attn_fresh, args2 = _build_attn_for_decode(
+            layer_id, seed=0, max_seq_len=max_seq_len)
+        with torch.inference_mode():
+            _ = attn_fresh(prefill_x, start_pos=0)
+        jax_state = _torch_attention_state_to_jax(attn_fresh, args2, bsz)
+        params_j = _torch_attention_to_jax_params(attn_fresh, args2)
+        fc = t2j(attn_fresh.freqs_cis).astype(jnp.complex64)
+        new_state, y_j = attention_decode_step(
+            t2j(x_step), start_pos, params_j, fc, jax_state,
+        )
+        diff = maxabs(y_j, o_t)
+        assert diff <= 5e-2, (
+            f"layer={layer_id} sp={start_pos} (max_seq_len={max_seq_len}): "
+            f"decode step output diff {diff}"
+        )
+
+
+class TestDecodeRollingEquivalenceWithPrefill:
+    """Stronger invariant: the SWA kv_cache buffer after a 32-step rolling
+    decode (starting from empty state with full_x[:, :32]) must match the
+    SWA kv_cache buffer after a torch prefill of length 32 on the same
+    inputs. This catches state-mutation bugs that per-step parity would
+    miss if the bug self-cancels at the output level.
+
+    We restrict the comparison to layer_id=0 (SWA) so the kv_cache is a
+    pure circular buffer with no compressor entanglement; CSA / HCA layers
+    are covered by the per-step rolling tests above.
+
+    Tolerance: atol=2e-2 (TOLERANCE_LOG T8) — bf16 RoPE-write accumulation
+    over 32 sequential per-step writes drifts by up to a few ULPs from a
+    bulk prefill that fuses the 32 writes."""
+
+    def test_swa_decode_state_equals_prefill_state_after_32_steps(self):
+        torch.manual_seed(7)
+        K = 32
+        attn, args = _build_attn_for_decode(0, seed=0, max_seq_len=64)
+        bsz = 1
+        full_x = torch.randn(bsz, K, args.dim, dtype=torch.bfloat16)
+
+        # Path A: torch prefill of length 32.
+        with torch.inference_mode():
+            _ = attn(full_x, start_pos=0)
+        kvc_prefill = attn.kv_cache[:bsz].detach().float().numpy().copy()
+
+        # Path B: 32 JAX decode steps starting from empty state on the
+        # SAME inputs. Use a fresh torch attention to source weights, but
+        # construct the empty JAX state directly via
+        # `attention_decode_init_state` (the torch reference cannot run a
+        # length-0 prefill — `sparse_attn_torch` would max over an empty
+        # axis).
+        attn_fresh, args2 = _build_attn_for_decode(0, seed=0, max_seq_len=64)
+        params_j = _torch_attention_to_jax_params(attn_fresh, args2)
+        fc = t2j(attn_fresh.freqs_cis).astype(jnp.complex64)
+        jax_state = attention_decode_init_state(
+            batch_size=bsz, cfg_max_seq_len=args2.max_seq_len,
+            params=params_j, cfg_index_head_dim=args2.index_head_dim,
+            dtype=jnp.bfloat16,
+        )
+        for k in range(K):
+            x_step = full_x[:, k:k+1]
+            jax_state, _ = attention_decode_step(
+                t2j(x_step), k, params_j, fc, jax_state,
+            )
+        kvc_decode = np.asarray(jax_state.kv_cache).astype(np.float32)
+
+        diff = float(np.abs(kvc_prefill - kvc_decode).max())
+        assert diff <= 2e-2, (
+            f"SWA kv_cache after 32 decode steps differs from prefill state: "
+            f"max abs diff {diff} (tolerance 2e-2 per TOLERANCE_LOG T8)"
+        )
+
+
+class TestCompressorDecodeStepExtended:
+    """Compressor decode parity at deeper start_pos values, including the
+    second + third compression events for ratio=4 and the second event
+    for ratio=128."""
+
+    @pytest.mark.parametrize("ratio,P,start_pos,max_seq_len", [
+        # ratio=4 CSA, sp=64 → 16th compression event boundary.
+        (4, 64, 64, 256),
+        # ratio=4 CSA, sp=63 → mid-window before 16th compression.
+        (4, 63, 63, 256),
+        # ratio=128 HCA, sp=255 → 2nd compression event boundary
+        # (start_pos+1 == 256, divisible by 128).
+        (128, 255, 255, 512),
+    ])
+    def test_compressor_decode_step_parity_extended(
+        self, ratio, P, start_pos, max_seq_len,
+    ):
+        torch.manual_seed(0)
+        args = make_tiny_args(max_seq_len=max_seq_len)
+        c = TorchCompressor(args, compress_ratio=ratio,
+                            head_dim=args.head_dim, rotate=False)
+        for n, p in c.named_parameters():
+            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
+            p.data.copy_(t.to(p.dtype))
+        kv_cache = torch.zeros(args.max_batch_size,
+                               args.max_seq_len // ratio, args.head_dim)
+        c.kv_cache = kv_cache
+        c.freqs_cis = torch_freqs(args.rope_head_dim, args.max_seq_len, 0,
+                                   args.compress_rope_theta, args.rope_factor,
+                                   args.beta_fast, args.beta_slow)
+        bsz = 1
+        prefill_x = torch.randn(bsz, P, args.dim, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            _ = c(prefill_x, start_pos=0)
+
+        kv_state_j = t2j(c.kv_state[:bsz].clone()).astype(jnp.float32)
+        score_state_j = t2j(c.score_state[:bsz].clone()).astype(jnp.float32)
+        params_j = _torch_compressor_to_jax_params(c)
+        fc_j = t2j(c.freqs_cis).astype(jnp.complex64)
+
+        x_step = torch.randn(bsz, 1, args.dim, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            kv_t = c(x_step, start_pos=start_pos)
+        new_kvst, new_scst, kv_compressed_j, did = compressor_decode_step(
+            t2j(x_step), start_pos, params_j, fc_j,
+            kv_state_j, score_state_j,
+        )
+        if kv_t is None:
+            assert not did, (
+                f"JAX claims compression but torch said no at "
+                f"ratio={ratio} sp={start_pos}"
+            )
+        else:
+            assert did, (
+                f"JAX did not compress but torch did at "
+                f"ratio={ratio} sp={start_pos}"
+            )
+            diff = maxabs(kv_compressed_j, kv_t)
+            assert diff <= 5e-2, (
+                f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
+            )
+        diff_kvst = float(np.abs(np.asarray(new_kvst) -
+                                  c.kv_state[:bsz].detach().float().numpy()).max())
+        sc_j = np.asarray(new_scst)
+        sc_t = c.score_state[:bsz].detach().float().numpy()
+        finite_mask = np.isfinite(sc_t)
+        if finite_mask.any():
+            diff_sc = float(np.abs(sc_j[finite_mask] - sc_t[finite_mask]).max())
+        else:
+            diff_sc = 0.0
+        assert diff_kvst <= 5e-2, (
+            f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
+        )
+        assert diff_sc <= 5e-2, (
+            f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
+        )
+
+
+class TestDecodeRollingParityLong:
+    """Rolling decode for longer K, exercising more compression events."""
+
+    @pytest.mark.parametrize("layer_id,P,K,max_seq_len", [
+        # SWA: 1+31 = 4× window-8 wraparounds. P=1 because the torch
+        # reference cannot run a length-0 prefill (sparse_attn_torch would
+        # max over an empty axis).
+        (0, 1, 31, 64),
+        # SWA: 16+32 = 48 total → 6× window wraparounds; prefill leaves a
+        # specific pattern in the circular buffer that decode then walks.
+        (0, 16, 32, 64),
+        # CSA: 1+31 = 32 steps total, ~8 compression events. P=1 for the
+        # same length-0 reason as above.
+        (2, 1, 31, 256),
+    ])
+    def test_rolling_decode_parity_long(self, layer_id, P, K, max_seq_len):
+        attn, args = _build_attn_for_decode(
+            layer_id, seed=42, max_seq_len=max_seq_len)
+        bsz = 1
+        torch.manual_seed(P + K + layer_id + 1000)
+        full_x = torch.randn(bsz, P + K, args.dim, dtype=torch.bfloat16)
+
+        with torch.inference_mode():
+            _ = attn(full_x[:, :P], start_pos=0)
+        jax_state = _torch_attention_state_to_jax(attn, args, bsz)
+        params_j = _torch_attention_to_jax_params(attn, args)
+        fc = t2j(attn.freqs_cis).astype(jnp.complex64)
+
+        for k in range(K):
+            sp = P + k
+            x_step = full_x[:, sp:sp + 1]
+            with torch.inference_mode():
+                o_t = attn(x_step, start_pos=sp)
+            jax_state, y_j = attention_decode_step(
+                t2j(x_step), sp, params_j, fc, jax_state,
+            )
+            diff = maxabs(y_j, o_t)
+            assert diff <= 5e-2, (
+                f"layer={layer_id} P={P} K={K} step k={k} sp={sp}: "
+                f"rolling decode diff {diff}"
+            )
+
