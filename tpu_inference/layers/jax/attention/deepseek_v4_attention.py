@@ -290,11 +290,15 @@ def compressor_prefill(
 
 def get_window_topk_idxs_prefill(window_size: int, bsz: int, seqlen: int) -> jnp.ndarray:
     """Window-attention topk indices for prefill (start_pos=0).
-    Returns [B, S, window_size] int32, with -1 for masked entries."""
+    Returns [B, S, min(S, window_size)] int32, with -1 for masked entries.
+    (When seqlen < window_size, the trailing window slots are absent — this
+    matches the torch reference's `arange(min(seqlen, window_size))` width.)
+    """
+    K = min(seqlen, window_size)
     base = jnp.arange(seqlen)[:, None]               # [S, 1]
-    matrix = jnp.maximum(base - window_size + 1, 0) + jnp.arange(min(seqlen, window_size))
-    matrix = jnp.where(matrix > base, -1, matrix)    # [S, window_size]
-    return jnp.broadcast_to(matrix[None, :, :], (bsz, seqlen, window_size)).astype(jnp.int32)
+    matrix = jnp.maximum(base - window_size + 1, 0) + jnp.arange(K)
+    matrix = jnp.where(matrix > base, -1, matrix)    # [S, K]
+    return jnp.broadcast_to(matrix[None, :, :], (bsz, seqlen, K)).astype(jnp.int32)
 
 
 def get_compress_topk_idxs_prefill(ratio: int, bsz: int, seqlen: int, offset: int) -> jnp.ndarray:

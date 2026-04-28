@@ -399,3 +399,389 @@ def make_freqs_cis(cfg: DeepseekV4Config, max_seq_len: int) -> Tuple[jnp.ndarray
         cfg.rope_beta_fast, cfg.rope_beta_slow,
     )
     return swa, compressed
+
+
+# ------------------------------------------------------------
+# Abstract param-tree construction (for Tier 3 compile-only tests)
+# ------------------------------------------------------------
+
+def _shape_struct(shape, dtype) -> jax.ShapeDtypeStruct:
+    return jax.ShapeDtypeStruct(tuple(int(s) for s in shape), dtype)
+
+
+def make_abstract_attention_params(cfg: DeepseekV4Config, layer_id: int) -> AttentionParams:
+    """Returns an AttentionParams populated with `jax.ShapeDtypeStruct`s
+    matching the real param shapes for `layer_id`. No allocation."""
+    H = cfg.num_attention_heads
+    Dh = cfg.head_dim
+    rd = cfg.qk_rope_head_dim
+    G = cfg.o_groups
+    R = cfg.o_lora_rank
+    qLR = cfg.q_lora_rank
+    cr = cfg.compress_ratios[layer_id]
+    bf16 = jnp.bfloat16
+    fp32 = jnp.float32
+
+    compressor = None
+    indexer = None
+    if cr > 0:
+        coff = 2 if cr == 4 else 1
+        compressor = CompressorParams(
+            ape=_shape_struct((cr, coff * Dh), fp32),
+            wkv=_shape_struct((coff * Dh, cfg.hidden_size), fp32),
+            wgate=_shape_struct((coff * Dh, cfg.hidden_size), fp32),
+            norm_w=_shape_struct((Dh,), fp32),
+            head_dim=Dh,
+            rope_head_dim=rd,
+            compress_ratio=cr,
+            norm_eps=cfg.rms_norm_eps,
+            rotate=False,
+        )
+        if cr == 4:
+            ic = CompressorParams(
+                ape=_shape_struct((cr, coff * cfg.index_head_dim), fp32),
+                wkv=_shape_struct((coff * cfg.index_head_dim, cfg.hidden_size), fp32),
+                wgate=_shape_struct((coff * cfg.index_head_dim, cfg.hidden_size), fp32),
+                norm_w=_shape_struct((cfg.index_head_dim,), fp32),
+                head_dim=cfg.index_head_dim,
+                rope_head_dim=rd,
+                compress_ratio=cr,
+                norm_eps=cfg.rms_norm_eps,
+                rotate=True,
+            )
+            indexer = IndexerParams(
+                wq_b=_shape_struct((cfg.index_n_heads * cfg.index_head_dim, qLR), bf16),
+                weights_proj=_shape_struct((cfg.index_n_heads, cfg.hidden_size), bf16),
+                compressor=ic,
+                n_heads=cfg.index_n_heads,
+                head_dim=cfg.index_head_dim,
+                rope_head_dim=rd,
+                index_topk=cfg.index_topk,
+                softmax_scale=cfg.index_head_dim ** -0.5,
+                norm_eps=cfg.rms_norm_eps,
+            )
+    return AttentionParams(
+        attn_sink=_shape_struct((H,), fp32),
+        wq_a=_shape_struct((qLR, cfg.hidden_size), bf16),
+        q_norm_w=_shape_struct((qLR,), fp32),
+        wq_b=_shape_struct((H * Dh, qLR), bf16),
+        wkv=_shape_struct((Dh, cfg.hidden_size), bf16),
+        kv_norm_w=_shape_struct((Dh,), fp32),
+        wo_a=_shape_struct((G * R, (H * Dh) // G), bf16),
+        wo_b=_shape_struct((cfg.hidden_size, G * R), bf16),
+        n_heads=H,
+        head_dim=Dh,
+        rope_head_dim=rd,
+        n_groups=G,
+        o_lora_rank=R,
+        window_size=cfg.sliding_window,
+        compress_ratio=cr,
+        norm_eps=cfg.rms_norm_eps,
+        softmax_scale=Dh ** -0.5,
+        compressor=compressor,
+        indexer=indexer,
+    )
+
+
+def make_abstract_moe_params(cfg: DeepseekV4Config, layer_id: int) -> MoEParams:
+    bf16 = jnp.bfloat16
+    fp32 = jnp.float32
+    is_hash = layer_id < cfg.num_hash_layers
+    gate = GateParams(
+        weight=_shape_struct((cfg.n_routed_experts, cfg.hidden_size), fp32),
+        bias=None if is_hash else _shape_struct((cfg.n_routed_experts,), fp32),
+        tid2eid=_shape_struct((cfg.vocab_size, cfg.num_experts_per_tok), jnp.int32) if is_hash else None,
+        score_func=cfg.score_func,
+        route_scale=cfg.routed_scaling_factor,
+        top_k=cfg.num_experts_per_tok,
+    )
+    expert_dtype = bf16  # See DECISIONS.md D2 — we treat all experts as bf16 (real V4 is fp4, dequantized at load).
+    expert_template = lambda: ExpertParams(
+        w1=_shape_struct((cfg.moe_intermediate_size, cfg.hidden_size), expert_dtype),
+        w2=_shape_struct((cfg.hidden_size, cfg.moe_intermediate_size), expert_dtype),
+        w3=_shape_struct((cfg.moe_intermediate_size, cfg.hidden_size), expert_dtype),
+        swiglu_limit=cfg.swiglu_limit,
+    )
+    experts = [expert_template() for _ in range(cfg.n_routed_experts)]
+    shared = expert_template()
+    return MoEParams(
+        gate=gate,
+        experts=experts,
+        shared_expert=shared,
+        n_routed_experts=cfg.n_routed_experts,
+        dim=cfg.hidden_size,
+    )
+
+
+def make_abstract_block_params(cfg: DeepseekV4Config, layer_id: int) -> BlockParams:
+    fp32 = jnp.float32
+    mix_hc = (2 + cfg.hc_mult) * cfg.hc_mult
+    hc_dim = cfg.hc_mult * cfg.hidden_size
+    return BlockParams(
+        attn=make_abstract_attention_params(cfg, layer_id),
+        moe=make_abstract_moe_params(cfg, layer_id),
+        attn_norm_w=_shape_struct((cfg.hidden_size,), fp32),
+        ffn_norm_w=_shape_struct((cfg.hidden_size,), fp32),
+        hc_attn_fn=_shape_struct((mix_hc, hc_dim), fp32),
+        hc_ffn_fn=_shape_struct((mix_hc, hc_dim), fp32),
+        hc_attn_base=_shape_struct((mix_hc,), fp32),
+        hc_ffn_base=_shape_struct((mix_hc,), fp32),
+        hc_attn_scale=_shape_struct((3,), fp32),
+        hc_ffn_scale=_shape_struct((3,), fp32),
+        hc_mult=cfg.hc_mult,
+        hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
+        hc_eps=cfg.hc_eps,
+        norm_eps=cfg.rms_norm_eps,
+    )
+
+
+def make_abstract_transformer_params(cfg: DeepseekV4Config) -> TransformerParams:
+    bf16 = jnp.bfloat16
+    fp32 = jnp.float32
+    layers = [make_abstract_block_params(cfg, i) for i in range(cfg.num_hidden_layers)]
+    mtp_blocks = []
+    for i in range(cfg.num_nextn_predict_layers):
+        layer_id = cfg.num_hidden_layers + i
+        block = make_abstract_block_params(cfg, layer_id)
+        mtp_blocks.append(MTPBlockParams(
+            block=block,
+            e_proj=_shape_struct((cfg.hidden_size, cfg.hidden_size), bf16),
+            h_proj=_shape_struct((cfg.hidden_size, cfg.hidden_size), bf16),
+            enorm_w=_shape_struct((cfg.hidden_size,), fp32),
+            hnorm_w=_shape_struct((cfg.hidden_size,), fp32),
+            final_norm_w=_shape_struct((cfg.hidden_size,), fp32),
+            hc_head_fn=_shape_struct((cfg.hc_mult, cfg.hc_mult * cfg.hidden_size), fp32),
+            hc_head_base=_shape_struct((cfg.hc_mult,), fp32),
+            hc_head_scale=_shape_struct((1,), fp32),
+        ))
+    return TransformerParams(
+        embed_w=_shape_struct((cfg.vocab_size, cfg.hidden_size), bf16),
+        layers=layers,
+        final_norm_w=_shape_struct((cfg.hidden_size,), fp32),
+        head_w=_shape_struct((cfg.vocab_size, cfg.hidden_size), fp32),
+        hc_head_fn=_shape_struct((cfg.hc_mult, cfg.hc_mult * cfg.hidden_size), fp32),
+        hc_head_base=_shape_struct((cfg.hc_mult,), fp32),
+        hc_head_scale=_shape_struct((1,), fp32),
+        mtp=mtp_blocks,
+        hc_mult=cfg.hc_mult,
+    )
+
+
+# ------------------------------------------------------------
+# Reporting helpers
+# ------------------------------------------------------------
+
+def count_param_bytes(params_struct: TransformerParams) -> int:
+    """Total bytes of all parameters when using the dtypes stored in the
+    ShapeDtypeStruct tree. Each parameter contributes prod(shape) * itemsize."""
+    total = 0
+    for leaf in jax.tree_util.tree_leaves(params_struct, is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct)):
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+            total += int(jnp.dtype(leaf.dtype).itemsize) * int(_prod(leaf.shape))
+    return total
+
+
+def _prod(xs):
+    p = 1
+    for v in xs:
+        p *= int(v)
+    return p
+
+
+def kv_cache_bytes_per_layer(cfg: DeepseekV4Config, max_seq_len: int, dtype_bytes: int = 2) -> Dict[str, int]:
+    """Per-layer KV cache size for a single sequence at `max_seq_len`. Reports
+    SWA-only, SWA+CSA-compressed, and SWA+HCA-compressed sizes separately so
+    the caller can sum the right ones based on `cfg.compress_ratios`."""
+    Dh = cfg.head_dim
+    out = {}
+    out["swa_only"] = cfg.sliding_window * Dh * dtype_bytes
+    if 4 in cfg.compress_ratios:
+        out["csa_layer"] = (cfg.sliding_window + max_seq_len // 4) * Dh * dtype_bytes
+    if 128 in cfg.compress_ratios:
+        out["hca_layer"] = (cfg.sliding_window + max_seq_len // 128) * Dh * dtype_bytes
+    return out
+
+
+# ------------------------------------------------------------
+# Pytree registration so jax.eval_shape can traverse our dataclasses
+# ------------------------------------------------------------
+
+def _register_pytree(cls, fields):
+    def flatten(obj):
+        children = tuple(getattr(obj, f) for f in fields)
+        # static metadata: any non-array fields of the dataclass.
+        meta = tuple((f, getattr(obj, f)) for f in obj.__dataclass_fields__ if f not in fields)
+        return children, meta
+
+    def unflatten(meta, children):
+        kw = dict(zip(fields, children))
+        for k, v in meta:
+            kw[k] = v
+        return cls(**kw)
+
+    jax.tree_util.register_pytree_node(cls, flatten, unflatten)
+
+
+# Register dataclasses with jnp.ndarray / ShapeDtypeStruct fields. Static
+# metadata (ints, floats, strings, etc.) is preserved across tree_map.
+_register_pytree(CompressorParams,
+                 ("ape", "wkv", "wgate", "norm_w"))
+_register_pytree(IndexerParams,
+                 ("wq_b", "weights_proj", "compressor"))
+_register_pytree(AttentionParams,
+                 ("attn_sink", "wq_a", "q_norm_w", "wq_b", "wkv",
+                  "kv_norm_w", "wo_a", "wo_b", "compressor", "indexer"))
+_register_pytree(GateParams,
+                 ("weight", "bias", "tid2eid"))
+_register_pytree(ExpertParams,
+                 ("w1", "w2", "w3"))
+_register_pytree(MoEParams,
+                 ("gate", "experts", "shared_expert"))
+_register_pytree(BlockParams,
+                 ("attn", "moe", "attn_norm_w", "ffn_norm_w",
+                  "hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base",
+                  "hc_attn_scale", "hc_ffn_scale"))
+_register_pytree(MTPBlockParams,
+                 ("block", "e_proj", "h_proj", "enorm_w", "hnorm_w",
+                  "final_norm_w", "hc_head_fn", "hc_head_base", "hc_head_scale"))
+_register_pytree(TransformerParams,
+                 ("embed_w", "layers", "final_norm_w", "head_w",
+                  "hc_head_fn", "hc_head_base", "hc_head_scale", "mtp"))
+
+
+# ------------------------------------------------------------
+# HF safetensors name → JAX param-tree path mapping (Tier 4)
+# ------------------------------------------------------------
+
+# Mapping schema:
+#   key   : a (regex, jax-path-template) pair
+#   regex : Python regex matching the HF parameter name (groups: layer, expert)
+#   path  : a list of (segment-template, kind) where kind is 'attr', 'index'
+#           and segment-template may use {layer}, {expert} placeholders.
+#
+# We build this mapping once and use it both to validate that every name in
+# the HF index has a destination in our param tree (Tier 4) and as the
+# basis for a real-weight loader (out of scope for this PR — see
+# PROD_TOPOLOGY_RISKS.md item 6).
+
+import re
+
+# Each entry: (regex, jax-path-template-string).
+# In path templates, {L} = layer index, {E} = expert index, {M} = mtp index.
+_HF_TO_JAX_RULES = [
+    # Top-level
+    (re.compile(r"^embed\.weight$"), "embed_w"),
+    (re.compile(r"^head\.weight$"), "head_w"),
+    (re.compile(r"^norm\.weight$"), "final_norm_w"),
+    (re.compile(r"^hc_head_fn$"), "hc_head_fn"),
+    (re.compile(r"^hc_head_base$"), "hc_head_base"),
+    (re.compile(r"^hc_head_scale$"), "hc_head_scale"),
+    # Layer mHC
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_attn_fn$"), "layers[{L}].hc_attn_fn"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_ffn_fn$"), "layers[{L}].hc_ffn_fn"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_attn_base$"), "layers[{L}].hc_attn_base"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_ffn_base$"), "layers[{L}].hc_ffn_base"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_attn_scale$"), "layers[{L}].hc_attn_scale"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.hc_ffn_scale$"), "layers[{L}].hc_ffn_scale"),
+    # Layer norms
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn_norm\.weight$"), "layers[{L}].attn_norm_w"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn_norm\.weight$"), "layers[{L}].ffn_norm_w"),
+    # Layer attn core
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.attn_sink$"), "layers[{L}].attn.attn_sink"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.wq_a\.weight$"), "layers[{L}].attn.wq_a"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.wq_b\.weight$"), "layers[{L}].attn.wq_b"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.q_norm\.weight$"), "layers[{L}].attn.q_norm_w"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.wkv\.weight$"), "layers[{L}].attn.wkv"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.kv_norm\.weight$"), "layers[{L}].attn.kv_norm_w"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.wo_a\.weight$"), "layers[{L}].attn.wo_a"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.wo_b\.weight$"), "layers[{L}].attn.wo_b"),
+    # Layer compressor
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.compressor\.ape$"), "layers[{L}].attn.compressor.ape"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.compressor\.norm\.weight$"), "layers[{L}].attn.compressor.norm_w"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.compressor\.wkv\.weight$"), "layers[{L}].attn.compressor.wkv"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.compressor\.wgate\.weight$"), "layers[{L}].attn.compressor.wgate"),
+    # Layer indexer
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.wq_b\.weight$"), "layers[{L}].attn.indexer.wq_b"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.weights_proj\.weight$"), "layers[{L}].attn.indexer.weights_proj"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.compressor\.ape$"), "layers[{L}].attn.indexer.compressor.ape"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.compressor\.norm\.weight$"), "layers[{L}].attn.indexer.compressor.norm_w"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.compressor\.wkv\.weight$"), "layers[{L}].attn.indexer.compressor.wkv"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.attn\.indexer\.compressor\.wgate\.weight$"), "layers[{L}].attn.indexer.compressor.wgate"),
+    # Layer ffn (MoE) gate
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.gate\.weight$"), "layers[{L}].moe.gate.weight"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.gate\.bias$"), "layers[{L}].moe.gate.bias"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.gate\.tid2eid$"), "layers[{L}].moe.gate.tid2eid"),
+    # Layer ffn experts
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.experts\.(?P<E>\d+)\.w1\.weight$"), "layers[{L}].moe.experts[{E}].w1"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.experts\.(?P<E>\d+)\.w2\.weight$"), "layers[{L}].moe.experts[{E}].w2"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.experts\.(?P<E>\d+)\.w3\.weight$"), "layers[{L}].moe.experts[{E}].w3"),
+    # Layer ffn shared experts
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.shared_experts\.w1\.weight$"), "layers[{L}].moe.shared_expert.w1"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.shared_experts\.w2\.weight$"), "layers[{L}].moe.shared_expert.w2"),
+    (re.compile(r"^layers\.(?P<L>\d+)\.ffn\.shared_experts\.w3\.weight$"), "layers[{L}].moe.shared_expert.w3"),
+    # MTP block — layout mirrors layers but rooted at mtp[M]
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.attn_sink$"), "mtp[{M}].block.attn.attn_sink"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.wq_a\.weight$"), "mtp[{M}].block.attn.wq_a"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.wq_b\.weight$"), "mtp[{M}].block.attn.wq_b"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.q_norm\.weight$"), "mtp[{M}].block.attn.q_norm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.wkv\.weight$"), "mtp[{M}].block.attn.wkv"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.kv_norm\.weight$"), "mtp[{M}].block.attn.kv_norm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.wo_a\.weight$"), "mtp[{M}].block.attn.wo_a"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn\.wo_b\.weight$"), "mtp[{M}].block.attn.wo_b"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.attn_norm\.weight$"), "mtp[{M}].block.attn_norm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn_norm\.weight$"), "mtp[{M}].block.ffn_norm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_attn_fn$"), "mtp[{M}].block.hc_attn_fn"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_ffn_fn$"), "mtp[{M}].block.hc_ffn_fn"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_attn_base$"), "mtp[{M}].block.hc_attn_base"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_ffn_base$"), "mtp[{M}].block.hc_ffn_base"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_attn_scale$"), "mtp[{M}].block.hc_attn_scale"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_ffn_scale$"), "mtp[{M}].block.hc_ffn_scale"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.gate\.weight$"), "mtp[{M}].block.moe.gate.weight"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.gate\.bias$"), "mtp[{M}].block.moe.gate.bias"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.experts\.(?P<E>\d+)\.w1\.weight$"), "mtp[{M}].block.moe.experts[{E}].w1"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.experts\.(?P<E>\d+)\.w2\.weight$"), "mtp[{M}].block.moe.experts[{E}].w2"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.experts\.(?P<E>\d+)\.w3\.weight$"), "mtp[{M}].block.moe.experts[{E}].w3"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.shared_experts\.w1\.weight$"), "mtp[{M}].block.moe.shared_expert.w1"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.shared_experts\.w2\.weight$"), "mtp[{M}].block.moe.shared_expert.w2"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.ffn\.shared_experts\.w3\.weight$"), "mtp[{M}].block.moe.shared_expert.w3"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.e_proj\.weight$"), "mtp[{M}].e_proj"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.h_proj\.weight$"), "mtp[{M}].h_proj"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.enorm\.weight$"), "mtp[{M}].enorm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hnorm\.weight$"), "mtp[{M}].hnorm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.norm\.weight$"), "mtp[{M}].final_norm_w"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_head_fn$"), "mtp[{M}].hc_head_fn"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_head_base$"), "mtp[{M}].hc_head_base"),
+    (re.compile(r"^mtp\.(?P<M>\d+)\.hc_head_scale$"), "mtp[{M}].hc_head_scale"),
+]
+
+# Suffixes that indicate FP4/FP8 quantization scales — present alongside .weight
+# in the HF checkpoint. The weight loader needs them paired with their .weight
+# counterpart for dequantization. For Tier 4 we just verify they are recognized.
+_QUANT_SUFFIXES = {".scale"}
+
+
+def map_hf_name_to_jax_path(name: str) -> Optional[str]:
+    """Returns the JAX param-tree path string for an HF parameter name, or
+    None if no rule matches.
+
+    Names ending in `.scale` (FP4/FP8 quantization scales) return the path of
+    the corresponding `.weight` plus a ".scale" suffix — the caller must
+    dequantize using the scale and then place the dequantized array at the
+    base path. (For our Tier 4 smoke test we just verify name-coverage; we
+    do NOT dequantize — see PROD_TOPOLOGY_RISKS.md item 6.)
+    """
+    base = name
+    suffix = ""
+    if name.endswith(".scale"):
+        base = name[:-len(".scale")] + ".weight"
+        suffix = "<scale>"
+    for pat, path in _HF_TO_JAX_RULES:
+        m = pat.match(base)
+        if m:
+            kw = {k.upper(): v for k, v in m.groupdict().items()}
+            try:
+                resolved = path.format(**kw)
+            except KeyError:
+                continue
+            return resolved + suffix
+    return None
