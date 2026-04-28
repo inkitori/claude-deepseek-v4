@@ -63,6 +63,21 @@ class KVCacheManager:
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
         self.use_mla = self.runner.model_config.use_mla
+        # DeepSeek V4 is mis-classified as MLA by vllm's name pattern matcher
+        # (see model_arch_config_convertor.is_deepseek_mla — it gates on
+        # `compress_ratios` + `head_dim`). V4 is NOT MLA; it has CSA/HCA/SWA
+        # hybrid sparse attention with no `kv_lora_rank`. Override use_mla
+        # locally so the kv_cache_spec / allocation paths take the non-MLA
+        # branch. V4's actual per-layer compressor/indexer state lives in the
+        # model's params tree (not in vllm's per-layer kv_caches), so the
+        # spec returned here is an inert placeholder for engine init.
+        _hf_text = getattr(self.runner.model_config, "hf_text_config",
+                           getattr(self.runner.model_config, "hf_config", None))
+        if _hf_text is not None and getattr(_hf_text, "model_type", None) == "deepseek_v4":
+            self.use_mla = False
+            self._is_deepseek_v4 = True
+        else:
+            self._is_deepseek_v4 = False
         # Set by `update_mamba_page_size_padded` for hybrid attention+mamba
         # models. When set, every attention layer spec reports this as its
         # `page_size_padded` so vLLM sees a uniform page size across groups
