@@ -35,3 +35,16 @@ Things that must remain true for the math to work. When something breaks, check 
 ## Tiny config tradeoffs (testing)
 - I21. Tiny config shrinks `head_dim`, `index_head_dim`, `q_lora_rank`, `o_lora_rank`, `vocab_size`, `n_routed_experts`, `dim`, `intermediate_size`. None of these affect *which code path* runs; they only affect arithmetic intensity. The `compress_ratios` pattern, `hc_mult`, and presence/absence of indexer are preserved exactly.
 - I22. Random weights for tiny tests are seeded identically on the PyTorch reference and the JAX implementation.
+
+## Decode (v2)
+- I23. **Compressor state shape:** `kv_state, score_state` are `[B, coff*ratio, coff*head_dim]` with `coff = 2 if ratio==4 else 1`. `score_state` is initialized to `-inf` so unfilled positions softmax-out to 0.
+- I24. **Compressor compression event:** the compressor emits a new compressed kv when `(start_pos+1) % ratio == 0`. Otherwise it just updates state. This is statically known from start_pos so JIT can branch on it.
+- I25. **Overlap-mode buffer shift:** when `ratio==4` and a compression event happens, `kv_state[:, :ratio]` is set to `kv_state[:, ratio:]`, "scrolling" the buffer up by one ratio group.
+- I26. **Attention kv_cache layout:** `[B, win + (max_seq_len/ratio if ratio else 0), head_dim]`. Slots `[0, win)` are the SWA circular buffer; slots `[win, win+max/ratio)` are the compressor cache. Decoding writes to `start_pos % win` (SWA) and `win + start_pos // ratio` (compressor, when compressed).
+- I27. **Indexer kv_cache** is a SEPARATE buffer from attention's, shape `[B, max/ratio, index_head_dim]`. The indexer's compressor state is also separate from attention's compressor state (different params, different head_dim).
+- I28. **Topk K is statically bounded** at decode time: `K = min(index_topk, (start_pos+1)/ratio)` for the indexer; window topk is exactly `window_size`.
+
+## Quantization (v2)
+- I29. **FP8 dequant:** weight is `float8_e4m3fn` with shape `[O, I]`; scale is `float8_e8m0fnu` with shape `[O/block, I/block]`. Block size from `quantization_config.weight_block_size` (32 in tiny, 128 in real). Dequant: `weight.float() * 2 ** (scale.uint8() - 127)` per-block.
+- I30. **FP4 dequant:** weight is `int8` with shape `[O, I/2]` (logical FP4 shape `[O, I]`). Each byte's low nibble at logical index `2k`, high nibble at `2k+1`. FP4_TABLE[low/high] gives the fp32 value. Block size from `fp4_block_size` (8 in tiny, 32 in real). Per-block scale is `float8_e8m0fnu` shape `[O, I/fp4_block]`.
+- I31. **Bit-exact loader:** `tiny_v4_quant` dequantized via I29 + I30 produces bf16 tensors that are *byte-identical* to `tiny_v4_groundtruth` (which was pre-dequantized using DeepSeek's `convert.py` recipe). Verified across all 355 tensors.
