@@ -31,7 +31,7 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 \
 | Tier | Count | What |
 |---|---|---|
 | 1 | 25 | RMSNorm, RoPE forward + inverse, sparse_attn (incl. all-invalid-mask edge case), Sinkhorn (parity + doubly-stochastic property), Compressor at ratio 4 & 128, Indexer top-k, Attention at SWA (`cr=0`), CSA (`cr=4`), HCA (`cr=128`), Block at every flavor + trailing-SWA, Gate hash + non-hash, Expert, MoE non-hash + hash. |
-| 2 | 6 | Full V4 transformer logits parity at seqlen 16/32/64 (single-batch), batch=4 multi-batch, ≥95% argmax token agreement, MTP block parity. |
+| 2 | 8 | Full V4 transformer logits parity at seqlen 16/32/64 (single-batch), batch=4 multi-batch, ≥95% argmax token agreement, MTP block parity, V4-Pro-style leading-HCA `compress_ratios` pattern, long-context (seqlen 128 with window=8) sliding-window wraparound. |
 | 3 | 10 | `eval_shape` succeeds on real V4-Flash and V4-Pro configs; per-device byte budgets reported on v4-8 and simulated v6e-32; `jit().lower().compile()` + forward succeeds on a 2-layer truncation of each. |
 | 4 | 2 | All 69,187 V4-Flash HF parameter names map to JAX paths; shard 1 (1 GB) of the safetensors checkpoint has correct shapes. |
 
@@ -73,7 +73,7 @@ Nothing is fully blocked, but the items below were intentionally scoped out:
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| 1 | `pytest tests/models/jax/test_deepseek_v4.py` is green | ✅ | All 43 tests pass under `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32`. |
+| 1 | `pytest tests/models/jax/test_deepseek_v4.py` is green | ✅ | All 45 collected tests pass under `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8` (use 8 not 32 for the compile tests — see Phase-7 commit). |
 | 2 | Tier 1 + Tier 2 + Tier 3 in `test_deepseek_v4.py` | ✅ | See §2. |
 | 3 | V3 tests still pass | ⚠️ | `test_deepseek_v3.py` was already broken on `main` *before* my changes — it imports `DeepSeekV3WeightLoader` which does not exist in `tpu_inference/models/jax/deepseek_v3.py`. This is **not a regression** introduced by my V4 work (verified by `git stash` + checking `main` directly). My V4 changes touch only one shared file (`tpu_inference/models/common/model_loader.py`, +2 lines) and do not affect V3 imports. |
 | 4 | All markdown files present | ✅ | PROGRESS, DECISIONS, V3_TO_V4_DIFF, TINY_CONFIG, INVARIANTS, TOLERANCE_LOG, FAILURES (empty), BLOCKERS (empty), STUCK (empty), PROD_TOPOLOGY_RISKS, SUMMARY (this file). |
