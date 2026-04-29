@@ -2110,9 +2110,156 @@ def _numpy_decode_e8m0fnu(buf: np.ndarray) -> np.ndarray:
     Returns float32 array with values 2^(byte - 127) for byte != 0xFF.
     """
     buf = buf.astype(np.uint8)
-    out = np.exp2(buf.astype(np.int32) - 127).astype(np.float32)
+    # Avoid an fp32 overflow warning for byte=0xFF (2^128 overflows to inf
+    # in the cast before the np.where re-masks to NaN). Pre-mask the
+    # exponent so the computation only sees finite-encoding bytes.
+    safe_buf = np.where(buf == 0xFF, np.uint8(0), buf)
+    out = np.exp2(safe_buf.astype(np.int32) - 127).astype(np.float32)
     out = np.where(buf == 0xFF, np.nan, out)
     return out
+
+
+class TestFp8CastByteDomain:
+    """Tier 4b extension (v8 iter 8): exhaustive byte-domain parity between
+    the numpy references (`_numpy_decode_e4m3fn`, `_numpy_decode_e8m0fnu`)
+    and torch's native cast for *every* one of the 256 possible input
+    bytes. The other byte-equal tests in this file (iter 7 and iter 8)
+    indirectly exercise these decoders on the byte distribution that
+    actually appears in V4-Flash weights. This test closes the remaining
+    gap by covering the byte distribution that *could* appear, including
+    rarely-seen subnormals, the FN-variant 0xFC..0xFE encodings, and
+    the explicit NaN bytes (e4m3fn 0x7F / 0xFF, e8m0fnu 0xFF).
+
+    A divergence here is a real spec mismatch between our reference and
+    torch's cast — it would invalidate every other Tier 4b byte-equal
+    test, so it's worth catching at the input boundary explicitly.
+
+    Per-byte parity is asserted via uint32 reinterpretation (NaN-aware:
+    NaN positions are equated by `np.isnan`, non-NaN values must match
+    bit-for-bit). The loader path itself is not exercised by this test —
+    only the numpy/torch dual-decoder boundary.
+    """
+
+    @staticmethod
+    def _all_bytes() -> np.ndarray:
+        return np.arange(256, dtype=np.uint8)
+
+    @staticmethod
+    def _f32_bits(arr: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(arr).view(np.uint32)
+
+    def test_e4m3fn_all_256_bytes_match_torch_cast(self):
+        """Iterate all 256 e4m3fn bytes; assert numpy ref == torch cast.
+
+        Expected NaN bytes per the FN spec (no Inf): {0x7F, 0xFF}
+          = (sign∈{0,1}, exp=15, mant=7).
+        Subnormals: bytes {0x00..0x07, 0x80..0x87} (exp==0).
+        Normals: everything else.
+
+        On torch≥2.4 the `view(float8_e4m3fn)` reinterpret + `.float()`
+        cast is the canonical decode; that's the path we lock in here.
+        """
+        all_bytes = self._all_bytes()
+        np_decoded = _numpy_decode_e4m3fn(all_bytes)
+        torch_decoded = (
+            torch.from_numpy(all_bytes).view(torch.float8_e4m3fn).float()
+            .numpy()
+        )
+
+        np_nan = np.isnan(np_decoded)
+        torch_nan = np.isnan(torch_decoded)
+        # NaN positions must match exactly. The FN spec defines exactly
+        # 2 NaN bytes (0x7F and 0xFF). Both decoders must agree.
+        assert np.array_equal(np_nan, torch_nan), (
+            f"e4m3fn NaN positions differ: numpy says "
+            f"{np.where(np_nan)[0].tolist()}, torch says "
+            f"{np.where(torch_nan)[0].tolist()}"
+        )
+        # FN spec sanity check — independent of either decoder.
+        assert np.where(np_nan)[0].tolist() == [0x7F, 0xFF], (
+            f"e4m3fn FN spec expects NaN at bytes {{0x7F, 0xFF}}; numpy "
+            f"reports NaN at {np.where(np_nan)[0].tolist()}"
+        )
+
+        # Non-NaN bit-pattern equality.
+        non_nan = ~np_nan
+        np_bits = self._f32_bits(np_decoded)[non_nan]
+        torch_bits = self._f32_bits(torch_decoded)[non_nan]
+        assert np.array_equal(np_bits, torch_bits), (
+            f"e4m3fn bit-pattern divergence on "
+            f"{int((np_bits != torch_bits).sum())} of "
+            f"{int(non_nan.sum())} non-NaN bytes; first divergent byte at "
+            f"index {int(np.where(np_bits != torch_bits)[0][0])} "
+            f"(numpy={np_decoded[np.where(np_bits != torch_bits)[0][0]]}, "
+            f"torch={torch_decoded[np.where(np_bits != torch_bits)[0][0]]})"
+        )
+
+        # Spec spot-checks (independent of either decoder).
+        # Byte 0x00 = +0.0, byte 0x80 = -0.0, byte 0x38 = exp=7,mant=0 = +1.0.
+        assert np_decoded[0x00] == 0.0
+        assert np_decoded[0x80] == 0.0  # -0.0 == 0.0 in float comparison
+        assert (
+            self._f32_bits(np_decoded)[0x80]
+            == np.float32(-0.0).view(np.uint32)
+        ), "e4m3fn 0x80 should encode -0.0, not +0.0"
+        assert np_decoded[0x38] == 1.0, (
+            f"e4m3fn 0x38 should decode to +1.0; got {np_decoded[0x38]}"
+        )
+        # Byte 0x7E = exp=15, mant=6 (FN normal at the edge): value =
+        # 1.75 * 2^(15-7) = 1.75 * 256 = 448.
+        assert np_decoded[0x7E] == 448.0, (
+            f"e4m3fn 0x7E should decode to 448.0 (FN max-normal); "
+            f"got {np_decoded[0x7E]}"
+        )
+
+    def test_e8m0fnu_all_256_bytes_match_torch_cast(self):
+        """Iterate all 256 e8m0fnu bytes; assert numpy ref == torch cast.
+
+        Spec: byte b in [0..254] → 2^(b-127); byte 255 → NaN.
+        b=0 → 2^-127 ≈ 5.88e-39 (subnormal in fp32, since fp32 min
+        normal is 2^-126). b=127 → 1.0. b=254 → 2^127 ≈ 1.70e38
+        (largest finite encoding).
+        """
+        all_bytes = self._all_bytes()
+        np_decoded = _numpy_decode_e8m0fnu(all_bytes)
+        torch_decoded = (
+            torch.from_numpy(all_bytes).view(torch.float8_e8m0fnu).float()
+            .numpy()
+        )
+
+        np_nan = np.isnan(np_decoded)
+        torch_nan = np.isnan(torch_decoded)
+        assert np.array_equal(np_nan, torch_nan), (
+            f"e8m0fnu NaN positions differ: numpy says "
+            f"{np.where(np_nan)[0].tolist()}, torch says "
+            f"{np.where(torch_nan)[0].tolist()}"
+        )
+        assert np.where(np_nan)[0].tolist() == [0xFF], (
+            f"e8m0fnu spec expects NaN only at 0xFF; numpy reports "
+            f"NaN at {np.where(np_nan)[0].tolist()}"
+        )
+
+        non_nan = ~np_nan
+        np_bits = self._f32_bits(np_decoded)[non_nan]
+        torch_bits = self._f32_bits(torch_decoded)[non_nan]
+        assert np.array_equal(np_bits, torch_bits), (
+            f"e8m0fnu bit-pattern divergence on "
+            f"{int((np_bits != torch_bits).sum())} of "
+            f"{int(non_nan.sum())} non-NaN bytes; first divergent byte at "
+            f"index {int(np.where(np_bits != torch_bits)[0][0])}"
+        )
+
+        # Spec spot-checks: byte=0 → 2^-127 (subnormal), byte=127 → 1.0,
+        # byte=254 → 2^127.
+        assert np_decoded[127] == 1.0, (
+            f"e8m0fnu 0x7F should decode to 1.0; got {np_decoded[127]}"
+        )
+        assert np_decoded[0] == np.float32(2.0 ** -127), (
+            f"e8m0fnu 0x00 should decode to 2^-127; got {np_decoded[0]}"
+        )
+        assert np_decoded[254] == np.float32(2.0 ** 127), (
+            f"e8m0fnu 0xFE should decode to 2^127; got {np_decoded[254]}"
+        )
 
 
 class TestFp8DequantIndependentReference:
@@ -2130,9 +2277,20 @@ class TestFp8DequantIndependentReference:
     REAL_DIR = _scratch("v4_flash")
     INDEX = _scratch("v4_flash/model.safetensors.index.json")
 
+    # v8 iter 7: 2 cases (wq_a, wkv on layer 0).
+    # v8 iter 8: +4 cases — wq_b (in>>out aspect, deeper layer), wo_a / wo_b
+    # (output projection, square-ish + transposed-aspect), shared_experts.w1
+    # (FP8 dense FFN — distinct from routed FP4 experts; covers the only
+    # FP8 path outside attn). Total 6 byte-equal real-tensor cases spanning
+    # 4 distinct shapes, 4 distinct shards, 5 distinct projections, and
+    # layers {0, 5, 10, 20, 40}.
     @pytest.mark.parametrize("tensor_base", [
-        "layers.0.attn.wq_a",   # 4 MB — same tensor as smoke
-        "layers.0.attn.wkv",    # 2 MB — different shape
+        "layers.0.attn.wq_a",                # iter7: [1024, 4096], shard 2
+        "layers.0.attn.wkv",                 # iter7: [512,  4096], shard 2
+        "layers.20.attn.wq_b",               # iter8: [32768, 1024] (out>>in)
+        "layers.10.attn.wo_a",               # iter8: [8192, 4096] (output proj A)
+        "layers.5.attn.wo_b",                # iter8: [4096, 8192] (output proj B; in>out)
+        "layers.40.ffn.shared_experts.w1",   # iter8: [2048, 4096] (FP8 dense FFN)
     ])
     def test_byte_equal_against_numpy_reference(self, tensor_base):
         if not os.path.exists(self.INDEX):
@@ -2230,9 +2388,17 @@ class TestFp4DequantIndependentReference:
         val = np.where(mag == 0.0, np.float32(0.0), val)
         return val
 
+    # v8 iter 7: 2 cases (experts.0.w1 layer 2; experts.0.w2 layer 0).
+    # v8 iter 8: +2 cases — deeper layer + mid-range expert id (experts.128 on
+    # layer 30; experts.50.w3 on layer 10). w3 is the gate-up projection
+    # distinct from the iter-7 w1/w2 cases. Total 4 byte-equal real-tensor
+    # cases spanning all three SwiGLU projections, expert ids in {0, 50,
+    # 128}, and layers {0, 2, 10, 30}.
     @pytest.mark.parametrize("tensor_base", [
-        "layers.2.ffn.experts.0.w1",     # 4 MB — same tensor as smoke
-        "layers.0.ffn.experts.0.w2",     # 4 MB — different projection
+        "layers.2.ffn.experts.0.w1",       # iter7: [2048, 2048] (4 MB)
+        "layers.0.ffn.experts.0.w2",       # iter7: [4096, 1024] (4 MB; w2 axis)
+        "layers.30.ffn.experts.128.w1",    # iter8: deep layer + mid expert id
+        "layers.10.ffn.experts.50.w3",     # iter8: w3 gate-up projection
     ])
     def test_byte_equal_against_numpy_reference(self, tensor_base):
         if not os.path.exists(self.INDEX):
