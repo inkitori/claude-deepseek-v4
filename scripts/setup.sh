@@ -73,11 +73,20 @@ else
     log "vllm already importable; skipping install"
 fi
 
-if ! python -c "import tpu_inference" 2>/dev/null; then
-    log "installing tpu-inference"
-    (cd "$WORK/tpu-inference" && uv pip install -e .) 2>&1 | tee -a "$SETUP_LOG"
+tpu_inference_path="$(python -c "import tpu_inference; print(tpu_inference.__file__)" 2>/dev/null || true)"
+expected_prefix="$WORK/tpu-inference/tpu_inference/"
+if [ -z "$tpu_inference_path" ]; then
+    log "installing tpu-inference (editable, from worktree)"
+    (cd "$WORK/tpu-inference" && uv pip install -e . --no-deps) 2>&1 | tee -a "$SETUP_LOG"
+elif [[ "$tpu_inference_path" != "$expected_prefix"* ]]; then
+    # A non-editable / PyPI install is shadowing the worktree. Reinstall
+    # from the worktree so test runs and `vllm serve` see our edits — and,
+    # critically, so the worktree's vllm pin (which may not yet have new
+    # symbols like SharedFusedMoE) lines up with the tpu_inference version.
+    log "tpu_inference resolves to $tpu_inference_path (not worktree); reinstalling editable"
+    (cd "$WORK/tpu-inference" && uv pip install -e . --no-deps) 2>&1 | tee -a "$SETUP_LOG"
 else
-    log "tpu_inference already importable; skipping install"
+    log "tpu_inference editable install already points at worktree; skipping"
 fi
 
 # gcsfuse is optional (only needed for the real-weight deploy gate); warn but

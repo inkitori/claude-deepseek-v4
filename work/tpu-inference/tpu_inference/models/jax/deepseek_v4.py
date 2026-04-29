@@ -901,19 +901,168 @@ def _build_class():
             return map_hf_name_to_jax_path(hf_name)
 
         def load_weights_from_dir(self, checkpoint_dir: str):
-            """Load real V4 weights from a checkpoint directory."""
+            """Load real V4 weights from a checkpoint directory.
+
+            Memory contract: this path is the v6e-32 deploy gate, where the
+            bf16-expanded V4-Flash weights are ~543 GB. We must NOT allocate
+            a transient zero copy of the full param tree (that alone hits
+            ~17 GB / chip and the load OOMs before any real weight lands),
+            and we must NOT buffer every dequantized weight on host RAM.
+
+            Strategy:
+              * Walk the abstract `ShapeDtypeStruct` tree once to capture
+                each leaf's target shape + dtype, indexed by JAX path.
+              * Stream-iterate the safetensors via
+                `iter_v4_safetensors_dequant_torch`: each step dequantizes a
+                single CPU torch tensor.
+              * Place that tensor as a sharded global `jax.Array` via
+                `place_torch_as_jax_sharded` (uses `attn_dp` as the primary
+                sharding axis when running with `enable_dp_attention=True`).
+              * Substitute the placed array into the dataclass tree at the
+                resolved path. Drop CPU buffer immediately, advance.
+              * Any leaves that the checkpoint doesn't cover (e.g. MTP
+                blocks absent on V4-Flash) are zero-filled at the end as
+                small replicated arrays — those are tiny relative to the
+                main param budget, so transient cost is negligible.
+            """
             from tpu_inference.models.jax.deepseek_v4_loader import (
-                apply_weights_to_param_tree, load_v4_safetensors_to_dict,
+                iter_v4_safetensors_dequant_torch, place_torch_as_jax_sharded,
             )
             current = self.params_v.get_value()
-            current = jax.tree_util.tree_map(
-                lambda x: jnp.zeros(x.shape, dtype=x.dtype) if isinstance(x, jax.ShapeDtypeStruct) else x,
-                current,
-                is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
+
+            # 1. Build JAX-path -> abstract leaf index. We use this to look
+            #    up target shape/dtype for each loaded weight in O(1).
+            path_to_leaf: Dict[str, Any] = {}
+
+            def _walk(obj, path: str):
+                # Array-like leaf (ShapeDtypeStruct or jnp.ndarray). We also
+                # accept duck-typed leaves with .shape/.dtype that are not
+                # themselves dataclasses (covers torch tensors and numpy
+                # arrays in test paths).
+                if isinstance(obj, jax.ShapeDtypeStruct) or (
+                    hasattr(obj, "shape") and hasattr(obj, "dtype")
+                    and not hasattr(obj, "__dataclass_fields__")
+                ):
+                    path_to_leaf[path] = obj
+                    return
+                if isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        _walk(item, f"{path}[{i}]")
+                    return
+                if hasattr(obj, "__dataclass_fields__"):
+                    for fname in obj.__dataclass_fields__:
+                        sub = getattr(obj, fname, None)
+                        if sub is None:
+                            continue
+                        sub_path = f"{path}.{fname}" if path else fname
+                        _walk(sub, sub_path)
+                    return
+                # Static metadata (int, float, bool, str, tuple, etc.) — not
+                # an array leaf; skip silently.
+
+            _walk(current, "")
+
+            # 2. Helper: navigate `current` to the parent of `path`, then
+            #    assign the new array in place. Reuses the regex split rule
+            #    from `apply_weights_to_param_tree` so HF→JAX path strings
+            #    remain consistent across the streaming and bulk loaders.
+            import re as _re
+            def _assign(path: str, arr):
+                parts = _re.split(r"\.|(\[\d+\])", path)
+                parts = [p for p in parts if p]
+                cur = current
+                for part in parts[:-1]:
+                    if part.startswith("["):
+                        cur = cur[int(part[1:-1])]
+                    else:
+                        cur = getattr(cur, part)
+                last = parts[-1]
+                if last.startswith("["):
+                    cur[int(last[1:-1])] = arr
+                else:
+                    setattr(cur, last, arr)
+
+            # 3. Stream-load every weight, placing each as a sharded array.
+            #    Logs heartbeat progress every 200 placements (~1% of a real
+            #    V4-Flash checkpoint's tensor count) so a long load doesn't
+            #    look like a hang. The CPU dequant is the dominant cost and
+            #    runs single-threaded inside `iter_v4_safetensors_dequant_torch`
+            #    on each Ray worker independently.
+            import sys as _sys
+            import time as _time
+            placed_paths: set = set()
+            skipped: List[str] = []
+            t0 = _time.time()
+            t_last = t0
+            placed_count = 0
+            print(
+                f"[deepseek_v4] load_weights_from_dir: streaming "
+                f"{checkpoint_dir!r} (mesh={self.mesh})",
+                file=_sys.stderr, flush=True,
             )
-            weights = load_v4_safetensors_to_dict(checkpoint_dir)
-            new_tree = apply_weights_to_param_tree(current, weights, self.config)
-            self.params_v = nnx.Param(new_tree)
+            for hf_name, torch_t in iter_v4_safetensors_dequant_torch(checkpoint_dir):
+                jax_path = map_hf_name_to_jax_path(hf_name)
+                if jax_path is None or jax_path.endswith("<scale>"):
+                    skipped.append(hf_name)
+                    del torch_t
+                    continue
+                leaf = path_to_leaf.get(jax_path)
+                if leaf is None:
+                    # Path not present in this config (e.g. MTP layers when
+                    # num_nextn_predict_layers == 0). Drop the tensor.
+                    skipped.append(hf_name)
+                    del torch_t
+                    continue
+                target_shape = tuple(leaf.shape)
+                target_dtype = jnp.dtype(leaf.dtype)
+                arr = place_torch_as_jax_sharded(
+                    torch_t, target_dtype, target_shape, self.mesh,
+                )
+                # Drop CPU buffer before assigning so peak host RAM tracks
+                # one tensor at a time.
+                del torch_t
+                _assign(jax_path, arr)
+                placed_paths.add(jax_path)
+                placed_count += 1
+                if placed_count % 200 == 0:
+                    now = _time.time()
+                    rate = 200.0 / max(now - t_last, 1e-9)
+                    print(
+                        f"[deepseek_v4] placed {placed_count} tensors "
+                        f"({rate:.1f}/s, last={hf_name})",
+                        file=_sys.stderr, flush=True,
+                    )
+                    t_last = now
+            elapsed = _time.time() - t0
+            print(
+                f"[deepseek_v4] load_weights_from_dir done: placed="
+                f"{placed_count} skipped={len(skipped)} elapsed={elapsed:.1f}s",
+                file=_sys.stderr, flush=True,
+            )
+
+            # 4. Zero-fill any leaves the checkpoint didn't cover. These are
+            #    small tail leaves (MTP, optional indexer scales, etc.) so
+            #    a replicated jnp.zeros is fine here.
+            still_abstract: List[str] = []
+            for path, leaf in path_to_leaf.items():
+                if path in placed_paths:
+                    continue
+                if isinstance(leaf, jax.ShapeDtypeStruct):
+                    still_abstract.append(path)
+                    z = jnp.zeros(leaf.shape, dtype=leaf.dtype)
+                    _assign(path, z)
+            if still_abstract:
+                # Surface in logs so we know which leaves stayed zero.
+                # (Not an error: the abstract tree is a superset of any single
+                # real-weight checkpoint, e.g. V4-Flash has 0 MTP layers.)
+                import sys as _sys
+                print(
+                    f"[deepseek_v4] zero-filled {len(still_abstract)} leaves "
+                    f"not present in checkpoint (e.g. {still_abstract[:3]})",
+                    file=_sys.stderr, flush=True,
+                )
+
+            self.params_v = nnx.Param(current)
             self.initialize_cache()
 
         def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:

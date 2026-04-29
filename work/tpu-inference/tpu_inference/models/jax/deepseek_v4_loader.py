@@ -44,11 +44,24 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from jax.sharding import NamedSharding, PartitionSpec as P
+
+# Map JAX dtypes to PyTorch raw-view dtypes so we can convert a torch tensor
+# (whose dtype numpy doesn't understand, e.g. bfloat16) to numpy via a
+# byte-equivalent integer view, then re-view the resulting numpy buffer back
+# to the JAX dtype. This avoids a costly fp32 detour for every weight.
+_DTYPE_VIEW_MAP = {
+    jnp.dtype(jnp.bfloat16): torch.uint16,
+    jnp.dtype(jnp.float32): torch.uint32,
+    jnp.dtype(jnp.float16): torch.uint16,
+    jnp.dtype(jnp.float8_e4m3fn): torch.uint8,
+}
 
 # Canonical FP4 codebook. Indices 0..7 = positives; 8..15 = negatives. Order
 # matches DeepSeek's `convert.py:FP4_TABLE`.
@@ -162,6 +175,12 @@ def detect_quant_config(hf_config: Dict[str, Any]) -> Dict[str, Any]:
         assert wbs[0] == wbs[1], f"non-square fp8 block size {wbs}"
     fp4_block = hf_config.get("fp4_block_size", None)
     expert_dtype = hf_config.get("expert_dtype", "bf16")
+    if fp4_block is None and expert_dtype == "fp4":
+        # The HF V4-Flash / V4-Pro public config.json doesn't carry
+        # fp4_block_size — it's hardcoded to 32 in DeepSeek's reference
+        # `inference/model.py:18`. Default to 32 so our loader matches the
+        # upstream FP4 layout convention.
+        fp4_block = 32
     return {
         "fp8_block": fp8_block,
         "fp4_block": fp4_block,
@@ -372,3 +391,249 @@ def apply_weights_to_param_tree(
                 arr = arr.astype(target_dtype)
             parent[idx] = arr
     return params
+
+
+# ------------------------------------------------------------
+# Streaming + sharded loader (production path for v6e-32 / TP=32).
+#
+# `load_v4_safetensors_to_dict` above buffers every dequantized weight in CPU
+# RAM and then materializes the full tree on TPU device — that approach
+# transient-doubles HBM and OOMs at the v6e-32 chip budget. The streaming
+# path below yields one dequantized torch tensor at a time so the caller can
+# place it directly onto a sharded global jax.Array and free the CPU buffer
+# before reading the next safetensors entry.
+# ------------------------------------------------------------
+
+
+def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
+    """Convert a CPU torch tensor to a numpy array of the same dtype + shape.
+
+    For torch dtypes that numpy doesn't natively support (bfloat16,
+    float8_e4m3fn, float8_e8m0fnu) we go through an integer raw-view bridge
+    and immediately re-view the resulting buffer to the matching `ml_dtypes`
+    dtype. The end result is a numpy array semantically equal to the torch
+    tensor — shape preserved, dtype preserved (or its ml_dtypes equivalent).
+
+    The previous implementation returned an integer-typed numpy buffer and
+    relied on the caller doing a `.view(target_dtype)` later; that was
+    correct only when the caller's target dtype had the same itemsize as
+    the source. For bf16 -> fp32 (e.g. a norm stored bf16 on disk but with
+    an fp32 abstract leaf), the byte-view halved the array's logical
+    length. Doing the conversion semantically here makes the caller's
+    `.astype(target)` always shape-preserving.
+    """
+    if not t.is_contiguous():
+        t = t.contiguous()
+    if t.dtype == torch.bfloat16:
+        import ml_dtypes
+        return t.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+    if t.dtype == torch.float8_e4m3fn:
+        import ml_dtypes
+        return t.view(torch.uint8).numpy().view(ml_dtypes.float8_e4m3fn)
+    if t.dtype == torch.float8_e8m0fnu:
+        # ml_dtypes doesn't carry e8m0fnu. We don't yield raw e8m0 tensors
+        # to the caller (they're consumed via `dequant_weight` -> bf16) so
+        # this branch is only here for paranoia / debug. Return uint8.
+        return t.view(torch.uint8).numpy()
+    return t.numpy()
+
+
+def pick_partition_spec(shape: Tuple[int, ...], mesh) -> P:
+    """Heuristically pick a `PartitionSpec` for a weight of `shape` on `mesh`.
+
+    Goal: shard the weight along its largest dim that's divisible by the
+    largest available mesh axis, so a 543 GB bf16 V4-Flash model spreads
+    evenly across the 32-chip slice (~17 GB / chip). When no dim divides
+    cleanly, fall back to fully replicated — that's safe for small leaves
+    (norms, biases, hc mix tables).
+
+    The axis preference order favors `attn_dp` first because that's the axis
+    that holds all 32 chips when `enable_dp_attention=True` is set, which is
+    the deploy shape for V4-Flash. Other axes are considered only if they
+    happen to carry size > 1.
+    """
+    if mesh is None or not shape:
+        return P()
+    sizes: Dict[str, int] = {}
+    try:
+        # jax.sharding.Mesh.shape is an OrderedDict-like mapping of name -> size.
+        for name, sz in mesh.shape.items():
+            sizes[str(name)] = int(sz)
+    except (AttributeError, TypeError):
+        return P()
+
+    preference = ["attn_dp", "model", "expert", "attn_dp_expert", "data"]
+    chosen_axis = None
+    chosen_size = 1
+    for name in preference:
+        if sizes.get(name, 1) > 1:
+            chosen_axis = name
+            chosen_size = sizes[name]
+            break
+    if chosen_axis is None:
+        return P()
+
+    # Pick the largest dim divisible by chosen_size. Tie-break: earlier dim.
+    best_dim = -1
+    best_dim_size = -1
+    for i, d in enumerate(shape):
+        if d % chosen_size == 0 and d >= chosen_size and d > best_dim_size:
+            best_dim = i
+            best_dim_size = d
+    if best_dim == -1:
+        return P()  # replicate
+    spec = [None] * len(shape)
+    spec[best_dim] = chosen_axis
+    return P(*spec)
+
+
+def place_torch_as_jax_sharded(
+    t: torch.Tensor,
+    target_dtype,
+    target_shape: Tuple[int, ...],
+    mesh,
+) -> jnp.ndarray:
+    """Convert a CPU torch tensor to a sharded global `jax.Array` on `mesh`.
+
+    The placement uses `jax.make_array_from_callback`, so each host populates
+    only its local shards (the callback receives a per-device index into the
+    global array). With multi-host JAX (the v6e-32 deploy shape), this means
+    we never replicate the full weight onto every chip.
+
+    Args:
+        t: CPU torch tensor in any dtype the loader produces (bf16, fp32,
+            int32, int64, etc.).
+        target_dtype: JAX dtype the abstract param tree expects at this leaf.
+            We cast on the host side via numpy view + `astype` rather than on
+            device, so the on-device buffer is the right size from the start.
+        target_shape: shape the abstract param tree expects. Must equal
+            `tuple(t.shape)`.
+        mesh: JAX mesh (e.g. from `tpu_runner._init_mesh`). If `None`, the
+            tensor is placed on a single device (test path / fallback).
+    """
+    if tuple(t.shape) != tuple(target_shape):
+        raise ValueError(
+            f"Shape mismatch placing tensor: torch={tuple(t.shape)} "
+            f"target={tuple(target_shape)}")
+    np_arr = _torch_to_numpy_preserve(t)
+    target = jnp.dtype(target_dtype)
+    if np_arr.dtype != target:
+        # Semantic dtype conversion (e.g. bf16 norm on disk -> fp32 leaf).
+        # `astype` preserves shape, unlike a raw-byte `.view(target)`.
+        np_arr = np_arr.astype(target)
+
+    if mesh is None:
+        return jnp.asarray(np_arr)
+
+    spec = pick_partition_spec(tuple(target_shape), mesh)
+    sharding = NamedSharding(mesh, spec)
+
+    def _callback(idx):
+        # idx is a tuple of slices — extract this device's shard from the
+        # full host-resident numpy buffer. JAX guarantees the slice covers
+        # only the local devices' data.
+        return np.asarray(np_arr[idx])
+
+    return jax.make_array_from_callback(tuple(target_shape), sharding, _callback)
+
+
+def iter_v4_safetensors_dequant_torch(
+    checkpoint_dir: str,
+    quant_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Stream-yield `(hf_name, dequantized_torch_tensor)` one at a time.
+
+    Reads safetensors shards in a fixed order, fetches each weight (and its
+    paired `.scale`, possibly from a different shard) lazily, dequantizes on
+    CPU, then yields. The caller MUST consume each tensor before requesting
+    the next: returned torch tensors are not retained inside this iterator,
+    so memory is released as soon as the caller drops its reference.
+
+    `.scale` entries are not yielded directly — they are merged into their
+    paired `.weight` via `dequant_weight`.
+    """
+    from safetensors import safe_open
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    with open(cfg_path) as f:
+        hf_config = json.load(f)
+    qc = detect_quant_config(hf_config)
+    qmeta_path = os.path.join(checkpoint_dir, "quant_meta.json")
+    if quant_meta is None and os.path.exists(qmeta_path):
+        with open(qmeta_path) as f:
+            quant_meta = json.load(f)
+    quant_meta = quant_meta or {}
+
+    # Build name -> shard path mapping from the official index. Falls back to
+    # scanning shard keys when an index is absent (single-file checkpoints).
+    name_to_shard: Dict[str, str] = {}
+    idx_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            idx = json.load(f)
+        for nm, sh in idx["weight_map"].items():
+            name_to_shard[nm] = os.path.join(checkpoint_dir, sh)
+    else:
+        for fn in sorted(os.listdir(checkpoint_dir)):
+            if fn.endswith(".safetensors"):
+                p = os.path.join(checkpoint_dir, fn)
+                with safe_open(p, framework="pt") as fh:
+                    for nm in fh.keys():
+                        name_to_shard[nm] = p
+
+    # Group names by shard so we can open each shard once and amortize the
+    # mmap cost across all its tensors.
+    shard_to_names: Dict[str, List[str]] = {}
+    for nm, sp in name_to_shard.items():
+        shard_to_names.setdefault(sp, []).append(nm)
+
+    def _determine_kind(name: str, dtype) -> str:
+        meta_entry = quant_meta.get(name)
+        if meta_entry is not None:
+            return meta_entry["kind"]
+        if dtype == torch.float8_e4m3fn:
+            return "fp8"
+        if dtype == torch.int8 and "experts" in name:
+            return "fp4"
+        return "bf16"
+
+    def _fetch_scale(scale_key: str) -> Optional[torch.Tensor]:
+        """Cross-shard scale lookup. The vast majority of V4 .scale entries
+        live in the same shard as their .weight, but we don't assume so."""
+        sh = name_to_shard.get(scale_key)
+        if sh is None:
+            return None
+        with safe_open(sh, framework="pt") as fh:
+            return fh.get_tensor(scale_key)
+
+    for sp in sorted(shard_to_names.keys()):
+        with safe_open(sp, framework="pt") as f:
+            local_keys = set(f.keys())
+            for hf_name in sorted(shard_to_names[sp]):
+                if hf_name.endswith(".scale"):
+                    continue
+                t = f.get_tensor(hf_name)
+                kind = _determine_kind(hf_name, t.dtype)
+                if kind in ("bf16", "raw"):
+                    deq = dequant_weight(t, None, kind)
+                else:
+                    if hf_name.endswith(".weight"):
+                        scale_key = hf_name[:-len(".weight")] + ".scale"
+                    else:
+                        scale_key = hf_name + ".scale"
+                    if scale_key in local_keys:
+                        scale_t = f.get_tensor(scale_key)
+                    else:
+                        scale_t = _fetch_scale(scale_key)
+                    if scale_t is None:
+                        raise ValueError(
+                            f"Missing scale for {kind!r} weight {hf_name!r}")
+                    deq = dequant_weight(t, scale_t, kind,
+                                         fp8_block=qc["fp8_block"],
+                                         fp4_block=qc["fp4_block"])
+                    del scale_t
+                del t
+                yield hf_name, deq
+                # Caller is expected to have consumed `deq` and let it fall
+                # out of scope before the next iteration. We don't hold a
+                # reference here past the yield.
+                del deq
