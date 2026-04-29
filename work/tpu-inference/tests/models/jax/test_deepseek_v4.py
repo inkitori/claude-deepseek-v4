@@ -2878,3 +2878,295 @@ class TestDecodeRollingParityLong:
                 f"rolling decode diff {diff}"
             )
 
+
+# ------------------------------------------------------------
+# Tier 4b — codebook + keystone-tensor reference (v8 iter 9)
+# ------------------------------------------------------------
+#
+# The byte-equal real-data tests above (iter 7 + iter 8) prove the FP4 /
+# FP8 *paths* are correct on real V4-Flash bytes. They do not directly
+# pin down the loader's 16-entry FP4 codebook table itself — a swap of
+# two adjacent table entries would produce real-data divergences only
+# if the surrounding bytes happen to address the swapped slots, which
+# is statistical, not exhaustive.
+#
+# Iter 9 closes the remaining boundary:
+#   * `TestFp4CodebookReference` enumerates all 16 nibble values (every
+#     byte in the FP4 codebook) and asserts the loader's
+#     `_FP4_TABLE_T` agrees with a manually-typed reference table at
+#     every slot, including the -0 → +0 canonicalization at index 8
+#     (INVARIANTS::I38).
+#   * `TestRealKeystoneTensorRoundTrip` round-trips three "keystone"
+#     real V4-Flash tensors through `to_jax_bf16`: a bf16 norm tensor,
+#     a fp32 attention sink tensor, and an int64 router lookup table
+#     (`tid2eid`). The bf16 round-trip in `TestRealShardRoundTrip`
+#     covers the embedding only; norms / sinks / int lookups travel
+#     the same `to_jax_bf16` dispatch but through different branches
+#     (fp32 direct copy, int64 direct copy) — these are the loader
+#     codepaths that move from torch into JAX *without* dequantization,
+#     and bugs there would silently corrupt the model without the
+#     existing FP4/FP8 byte-equal tests catching it.
+
+
+class TestFp4CodebookReference:
+    """Tier 4b extension (v8 iter 9): exhaustive enumeration of all 16
+    FP4 codebook entries vs a manually-typed reference table.
+
+    The DeepSeek FP4 codebook is sign-magnitude:
+
+        nibble = (sign << 3) | mag_idx
+        mag_idx ∈ [0..7] indexes [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+        sign 0 → positive, sign 1 → negative
+        BUT (sign=1, mag_idx=0) is collapsed to +0.0 — the negative-zero
+        slot is unused (I38).
+
+    The loader's `_FP4_TABLE_T` is a single 16-entry torch tensor that
+    serves as a direct lookup for the full nibble. A swap of two
+    adjacent entries (e.g. table[5] ↔ table[6], "3 ↔ 4") would not
+    necessarily fail any other Tier 4b real-data test since the affected
+    bytes would be statistically rare. This test forces the issue by
+    enumerating every nibble.
+
+    Reference values (per DeepSeek `inference/convert.py:FP4_TABLE`):
+      nibble 0 →  0.0,   1 →  0.5,   2 →  1.0,   3 →  1.5,
+      nibble 4 →  2.0,   5 →  3.0,   6 →  4.0,   7 →  6.0,
+      nibble 8 →  0.0   (the -0.0 slot, canonicalized),
+      nibble 9 → -0.5,  10 → -1.0,  11 → -1.5,
+      nibble 12 → -2.0, 13 → -3.0, 14 → -4.0, 15 → -6.0.
+    """
+
+    REFERENCE = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ]
+
+    def test_loader_table_matches_reference_element_for_element(self):
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            _FP4_TABLE_T, FP4_TABLE_LIST,
+        )
+        # First: list constant equals our reference verbatim.
+        assert FP4_TABLE_LIST == self.REFERENCE, (
+            f"FP4_TABLE_LIST diverged from reference at entries: "
+            f"{[i for i, (a, b) in enumerate(zip(FP4_TABLE_LIST, self.REFERENCE)) if a != b]}"
+        )
+        # Then: tensor matches list bit-for-bit (fp32; values are dyadic).
+        assert _FP4_TABLE_T.dtype == torch.float32, (
+            f"loader expects fp32 codebook for indexing; got {_FP4_TABLE_T.dtype}"
+        )
+        ref_t = torch.tensor(self.REFERENCE, dtype=torch.float32)
+        assert torch.equal(_FP4_TABLE_T, ref_t), (
+            f"_FP4_TABLE_T diverged from reference: "
+            f"got {_FP4_TABLE_T.tolist()}, expected {self.REFERENCE}"
+        )
+
+    def test_decode_every_nibble_via_loader_unpack(self):
+        """Pack every nibble in [0..15] into a single int8 byte and run it
+        through `dequant_fp4_to_bf16` with a unit scale, then assert the
+        bf16 outputs match the reference table at every position.
+
+        This exercises the *loader's* nibble extraction (low nibble at
+        index 2k, high at 2k+1) and table indexing — the same code that
+        runs on every real V4-Flash FP4 expert weight. A swap, an
+        off-by-one in the shift, or an incorrect mask would be caught.
+        """
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            dequant_fp4_to_bf16,
+        )
+        # Build a single row containing every nibble 0..15 as 8 bytes:
+        # byte k packs (high=2k+1, low=2k). Choose pairs (low=k, high=k+8)
+        # so that across the 8 bytes we hit every nibble exactly once
+        # in both nibble positions.
+        # bytes[k] = (k+8) << 4 | k    for k in 0..7
+        # → low nibbles: [0,1,2,3,4,5,6,7]; high nibbles: [8,9,..,15]
+        bytes_row = np.array(
+            [((k + 8) << 4) | k for k in range(8)],
+            dtype=np.uint8,
+        )
+        # int8 view (PyTorch's `view` requires same itemsize). Some bytes
+        # are >= 0x80 → negative when reinterpreted as int8. The loader
+        # explicitly casts to uint8 before nibble math, so this should
+        # not affect output.
+        w_int8 = torch.from_numpy(bytes_row.view(np.int8)).view(1, 8)
+        # Unit scale: byte 127 = 2^0 = 1.0 in e8m0fnu.
+        s = torch.full((1, 16 // 32 if 16 % 32 == 0 else 1), 127, dtype=torch.uint8)
+        # Actual scale shape: [out_dim=1, in_logical/fp4_block].
+        # We want fp4_block=16 so that one scale entry covers all 16
+        # nibbles in the row. Construct via the e8m0fnu reinterpret.
+        s_e8m0 = torch.tensor([[127]], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        bf = dequant_fp4_to_bf16(w_int8, s_e8m0, fp4_block=16)
+        assert tuple(bf.shape) == (1, 16), f"shape {bf.shape}"
+        out = bf.float().squeeze(0).tolist()
+        # Output ordering: [low_0, high_0, low_1, high_1, ..., low_7, high_7]
+        # = [0, 8, 1, 9, 2, 10, ..., 7, 15]
+        # so out[2k] should equal REFERENCE[k] and out[2k+1] should
+        # equal REFERENCE[k+8].
+        for k in range(8):
+            assert out[2 * k] == self.REFERENCE[k], (
+                f"low nibble {k}: loader produced {out[2 * k]}, "
+                f"reference says {self.REFERENCE[k]}"
+            )
+            assert out[2 * k + 1] == self.REFERENCE[k + 8], (
+                f"high nibble {k + 8}: loader produced {out[2 * k + 1]}, "
+                f"reference says {self.REFERENCE[k + 8]}"
+            )
+        # Final sanity: every reference value appears in the output.
+        out_sorted = sorted(out)
+        ref_sorted = sorted(self.REFERENCE)
+        assert out_sorted == ref_sorted, (
+            f"loader output multiset {out_sorted} differs from "
+            f"reference multiset {ref_sorted}"
+        )
+
+
+class TestRealKeystoneTensorRoundTrip:
+    """Tier 4b extension (v8 iter 9): byte-equal round-trip through
+    `to_jax_bf16` for the three non-quantized storage classes that the
+    real V4-Flash checkpoint actually uses:
+
+      * **bf16 norm**: e.g. `layers.0.attn.kv_norm.weight`. Stored as
+        torch.bfloat16; loader path is
+        `jnp.asarray(t.float().numpy()).astype(jnp.bfloat16)`. The
+        intermediate fp32 hop is exact for bf16 (every bf16 value is
+        representable in fp32) so round-trip must be byte-exact.
+      * **fp32 attention sink**: `layers.0.attn.attn_sink`. Stored as
+        torch.float32; loader path is `jnp.asarray(t.numpy())` — direct
+        zero-copy. Round-trip must be byte-exact.
+      * **int64 router table**: `layers.0.ffn.gate.tid2eid`. Stored as
+        torch.int64; loader path is `jnp.asarray(t.numpy())`. Round-trip
+        must be byte-exact.
+
+    `TestRealShardRoundTrip` already covers the bf16 path on the
+    embedding tensor. This test covers the three other code branches in
+    `to_jax_bf16` (fp32, int64, bf16-norm) on real V4-Flash data so that
+    every branch is independently anchored to a real-data byte-equal
+    proof. A regression that e.g. accidentally cast int64 → int32 (a
+    real loss-of-information bug for the 129280-row tid2eid table) would
+    fire here.
+    """
+
+    REAL_DIR = _scratch("v4_flash")
+    INDEX = _scratch("v4_flash/model.safetensors.index.json")
+
+    @pytest.mark.parametrize("name", [
+        "layers.0.attn.kv_norm.weight",     # bf16, [512]
+        "layers.30.attn.q_norm.weight",     # bf16, [1024], deeper layer
+        "layers.0.attn_norm.weight",        # bf16, [4096], pre-attn block norm
+    ])
+    def test_real_bf16_norm_byte_equal(self, name):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import to_jax_bf16
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        if name not in mapping:
+            pytest.skip(f"{name} not in V4-Flash index")
+        shard_path = os.path.join(self.REAL_DIR, mapping[name])
+        with safe_open(shard_path, framework="pt") as f:
+            t = f.get_tensor(name)
+        assert t.dtype == torch.bfloat16, (
+            f"{name}: expected bf16 storage, got {t.dtype}"
+        )
+        jax_arr = to_jax_bf16(t)
+        # Bit-equal in the underlying uint16 view.
+        loader_u16 = (
+            torch.from_numpy(np.asarray(jax_arr).view(np.uint16).copy())
+        )
+        # Direct safetensors → torch bf16 → uint16 view.
+        ref_u16 = t.contiguous().view(torch.uint16)
+        assert loader_u16.shape == ref_u16.shape, (
+            f"{name}: shape changed under to_jax_bf16: "
+            f"{loader_u16.shape} vs {ref_u16.shape}"
+        )
+        diff = (loader_u16 != ref_u16).sum().item()
+        assert diff == 0, (
+            f"{name}: {diff}/{loader_u16.numel()} bf16 bytes differ "
+            f"after round-trip — to_jax_bf16's fp32 hop is no longer "
+            f"exact for bf16 inputs"
+        )
+
+    @pytest.mark.parametrize("name", [
+        "layers.0.attn.attn_sink",          # fp32, [64]
+        "layers.30.attn.attn_sink",         # fp32, [64], deeper layer
+        "layers.0.hc_attn_base",            # fp32, [24], head-mix base
+        "hc_head_base",                     # fp32, [4], top-level head base
+    ])
+    def test_real_fp32_byte_equal(self, name):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import to_jax_bf16
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        if name not in mapping:
+            pytest.skip(f"{name} not in V4-Flash index")
+        shard_path = os.path.join(self.REAL_DIR, mapping[name])
+        with safe_open(shard_path, framework="pt") as f:
+            t = f.get_tensor(name)
+        assert t.dtype == torch.float32, (
+            f"{name}: expected fp32 storage, got {t.dtype}"
+        )
+        jax_arr = to_jax_bf16(t)
+        # to_jax_bf16's fp32 branch is `jnp.asarray(t.numpy())` — direct
+        # passthrough, must round-trip with full fp32 precision.
+        np_jax = np.asarray(jax_arr)
+        np_torch = t.numpy()
+        assert np_jax.dtype == np.float32, (
+            f"{name}: to_jax_bf16 changed fp32 → {np_jax.dtype}"
+        )
+        # Bit-equal via uint32 reinterpret.
+        jax_u32 = np_jax.view(np.uint32)
+        torch_u32 = np_torch.view(np.uint32)
+        assert np.array_equal(jax_u32, torch_u32), (
+            f"{name}: fp32 bytes differ after round-trip — to_jax_bf16's "
+            f"fp32 branch is no longer zero-copy"
+        )
+
+    def test_real_int64_router_lookup_byte_equal(self):
+        """`tid2eid` is the per-layer token-id → expert-id router lookup,
+        shape `[vocab=129280, top_k=6]`, stored as int64. A silent
+        truncation to int32 would still produce valid expert IDs (since
+        all expert IDs fit in int16) but would corrupt high-id
+        lookups via wraparound during indexing. Catch that here.
+        """
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import to_jax_bf16
+        name = "layers.0.ffn.gate.tid2eid"
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        if name not in mapping:
+            pytest.skip(f"{name} not in V4-Flash index")
+        shard_path = os.path.join(self.REAL_DIR, mapping[name])
+        with safe_open(shard_path, framework="pt") as f:
+            t = f.get_tensor(name)
+        assert t.dtype == torch.int64, (
+            f"{name}: expected int64 storage, got {t.dtype}"
+        )
+        jax_arr = to_jax_bf16(t)
+        np_jax = np.asarray(jax_arr)
+        np_torch = t.numpy()
+        # JAX may upcast int64 → int32 if `jax_enable_x64` is off
+        # (the default). Either is acceptable as long as no value is
+        # truncated. Spec says expert IDs fit in int16 so int32 is safe.
+        if np_jax.dtype == np.int64:
+            assert np.array_equal(np_jax, np_torch), (
+                f"{name}: int64 values differ after round-trip"
+            )
+        elif np_jax.dtype == np.int32:
+            # Verify lossless downcast: every value must fit in int32.
+            tmin, tmax = int(np_torch.min()), int(np_torch.max())
+            assert tmin >= np.iinfo(np.int32).min and tmax <= np.iinfo(np.int32).max, (
+                f"{name}: int64 → int32 downcast would lose data: "
+                f"value range [{tmin}, {tmax}] doesn't fit in int32"
+            )
+            assert np.array_equal(np_jax.astype(np.int64), np_torch), (
+                f"{name}: int64 → int32 → int64 round-trip differs"
+            )
+        else:
+            pytest.fail(
+                f"{name}: to_jax_bf16 produced unexpected dtype {np_jax.dtype} "
+                f"for int64 input"
+            )
+

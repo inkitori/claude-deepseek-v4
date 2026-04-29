@@ -633,3 +633,28 @@ real-tensor byte-equal coverage from layer-0 attn to a spread of layers
      element-equal to a manually-typed reference table of `{0, ±0.5, ±1,
      ±1.5, ±2, ±3, ±4, ±6}` with the -0 → +0 canonicalization (I38). Pure
      local code; small.
+
+---
+
+## v8 iter 9 RESUMED at 2026-04-29T18:01Z
+
+Baseline reproduced: CPU **109 passed, 6 skipped** in 3:43; TPU
+spot-check (`TestRealTpuTinyForward`) **1 passed** in 19.5 s. Mount + 4
+v6e chips + scratch fixtures all healthy. T8 still architecturally
+blocked on this 4-chip view (BLOCKERS::T8-HBM-OOM unchanged from iter
+3).
+
+Plan for iter 9 (this session): the user's prompt explicitly says "If
+you finish early, do NOT add features. Tighten Tier 5/6/7/8 tolerances,
+add more decode parity points, polish SUMMARY.md." Iter 8 already
+exhausted the easy tightenings; remaining levers in priority order are
+(a) tighten the moe_hash 5e-2 holdout if we can prove a tighter bound
+on real-data; (b) add the 16-nibble FP4 codebook reference (the
+follow-up explicitly listed in iter-8's hint); (c) widen Tier 4b
+byte-equal real-data coverage to >=2 more shards to span the FP8 dense
+keystone projections we haven't independently checked; (d) add a real-
+data Tier 4b round-trip on a *real V4-Flash bf16 norm tensor* (the
+single keystone storage path we haven't byte-equal-validated end-to-end
+on real data — embeddings are bf16 and pass; norms are fp32-stored).
+
+If killed mid-iter-9: see this entry. The headline is still T8-HBM-OOM.
