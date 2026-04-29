@@ -2,20 +2,24 @@
 
 Every place where a numerical tolerance was loosened from the default (fp32 1e-5/1e-5, bf16 1e-2/1e-2). Each entry must include evidence.
 
-## T1 — Attention prefill (Tier 1, `TestAttentionComponent`): `atol=5e-2`
+## T1 — Attention prefill (Tier 1, `TestAttentionComponent`): `atol=1e-3` (v8 iter 4 tightening from 5e-2)
 **Where:** `tests/models/jax/test_deepseek_v4.py::TestAttentionComponent::test_attention_prefill_matches_torch`.
 **Default:** bf16 atol/rtol = 1e-2.
-**Looser bound:** atol=5e-2.
-**Evidence:**
-- The attention forward chains 4 matmuls (`wq_a`, `wq_b`, `wkv`, `wo_a`@`wo_b`) plus 2 RMSNorms, RoPE, sparse softmax over up to 32 KV slots, and a low-rank grouped O projection.
-- bf16 dot-product accumulation has ~3 bits of mantissa-noise per matmul; chained over 4 matmuls + softmax-renorm this is ~16 ULPs of bf16 ≈ 0.005 per output value. Combined with attention-output magnitudes that can reach ~0.5 in random-init tests, the absolute error is up to 5e-2.
-- A minimal repro: with all weights = 0.02-std normal at seed 0 and seqlen 32, observed max abs diff is ~0.025 (within bound). The 5e-2 bound is a safety margin for higher-magnitude paths (CSA/HCA where extra Sinkhorn-derived scaling enters).
+**Effective bound:** atol=1e-3.
+**Evidence (measured 2026-04-29 v8 iter 4 across 45 (compress_ratio, layer_id, seed) combos):**
+- Worst observed: **7.63e-6**, stable across all 45 trials (only seed=0 and seed=7 produced any non-3.8e-6 outlier, and the outlier itself is ~2 ULPs of bf16 at the output magnitude).
+- Why the 5e-2 estimate was loose: it assumed 3 bits of bf16 mantissa noise per matmul with a magnitude of ~0.5 at the output. The empirical activations at sigma=0.02-init weights are much smaller — output values are ~0.03 magnitude — so the absolute noise is bounded near a single ULP at that scale (~1e-5 on the diff scale).
+- 1e-3 keeps a 130× margin over the empirical worst, which is large enough to absorb any future variation in torch's matmul tiling or seed sensitivity, while immediately catching any per-op math regression.
 
-## T2 — Block forward (Tier 1, `TestBlockComponent`): `atol=5e-2`
+## T2 — Block forward (Tier 1, `TestBlockComponent`): `atol=2e-2` (v8 iter 4 tightening from 5e-2)
 **Where:** `TestBlockComponent::test_block_matches_torch`.
 **Default:** bf16 atol/rtol = 1e-2.
-**Looser bound:** atol=5e-2.
-**Evidence:** Block adds Sinkhorn (20 iterations of fp32 row/col normalize) + the mHC `hc_post` einsum on top of attention. Sinkhorn is fp32 and matches at 1e-5; the mHC einsum operates on fp32 residuals and the result is cast back to bf16. Empirically the same 5e-2 bound holds. No surprising amplification.
+**Effective bound:** atol=2e-2.
+**Evidence (measured 2026-04-29 v8 iter 4 across 80 (layer_id, seed) combos):**
+- Worst observed: **7.81e-3**, stable across all 80 trials (the value comes out to 1/128 = 1 ULP of bf16 at the Block output magnitude in this tiny config).
+- Block adds Sinkhorn + mHC `hc_post` on top of attention; the residual stream picks up an additional ~1 ULP of bf16 noise per scaling step. Empirically that ULP is bounded at the magnitude in question.
+- 2e-2 keeps a 2.5× margin over the empirical ceiling. We deliberately did not tighten further: the bf16 ULP at the output magnitude could shift by a factor of ~2 if the Block input distribution changes (e.g. if a future torch ref uses different seeded inits), and 2.5× absorbs that. Tighter than 1.5e-2 risks flakes; looser than 5e-2 hides bugs.
+- TestMoEComponent.test_moe_matches_torch was also tightened from 5e-2 -> 5e-3 (worst observed 4.88e-4 across 10 seeds; 10× margin). The hash variant (`test_moe_hash_layer_matches_torch`) stays at 5e-2 — observed worst 4.2e-2 is too close to tighten safely.
 
 ## T3 — End-to-end transformer logits (Tier 2, `TestEndToEnd`): `atol=1e-3` (v8 iter 4 tightening from 0.1; long-context 0.15 → 2e-3)
 **Where:** `TestEndToEnd::test_single_batch_prefill_logits_parity`, `test_multi_batch_prefill`, `test_v4_pro_style_compress_ratios`, `test_mtp_forward_parity` (1e-3); `test_long_context_sliding_window_wraparound` (2e-3).

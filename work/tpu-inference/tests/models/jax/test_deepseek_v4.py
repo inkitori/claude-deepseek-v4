@@ -382,7 +382,9 @@ class TestAttentionComponent:
         max_diff = maxabs(y_j, y_t)
         max_rel = float(np.abs(np.asarray(y_j).astype(np.float32) - y_t.float().numpy()).max() /
                          max(1e-6, float(np.abs(y_t.float().numpy()).max())))
-        assert max_diff <= 5e-2, f"compress_ratio={compress_ratio}: max abs diff {max_diff}"
+        # v8 iter 4 tightening: 5e-2 -> 1e-3. Worst observed across 45 seed
+        # combos: 7.6e-6 (130x margin). See TOLERANCE_LOG.md T1.
+        assert max_diff <= 1e-3, f"compress_ratio={compress_ratio}: max abs diff {max_diff}"
 
 
 # =============================================================
@@ -537,9 +539,11 @@ class TestBlockComponent:
         fc = t2j(blk.attn.freqs_cis).astype(jnp.complex64)
         y_j = block_forward(t2j(x), t2j(ids).astype(jnp.int32), params, fc)
         # Block math compounds many matmul + sinkhorn iterations + softmax.
-        # bf16 atol of 5e-2 is reasonable. Document any looser bound.
+        # v8 iter 4 tightening: 5e-2 -> 2e-2. Worst observed across 80 seed
+        # combos: 7.8e-3 (2.5x margin) — bf16 ULP-bounded by 1/128 at the
+        # output magnitude in this tiny config. See TOLERANCE_LOG.md T2.
         diff = maxabs(y_j, y_t)
-        assert diff <= 5e-2, f"layer_id={layer_id}: block max diff {diff}"
+        assert diff <= 2e-2, f"layer_id={layer_id}: block max diff {diff}"
 
 
 class TestMoEComponent:
@@ -594,7 +598,10 @@ class TestMoEComponent:
             y_t = moe(x, ids)
         params = _torch_moe_to_jax_params(moe)
         y_j = moe_forward(t2j(x), t2j(ids).astype(jnp.int32), params)
-        assert maxabs(y_j, y_t) <= 5e-2
+        # v8 iter 4 tightening: 5e-2 -> 5e-3. Worst observed across 10 seeds:
+        # 4.88e-4 (10x margin). The hash variant stays at 5e-2 (observed
+        # 4.2e-2 — too close to tighten safely).
+        assert maxabs(y_j, y_t) <= 5e-3
 
     def test_moe_hash_layer_matches_torch(self):
         torch.manual_seed(0)
