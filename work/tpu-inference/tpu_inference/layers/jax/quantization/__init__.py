@@ -31,6 +31,14 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
     method_to_config: dict[str | None, type] = {
         None: UnquantizedConfig,
         FP8: Fp8Config,
+        # DeepSeek V4 ships as FP8 (linear/dense) + FP4 (MoE experts).
+        # The JAX V4 model (tpu_inference/models/jax/deepseek_v4*.py)
+        # bypasses vllm's torch quant layers and does dequantization in
+        # `deepseek_v4_loader`. The Fp8Config / qwix paths are not used,
+        # so map to UnquantizedConfig to keep `get_tpu_quantization_config`
+        # callable while ensuring the JAX V4 path's load_weights stays in
+        # control of the actual dequant.
+        "deepseek_v4_fp8": UnquantizedConfig,
     }
 
     if model_config.quantization not in method_to_config:
