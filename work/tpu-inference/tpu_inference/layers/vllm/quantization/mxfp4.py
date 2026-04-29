@@ -1,0 +1,223 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Optional
+
+import jax
+import jax.numpy as jnp
+import torch
+from jax.sharding import Mesh, PartitionSpec
+from torch.nn.parameter import Parameter
+from torchax.interop import jax_view, torch_view
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization import \
+    register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizeMethodBase
+from vllm.model_executor.layers.quantization.mxfp4 import \
+    GptOssMxfp4Config as Mxfp4Config
+from vllm.model_executor.layers.quantization.mxfp4 import \
+    GptOssMxfp4MoEMethod as Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import \
+    is_layer_skipped
+
+from tpu_inference.layers.common.moe import MoEBackend
+from tpu_inference.layers.common.process_weights.moe_weights import (
+    FusedMoEWeights, process_moe_weights, quantize_moe_weights,
+    shard_moe_weights)
+from tpu_inference.layers.common.quant_methods import MXFP4
+from tpu_inference.layers.common.quantization import \
+    dequantize_tensor_from_mxfp4_packed
+from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.vllm.interface.moe import (
+    select_moe_backend_from_fused_moe_config, vllm_moe_apply)
+from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
+from tpu_inference.layers.vllm.quantization.unquantized import \
+    VllmUnquantizedLinearMethod
+from tpu_inference.logger import init_logger
+from tpu_inference.utils import get_mesh_shape_product, t2j
+
+REQUANTIZED_BLOCK_SIZE = 512
+
+P = PartitionSpec
+
+logger = init_logger(__name__)
+
+
+@register_quantization_config(MXFP4)
+class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
+
+    @classmethod
+    def get_name(cls):
+        return MXFP4
+
+    def get_quant_method(self, layer: torch.nn.Module,
+                         prefix: str) -> Optional["QuantizeMethodBase"]:
+
+        if isinstance(layer, LinearBase):
+            linear_config = self.get_linear_config(layer)
+            if self.ignored_layers and is_layer_skipped(
+                    prefix=prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+            ):
+                return VllmUnquantizedLinearMethod(linear_config)
+            logger.warning_once(
+                "MXFP4 linear layer is not implemented - falling back to "
+                "UnquantizedLinearMethod.")
+            return VllmUnquantizedLinearMethod(linear_config)
+        elif isinstance(layer, FusedMoE):
+            moe_config = self.get_moe_config(layer)
+            return VllmMxfp4MoEMethod(moe_config, self.mesh)
+        elif isinstance(layer, Attention):
+            logger.warning_once("MXFP4 attention layer is not implemented. "
+                                "Skipping quantization for this layer.")
+        return None
+
+
+class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
+
+    def __init__(
+        self,
+        moe: FusedMoEConfig,
+        mesh: Mesh,
+        ep_axis_name: str = "model",
+    ):
+        FusedMoEMethodBase.__init__(self, moe)
+
+        # We piggyback on triton implementation as it applies minimal hardware
+        # specific post processing to the weights.
+        self.mxfp4_backend = Mxfp4MoeBackend.TRITON
+
+        self.mesh = mesh
+        self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
+
+        self.extra_backend_kwargs = {}
+        if self.moe_backend == MoEBackend.FUSED_MOE:
+            # When fused moe kernle is used, we pass extra arguments like
+            # tuned block sizes to the kernel.
+            self.extra_backend_kwargs = dict(ep_axis_name=ep_axis_name, )
+
+    def get_fused_moe_quant_config(
+            self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
+        return mxfp4_w4a16_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=layer.w13_bias,
+            w2_bias=layer.w2_bias,
+        )
+
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        assert isinstance(layer, FusedMoE)
+        assert layer.moe_config.has_bias, "mxfp4 quantization alwyas use bias."
+
+        w13_weight = t2j(layer.w13_weight, use_dlpack=False)
+        w13_weight_scale = t2j(layer.w13_weight_scale, use_dlpack=False)
+        w13_bias = t2j(layer.w13_bias, use_dlpack=False)
+
+        w2_weight = t2j(layer.w2_weight, use_dlpack=False)
+        w2_weight_scale = t2j(layer.w2_weight_scale, use_dlpack=False)
+        w2_bias = t2j(layer.w2_bias, use_dlpack=False)
+
+        @jax.jit
+        def process_mxfp4_moe_weights(
+            w13_weight: jax.Array,
+            w13_weight_scale: jax.Array,
+            w13_bias: jax.Array,
+            w2_weight: jax.Array,
+            w2_weight_scale: jax.Array,
+            w2_bias: jax.Array,
+        ) -> FusedMoEWeights:
+            # Dequantize fp4 weights into fp32.
+            w13_weight = dequantize_tensor_from_mxfp4_packed(
+                w13_weight, w13_weight_scale, 2, jnp.float32)
+            w2_weight = dequantize_tensor_from_mxfp4_packed(
+                w2_weight, w2_weight_scale, 2, jnp.float32)
+            w13_interleave = layer.activation == MoEActivation.SWIGLUOAI
+            w13_reorder_size = get_mesh_shape_product(
+                self.mesh, ShardingAxisName.MLP_TENSOR)
+
+            weights = quantize_moe_weights(
+                FusedMoEWeights(
+                    w13_weight=w13_weight,
+                    w13_weight_scale=None,
+                    w13_bias=w13_bias,
+                    w2_weight=w2_weight,
+                    w2_weight_scale=None,
+                    w2_bias=w2_bias,
+                ),
+                jnp.float4_e2m1fn,
+                REQUANTIZED_BLOCK_SIZE,
+            )
+            return process_moe_weights(
+                weights,
+                moe_backend=self.moe_backend,
+                w13_reorder_size=w13_reorder_size,
+                w13_interleave=w13_interleave,
+            )
+
+        weights = process_mxfp4_moe_weights(
+            w13_weight,
+            w13_weight_scale,
+            w13_bias,
+            w2_weight,
+            w2_weight_scale,
+            w2_bias,
+        )
+        weights = torch_view(
+            shard_moe_weights(weights, self.moe_backend, self.mesh))
+
+        layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
+
+        layer.w13_weight_scale = Parameter(weights.w13_weight_scale,
+                                           requires_grad=False)
+        layer.w2_weight_scale = Parameter(weights.w2_weight_scale,
+                                          requires_grad=False)
+
+        layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
+        layer.w2_bias = Parameter(weights.w2_bias, requires_grad=False)
+
+    def apply_monolithic(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+
+        weights = FusedMoEWeights(
+            w13_weight=jax_view(layer.w13_weight),
+            w13_weight_scale=jax_view(layer.w13_weight_scale),
+            w13_bias=jax_view(layer.w13_bias),
+            w2_weight=jax_view(layer.w2_weight),
+            w2_weight_scale=jax_view(layer.w2_weight_scale),
+            w2_bias=jax_view(layer.w2_bias),
+        )
+
+        return vllm_moe_apply(layer=layer,
+                              weights=weights,
+                              quant_method_instance=self,
+                              x=x,
+                              router_logits=router_logits)
