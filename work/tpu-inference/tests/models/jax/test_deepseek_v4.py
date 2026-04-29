@@ -2180,6 +2180,20 @@ class TestDecodeAttentionParityExtended:
         # SWA at sp=1023: max-context single-step parity, 127 window
         # wraparounds. The SWA path is the cheapest end-of-context probe.
         (0, 1023, 1024),
+        # v8 iter 4 additions — fill gaps in {0..1023} between sp=192 and
+        # sp=500, and between sp=500 and sp=1023. SWA only (the cheapest
+        # probe) and HCA with multiple compression events accumulated.
+        # SWA at sp=256: 32 wraparounds of window=8.
+        (0, 256, 512),
+        # SWA at sp=768: 96 wraparounds; mid-band between {500, 1023}.
+        (0, 768, 1024),
+        # HCA at sp=256: just past the 2nd compression event (event at
+        # sp+1 == 256). Tests that the compressor pool is consistent
+        # immediately after a compression.
+        (3, 256, 512),
+        # HCA at sp=768: 6 compression events accumulated (events at
+        # sp+1 ∈ {128, 256, 384, 512, 640, 768}). Deep state probe.
+        (3, 768, 1024),
     ])
     def test_decode_step_parity_extended(self, layer_id, start_pos, max_seq_len):
         attn, args = _build_attn_for_decode(
