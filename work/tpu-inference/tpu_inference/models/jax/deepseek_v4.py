@@ -944,39 +944,153 @@ def _build_class():
         ):
             """vLLM-runtime forward.
 
-            Returns `(kv_caches, hidden_TM, [])`.
+            Returns `(kv_caches, hidden_TM, [])` with `hidden_TM` of shape
+            `[T, hc*D]` (T = total tokens; hc*D collapsed by `head_hc`).
 
-            For now this only correctly supports the **single-sequence
-            prefill** case: input_ids is treated as one contiguous sequence
-            of T tokens at positions [0, T). Multi-sequence batches and
-            decode steps with start_pos>0 require the per-layer V4 state
-            plumbing tracked in BLOCKERS B1.
+            Multi-sequence dispatch (B1):
+              When `attention_metadata` carries a `query_start_loc` with
+              more than one strictly-increasing segment, this dispatches
+              each sequence through `transformer_body_forward` independently
+              — so token i in sequence k attends only to other tokens of
+              seq k (positions [0, len_k)). The per-seq hidden states are
+              concatenated back in their original `input_ids` order before
+              the HC head mix.
+
+              This is a Python loop over sequences (eager only). Under jit
+              the active-seq count would have to be padded to a static bound
+              with `lax.dynamic_slice` per slot — deferred. For the eager-
+              mode `--enforce-eager` deploy gate (Tier 8 first pass) and the
+              `TestConcurrentDecodeTwoSeqs` unit test, the Python loop is
+              correct and sufficient.
+
+            Single-sequence (no metadata, or metadata with one segment) is
+            still handled by a single body call as before — exact-equal
+            output to the multi-seq path with `num_seqs=1`.
+
+            For decode steps with `input_positions[start] > 0` the V4 body
+            is stateless: this `__call__` recomputes attention over the
+            tokens vllm passed in this step only, so a multi-token decode
+            slice will see only those tokens (vllm in `--enforce-eager`
+            paged-KV-disabled mode passes the full prompt+generated context
+            on each step, which makes this correct; otherwise it remains
+            a future-work item — see BLOCKERS.md B1 followup).
             """
             ids = jnp.asarray(input_ids)
-            if ids.ndim == 1:
-                ids_2d = ids.reshape(1, -1)
-            elif ids.ndim == 2:
-                ids_2d = ids
-            else:
-                raise ValueError(f"input_ids must be 1D or 2D, got shape {ids.shape}")
+            if ids.ndim == 0:
+                raise ValueError("input_ids must be 1D or 2D")
+            if ids.ndim > 2:
+                raise ValueError(
+                    f"input_ids must be 1D or 2D, got shape {ids.shape}")
             params = self.params_v.get_value()
-            h = transformer_body_forward(
-                ids_2d, params,
-                self._freqs_swa_v.get_value(),
-                self._freqs_compressed_v.get_value(),
-                self.config,
-            )
-            # h: [B, S, hc, D]. We collapse hc into D here (via the HC head
-            # mix) so vLLM's compute_logits gets per-token (T, D) hidden —
-            # the convention that compilation_manager._precompile_compute_logits
-            # bakes in for all flax_nnx models.
-            h_BSD = head_hc(
-                h, params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
-                self.config.rms_norm_eps, self.config.hc_eps,
-            )
-            B, S, D = h_BSD.shape
-            hidden_TD = h_BSD.reshape(B * S, D)
+            freqs_swa = self._freqs_swa_v.get_value()
+            freqs_comp = self._freqs_compressed_v.get_value()
+
+            seg_bounds = self._extract_seq_segments(ids, attention_metadata)
+            if seg_bounds is None or len(seg_bounds) <= 1:
+                if ids.ndim == 1:
+                    ids_2d = ids.reshape(1, -1)
+                else:
+                    ids_2d = ids
+                h = transformer_body_forward(
+                    ids_2d, params, freqs_swa, freqs_comp, self.config)
+                h_BSD = head_hc(
+                    h, params.hc_head_fn, params.hc_head_scale,
+                    params.hc_head_base,
+                    self.config.rms_norm_eps, self.config.hc_eps,
+                )
+                B, S, D = h_BSD.shape
+                hidden_TD = h_BSD.reshape(B * S, D)
+                return kv_caches, hidden_TD, []
+
+            # Multi-sequence dispatch.
+            if ids.ndim == 2:
+                if ids.shape[0] != 1:
+                    raise ValueError(
+                        "multi-seq dispatch requires 1D input_ids or "
+                        f"shape (1, T); got {ids.shape}")
+                ids_flat = ids.reshape(-1)
+            else:
+                ids_flat = ids
+
+            D = self.config.hidden_size
+            T_total = int(ids_flat.shape[0])
+            per_seq_hidden = []
+            covered = 0
+            for s_start, s_end in seg_bounds:
+                seq_ids = ids_flat[s_start:s_end].reshape(1, -1)
+                h = transformer_body_forward(
+                    seq_ids, params, freqs_swa, freqs_comp, self.config)
+                h_BSD = head_hc(
+                    h, params.hc_head_fn, params.hc_head_scale,
+                    params.hc_head_base,
+                    self.config.rms_norm_eps, self.config.hc_eps,
+                )
+                per_seq_hidden.append(h_BSD.reshape(-1, D))
+                covered = s_end
+
+            hidden_TD = jnp.concatenate(per_seq_hidden, axis=0)
+            # If query_start_loc didn't cover the full padded input length
+            # (vllm pads to a bucket), tail-pad with zeros.
+            if covered < T_total:
+                hidden_TD = jnp.concatenate(
+                    [hidden_TD,
+                     jnp.zeros((T_total - covered, D), dtype=hidden_TD.dtype)],
+                    axis=0,
+                )
+            assert hidden_TD.shape[0] == T_total, (
+                f"per-seq concat={hidden_TD.shape[0]} != T_total={T_total}")
             return kv_caches, hidden_TD, []
+
+        def _extract_seq_segments(self, ids, attention_metadata):
+            """Return a list of (start, end) Python int tuples describing
+            each active sequence's slice of `input_ids`. Returns None to
+            signal "treat as a single sequence" (the legacy default).
+
+            This reads `attention_metadata.query_start_loc` (shape
+            `(max_num_seqs+1,)`, padded with the last value in trailing
+            slots) and uses `seq_lens` (padded with zeros) to count the
+            active sequences.
+            """
+            if attention_metadata is None:
+                return None
+            qsl_arr = getattr(attention_metadata, "query_start_loc", None)
+            if qsl_arr is None:
+                return None
+            try:
+                import numpy as _np
+                qsl = _np.asarray(qsl_arr).tolist()
+            except Exception:
+                return None
+            if len(qsl) < 2:
+                return None
+            seq_lens = getattr(attention_metadata, "seq_lens", None)
+            if seq_lens is not None:
+                try:
+                    import numpy as _np
+                    sl = _np.asarray(seq_lens).tolist()
+                    n_active = sum(1 for s in sl if int(s) > 0)
+                except Exception:
+                    n_active = None
+            else:
+                n_active = None
+            if n_active is None:
+                # Fall back: count strictly-increasing entries in qsl.
+                n_active = 0
+                for i in range(len(qsl) - 1):
+                    if int(qsl[i + 1]) > int(qsl[i]):
+                        n_active += 1
+                    else:
+                        break
+            if n_active <= 0:
+                return None
+            segs = []
+            for i in range(n_active):
+                s_start = int(qsl[i])
+                s_end = int(qsl[i + 1])
+                if s_end <= s_start:
+                    continue
+                segs.append((s_start, s_end))
+            return segs if segs else None
 
         def compute_logits(self, hidden_states):
             """Apply the head matmul to per-token hidden. `hidden_states` is

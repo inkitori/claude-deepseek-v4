@@ -754,6 +754,196 @@ class TestEndToEnd:
 
 
 # =============================================================
+# Tier 2 hardening (v8) — B1 multi-sequence dispatch
+# =============================================================
+
+
+def _hf_dict_from_torch_args(a: TorchArgs) -> dict:
+    """Translate the PyTorch ref's `ModelArgs` → an HF-style config dict
+    that `DeepseekV4Config.from_hf_dict` accepts. Used by the B1 multi-seq
+    test to build a `DeepseekV4ForCausalLM` wrapper whose `__call__` we
+    can exercise directly (no fixture / no vllm subprocess).
+    """
+    return {
+        "vocab_size": a.vocab_size,
+        "hidden_size": a.dim,
+        "intermediate_size": a.moe_inter_dim,
+        "moe_intermediate_size": a.moe_inter_dim,
+        "num_hidden_layers": a.n_layers,
+        "num_attention_heads": a.n_heads,
+        "num_key_value_heads": 1,
+        "head_dim": a.head_dim,
+        "qk_rope_head_dim": a.rope_head_dim,
+        "q_lora_rank": a.q_lora_rank,
+        "o_lora_rank": a.o_lora_rank,
+        "o_groups": a.o_groups,
+        "n_routed_experts": a.n_routed_experts,
+        "n_shared_experts": a.n_shared_experts,
+        "num_experts_per_tok": a.n_activated_experts,
+        "num_hash_layers": a.n_hash_layers,
+        "num_nextn_predict_layers": a.n_mtp_layers,
+        "sliding_window": a.window_size,
+        "swiglu_limit": a.swiglu_limit,
+        "scoring_func": a.score_func,
+        "routed_scaling_factor": a.route_scale,
+        "rms_norm_eps": a.norm_eps,
+        "rope_theta": a.rope_theta,
+        "compress_rope_theta": a.compress_rope_theta,
+        "max_position_embeddings": a.max_seq_len,
+        "compress_ratios": list(a.compress_ratios),
+        "index_n_heads": a.index_n_heads,
+        "index_head_dim": a.index_head_dim,
+        "index_topk": a.index_topk,
+        "hc_mult": a.hc_mult,
+        "hc_sinkhorn_iters": a.hc_sinkhorn_iters,
+        "hc_eps": a.hc_eps,
+        "rope_scaling": {
+            "factor": a.rope_factor,
+            "beta_fast": a.beta_fast,
+            "beta_slow": a.beta_slow,
+            "original_max_position_embeddings": a.original_seq_len,
+        },
+    }
+
+
+class TestConcurrentMultiSeqDispatch:
+    """B1 (v8): when `vllm serve` schedules multiple concurrent sequences in
+    one forward call, `DeepseekV4ForCausalLM.__call__` must dispatch each
+    sequence through `transformer_body_forward` independently — so seq B's
+    tokens don't attend to seq A's prefix. Prior to v8 the wrapper
+    collapsed all `input_ids` into a single mega-sequence, which was the
+    headline B1 bug. This test pins the per-sequence isolation invariant.
+    """
+
+    @staticmethod
+    def _build_wrapper_with_real_params(seed: int = 0):
+        from types import SimpleNamespace
+        from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
+        torch.manual_seed(seed)
+        a = make_tiny_args()
+        torch_model = TorchTransformer(a)
+        from _deepseek_v4_reference.model import init_model_random
+        init_model_random(torch_model, seed=seed)
+        params, cfg = _torch_transformer_to_jax_params_and_cfg(torch_model)
+        # Build the nnx wrapper from a torch-args-derived HF dict; same cfg
+        # math the wrapper would derive from a real config.json.
+        hf_dict = _hf_dict_from_torch_args(a)
+        fake_hf = SimpleNamespace(**hf_dict)
+        fake_hf.to_dict = lambda: hf_dict
+        fake_vc = SimpleNamespace(model_config=SimpleNamespace(hf_config=fake_hf))
+        m = DeepseekV4ForCausalLM(fake_vc)
+        # Replace the auto-zero-init params with the real torch-derived ones
+        # so __call__ produces meaningful per-token hidden states.
+        from flax import nnx
+        m.params_v = nnx.Param(params)
+        return m, cfg
+
+    @staticmethod
+    def _attention_metadata_for(qsl_list, max_num_seqs=4):
+        from tpu_inference.layers.common.attention_metadata import \
+            AttentionMetadata
+        # qsl_list[-1] is the total tokens; pad with that value to length
+        # max_num_seqs+1 to match vllm's padded layout.
+        qsl = list(qsl_list)
+        while len(qsl) < max_num_seqs + 1:
+            qsl.append(qsl[-1])
+        seq_lens = [qsl_list[i + 1] - qsl_list[i]
+                    for i in range(len(qsl_list) - 1)]
+        while len(seq_lens) < max_num_seqs:
+            seq_lens.append(0)
+        T = qsl_list[-1]
+        return AttentionMetadata(
+            input_positions=jnp.zeros((T,), dtype=jnp.int32),
+            block_tables=jnp.zeros((max_num_seqs,), dtype=jnp.int32),
+            seq_lens=jnp.asarray(seq_lens, dtype=jnp.int32),
+            query_start_loc=jnp.asarray(qsl, dtype=jnp.int32),
+            request_distribution=jnp.asarray(
+                [0, len(qsl_list) - 1, 0], dtype=jnp.int32),
+        )
+
+    def test_concurrent_decode_two_seqs(self):
+        """Two sequences with different prompt lengths run through one
+        `__call__` must produce per-sequence hidden states that are
+        bit-identical to running each sequence alone.
+
+        This is the strongest correctness invariant for multi-seq dispatch —
+        if any layer's attention or HC mix leaks across the sequence
+        boundary, the per-seq slice of the concurrent run will diverge
+        from the serial run.
+        """
+        m, cfg = self._build_wrapper_with_real_params(seed=11)
+        # Two prompts with different lengths, different vocab — the values
+        # don't matter as long as they trigger different intermediate
+        # activations.
+        seq_a = jnp.asarray([3, 17, 1, 42, 7, 9], dtype=jnp.int32)
+        seq_b = jnp.asarray([5, 11, 23, 8], dtype=jnp.int32)
+        T_a, T_b = int(seq_a.shape[0]), int(seq_b.shape[0])
+
+        # Serial single-seq runs (treat each as a fresh prefill).
+        _, hidden_a, _ = m([], seq_a, attention_metadata=None)
+        _, hidden_b, _ = m([], seq_b, attention_metadata=None)
+        assert hidden_a.shape == (T_a, cfg.hidden_size)
+        assert hidden_b.shape == (T_b, cfg.hidden_size)
+
+        # Concurrent run — concatenated input_ids, two-segment metadata.
+        ids_concat = jnp.concatenate([seq_a, seq_b], axis=0)
+        meta = self._attention_metadata_for([0, T_a, T_a + T_b])
+        _, hidden_concat, _ = m([], ids_concat, attention_metadata=meta)
+        assert hidden_concat.shape == (T_a + T_b, cfg.hidden_size)
+
+        # Per-seq slices must be bit-identical to the serial runs.
+        diff_a = float(jnp.max(jnp.abs(hidden_concat[:T_a] - hidden_a)))
+        diff_b = float(jnp.max(
+            jnp.abs(hidden_concat[T_a:T_a + T_b] - hidden_b)))
+        assert diff_a == 0.0, (
+            f"seq A leaked across boundary: max diff {diff_a}")
+        assert diff_b == 0.0, (
+            f"seq B leaked across boundary: max diff {diff_b}")
+
+    def test_single_seq_via_metadata_matches_no_metadata(self):
+        """Sanity: passing `attention_metadata` describing a single sequence
+        must produce the same result as passing `attention_metadata=None`.
+        Exercises the `n_active == 1` branch of the dispatcher — which
+        falls through to the legacy single-body path."""
+        m, cfg = self._build_wrapper_with_real_params(seed=17)
+        seq = jnp.asarray([2, 4, 6, 8, 10, 12, 14, 16], dtype=jnp.int32)
+        T = int(seq.shape[0])
+        _, hidden_no_meta, _ = m([], seq, attention_metadata=None)
+        meta = self._attention_metadata_for([0, T])
+        _, hidden_with_meta, _ = m([], seq, attention_metadata=meta)
+        diff = float(jnp.max(jnp.abs(hidden_with_meta - hidden_no_meta)))
+        assert diff == 0.0, (
+            f"single-seq with metadata diverged: max diff {diff}")
+
+    def test_three_seqs_concurrent(self):
+        """Three sequences in one forward — pads `query_start_loc` to
+        `max_num_seqs+1` and asserts each per-seq slice matches its serial
+        run. Catches off-by-one in the `n_active` count or in trailing-pad
+        handling."""
+        m, cfg = self._build_wrapper_with_real_params(seed=23)
+        seq_a = jnp.asarray([1, 2, 3, 4], dtype=jnp.int32)
+        seq_b = jnp.asarray([10, 11, 12, 13, 14], dtype=jnp.int32)
+        seq_c = jnp.asarray([20, 21, 22], dtype=jnp.int32)
+        T_a, T_b, T_c = (int(seq_a.shape[0]), int(seq_b.shape[0]),
+                          int(seq_c.shape[0]))
+        _, hid_a, _ = m([], seq_a)
+        _, hid_b, _ = m([], seq_b)
+        _, hid_c, _ = m([], seq_c)
+        ids = jnp.concatenate([seq_a, seq_b, seq_c], axis=0)
+        meta = self._attention_metadata_for(
+            [0, T_a, T_a + T_b, T_a + T_b + T_c])
+        _, hid_concat, _ = m([], ids, attention_metadata=meta)
+        assert hid_concat.shape == (T_a + T_b + T_c, cfg.hidden_size)
+        d_a = float(jnp.max(jnp.abs(hid_concat[:T_a] - hid_a)))
+        d_b = float(
+            jnp.max(jnp.abs(hid_concat[T_a:T_a + T_b] - hid_b)))
+        d_c = float(jnp.max(
+            jnp.abs(hid_concat[T_a + T_b:T_a + T_b + T_c] - hid_c)))
+        assert d_a == 0.0 and d_b == 0.0 and d_c == 0.0, (
+            f"three-seq concurrent leaked: a={d_a} b={d_b} c={d_c}")
+
+
+# =============================================================
 # Tier 3 — compile-only against real V4 configs
 # =============================================================
 
