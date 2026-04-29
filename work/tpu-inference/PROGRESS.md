@@ -131,3 +131,7 @@ If killed mid-probe: `/tmp/vllm_serve_probe3.log` (or similar) holds the latest 
 
 ## Resume hint (post-v6 final)
 **If killed now**, the next session should: see SUMMARY.md "v6 — what's new". The session completed every overnight goal: W1 + W2 (workaround) + W3 (prefill path) + W4 done; T5/T6/T7 + Tier 1-4 all green; structural blockers B2/B3/B5 resolved; B1 remains as production-correctness future-work for multi-sequence concurrent decode (see BLOCKERS.md). Suggested next: address B1 — write a Pallas kernel for V4 sparse-attn over [SWA window || compressed slots], OR extend vllm's per-layer kv_cache schema to admit V4's compressor/indexer state pytree. Until then, V4 in vllm serve is correct-but-not-multi-sequence-paged.
+
+---
+
+RESUMED at 2026-04-28 22:19 UTC (v7 — finish-early hardening) — picking up post-v6 with all W1–W4 done, T1–T7 green (modulo TPU-only T6 skipped on CPU). Per spec's "If you finish early" guidance: do NOT add features; tighten T5/T6/T7 tolerances, add more decode parity points, polish SUMMARY.md. Plan: (a) reconfirm baseline 83+1 still passes, (b) measure observed atol on T6/T7 to see if the 0.2/0.1 budgets are loose vs. evidence and tighten with TOLERANCE_LOG entries, (c) extend decode parity at long sp values (sp ∈ {500, 1023}) if time, (d) polish SUMMARY.md "v7 — what's new".
