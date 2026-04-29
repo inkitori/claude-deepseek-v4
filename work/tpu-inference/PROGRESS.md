@@ -359,3 +359,40 @@ If killed mid-iter-6: the test edit is at line 2426 (5e-2 -> 1e-4) and the
 TOLERANCE_LOG "Decode step parity" entry has been extended to mention
 TestDecodeRollingParityLong + the 7.63e-6 measurement. Re-run that class to
 confirm green at 1e-4; then full suite; then commit + push.
+
+
+## Resume hint (post-v8 iter 6 — final state of this session)
+
+**If killed now:** the headline is still BLOCKERS.md::T8-HBM-OOM
+(architectural, unchanged from iter 3). Iters 5 + 6 were pure polish —
+last two unmeasured 5e-2 budgets tightened with measurement evidence.
+The functional core is unchanged.
+
+**Test suite end-state (commit 3b7530c8 + 33f4032d):**
+  - CPU: **91 passed, 6 skipped** (3:40, no regressions vs all prior iters).
+  - TPU: **1 passing** (T6 spot-check confirmed post iter-5/6, ~20s).
+  - 5e-2 budgets remaining in test file: **1**, intentionally kept
+    (test_moe_hash_layer_matches_torch — observed 4.20e-2 in iter 4,
+    no safe tightening).
+  - All other measurable tolerance budgets are at fp32-ULP / bf16-ULP /
+    byte-exact / measurement-bound levels per TOLERANCE_LOG.md.
+
+**Cumulative iter-5/6 tightenings (this session):**
+  - iter 5: TestCompressorDecodeStep + TestCompressorDecodeStepExtended
+    kv_compressed/kv_state/score_state: 5e-2 → 1e-5 (worst observed
+    0.0/7.15e-7/5.96e-7 across 9 configs × 8 seeds = 72 measurements).
+  - iter 6: TestDecodeRollingParityLong: 5e-2 → 1e-4 (worst observed
+    7.63e-6 across 3 configs × 6 seeds × ≤32 steps ≈ 500 step
+    measurements). Same path as iter 4 sister classes.
+
+**Useful follow-up if more session time appears:**
+  1. T8 architectural unblock — needs user decision (multi-host launcher
+     vs native FP4/FP8 storage vs host-RAM offload). None are pure
+     model-code work.
+  2. Tier 5 hardening — extend TestVllmServeRoundtrip to send 2
+     concurrent requests in a single subprocess (would exercise B1
+     end-to-end through vllm). Existing test exercises 3 prompt variants
+     + max_tokens=16 sequentially.
+  3. Tier 4b — add a real V4-Flash *expert* shard byte-equal round-trip
+     (currently we have bf16 embed + FP8 wq_a + FP4 expert dequant; an
+     expert bf16 round-trip would cover the heaviest weight class).
