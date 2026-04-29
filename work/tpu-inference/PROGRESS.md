@@ -297,3 +297,38 @@ through silently.
      TestCompressorDecodeStepExtended) — atol=5e-2 there too; not yet
      measured in iter 4 because the tests have separate kv_state /
      score_state assertions that need individual treatment.
+
+
+## RESUMED 2026-04-29 ~16:46 UTC — v8 iter 5 (compressor-decode parity tightening)
+
+Picking up from iter 4's clean state (91 passed, 6 skipped on CPU + 1 on TPU,
+sha 454896fa). Headline blocker T8-HBM-OOM unchanged — architectural, gates
+real-weight deploy on this 4-chip slice; needs user decision per
+BLOCKERS.md::T8-HBM-OOM. Iter 5 is pure polish / "honor correctness over
+features".
+
+Plan:
+  (1) confirm baseline 91/6 still green — DONE (3:43, no regressions).
+  (2) tighten the remaining loose budget — TestCompressorDecodeStep +
+      TestCompressorDecodeStepExtended (atol=5e-2 on three quantities;
+      explicitly flagged in iter 4's resume hint as "not yet measured").
+  (3) update TOLERANCE_LOG.md with measured-evidence entry T-CDS.
+  (4) update STATUS.md / SUMMARY.md to reflect iter 5.
+  (5) commit each green step; push.
+
+Measured (scripts/measure_compressor_decode_parity.py, 9 configs × 8 seeds):
+  - kv_compressed: worst 0.0 (24 hits — 3 compress configs × 8 seeds).
+  - kv_state:      worst 7.15e-7 (ratio=4 sp=4 seed=3).
+  - score_state:   worst 5.96e-7 (ratio=128 sp=128 seed=13).
+  Both kv_state / score_state quantities are full fp32 accumulator math
+  on both sides; their parity should be at fp32 ULP, not bf16 noise.
+  Old 5e-2 budget was ~70,000× looser than necessary — would have hidden
+  a fp32→bf16 accumulator regression silently.
+
+Tightened from 5e-2 → 1e-5 (14–17× margin over measured worst).
+
+If killed mid-iter-5: TOLERANCE_LOG already has the T-CDS entry; the test
+edits are already in tests/models/jax/test_deepseek_v4.py at lines 2135 +
+2149-2150 + 2366 + 2378-2382. Re-run TestCompressorDecodeStep* to confirm
+green at the new bound; then re-run the full suite to confirm no regressions
+elsewhere; then commit + push.

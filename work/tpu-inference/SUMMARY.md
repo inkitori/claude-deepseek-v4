@@ -101,6 +101,42 @@ Iter 4 commits:
   - cadebad8 — tighten T3 end-to-end logits parity bounds
   - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
 
+## v8 iter 5 — compressor decode-step parity tightening
+
+**Headline:** Iter 4 explicitly listed `TestCompressorDecodeStep` /
+`TestCompressorDecodeStepExtended` as "atol=5e-2 there too; not yet measured
+in iter 4 because the tests have separate kv_state / score_state assertions
+that need individual treatment." Iter 5 closes that gap. **Total tests:
+still 91 passing, 6 skipped on CPU + 1 passing on TPU** — no new tests, just
+tightened bounds.
+
+| Area | iter 4 state | iter 5 state | Measured worst | Margin |
+|---|---|---|---|---|
+| Compressor decode-step `kv_compressed` (`TestCompressorDecodeStep` + `Extended` — 9 configs × 8 seeds, 24 compress hits) | `atol=5e-2` | **`atol=1e-5`** | 0.0 | ∞ |
+| Compressor decode-step `kv_state`     (72 measurements: 9 configs × 8 seeds) | `atol=5e-2` | **`atol=1e-5`** | 7.15e-7 (ratio=4 sp=4 seed=3) | 14× |
+| Compressor decode-step `score_state`  (72 measurements: 9 configs × 8 seeds) | `atol=5e-2` | **`atol=1e-5`** | 5.96e-7 (ratio=128 sp=128 seed=13) | 17× |
+
+**Why fp32-ULP-level tightening is appropriate here.** The compressor's
+score/kv accumulator is fp32 end-to-end on both reference and
+implementation: torch's `Compressor.forward` casts `x.float()` then keeps
+`kv_state`/`score_state` in fp32; our `compressor_decode_step` does
+`x_step.astype(jnp.float32)` and stores in fp32. The only bf16 boundary
+is the input `x_step` and the *re-quantization* of the new compressed
+position to bf16 inside RMSNorm + RoPE — neither affects state-tensor
+parity. So the 5e-2 placeholder budget was 70,000× looser than the actual
+floor (~e-7); iter 5's 1e-5 budget keeps comfortable seed-to-seed margin
+(14–17×) while shutting the door on a fp32-vs-mixed-precision regression.
+
+**Zero risk profile.** No new test cases, no model code touched, no
+fixture work. Pure assertion-bound change in two pytest classes plus a
+TOLERANCE_LOG.md entry (T-CDS) capturing the measurement methodology.
+
+Measurement script: `scripts/measure_compressor_decode_parity.py`
+(replays the test setup and prints worst-case atol JSON).
+
+Iter 5 commits (pending):
+  - tighten compressor decode-step bounds + TOLERANCE_LOG T-CDS entry
+
 ## v6 — what's new since v3/v5
 
 ## v6 — what's new since v3/v5
