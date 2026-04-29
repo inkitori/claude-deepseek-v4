@@ -1,4 +1,4 @@
-# DeepSeek V4 v8 status (host-direct on v6e-32; iter 4 polish — tightened tolerances + 4 new parity points)
+# DeepSeek V4 v8 status (host-direct on v6e-32; iter 4 polish — 7 tolerance tightenings + 4 new parity points)
 TPU preflight: ok (4 v6e chips, logs/tpu-preflight.log)
 Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   708 GB host RAM). No docker. Real V4-Flash weights mounted via gcsfuse at
@@ -10,14 +10,16 @@ Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
 
 Latest passing tier: T1-T7 + B1 multi-seq dispatch + T4b on real V4-Flash
   bf16/FP8/FP4 + decode parity at sp ∈ {1, 4, 7, 8, 9, 16, 32, 64, 128, 192,
-  256, 500, 768, 1023}. T8 (deploy gate) BLOCKED on HBM OOM (architectural;
-  see BLOCKERS.md::T8-HBM-OOM).
+  256, 500, 768, 1023}, all under tightened tolerances. T8 (deploy gate)
+  BLOCKED on HBM OOM (architectural; see BLOCKERS.md::T8-HBM-OOM).
 
-Tier 1: 25/25
-Tier 2: 8/8
+Tier 1: 25/25  (T1 attention: 5e-2 -> 1e-3; T2 block: 5e-2 -> 2e-2;
+  T2 MoE: 5e-2 -> 5e-3; MoE-hash kept at 5e-2 — all tightenings backed
+  by measured worst-case in TOLERANCE_LOG.md)
+Tier 2: 8/8    (T3 logits parity: 0.1 -> 1e-3; long-context: 0.15 -> 2e-3)
 Tier 2 hardening (v3 + v8 long-context + iter 4 256/768): 19/19 — 11 from v3,
   4 from v8 iter 3 (sp ∈ {500, 1023}), 4 new in v8 iter 4 (sp ∈ {256, 768}
-  SWA + HCA), all at the tightened atol=1e-4 bound.
+  SWA + HCA), all at the tightened atol=1e-4 bound (was 5e-2).
 Tier 3: 10/10  (V4-Flash full + 2-layer compile; V4-Pro skipped — no v4_pro fixture)
 Tier 4: 2/2    (HF->JAX name mapping)
 Tier 4b: 3/3   (real V4-Flash byte-equal bf16 shard + FP8 + FP4 dequant smokes
@@ -44,22 +46,30 @@ W5 deploy gate: BLOCKED on HBM topology — see Tier 8 above and BLOCKERS::T8-HB
   The deploy gate cannot pass on a 4-chip slice; the user's deployment target
   must be the full 32-chip v6e-32 slice (8 hosts) to fit V4-Flash bf16.
 
-Tolerance tightenings (v8 iter 4, evidence in TOLERANCE_LOG.md):
+Tolerance tightenings (v8 iter 4 — every entry has measured-worst evidence in TOLERANCE_LOG.md):
+  - T1 attention prefill (3 tests): 5e-2 -> 1e-3 (worst 7.63e-6 / 45 seeds; 130x margin).
+  - T2 block forward (4 tests): 5e-2 -> 2e-2 (worst 7.81e-3 / 80 seeds; 2.5x margin).
+  - T2 MoE forward: 5e-2 -> 5e-3 (worst 4.88e-4 / 10 seeds; 10x margin).
+  - T3 logits parity (5 tests): 0.1 -> 1e-3 (worst 1.35e-4 / 60 seeds; 7x margin).
+  - T3 long-context: 0.15 -> 2e-3 (worst 1.22e-4; 16x margin).
   - T7 quant≡groundtruth logits: 0.1 -> byte-exact (np.array_equal). Measured 0.0.
-  - T8 SWA decode-state ≡ prefill-state: 2e-2 -> byte-exact. Measured 0.0 across 8 seeds.
-  - Decode step parity (3 test classes, 22 points): 5e-2 -> 1e-4. Worst measured 3.81e-6.
+  - T8 SWA decode-state ≡ prefill-state: 2e-2 -> byte-exact. Measured 0.0 / 8 seeds.
+  - Decode step parity (3 test classes, 26 points): 5e-2 -> 1e-4 (worst 3.81e-6; 25x margin).
 
 Patches committed this iter (v8 iter 4):
+  - 06a7b3b7 v8 iter 4 polish: tighten T1/T2 component bounds with measured evidence
+  - cadebad8 v8 iter 4 polish: tighten T3 end-to-end logits parity bounds
+  - b9f544be v8 iter 4 docs: 91+1 / 6 skipped; tightenings + 4 new parity points recorded
   - 0b8d7fe3 v8 iter 4: 4 new decode parity points (sp ∈ {256, 768}, SWA + HCA)
   - edc4647a v8 iter 4 polish: tighten T7 + T8 + decode-step parity bounds
 
 Full CPU run target: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py`
-  -> **91 passed, 6 skipped (3:45)**. Up from iter 3's 87+6; +4 net from iter 4
+  -> **91 passed, 6 skipped (3:47)**. Up from iter 3's 87+6; +4 net from iter 4
   (4 new decode parity points; tightenings reused existing test bodies).
   Skipped: 5 V4-Pro RealConfigCompile tests (no v4_pro fixture on this host)
   + 1 TPU-only forward (TestRealTpuTinyForward, needs JAX_PLATFORMS=tpu).
 TPU spot-check target: `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward`
-  -> 1 passed (~26 s).
+  -> 1 passed (~25 s). Confirmed post all iter 4 tightenings.
 
 If killed now, next session must:
   (1) read BLOCKERS.md::T8-HBM-OOM end-to-end (it's still the headline);

@@ -57,36 +57,49 @@ math doesn't close.
 already proven, the spec's "finish early" guidance applies: tighten
 tolerances with measurement evidence, add more decode parity points,
 polish docs. **Total tests: 91 passing, 6 skipped on CPU + 1 passing on
-TPU.** Up from 87+6 in iter 3.
+TPU.** Up from 87+6 in iter 3 (+4 new decode parity points). Every
+tightening below is backed by a measured-worst-case entry in
+TOLERANCE_LOG.md.
 
-| Area | iter 3 state | iter 4 state |
-|---|---|---|
-| T7 (quant ≡ groundtruth logits) | `atol=0.1` | **byte-exact** (`np.array_equal` AND `max-abs == 0`). Measured worst-case across the test fixture: `0.0` exactly. The loader is byte-equal across 355 tensors (proven by `TestFp8Dequant`); both forward paths run identical Python on identical JAX devices, so byte-exactness is the right invariant. |
-| T8 SWA decode-state ≡ prefill-state | `atol=2e-2` | **byte-exact** (`np.array_equal`). Measured worst-case across 8 random seeds for the input tensor: `0.0` for every seed. The prefill kv-write loop and the decode-step kv-write paths emit identical XLA HLO per position; the prior 2e-2 budget was based on a pessimistic estimate that never materialized. |
-| Decode step parity (`TestDecodeAttentionParity`, `TestDecodeRollingParity`, `TestDecodeAttentionParityExtended`) | `atol=5e-2` | **`atol=1e-4`** — 500× tighter. Worst observed across 22 measurements: `3.81e-6`; new bound keeps a 25× margin. Old budget would never have caught a real per-layer regression. |
-| Decode parity coverage | sp ∈ {1, 4, 7, 8, 9, 16, 32, 64, 128, 192, 500, 1023} | **+ sp ∈ {256, 768} for SWA and HCA** — fills the gaps between sp=192/500 and sp=500/1023. HCA sp=256 is right after the 2nd compression event (event boundaries at sp+1 ∈ {128, 256, 384, ...}); HCA sp=768 has 6 compression events accumulated. All 4 new points pass at the tightened 1e-4 bound. |
-| TOLERANCE_LOG.md | T7 + T8 entries assumed loose budget needed | T7 + T8 rewritten to document byte-exactness; new "Decode step parity" entry citing per-point measured atol across all three test classes. |
+| Area | iter 3 state | iter 4 state | Measured worst | Margin |
+|---|---|---|---|---|
+| T1 attention prefill (`TestAttentionComponent`) | `atol=5e-2` | **`atol=1e-3`** | 7.63e-6 (45 seed combos) | 130× |
+| T2 block forward (`TestBlockComponent`) | `atol=5e-2` | **`atol=2e-2`** | 7.81e-3 (80 seed combos, ULP-stable) | 2.5× |
+| T2 MoE forward (`TestMoEComponent.test_moe_matches_torch`) | `atol=5e-2` | **`atol=5e-3`** | 4.88e-4 (10 seeds) | 10× |
+| T2 MoE-hash (`test_moe_hash_layer_matches_torch`) | `atol=5e-2` | **`atol=5e-2`** (kept) | 4.20e-2 — too close, leave | 1.2× |
+| T3 single/multi-batch logits parity (`TestEndToEnd` 4 tests) | `atol=0.1` | **`atol=1e-3`** | 1.35e-4 (60 seed combos) | 7× |
+| T3 long-context (`test_long_context_sliding_window_wraparound`) | `atol=0.15` | **`atol=2e-3`** | 1.22e-4 | 16× |
+| T7 quant ≡ groundtruth logits (`TestQuantToParamsApply`) | `atol=0.1` | **byte-exact** (`np.array_equal`) | 0.0 | ∞ |
+| T8 SWA decode-state ≡ prefill-state | `atol=2e-2` | **byte-exact** (`np.array_equal`) | 0.0 (8 seeds) | ∞ |
+| Decode step parity (3 test classes, 26 points) | `atol=5e-2` | **`atol=1e-4`** | 3.81e-6 | 25× |
+| Decode parity coverage | sp ∈ {1, 4, 7, 8, 9, 16, 32, 64, 128, 192, 500, 1023} | **+ sp ∈ {256, 768}** for SWA and HCA — 4 new parametrized points | n/a | n/a |
 
 **What this buys the user:** any future regression that introduces a
-real per-layer error of >0.0001 (or breaks loader byte-equality, or
-breaks decode/prefill state equivalence) is now an immediate test
-failure. Under iter 3's bounds those regressions would have passed
-silently up to ~0.05 magnitude, which is well into "wrong-model"
-territory. The functional core is the same, but the suite now actually
-defends it.
+real per-layer error of more than the bound is now an immediate test
+failure. Under iter 3's bounds, real regressions could have passed
+silently up to ~0.05–0.15 in absolute logit error — well into
+"wrong-model" territory. The functional core is the same; the suite
+now actually defends it.
+
+**Notable not-tightened:**
+  - `test_moe_hash_layer_matches_torch` (5e-2 kept) — observed worst
+    4.2e-2 across 10 seeds is too close to safely tighten; the hash
+    routing path has higher per-output ULP noise.
+  - All "default-1e-2" bf16 bounds in component sub-tests (q-proj,
+    rotate, expert, gate-weights) — those are already at the bf16
+    default and don't need tightening.
+  - Tier 4b real-shard atol — already at byte-exact.
 
 **What was *not* attempted in iter 4:**
   - No T8 retry. The HBM-OOM blocker is architectural (4-chip slice,
     128 GB HBM vs 543 GB bf16 weights). No model-code work moves it.
   - No new features. The spec said no, and the suite doesn't need any.
-  - No tightening of T1/T2/T3 budgets (5e-2, 5e-2, 0.1). Those measure
-    the full attention/transformer chain, where the bf16 noise estimate
-    in TOLERANCE_LOG is matched empirically. Tightening would just add
-    flakes without revealing more bugs.
 
 Iter 4 commits:
   - edc4647a — tighten T7/T8/decode-step bounds + TOLERANCE_LOG entries
   - 0b8d7fe3 — 4 new decode parity points (sp ∈ {256, 768} for SWA + HCA)
+  - cadebad8 — tighten T3 end-to-end logits parity bounds
+  - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
 
 ## v6 — what's new since v3/v5
 

@@ -245,3 +245,55 @@ loose 0.1/2e-2/5e-2 budgets that would have waved real regressions through.
      existing test already exercises 3 prompt variants and max_tokens=16;
      adding batch=2 would exercise B1 end-to-end through vllm.
   4. Polish: V3_TO_V4_DIFF.md, PROD_TOPOLOGY_RISKS.md sanity passes.
+
+## Phase v8 iter 4 continuation (2026-04-29 16:25–16:40 UTC) — extend to T1/T2/T3
+
+After the first iter 4 commit batch (T7/T8/decode-step), measured headroom on
+Tier 1 + Tier 2 component tests and Tier 2 end-to-end logits parity. All had
+1000–10000× headroom under the original budgets:
+
+- TestAttentionComponent (45 seed combos): worst 7.63e-6 vs budget 5e-2 — tightened to 1e-3 (130× margin).
+- TestBlockComponent (80 seed combos): worst 7.81e-3 (ULP-stable) vs budget 5e-2 — tightened to 2e-2 (2.5× margin).
+- TestMoEComponent.test_moe_matches_torch (10 seeds): worst 4.88e-4 vs budget 5e-2 — tightened to 5e-3 (10× margin).
+- TestMoEComponent.test_moe_hash_layer_matches_torch (10 seeds): worst 4.20e-2 — too close, kept at 5e-2.
+- TestEndToEnd single/multi-batch/V4-Pro/MTP (60 seed combos): worst 1.35e-4 vs budget 0.1 — tightened to 1e-3 (7× margin).
+- TestEndToEnd long-context S=128: worst 1.22e-4 vs budget 0.15 — tightened to 2e-3 (16× margin).
+
+TOLERANCE_LOG.md T1, T2, T3 entries rewritten with measurement evidence;
+the original "loose" budgets came from theoretical worst-case bf16
+accumulation estimates that empirically don't materialize (the fp32
+head matmul absorbs much of the residual stream's bf16 noise; per-layer
+bf16 noise at sigma=0.02-init activations is ~1 ULP of bf16 at the
+output magnitude, not ~0.025).
+
+Commits this iter (continuation):
+  - cadebad8 — tighten T3 end-to-end logits parity bounds (5 tests)
+  - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
+
+Final state: **91 passed, 6 skipped on CPU + 1 passing on TPU** under
+the new tighter bounds. Zero regressions. SUMMARY.md / STATUS.md /
+TOLERANCE_LOG.md / PROGRESS.md (this file) updated.
+
+## Resume hint (post-v8 iter 4 complete)
+
+**If killed now:** the headline is still BLOCKERS.md::T8-HBM-OOM (architectural,
+unchanged from iter 3). Iter 4 tightened 7 tolerance budgets (T1, T2, T3, T7,
+T8, decode-step parity ×3) and added 4 new decode parity points (sp ∈ {256,
+768} for SWA + HCA). The functional core is unchanged; the tests now defend
+it byte-equally where possible (T7, T8) and at 1e-3–1e-4 elsewhere, instead
+of the previous 0.1–5e-2 budgets that would have waved real per-layer bugs
+through silently.
+
+**Useful follow-up if more session time appears:**
+  1. T8 architectural unblock — needs user decision (multi-host launcher
+     vs native FP4/FP8 storage vs host-RAM offload). None of these are
+     pure model-code work.
+  2. Tier 5 hardening — extend TestVllmServeRoundtrip to send 2 concurrent
+     requests in a single subprocess (would exercise B1 end-to-end through
+     vllm). Existing test already exercises 3 prompt variants and
+     max_tokens=16 sequentially; adding parallel batch=2 would be the next
+     natural step.
+  3. Compressor decode-step parity (TestCompressorDecodeStep,
+     TestCompressorDecodeStepExtended) — atol=5e-2 there too; not yet
+     measured in iter 4 because the tests have separate kv_state /
+     score_state assertions that need individual treatment.
