@@ -112,12 +112,30 @@ ensure_ssh_agent() {
     fi
 }
 
-# Kill only the ssh-agent we ourselves spawned (don't kill the user's existing one).
+# Reap children + the ssh-agent we spawned on TERM/INT/EXIT so `./run.sh stop`
+# doesn't leave orphaned pytest / claude / timeout processes behind.
 cleanup() {
+    # Kill the loop's process subtree (children, grandchildren, ...). Do this
+    # FIRST so any in-flight `claude -p` / `pytest` from the agent shuts down.
+    local pgid
+    pgid="$(ps -o pgid= -p $$ | tr -d ' ' || true)"
+    if [ -n "$pgid" ] && [ "$pgid" != "$$" ]; then
+        # We're a process-group leader: signal the whole group except ourselves.
+        kill -TERM -- -"$pgid" 2>/dev/null || true
+        sleep 1
+        kill -KILL -- -"$pgid" 2>/dev/null || true
+    else
+        # Fallback: walk pkill -P recursively (one level deep covers most cases)
+        pkill -TERM -P $$ 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P $$ 2>/dev/null || true
+    fi
+    # Now the ssh-agent (only if we spawned it).
     if [ "$SPAWNED_AGENT" = "1" ] && [ -n "${SSH_AGENT_PID:-}" ]; then
         kill "$SSH_AGENT_PID" 2>/dev/null || true
     fi
 }
+trap 'cleanup; exit 0' TERM INT
 trap cleanup EXIT
 
 ensure_ssh_agent

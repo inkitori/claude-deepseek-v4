@@ -1,6 +1,7 @@
-# DeepSeek V4 v6 status (Tier 5 GREEN end-to-end)
-TPU preflight: ok (4 v4 chips, /workspace/logs/tpu-preflight.log)
-Latest passing tier: T7 + T6 (TPU) + T5 (vllm serve curl roundtrip)
+# DeepSeek V4 v8 status (host-direct on v6e-32; fixtures+mount in place)
+TPU preflight: ok (4 v6e chips, logs/tpu-preflight.log)
+Host: TPU v6e-32 single-VM (4 local chips). No docker. Real V4-Flash weights mounted via gcsfuse at ~/.cache/huggingface/hub/. Synthetic fixtures regenerated under work/scratch/{tiny_v4_bf16,tiny_v4_quant,tiny_v4_groundtruth}.
+Latest passing tier: T7 + T6 (TPU) + T5 (vllm serve curl roundtrip) — v6 baseline; v8 first iter has not yet rerun on this host
 Tier 1: 25/25
 Tier 2: 8/8
 Tier 3: 10/10
@@ -21,4 +22,4 @@ Full CPU run: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_coun
 TPU run: `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward`
   → 1 passed in ~14s.
 
-If killed now, next session must: harden Tier 5 (currently passes byte-equal text on 2 identical seed=0 requests; could extend to varied prompts, longer contexts, batch=2). The structural blockers are resolved; remaining work is depth-vs-breadth coverage. See SUMMARY.md "v6 — what's new since v5".
+If killed now, next session must: (1) reconfirm baseline `pytest tests/models/test_deepseek_v4.py -v` on this host now that fixtures + GCS mount are present (expect formerly-skipped Tier 4 shard / 4b / 5 / 6 / 7 / W3-helper tests to switch from skip to pass) — record the new pass/skip count here; (2) attack B1 (multi-seq concurrent decode in `DeepseekV4ForCausalLM.__call__`) — gates Tier 8; (3) execute Tier 8 real-weight `vllm serve deepseek-ai/DeepSeek-V4-Flash` per prompt §W5. v6/v7 numbers above are historical; rewrite this whole STATUS.md per the prompt §"STATUS.md mandate" once you have v8 numbers.

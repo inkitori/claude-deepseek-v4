@@ -33,10 +33,13 @@ case "$cmd" in
 stop)
     if is_alive; then
         pid="$(cat "$PID_FILE")"
-        echo "stopping loop pid=$pid"
-        kill "$pid"
-        sleep 1
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        echo "stopping loop pgid=$pid (group-kill, reaps children)"
+        # The loop runs in its own session (setsid) — kill the whole group.
+        kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        sleep 2
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL -- -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+        fi
     else
         echo "no running loop"
     fi
@@ -101,8 +104,11 @@ fi
 # 3. TPU pre-flight
 "$REPO_DIR/scripts/preflight.sh" || true   # never block on preflight failure
 
-# 4. Background the loop
-nohup "$REPO_DIR/scripts/loop.sh" >>"$LOGS/loop.out" 2>&1 &
+# 4. Background the loop. Use `setsid` so loop.sh becomes its own session/
+# process-group leader; that lets `./run.sh stop` kill the entire subtree
+# (loop + timeout + claude + any agent-spawned pytest) by signaling the
+# group, instead of orphaning grandchildren.
+setsid nohup "$REPO_DIR/scripts/loop.sh" >>"$LOGS/loop.out" 2>&1 < /dev/null &
 loop_pid=$!
 echo "$loop_pid" > "$PID_FILE"
 disown "$loop_pid" 2>/dev/null || true

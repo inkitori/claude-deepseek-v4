@@ -141,3 +141,21 @@ RESUMED at 2026-04-28 22:19 UTC (v7 — finish-early hardening) — picking up p
 RESUMED at 2026-04-29 11:38 UTC (v8 — host-direct on v6e-32). TPU preflight ok (4 v6 chips, n_tpu=4). Baseline reconfirmed `64 passed, 20 skipped` (1:17). Skip count higher than v6's 83p+1s because the new host has no `/mnt/scratch/` and no GCS mount available to this user (`/tmp/gcs/bucket/` permission-denied; `~/.cache/huggingface/hub/` empty; `work/scratch/` empty). Fixture-dependent tests (Tier 4 shard, Tier 4b, Tier 5, Tier 6 forward, Tier 7, FP8 dequant unit, W3 helpers) skip cleanly. Test paths updated: `_scratch(name)` helper resolves `V4_SCRATCH_DIR` env / `/mnt/scratch/` / `work/scratch/` candidates and falls back to `work/scratch/`. Added skip guard to `test_eval_shape_makes_abstract_module` (was hard-failing on missing config.json). Plan: focus on B1 (highest priority per spec, gates Tier 8); document missing-fixture/mount situation in BLOCKERS.md as `T5/T6/T7-fixtures-missing` and `T8-mount-missing` so the user knows why those tiers skipped on this run; do W5 Tier 8 only if the GCS mount becomes available within this session.
 
 If killed now, next session must: (1) read this PROGRESS.md tail and STATUS.md; (2) confirm fixture/mount situation hasn't changed (`ls /tmp/gcs/bucket` and `ls work/scratch`); (3) continue B1 work — reading `tpu_inference/models/jax/deepseek_v4.py`'s `__call__` and `tpu_inference/models/jax/deepseek_v3.py:1383`'s reference for per-sequence handling.
+
+---
+
+HOST-UPDATE at 2026-04-29 11:56 UTC (between v8 iter 1 and iter 2): the user resolved both blockers from v8 iter 1. (a) gcsfuse mount of `gs://personal-mark-eu/vllm/hub/` is now live at `~/.cache/huggingface/hub/`; the real DeepSeek-V4-Flash snapshot resolves at `~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/fd53f944496234770ba80e15004f9b6d269a71f5/` (config.json + 46 model-*.safetensors + DeepSeek's `inference/` reference code). (b) Synthetic fixtures regenerated under `work/scratch/tiny_v4_{bf16,quant,groundtruth}/` via `scripts/make_tiny_v4_checkpoint.py` reading metadata from the mount. (c) `.env` now has `MOUNT_GCS=1` so `./run.sh` auto-mounts on subsequent restarts. Verified: `mountpoint -q ~/.cache/huggingface/hub` ✓; `ls work/scratch/tiny_v4_bf16/` shows config.json + tokenizer.json + safetensors. The 20 fixture-dependent skips from v8 iter 1 should now turn into passes — re-run baseline first thing and update STATUS.md with the v8 numbers.
+
+If killed now (post-host-update), next session must: (1) reconfirm `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py -q` — expect close to v6's 83+1, modulo any iter-1 code edits; (2) run `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward` (TPU-only); (3) attack B1 in `deepseek_v4.py::__call__` (multi-seq decode); (4) Tier 8 real-weight gate via `JAX_PLATFORMS=tpu HF_HUB_OFFLINE=1 vllm serve deepseek-ai/DeepSeek-V4-Flash --tensor-parallel-size 4 --enforce-eager --max-model-len 256 --max-num-seqs 1 --port 18081 --seed 0 --trust-remote-code --dtype bfloat16` then curl smoke (expect "Paris"-starting completion).
+
+**WIP NOTE for the resuming agent:** v8 iter 1 was killed mid-flight while writing B1 (multi-seq dispatch). Two files have **uncommitted** WIP in your working tree (run `git status` to see):
+  - `tpu_inference/models/jax/deepseek_v4.py` — `__call__` rewritten to dispatch per `query_start_loc` segments, calling `transformer_body_forward` per sequence and reassembling `hidden_TM`. Eager-only; jit support deferred.
+  - `tests/models/jax/test_deepseek_v4.py` — `+190` lines: `_hf_dict_from_torch_args` helper + `TestB1MultiSeqDispatch` class.
+
+**Do not blindly discard or commit.** Inspect with `git diff`, run the new B1 test:
+```
+cd work/tpu-inference
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 \
+  pytest tests/models/test_deepseek_v4.py::TestB1MultiSeqDispatch -v
+```
+If it passes, run the full suite to check for regressions, then commit (`B1: per-seq dispatch in __call__ — multi-seq logits match serial single-seq`). If it fails, debug — don't `git checkout` away from your iter-1 reasoning unless you're sure it's wrong.
