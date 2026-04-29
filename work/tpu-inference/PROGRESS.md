@@ -208,3 +208,40 @@ Plan for iter 4:
 
 If killed now: see prior resume hint (post-v8 iter 3); current iter is pure polish so killing mid-iter doesn't lose anything substantive. Nothing in this iter touches W5/T8 architectural blocker.
 
+
+## Phase v8 iter 4 (2026-04-29 ~16:08–16:25 UTC) — finish-early polish
+
+- [x] Baseline reconfirmed clean: **87 passed, 6 skipped** in 3:45 (no regressions vs v8 iter 3 final b55e5a30).
+- [x] TPU T6 spot-check confirmed clean: 1/1 in 25s.
+- [x] **T7 measurement** (TestQuantToParamsApply forward logits, quant ≡ groundtruth): observed `max_abs_diff = 0.0`, `argmax_agree = 1.0`, `byte_equal = True`. Tightened from atol=0.1 to byte-exact (np.array_equal AND max-abs == 0).
+- [x] **T8 measurement** (TestDecodeRollingEquivalenceWithPrefill: SWA decode-state ≡ prefill-state after 32 steps): observed `0.0` max-abs across 8 random seeds {7, 1, 2, 3, 5, 11, 13, 17}. Tightened from atol=2e-2 to byte-exact.
+- [x] **Decode step parity measurements** (TestDecodeAttentionParity 9 points, TestDecodeRollingParity 5 (P,K) combos, TestDecodeAttentionParityExtended 8 points = 22 total): observed worst `3.81e-6`. Tightened from atol=5e-2 to atol=1e-4 (25× margin over observed worst).
+- [x] **TOLERANCE_LOG.md** rewritten: T7 + T8 entries replaced with byte-exact evidence; new "Decode step parity" entry citing per-class measured atol.
+- [x] **4 new decode parity points** added to TestDecodeAttentionParityExtended: SWA + HCA at sp ∈ {256, 768}. Fills gaps between sp=192/500 and sp=500/1023. All four pass at the new 1e-4 bound.
+- [x] **Affected-tests run** (24 tests): 24 passed in 20s. **Full CPU suite re-run: 91 passed, 6 skipped** in 3:45 (+4 from new parity points; 0 regressions). **TPU T6 re-check post-tightening: 1/1 in 26s.**
+- [x] STATUS.md / SUMMARY.md / TOLERANCE_LOG.md / PROGRESS.md (this file) updated for iter 4.
+
+Commits this iter:
+  - edc4647a — tighten T7/T8/decode-step bounds + TOLERANCE_LOG entries
+  - 0b8d7fe3 — 4 new decode parity points (sp ∈ {256, 768}, SWA + HCA)
+
+## Resume hint (post-v8 iter 4)
+
+**If killed now:** the headline is still BLOCKERS.md::T8-HBM-OOM (architectural,
+unchanged from iter 3). Iter 4 was pure polish — tightened tolerances and added
+parity coverage. The functional core is unchanged. Tests now defend the
+implementation at byte-exactness for T7/T8 and at 1e-4 for decode parity, vs
+loose 0.1/2e-2/5e-2 budgets that would have waved real regressions through.
+
+**What's left to do (order of value):**
+  1. **T8 architectural unblock — needs user decision** (multi-host launcher
+     vs native FP4/FP8 storage vs host-RAM offload). None of these are pure
+     model-code work.
+  2. Tighten T1/T2/T3 budgets only if measurements show comfortable headroom.
+     The full attention/transformer chain has bf16 noise estimates that
+     match measured behavior — likely no headroom there. Skipped here.
+  3. **Tier 5 hardening** — extend TestVllmServeRoundtrip to more prompts /
+     longer max_tokens / batch=2 multi-seq (now that B1 is wired). The
+     existing test already exercises 3 prompt variants and max_tokens=16;
+     adding batch=2 would exercise B1 end-to-end through vllm.
+  4. Polish: V3_TO_V4_DIFF.md, PROD_TOPOLOGY_RISKS.md sanity passes.

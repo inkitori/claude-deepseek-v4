@@ -1,4 +1,4 @@
-# DeepSeek V4 v8 status (host-direct on v6e-32; B1 done; T8 blocked on HBM)
+# DeepSeek V4 v8 status (host-direct on v6e-32; iter 4 polish — tightened tolerances + 4 new parity points)
 TPU preflight: ok (4 v6e chips, logs/tpu-preflight.log)
 Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   708 GB host RAM). No docker. Real V4-Flash weights mounted via gcsfuse at
@@ -9,23 +9,24 @@ Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   Tier 3/4b real-config + real-shard tests resolve.
 
 Latest passing tier: T1-T7 + B1 multi-seq dispatch + T4b on real V4-Flash
-  bf16/FP8/FP4 + long-context decode parity at sp ∈ {500, 1023}. T8 (deploy
-  gate) BLOCKED on HBM OOM (architectural; see BLOCKERS.md::T8-HBM-OOM).
+  bf16/FP8/FP4 + decode parity at sp ∈ {1, 4, 7, 8, 9, 16, 32, 64, 128, 192,
+  256, 500, 768, 1023}. T8 (deploy gate) BLOCKED on HBM OOM (architectural;
+  see BLOCKERS.md::T8-HBM-OOM).
 
 Tier 1: 25/25
 Tier 2: 8/8
-Tier 2 hardening (v3 + v8 long-context): 15/15 — 11 from v3 plus 4 new in
-  v8 iter 3 at sp ∈ {500, 1023} (SWA/CSA/HCA at sp=500; SWA at sp=1023).
+Tier 2 hardening (v3 + v8 long-context + iter 4 256/768): 19/19 — 11 from v3,
+  4 from v8 iter 3 (sp ∈ {500, 1023}), 4 new in v8 iter 4 (sp ∈ {256, 768}
+  SWA + HCA), all at the tightened atol=1e-4 bound.
 Tier 3: 10/10  (V4-Flash full + 2-layer compile; V4-Pro skipped — no v4_pro fixture)
 Tier 4: 2/2    (HF->JAX name mapping)
-Tier 4b: 3/3   (real V4-Flash byte-equal bf16 shard, plus new in v8 iter 3:
-  real V4-Flash FP8 dequant smoke at block=128 from layers.0.attn.wq_a, and
-  real V4-Flash FP4 dequant smoke at block=32 from layers.2.ffn.experts.0.w1
-  — all three on the gcsfuse-mounted snapshot)
+Tier 4b: 3/3   (real V4-Flash byte-equal bf16 shard + FP8 + FP4 dequant smokes
+  on the gcsfuse-mounted snapshot)
 Tier 5: 1/1    (vllm serve /v1/completions byte-equal — synthetic tiny_v4_bf16)
 Tier 6: 1/1    (TPU-only — `JAX_PLATFORMS=tpu pytest TestRealTpuTinyForward`)
-Tier 7: 1/1    (forward on tiny_v4_quant ≡ forward on tiny_v4_groundtruth)
-Tier 2 v8 (B1 multi-seq dispatch, new this iter): 3/3 — concurrent_decode_two_seqs,
+Tier 7: 1/1    (forward on tiny_v4_quant ≡ forward on tiny_v4_groundtruth —
+  v8 iter 4 tightened 0.1 -> byte-exact, measured 0.0)
+Tier 2 v8 (B1 multi-seq dispatch): 3/3 — concurrent_decode_two_seqs,
   single_seq_via_metadata_matches_no_metadata, three_seqs_concurrent.
 Tier 8 deploy gate: BLOCKED — `vllm serve deepseek-ai/DeepSeek-V4-Flash` OOMs
   during load_weights at HBM allocation time. V4-Flash bf16 = 543 GB; this
@@ -38,33 +39,30 @@ B1 multi-seq: done — `DeepseekV4ForCausalLM.__call__` extracts per-seq segment
   from `attention_metadata.query_start_loc` and dispatches each through
   `transformer_body_forward` independently. Eager-only Python loop;
   jit-compiled multi-seq remains future work but is not gated by Tier 8 with
-  `--enforce-eager`. Three new regression tests in TestConcurrentMultiSeqDispatch.
+  `--enforce-eager`. Three regression tests in TestConcurrentMultiSeqDispatch.
 W5 deploy gate: BLOCKED on HBM topology — see Tier 8 above and BLOCKERS::T8-HBM-OOM.
   The deploy gate cannot pass on a 4-chip slice; the user's deployment target
   must be the full 32-chip v6e-32 slice (8 hosts) to fit V4-Flash bf16.
 
-Patches committed this iter (v8 iter 3):
-  - dd731cf2 W5/T8: TpuPlatform supported_quantization includes deepseek_v4_fp8
-  - a249970f T8: t8_eager_smoke.sh adds --additional_config enable_dp_attention
-  - f2f5a8e8 W5/T8: deepseek_v4_fp8 -> UnquantizedConfig in TPU quant registry
-  - 06e974e0 v8 iter 3 docs: T8 architectural truth (HBM-OOM evidence)
-  - 1d29afd9 T4b extension: FP8 dequant smoke on real V4-Flash tensor
-  - 39b0f71f T4b extension: FP4 dequant smoke on real V4-Flash expert tensor
-  - 336e5a34 T2 hardening: long-context decode parity at sp ∈ {500, 1023}
-  - (B1 already at 25ad1a11 — committed in iter 2)
+Tolerance tightenings (v8 iter 4, evidence in TOLERANCE_LOG.md):
+  - T7 quant≡groundtruth logits: 0.1 -> byte-exact (np.array_equal). Measured 0.0.
+  - T8 SWA decode-state ≡ prefill-state: 2e-2 -> byte-exact. Measured 0.0 across 8 seeds.
+  - Decode step parity (3 test classes, 22 points): 5e-2 -> 1e-4. Worst measured 3.81e-6.
+
+Patches committed this iter (v8 iter 4):
+  - 0b8d7fe3 v8 iter 4: 4 new decode parity points (sp ∈ {256, 768}, SWA + HCA)
+  - edc4647a v8 iter 4 polish: tighten T7 + T8 + decode-step parity bounds
 
 Full CPU run target: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py`
-  -> **87 passed, 6 skipped (3:43)**. Up from v7's 83+1; +6 net from v8
-  iter 3 (3 B1 + 1 FP8 real smoke + 1 FP4 real smoke + 4 long-context
-  parity = +9, minus the 5 V4-Pro skips that v7 didn't have because v7
-  ran on the older host with a different fixture layout). Skipped: 5
-  V4-Pro RealConfigCompile tests (no v4_pro fixture on this host) + 1
-  TPU-only forward (TestRealTpuTinyForward, needs JAX_PLATFORMS=tpu).
+  -> **91 passed, 6 skipped (3:45)**. Up from iter 3's 87+6; +4 net from iter 4
+  (4 new decode parity points; tightenings reused existing test bodies).
+  Skipped: 5 V4-Pro RealConfigCompile tests (no v4_pro fixture on this host)
+  + 1 TPU-only forward (TestRealTpuTinyForward, needs JAX_PLATFORMS=tpu).
 TPU spot-check target: `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward`
-  -> 1 passed (~25 s).
+  -> 1 passed (~26 s).
 
 If killed now, next session must:
-  (1) read BLOCKERS.md::T8-HBM-OOM end-to-end (it's the headline);
+  (1) read BLOCKERS.md::T8-HBM-OOM end-to-end (it's still the headline);
   (2) confirm with the user whether the deploy target is the full 32-chip
       v6e-32 slice or this 4-chip view — if 4-chip, T8 is architecturally
       infeasible without options (B) or (C) in BLOCKERS;

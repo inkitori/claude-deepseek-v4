@@ -51,6 +51,43 @@ Three orthogonal unblock paths are recorded in BLOCKERS.md::T8-HBM-OOM:
 **Sharding annotations alone do not unblock T8 on a 4-chip slice.** The
 math doesn't close.
 
+## v8 iter 4 — what's new (finish-early polish)
+
+**Headline:** With T8 architecturally blocked and the functional core
+already proven, the spec's "finish early" guidance applies: tighten
+tolerances with measurement evidence, add more decode parity points,
+polish docs. **Total tests: 91 passing, 6 skipped on CPU + 1 passing on
+TPU.** Up from 87+6 in iter 3.
+
+| Area | iter 3 state | iter 4 state |
+|---|---|---|
+| T7 (quant ≡ groundtruth logits) | `atol=0.1` | **byte-exact** (`np.array_equal` AND `max-abs == 0`). Measured worst-case across the test fixture: `0.0` exactly. The loader is byte-equal across 355 tensors (proven by `TestFp8Dequant`); both forward paths run identical Python on identical JAX devices, so byte-exactness is the right invariant. |
+| T8 SWA decode-state ≡ prefill-state | `atol=2e-2` | **byte-exact** (`np.array_equal`). Measured worst-case across 8 random seeds for the input tensor: `0.0` for every seed. The prefill kv-write loop and the decode-step kv-write paths emit identical XLA HLO per position; the prior 2e-2 budget was based on a pessimistic estimate that never materialized. |
+| Decode step parity (`TestDecodeAttentionParity`, `TestDecodeRollingParity`, `TestDecodeAttentionParityExtended`) | `atol=5e-2` | **`atol=1e-4`** — 500× tighter. Worst observed across 22 measurements: `3.81e-6`; new bound keeps a 25× margin. Old budget would never have caught a real per-layer regression. |
+| Decode parity coverage | sp ∈ {1, 4, 7, 8, 9, 16, 32, 64, 128, 192, 500, 1023} | **+ sp ∈ {256, 768} for SWA and HCA** — fills the gaps between sp=192/500 and sp=500/1023. HCA sp=256 is right after the 2nd compression event (event boundaries at sp+1 ∈ {128, 256, 384, ...}); HCA sp=768 has 6 compression events accumulated. All 4 new points pass at the tightened 1e-4 bound. |
+| TOLERANCE_LOG.md | T7 + T8 entries assumed loose budget needed | T7 + T8 rewritten to document byte-exactness; new "Decode step parity" entry citing per-point measured atol across all three test classes. |
+
+**What this buys the user:** any future regression that introduces a
+real per-layer error of >0.0001 (or breaks loader byte-equality, or
+breaks decode/prefill state equivalence) is now an immediate test
+failure. Under iter 3's bounds those regressions would have passed
+silently up to ~0.05 magnitude, which is well into "wrong-model"
+territory. The functional core is the same, but the suite now actually
+defends it.
+
+**What was *not* attempted in iter 4:**
+  - No T8 retry. The HBM-OOM blocker is architectural (4-chip slice,
+    128 GB HBM vs 543 GB bf16 weights). No model-code work moves it.
+  - No new features. The spec said no, and the suite doesn't need any.
+  - No tightening of T1/T2/T3 budgets (5e-2, 5e-2, 0.1). Those measure
+    the full attention/transformer chain, where the bf16 noise estimate
+    in TOLERANCE_LOG is matched empirically. Tightening would just add
+    flakes without revealing more bugs.
+
+Iter 4 commits:
+  - edc4647a — tighten T7/T8/decode-step bounds + TOLERANCE_LOG entries
+  - 0b8d7fe3 — 4 new decode parity points (sp ∈ {256, 768} for SWA + HCA)
+
 ## v6 — what's new since v3/v5
 
 ## v6 — what's new since v3/v5
