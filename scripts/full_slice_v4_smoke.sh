@@ -67,15 +67,14 @@ if [ -n "$V4_JAX_CACHE_DIR" ]; then
     export JAX_COMPILATION_CACHE_DIR="$V4_JAX_CACHE_DIR"
 fi
 
-# XLA: parallelize compile passes across CPU cores. Modest 10-30% compile
-# speedup. Off by default in tpu-inference; turning it on for our smoke.
-existing_xla="${XLA_FLAGS:-}"
-xla_extra="--xla_tpu_impure_hlo_parallel_compile=true"
-if [ -n "$existing_xla" ]; then
-    export XLA_FLAGS="$existing_xla $xla_extra"
-else
-    export XLA_FLAGS="$xla_extra"
-fi
+# NOTE on XLA flags: don't add unverified flags here. An earlier attempt
+# at `--xla_tpu_impure_hlo_parallel_compile=true` *crashed every worker*
+# on libtpu init with `Unknown flag in XLA_FLAGS`. The string appears in
+# tpu_inference logs as a deepsea_compiler INTERNAL config option but
+# isn't a recognized XLA flag in this build. Verify any addition with
+# `python -c "import jax; jax.devices()"` under a candidate XLA_FLAGS
+# value before wiring it into the smoke launcher.
+export XLA_FLAGS="${XLA_FLAGS:-}"
 
 # Bump Ray's compiled-graph channel timeout. Default is 300 seconds, which
 # trips during the first inference if jit_run_model recompiles for the
