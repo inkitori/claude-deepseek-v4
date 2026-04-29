@@ -9,15 +9,19 @@ Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   Tier 3/4b real-config + real-shard tests resolve.
 
 Latest passing tier: T1-T7 + B1 multi-seq dispatch + T4b on real V4-Flash
-  bf16 shard. T8 (deploy gate) BLOCKED on HBM OOM (architectural; see
-  BLOCKERS.md::T8-HBM-OOM).
+  bf16/FP8/FP4 + long-context decode parity at sp ∈ {500, 1023}. T8 (deploy
+  gate) BLOCKED on HBM OOM (architectural; see BLOCKERS.md::T8-HBM-OOM).
 
 Tier 1: 25/25
 Tier 2: 8/8
-Tier 2 hardening (v3): 11/11
+Tier 2 hardening (v3 + v8 long-context): 15/15 — 11 from v3 plus 4 new in
+  v8 iter 3 at sp ∈ {500, 1023} (SWA/CSA/HCA at sp=500; SWA at sp=1023).
 Tier 3: 10/10  (V4-Flash full + 2-layer compile; V4-Pro skipped — no v4_pro fixture)
 Tier 4: 2/2    (HF->JAX name mapping)
-Tier 4b: 1/1   (real V4-Flash bf16 shard byte-equal round-trip on gcsfuse mount)
+Tier 4b: 3/3   (real V4-Flash byte-equal bf16 shard, plus new in v8 iter 3:
+  real V4-Flash FP8 dequant smoke at block=128 from layers.0.attn.wq_a, and
+  real V4-Flash FP4 dequant smoke at block=32 from layers.2.ffn.experts.0.w1
+  — all three on the gcsfuse-mounted snapshot)
 Tier 5: 1/1    (vllm serve /v1/completions byte-equal — synthetic tiny_v4_bf16)
 Tier 6: 1/1    (TPU-only — `JAX_PLATFORMS=tpu pytest TestRealTpuTinyForward`)
 Tier 7: 1/1    (forward on tiny_v4_quant ≡ forward on tiny_v4_groundtruth)
@@ -43,12 +47,19 @@ Patches committed this iter (v8 iter 3):
   - dd731cf2 W5/T8: TpuPlatform supported_quantization includes deepseek_v4_fp8
   - a249970f T8: t8_eager_smoke.sh adds --additional_config enable_dp_attention
   - f2f5a8e8 W5/T8: deepseek_v4_fp8 -> UnquantizedConfig in TPU quant registry
+  - 06e974e0 v8 iter 3 docs: T8 architectural truth (HBM-OOM evidence)
+  - 1d29afd9 T4b extension: FP8 dequant smoke on real V4-Flash tensor
+  - 39b0f71f T4b extension: FP4 dequant smoke on real V4-Flash expert tensor
+  - 336e5a34 T2 hardening: long-context decode parity at sp ∈ {500, 1023}
   - (B1 already at 25ad1a11 — committed in iter 2)
 
 Full CPU run target: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py`
-  -> 81 passed, 6 skipped (3:44). Skipped: 5 V4-Pro RealConfigCompile tests
-  (no v4_pro fixture on this host) + 1 TPU-only forward (TestRealTpuTinyForward,
-  needs JAX_PLATFORMS=tpu).
+  -> **87 passed, 6 skipped (3:43)**. Up from v7's 83+1; +6 net from v8
+  iter 3 (3 B1 + 1 FP8 real smoke + 1 FP4 real smoke + 4 long-context
+  parity = +9, minus the 5 V4-Pro skips that v7 didn't have because v7
+  ran on the older host with a different fixture layout). Skipped: 5
+  V4-Pro RealConfigCompile tests (no v4_pro fixture on this host) + 1
+  TPU-only forward (TestRealTpuTinyForward, needs JAX_PLATFORMS=tpu).
 TPU spot-check target: `JAX_PLATFORMS=tpu pytest tests/models/test_deepseek_v4.py::TestRealTpuTinyForward`
   -> 1 passed (~25 s).
 
