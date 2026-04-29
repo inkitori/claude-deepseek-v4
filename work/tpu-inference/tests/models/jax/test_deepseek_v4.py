@@ -2281,9 +2281,14 @@ class TestFp8DequantIndependentReference:
     # v8 iter 8: +4 cases — wq_b (in>>out aspect, deeper layer), wo_a / wo_b
     # (output projection, square-ish + transposed-aspect), shared_experts.w1
     # (FP8 dense FFN — distinct from routed FP4 experts; covers the only
-    # FP8 path outside attn). Total 6 byte-equal real-tensor cases spanning
-    # 4 distinct shapes, 4 distinct shards, 5 distinct projections, and
-    # layers {0, 5, 10, 20, 40}.
+    # FP8 path outside attn).
+    # v8 iter 9: +1 case — layers.42.attn.wkv on the LAST transformer layer
+    # (V4-Flash has 43 layers indexed 0..42), shard 44 (rightmost weight
+    # shard). Anchors the byte-equal evidence at the *boundary* layer that
+    # all earlier cases miss.
+    # Total 7 byte-equal real-tensor cases spanning 4 distinct shapes,
+    # 5 distinct shards, 5 distinct projections, and layers {0, 5, 10, 20,
+    # 40, 42}.
     @pytest.mark.parametrize("tensor_base", [
         "layers.0.attn.wq_a",                # iter7: [1024, 4096], shard 2
         "layers.0.attn.wkv",                 # iter7: [512,  4096], shard 2
@@ -2291,6 +2296,7 @@ class TestFp8DequantIndependentReference:
         "layers.10.attn.wo_a",               # iter8: [8192, 4096] (output proj A)
         "layers.5.attn.wo_b",                # iter8: [4096, 8192] (output proj B; in>out)
         "layers.40.ffn.shared_experts.w1",   # iter8: [2048, 4096] (FP8 dense FFN)
+        "layers.42.attn.wkv",                # iter9: LAST layer (43 layers, 0..42), shard 44
     ])
     def test_byte_equal_against_numpy_reference(self, tensor_base):
         if not os.path.exists(self.INDEX):
@@ -2391,14 +2397,21 @@ class TestFp4DequantIndependentReference:
     # v8 iter 7: 2 cases (experts.0.w1 layer 2; experts.0.w2 layer 0).
     # v8 iter 8: +2 cases — deeper layer + mid-range expert id (experts.128 on
     # layer 30; experts.50.w3 on layer 10). w3 is the gate-up projection
-    # distinct from the iter-7 w1/w2 cases. Total 4 byte-equal real-tensor
-    # cases spanning all three SwiGLU projections, expert ids in {0, 50,
-    # 128}, and layers {0, 2, 10, 30}.
+    # distinct from the iter-7 w1/w2 cases.
+    # v8 iter 9: +2 cases — boundary expert id (255, the largest, on layer 0
+    # to span the first router-routing path) + boundary layer (42, the last
+    # transformer layer, with the boundary expert + w2 projection). Together
+    # these anchor the corners of the (layer, expert_id, projection) cube.
+    # Total 6 byte-equal real-tensor cases spanning all three SwiGLU
+    # projections, expert ids in {0, 50, 128, 255}, and layers {0, 2, 10,
+    # 30, 42}.
     @pytest.mark.parametrize("tensor_base", [
         "layers.2.ffn.experts.0.w1",       # iter7: [2048, 2048] (4 MB)
         "layers.0.ffn.experts.0.w2",       # iter7: [4096, 1024] (4 MB; w2 axis)
         "layers.30.ffn.experts.128.w1",    # iter8: deep layer + mid expert id
         "layers.10.ffn.experts.50.w3",     # iter8: w3 gate-up projection
+        "layers.0.ffn.experts.255.w1",     # iter9: max expert id, first layer
+        "layers.42.ffn.experts.255.w2",    # iter9: max expert id, LAST layer + w2
     ])
     def test_byte_equal_against_numpy_reference(self, tensor_base):
         if not os.path.exists(self.INDEX):
