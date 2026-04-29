@@ -29,6 +29,7 @@ os.environ.setdefault("XLA_FLAGS",
                       "--xla_force_host_platform_device_count=32")
 
 import sys
+import json
 import math
 from pathlib import Path
 
@@ -1816,6 +1817,94 @@ class TestRealShardRoundTrip:
                 f"({i},{j}): JAX={np_jax[i, j]} torch={np_direct[i, j]}"
         # Full byte-equality (bf16 → fp32 cast is exact).
         np.testing.assert_array_equal(np_jax, np_direct)
+
+
+class TestRealFp8DequantSmoke:
+    """Tier 4b extension (v8 iter 3): exercise the FP8 dequant path on a
+    real V4-Flash tensor. The tiny_v4_quant fixture validates the recipe;
+    this test confirms the same code handles real V4-Flash FP8 (block=128)
+    without producing NaN/inf or all-zeros.
+
+    The bf16 round-trip in TestRealShardRoundTrip only covers the
+    embedding (which is stored as bf16, no scale). Dense layers like
+    `layers.0.attn.wq_a.{weight,scale}` are FP8 e4m3fn + e8m0fnu scale
+    at block=128 — the production path. Without this smoke we have no
+    real-data evidence for the FP8 dequant path.
+    """
+
+    REAL_DIR = _scratch("v4_flash")
+    INDEX = _scratch("v4_flash/model.safetensors.index.json")
+    # Pick a small FP8-quantized weight in shard 2 (layer 0 attn q_a).
+    # Shape [1024, 4096], scale [8, 32], block=128.
+    TENSOR_BASE = "layers.0.attn.wq_a"
+
+    def test_real_fp8_dequant_produces_finite_nontrivial_bf16(self):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            dequant_fp8_to_bf16,
+        )
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        w_name = self.TENSOR_BASE + ".weight"
+        s_name = self.TENSOR_BASE + ".scale"
+        if w_name not in mapping or s_name not in mapping:
+            pytest.skip(f"{w_name} / {s_name} not in real V4-Flash index")
+        if mapping[w_name] != mapping[s_name]:
+            pytest.skip(
+                f"weight + scale across different shards "
+                f"({mapping[w_name]} vs {mapping[s_name]})"
+            )
+        shard_path = os.path.join(self.REAL_DIR, mapping[w_name])
+        with safe_open(shard_path, framework="pt") as f:
+            w = f.get_tensor(w_name)
+            s = f.get_tensor(s_name)
+        # Sanity on storage dtypes — these are the production FP8 dtypes.
+        assert str(w.dtype) == "torch.float8_e4m3fn", (
+            f"unexpected weight dtype {w.dtype}; "
+            f"FP8 e4m3fn was assumed by deepseek_v4_loader.dequant_fp8_to_bf16"
+        )
+        assert str(s.dtype) == "torch.float8_e8m0fnu", (
+            f"unexpected scale dtype {s.dtype}; "
+            f"e8m0fnu was assumed by deepseek_v4_loader.dequant_fp8_to_bf16"
+        )
+        # Block size derived from shapes: real V4-Flash uses 128.
+        out_dim, in_dim = w.shape
+        so, si = s.shape
+        block_o = out_dim // so
+        block_i = in_dim // si
+        assert block_o == block_i, (
+            f"non-square block {block_o}x{block_i}: dequant_fp8_to_bf16 "
+            f"assumes block-square; bail rather than silently mis-dequant"
+        )
+        block = block_o
+        assert block == 128, (
+            f"V4-Flash spec is weight_block_size=[128,128]; got {block}"
+        )
+
+        bf = dequant_fp8_to_bf16(w, s, block=block)
+        assert bf.dtype == torch.bfloat16, f"got {bf.dtype}"
+        assert tuple(bf.shape) == tuple(w.shape), (
+            f"shape changed: {bf.shape} vs {w.shape}"
+        )
+        # Numerical sanity: no NaN, no Inf, non-trivial std, not all zeros.
+        bf_f = bf.float()
+        assert torch.isfinite(bf_f).all(), (
+            "dequant produced NaN/Inf — likely a scale-decode bug"
+        )
+        std = bf_f.std().item()
+        assert std > 1e-4, (
+            f"dequant std={std:.4g} is suspiciously small; "
+            f"all-zero output would suggest a missing scale multiply"
+        )
+        # Reasonable abs range — V4 weights are O(1) at bf16 init.
+        # We allow a wide envelope to avoid being brittle.
+        amax = bf_f.abs().max().item()
+        assert 1e-3 < amax < 1e3, (
+            f"dequant amax={amax:.4g} outside [1e-3, 1e3] — likely a "
+            f"scale-exponent or sign-bit bug in dequant_fp8_to_bf16"
+        )
 
 
 class TestQuantToParamsApply:
