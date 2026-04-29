@@ -17,15 +17,19 @@ Every place where a numerical tolerance was loosened from the default (fp32 1e-5
 **Looser bound:** atol=5e-2.
 **Evidence:** Block adds Sinkhorn (20 iterations of fp32 row/col normalize) + the mHC `hc_post` einsum on top of attention. Sinkhorn is fp32 and matches at 1e-5; the mHC einsum operates on fp32 residuals and the result is cast back to bf16. Empirically the same 5e-2 bound holds. No surprising amplification.
 
-## T3 — End-to-end transformer logits (Tier 2, `TestEndToEnd`): `atol=0.1`
-**Where:** `TestEndToEnd::test_single_batch_prefill_logits_parity`, `test_multi_batch_prefill`, `test_mtp_forward_parity`.
+## T3 — End-to-end transformer logits (Tier 2, `TestEndToEnd`): `atol=1e-3` (v8 iter 4 tightening from 0.1; long-context 0.15 → 2e-3)
+**Where:** `TestEndToEnd::test_single_batch_prefill_logits_parity`, `test_multi_batch_prefill`, `test_v4_pro_style_compress_ratios`, `test_mtp_forward_parity` (1e-3); `test_long_context_sliding_window_wraparound` (2e-3).
 **Default:** bf16 atol/rtol = 1e-2.
-**Looser bound:** atol=0.1.
-**Evidence:**
-- The full forward stacks 6 layers × (Block) × (Attention + MoE) plus a final `head_hc` mixer + RMSNorm + bf16→fp32 lm_head matmul.
-- After 6 layers, accumulated bf16 noise in the residual stream is ~6 × 0.025 ≈ 0.15 (worst-case), which exceeds 0.1 in absolute terms. To stay under 0.1, the per-layer error must average ≤0.017 — observed empirically.
-- The argmax agreement test (`test_argmax_token_agreement`) requires ≥95% of token positions to have the same argmax — a discrete invariant that bf16 rounding generally cannot break.
-- The 0.1 bound is conservative enough that a real bug (any per-layer math error) would push the diff well above it.
+**Effective bound:** atol=1e-3 (long-context: atol=2e-3).
+**Evidence (measured 2026-04-29 v8 iter 4 across 60 (build_seed, input_seed) combos):**
+- Worst observed across `test_single_batch_prefill_logits_parity` for seqlen ∈ {16, 32, 64} and 10 build seeds × 2 input seeds: **1.35e-4** (at build_seed=3, input_seed=10, seqlen=64).
+- `test_multi_batch_prefill` (B=4, S=16): **4.84e-5**.
+- `test_v4_pro_style_compress_ratios` (leading-HCA pattern): **3.99e-5**.
+- `test_long_context_sliding_window_wraparound` (S=128, 16 SWA wraparounds): **1.22e-4**.
+- `test_mtp_forward_parity` (MTP head only): **2.30e-5**.
+- The original 0.1/0.15 budgets came from a pessimistic theoretical estimate (6 layers × ~0.025 per-layer worst-case) that empirically does not hold. The fp32 head matmul absorbs much of the bf16 residual noise; per-layer noise in this network is ~2e-5 not ~2.5e-2.
+- 1e-3 keeps a ~7× margin over the worst single-batch observation; 2e-3 long-context keeps a ~16× margin. Both are tight enough to surface real per-layer regressions (which would push the diff into the 0.01+ range) and loose enough to absorb seed/version drift.
+- The argmax agreement test (`test_argmax_token_agreement`) is independent and unchanged at ≥95%.
 
 ## T6 — Real-TPU compile + sanity check (no per-element atol)
 **Where:** `TestRealTpuTinyForward::test_tiny_tpu_compile_and_forward`.

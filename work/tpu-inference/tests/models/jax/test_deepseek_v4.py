@@ -657,13 +657,13 @@ class TestEndToEnd:
             model.reset_state()
             l_t = model(x, start_pos=0)
         l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
-        # Logits go through final RMSNorm + linear in fp32. bf16 inputs cause
-        # accumulation noise on the order of 1e-2 per token. Tier 2 spec is
-        # bf16 atol/rtol of 1e-2; we use a slightly looser 5e-2 (documented
-        # in TOLERANCE_LOG.md) since the network has 6 layers and each layer
-        # has many matmuls.
+        # bf16 noise in the 6-layer tiny config plateaus at ~1.4e-4 for
+        # seqlen=64 (measured across 60 seed combos in v8 iter 4); the
+        # original 0.1 budget assumed worst-case 0.025/layer accumulation
+        # that doesn't materialize. 1e-3 keeps a 7x margin and catches any
+        # real per-layer regression. See TOLERANCE_LOG.md T3.
         diff = maxabs(l_j, l_t)
-        assert diff <= 0.1, f"seqlen={seqlen}: max logits diff {diff}"
+        assert diff <= 1e-3, f"seqlen={seqlen}: max logits diff {diff}"
 
     def test_multi_batch_prefill(self):
         model, params, cfg, swa, comp = self._build_pair(seed=42)
@@ -674,7 +674,8 @@ class TestEndToEnd:
             l_t = model(x, start_pos=0)
         l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
         diff = maxabs(l_j, l_t)
-        assert diff <= 0.1, f"multi-batch max logits diff {diff}"
+        # v8 iter 4 tightening per TOLERANCE_LOG.md T3 (was 0.1, observed ~5e-5).
+        assert diff <= 1e-3, f"multi-batch max logits diff {diff}"
 
     def test_argmax_token_agreement(self):
         """The strongest invariant: the argmax token at every position must
@@ -710,7 +711,8 @@ class TestEndToEnd:
             l_t = model(x, start_pos=0)
         l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
         diff = maxabs(l_j, l_t)
-        assert diff <= 0.1, f"V4-Pro-style pattern: max logits diff {diff}"
+        # v8 iter 4 tightening per TOLERANCE_LOG.md T3 (was 0.1, observed ~4e-5).
+        assert diff <= 1e-3, f"V4-Pro-style pattern: max logits diff {diff}"
 
     def test_long_context_sliding_window_wraparound(self):
         """Tier 2 hardening: prefill with seqlen >> sliding_window. With
@@ -725,7 +727,9 @@ class TestEndToEnd:
             l_t = model(x, start_pos=0)
         l_j = deepseek_v4_forward_prefill(t2j(x).astype(jnp.int32), params, swa, comp, cfg)
         diff = maxabs(l_j, l_t)
-        assert diff <= 0.15, f"long-context max logits diff {diff}"
+        # v8 iter 4 tightening per TOLERANCE_LOG.md T3 (was 0.15, observed
+        # 1.2e-4 at S=128). 2e-3 keeps a ~16x margin.
+        assert diff <= 2e-3, f"long-context max logits diff {diff}"
         # Argmax invariant — must agree on >=90% of the 128 positions.
         argmax_t = l_t.argmax(dim=-1).numpy()
         argmax_j = np.asarray(l_j.argmax(axis=-1))
@@ -751,7 +755,8 @@ class TestEndToEnd:
             params.embed_w, params.head_w, swa, comp, cfg,
         )
         diff = maxabs(mtp_logits_j, mtp_logits_t)
-        assert diff <= 0.1, f"MTP max logits diff {diff}"
+        # v8 iter 4 tightening per TOLERANCE_LOG.md T3 (was 0.1, observed ~2e-5).
+        assert diff <= 1e-3, f"MTP max logits diff {diff}"
 
 
 # =============================================================
