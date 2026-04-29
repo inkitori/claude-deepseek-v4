@@ -1,4 +1,4 @@
-# DeepSeek V4 v8 status (host-direct on v6e-32; iter 5 polish — compressor decode-step parity tightening)
+# DeepSeek V4 v8 status (host-direct on v6e-32; iter 6 polish — last 5e-2 holdout on attention_decode_step path tightened)
 TPU preflight: ok (4 v6e chips, logs/tpu-preflight.log)
 Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   708 GB host RAM). No docker. Real V4-Flash weights mounted via gcsfuse at
@@ -61,9 +61,15 @@ Tolerance tightenings (cumulative through iter 5 — every entry has measured-wo
   - Decode step parity (3 test classes, 26 points): 5e-2 -> 1e-4 (worst 3.81e-6; 25x margin).
   - **iter 5: Compressor decode-step parity (kv_compressed/kv_state/score_state, 9 configs × 8 seeds):
     5e-2 -> 1e-5 (worst 0.0/7.15e-7/5.96e-7 — fp32 ULP floor; 14–17x margin).**
+  - **iter 6: TestDecodeRollingParityLong (3 configs × 6 seeds × up to 32 steps ≈ 500 measurements):
+    5e-2 -> 1e-4 (worst 7.63e-6; 13x margin). Last 5e-2 holdout on the
+    attention_decode_step codepath (the only 5e-2 left is the intentionally-kept
+    moe_hash_layer test from iter 4, observed 4.20e-2 — too close to tighten).**
 
-Patches committed this iter (v8 iter 5 — cumulative):
-  - (pending commit): tighten compressor decode-step parity bounds + TOLERANCE_LOG T-CDS
+Patches committed this iter (v8 iter 6 — cumulative):
+  - (pending commit): iter 6 tighten TestDecodeRollingParityLong + extend TOLERANCE_LOG
+  - a761bf99 v8 iter 5 docs: STATUS/SUMMARY/PROGRESS reflect compressor-decode tightening
+  - e5712207 v8 iter 5 polish: tighten compressor decode-step parity (5e-2 -> 1e-5)
   - 454896fa v8 iter 4 final docs: 7 tolerance tightenings + 4 new parity points
   - 06a7b3b7 v8 iter 4 polish: tighten T1/T2 component bounds with measured evidence
   - cadebad8 v8 iter 4 polish: tighten T3 end-to-end logits parity bounds

@@ -101,6 +101,34 @@ Iter 4 commits:
   - cadebad8 — tighten T3 end-to-end logits parity bounds
   - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
 
+## v8 iter 6 — last `attention_decode_step` 5e-2 holdout tightened
+
+**Headline:** `TestDecodeRollingParityLong` was the last test still asserting
+`<= 5e-2` on the `attention_decode_step` codepath after iter 4 + iter 5. It
+runs the same per-step decode kernel as the iter-4-tightened
+`TestDecodeAttentionParity*` / `TestDecodeRollingParity` classes, just for
+longer rolling K (up to 32). **Total tests: 91 passing, 6 skipped on CPU +
+1 passing on TPU** — unchanged in count, tighter in defended bound.
+
+| Area | iter 5 state | iter 6 state | Measured worst | Margin |
+|---|---|---|---|---|
+| `TestDecodeRollingParityLong::test_rolling_decode_parity_long` (3 (layer, P, K) configs × ~32 steps each × 6 seeds ≈ 500 step measurements) | `atol=5e-2` | **`atol=1e-4`** | 7.63e-6 (layer=0 P=1 K=31 seed=7 step k=26) | 13× |
+
+**Why the longer rolling chain doesn't compound the per-step error.**
+`attention_decode_step` writes its result to `jax_state` and returns the
+new state for the next step. The per-step error is determined by the
+attention math at that single step (which is at bf16 ULP), not by
+accumulated drift, because the state buffers (KV slots + sliding window)
+are the same fp32 tensors that the torch reference holds — both sides
+read exact same fp32 history at step k. The 32-step rolling test is thus
+500× the surface area at the same per-step bf16 floor as iter 4's
+~22-measurement classes. 7.63e-6 is consistent with iter 4's 3.81e-6.
+
+Measurement script: `scripts/measure_rolling_long_parity.py`.
+
+Iter 6 commits (pending):
+  - tighten TestDecodeRollingParityLong + extend TOLERANCE_LOG entry
+
 ## v8 iter 5 — compressor decode-step parity tightening
 
 **Headline:** Iter 4 explicitly listed `TestCompressorDecodeStep` /

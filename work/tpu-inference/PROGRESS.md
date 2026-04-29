@@ -332,3 +332,30 @@ edits are already in tests/models/jax/test_deepseek_v4.py at lines 2135 +
 2149-2150 + 2366 + 2378-2382. Re-run TestCompressorDecodeStep* to confirm
 green at the new bound; then re-run the full suite to confirm no regressions
 elsewhere; then commit + push.
+
+
+## v8 iter 6 (2026-04-29 ~17:00 UTC) — last attention_decode_step 5e-2 holdout
+
+After iter 5 landed cleanly (commit e5712207 + a761bf99, pushed), grep for
+remaining `5e-2` budgets in the test file showed two: (a) the
+`test_moe_hash_layer_matches_torch` 5e-2 (intentionally kept — observed
+4.20e-2 in iter 4, too close to tighten safely); (b)
+`TestDecodeRollingParityLong::test_rolling_decode_parity_long` — same
+`attention_decode_step` path as iter 4 tightened to 1e-4, just for longer K.
+
+Plan for iter 6:
+  (1) measure rolling-long parity worst-case across 3 configs × 6 seeds × up to
+      32 steps per row.
+  (2) tighten 5e-2 -> 1e-4 (same bound as iter 4 sister classes).
+  (3) extend the existing "Decode step parity" TOLERANCE_LOG entry.
+  (4) re-run full suite to confirm no regressions; commit + push.
+
+Measured (scripts/measure_rolling_long_parity.py): worst 7.63e-6 (layer=0
+P=1 K=31 seed=7 step k=26). Same bf16 ULP regime as iter 4's measurements;
+the 32-step rolling chain doesn't compound per-step error because the state
+buffers are exact fp32 history on both sides. 1e-4 keeps a 13× margin.
+
+If killed mid-iter-6: the test edit is at line 2426 (5e-2 -> 1e-4) and the
+TOLERANCE_LOG "Decode step parity" entry has been extended to mention
+TestDecodeRollingParityLong + the 7.63e-6 measurement. Re-run that class to
+confirm green at 1e-4; then full suite; then commit + push.
