@@ -1907,6 +1907,95 @@ class TestRealFp8DequantSmoke:
         )
 
 
+class TestRealFp4DequantSmoke:
+    """Tier 4b extension (v8 iter 3): exercise the FP4 dequant path on a
+    real V4-Flash expert tensor. The synthetic tiny_v4_quant fixture uses
+    fp4_block=8, but real V4-Flash uses fp4_block=32 — this test confirms
+    the loader's recipe (FP4_TABLE codebook + e8m0 scale) handles the
+    production block size without producing NaN/inf or all-zeros.
+
+    Picks `layers.2.ffn.experts.0.w1` (shard 4): packed int8 [2048, 2048],
+    scale e8m0fnu [2048, 128] -> fp4_block = 4096 / 128 = 32.
+    """
+
+    REAL_DIR = _scratch("v4_flash")
+    INDEX = _scratch("v4_flash/model.safetensors.index.json")
+    TENSOR_BASE = "layers.2.ffn.experts.0.w1"
+
+    def test_real_fp4_dequant_produces_finite_nontrivial_bf16(self):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            dequant_fp4_to_bf16,
+        )
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        w_name = self.TENSOR_BASE + ".weight"
+        s_name = self.TENSOR_BASE + ".scale"
+        if w_name not in mapping or s_name not in mapping:
+            pytest.skip(f"{w_name} / {s_name} not in real V4-Flash index")
+        if mapping[w_name] != mapping[s_name]:
+            pytest.skip(
+                f"weight + scale across different shards "
+                f"({mapping[w_name]} vs {mapping[s_name]})"
+            )
+        shard_path = os.path.join(self.REAL_DIR, mapping[w_name])
+        with safe_open(shard_path, framework="pt") as f:
+            w = f.get_tensor(w_name)
+            s = f.get_tensor(s_name)
+        # Sanity on storage dtypes — these are the production FP4 dtypes.
+        assert w.dtype == torch.int8, (
+            f"unexpected weight dtype {w.dtype}; "
+            f"int8-packed FP4 was assumed by deepseek_v4_loader.dequant_fp4_to_bf16"
+        )
+        assert str(s.dtype) == "torch.float8_e8m0fnu", (
+            f"unexpected scale dtype {s.dtype}; "
+            f"e8m0fnu was assumed by deepseek_v4_loader.dequant_fp4_to_bf16"
+        )
+        # Block size derived from shapes: real V4-Flash uses 32.
+        out_dim, in_packed = w.shape
+        in_logical = 2 * in_packed
+        so, si = s.shape
+        assert so == out_dim, f"scale rows {so} != out_dim {out_dim}"
+        fp4_block = in_logical // si
+        assert fp4_block == 32, (
+            f"V4-Flash expects fp4_block=32; got {fp4_block} "
+            f"(in_logical={in_logical}, si={si})"
+        )
+
+        bf = dequant_fp4_to_bf16(w, s, fp4_block=fp4_block)
+        assert bf.dtype == torch.bfloat16, f"got {bf.dtype}"
+        assert tuple(bf.shape) == (out_dim, in_logical), (
+            f"shape: got {bf.shape}, expected ({out_dim}, {in_logical})"
+        )
+        # Numerical sanity.
+        bf_f = bf.float()
+        assert torch.isfinite(bf_f).all(), (
+            "FP4 dequant produced NaN/Inf — likely a scale-decode or "
+            "FP4_TABLE codebook bug"
+        )
+        std = bf_f.std().item()
+        assert std > 1e-4, (
+            f"FP4 dequant std={std:.4g} is suspiciously small"
+        )
+        amax = bf_f.abs().max().item()
+        assert 1e-3 < amax < 1e3, (
+            f"FP4 dequant amax={amax:.4g} outside [1e-3, 1e3]"
+        )
+        # FP4_TABLE only contains values in {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
+        # After scale multiplication every output should be a member of this
+        # set times a power-of-two scale. We don't enforce that exactly
+        # (would need to factor out the scale), but we DO check that
+        # exact-zero values exist (FP4 codebook has 0 entries) — a missing
+        # zero would suggest an off-by-one in the codebook lookup.
+        zeros_count = (bf_f == 0.0).sum().item()
+        assert zeros_count > 0, (
+            "FP4 dequant produced no exact zeros — codebook lookup likely "
+            "off; FP4_TABLE indices 0 and 8 both decode to 0.0"
+        )
+
+
 class TestQuantToParamsApply:
     """Tier 7 prep: apply dequantized tiny_v4_quant weights into the abstract
     DeepseekV4 param tree, run forward on a fixed input, and compare logits
