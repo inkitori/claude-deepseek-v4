@@ -396,3 +396,109 @@ The functional core is unchanged.
   3. Tier 4b — add a real V4-Flash *expert* shard byte-equal round-trip
      (currently we have bf16 embed + FP8 wq_a + FP4 expert dequant; an
      expert bf16 round-trip would cover the heaviest weight class).
+
+
+## v8 iter 7 (2026-04-29 ~17:30 UTC) — Tier 4b real-V4-Flash dequant byte-equal
+
+RESUMED at 2026-04-29T17:07Z. Baseline confirmed: 91 passed / 6 skipped on
+CPU, 1 passed on TPU — same end-state as iter 6 (commits dcc10282 +
+3b7530c8 + 33f4032d). T8 still architecturally blocked on HBM (BLOCKERS::
+T8-HBM-OOM).
+
+**Picked from prior session's follow-up list:** option (3) Tier 4b
+expansion. Chose this over (2) Tier 5 hardening because: (a) it's pure
+local code with no vllm-runtime debugging risk; (b) byte-equal independent
+reference is a stronger correctness check than concurrent vllm coverage;
+(c) iter 7 measurement evidence directly supports new spec-correctness
+invariants (I36-I38).
+
+**What landed (iter 7):**
+  1. Parametrized `TestRealFp8DequantSmoke` from 1 case
+     (`layers.0.attn.wq_a`) to 4 cases covering layers {0, 10, 30} and
+     attn projections {wq_a, wkv}.
+  2. Parametrized `TestRealFp4DequantSmoke` from 1 case
+     (`layers.2.ffn.experts.0.w1`) to 4 cases covering layers {0, 2, 5, 42},
+     experts {0, 10, 255}, and projections {w1, w2, w3}.
+  3. Added `TestFp8DequantIndependentReference` — bit-level e4m3fn
+     decode + bit-level e8m0fnu decode + np.kron block-broadcast, all in
+     numpy. Asserts bf16 byte-equal vs loader on `layers.0.attn.{wq_a,
+     wkv}`. 2 cases.
+  4. Added `TestFp4DequantIndependentReference` — sign-magnitude FP4
+     nibble decomposition with -0->+0 canonicalization (matches the
+     DeepSeek codebook spec choice). Asserts bf16 byte-equal vs loader's
+     16-entry FP4_TABLE lookup on `layers.{2,0}.ffn.experts.0.{w1, w2}`.
+     2 cases.
+
+**Spec finding (iter 7):** First version of the FP4 reference produced
+-0.0 (bf16 0x8000) where the loader produced +0.0 (bf16 0x0000) for
+nibble-8 inputs. Investigation revealed DeepSeek's FP4_TABLE intentionally
+maps both nibble 0 and nibble 8 to +0.0 (the negative-zero slot is unused).
+The reference now canonicalizes mag==0 -> +0.0 to match the loader's
+table-lookup output. This is now codified as INVARIANTS::I38.
+
+Affects ~0.6% of real expert weight bytes (every nibble-8 byte). Worth
+making explicit because:
+  - A future numerics check that compares loader against pure sign-magnitude
+    decode without the canonicalization would falsely flag a bug.
+  - Any third-party FP4 dequant for V4 weights (in vllm-tpu or otherwise)
+    must collapse -0 to +0 to match DeepSeek's runtime.
+
+**Test count: 91 -> 101 passed**, 6 skipped unchanged. CPU runtime barely
+changed (223s vs 227s) — gcsfuse cache absorbed the extra IO. TPU
+spot-check: 1 passed (~21s).
+
+**New TOLERANCE_LOG entries:** T-FP8-REF (byte-exact, 6.3M elements
+across 2 tensors), T-FP4-REF (byte-exact, 12.6M elements across 2 tensors).
+
+Iter 7 commits:
+  - c818b6c1 — code: parametrize Tier 4b FP8/FP4 smokes + add byte-equal
+    independent reference dequant.
+  - (pending) — iter 7 docs.
+
+If killed mid-iter-7: the code change is in commit c818b6c1 (already
+pushed). Docs in this session may not yet be pushed. Re-run the new test
+classes (`TestRealFp8DequantSmoke`, `TestRealFp4DequantSmoke`,
+`TestFp8DequantIndependentReference`, `TestFp4DequantIndependentReference`)
+to confirm green; then push.
+
+
+## Resume hint (post-v8 iter 7 — final state of this session)
+
+**If killed now:** the headline is still BLOCKERS.md::T8-HBM-OOM
+(architectural, unchanged from iter 3). Iter 7 was real-data hardening of
+Tier 4b — independent-reference byte-equal coverage closes a quiet
+correctness gap that the smoke tests left open.
+
+**Test suite end-state (commits c818b6c1 + iter-7 docs):**
+  - CPU: **101 passed, 6 skipped** (~3:43, +10 over iter 6's 91+6).
+  - TPU: **1 passing** (T6 spot-check confirmed post iter 7, ~21s).
+  - 5e-2 budgets remaining in test file: **1**, intentionally kept
+    (test_moe_hash_layer_matches_torch — observed 4.20e-2 in iter 4,
+    no safe tightening).
+  - Tier 4b coverage: 13 passing tests (was 3 in iter 6) — 1 bf16 shard
+    round-trip + 4 FP8 attn smokes + 4 FP4 expert smokes + 2 FP8
+    byte-equal-vs-numpy-reference + 2 FP4 byte-equal-vs-sign-magnitude-reference.
+  - All measurable tolerance budgets at fp32-ULP / bf16-ULP / byte-exact /
+    measurement-bound levels per TOLERANCE_LOG.md.
+
+**Cumulative iter-7 additions (this session):**
+  - 6 new parametrize cases (3 FP8 + 3 FP4) on diverse real V4-Flash tensors.
+  - 4 new byte-equal independent-reference tests (2 FP8 + 2 FP4).
+  - 3 new invariants: I36 (FP8 byte-equal to bit-level reference),
+    I37 (FP4 byte-equal to sign-magnitude reference), I38 (FP4 codebook
+    collapses -0 to +0).
+  - 2 new TOLERANCE_LOG entries: T-FP8-REF, T-FP4-REF.
+
+**Useful follow-up if more session time appears:**
+  1. T8 architectural unblock — needs user decision (multi-host launcher
+     vs native FP4/FP8 storage vs host-RAM offload). None are pure
+     model-code work.
+  2. Tier 5 hardening — extend TestVllmServeRoundtrip with 2 concurrent
+     requests via threads to exercise B1 end-to-end through vllm's
+     scheduler (current test is sequential; with --max-num-seqs 2 the
+     scheduler would batch concurrent requests but only sees serial ones).
+     Risk: paged-KV path through vllm has known limitations (BLOCKERS::B1).
+  3. Tier 4b independent reference for the e4m3fn cast itself — iterate
+     all 256 byte values and verify torch's `.float()` matches the
+     hand-decoded value exactly. Tautology if torch is correct, but
+     locks in the assumption explicitly.

@@ -101,6 +101,52 @@ Iter 4 commits:
   - cadebad8 — tighten T3 end-to-end logits parity bounds
   - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
 
+## v8 iter 7 — Tier 4b real-V4-Flash dequant byte-equal coverage
+
+**Headline:** Tier 4b's real-V4-Flash dequant validation was previously two
+single-tensor smoke tests asserting only "finite, non-trivial std,
+expected magnitude range." Iter 7 expands to **8 parametrized smokes
+across diverse layers/projections/experts plus 4 byte-equal independent-
+reference checks** that catch FP8/FP4 spec divergence at the bit level.
+**Total tests: 101 passing, 6 skipped on CPU + 1 passing on TPU** — was
+91+1 in iters 4-6.
+
+| Area | iter 6 state | iter 7 state | What it catches |
+|---|---|---|---|
+| `TestRealFp8DequantSmoke` (real V4-Flash FP8 attn weights) | 1 case (`layers.0.attn.wq_a`) | **4 cases** — `layers.{0,10,30}.attn.{wq_a,wkv}` | per-layer / per-projection scale-decode anomalies |
+| `TestRealFp4DequantSmoke` (real V4-Flash FP4 expert weights) | 1 case (`layers.2.ffn.experts.0.w1`) | **4 cases** — w1/w2/w3 across experts {0,10,255} and layers {0,2,5,42} | per-expert / per-projection codebook-lookup bugs |
+| `TestFp8DequantIndependentReference` | did not exist | **2 cases byte-equal vs numpy reference** — `layers.0.attn.{wq_a,wkv}` | torch's e4m3fn->fp32 cast diverging from spec; scale-block axis swap; off-by-one in scale broadcast |
+| `TestFp4DequantIndependentReference` | did not exist | **2 cases byte-equal vs sign-magnitude reference** — `layers.{2,0}.ffn.experts.0.{w1,w2}` | nibble-order swap; sign-bit at wrong position; FP4_TABLE corruption; scale-axis misalignment |
+
+**The reference test design.** The smoke tests verified plausibility; the
+reference tests verify spec correctness. Each reference uses a deliberately
+different code path from the loader:
+
+  - **FP8:** loader does `weight.float() * scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)` then `.bfloat16()`. Reference decodes e4m3fn from raw bytes (sign + 4-bit biased exponent + 3-bit mantissa, FN-variant NaN at `0x7F/0xFF`), decodes e8m0fnu via `np.exp2(byte - 127)`, broadcasts via `np.kron(scale, np.ones((128,128)))`, casts to bf16 via torch.
+  - **FP4:** loader does a 16-entry `_FP4_TABLE_T[nibble]` lookup. Reference decomposes each nibble into sign + 3-bit magnitude index, looks up an 8-entry magnitude table, and conditionally negates. Both paths share *only* the canonical magnitude set `{0, ½, 1, 1½, 2, 3, 4, 6}`.
+
+Both pairs produce byte-identical bf16 output across all 6.3M+ FP8
+elements and 12.6M+ FP4 elements tested. A regression here would indicate
+a real loader bug — not a precision drift.
+
+**Spec finding from iter 7 (now I38):** DeepSeek's FP4 codebook collapses
+nibble 8 (sign=1, mag=0) to **+0.0**, not -0.0. Pure sign-magnitude
+decode produces -0.0 (bf16 `0x8000`) where the loader's table lookup
+produces +0.0 (bf16 `0x0000`). The reference now canonicalizes -0 → +0
+to match. This affects ~0.6% of real expert weight bytes (every nibble-8
+input) and is recorded in INVARIANTS.md::I38.
+
+**Three new invariants** (INVARIANTS.md):
+  - I36 — FP8 dequant byte-equal to bit-level reference on real V4-Flash.
+  - I37 — FP4 dequant byte-equal to sign-magnitude reference on real V4-Flash.
+  - I38 — DeepSeek's FP4 codebook collapses negative-zero to positive-zero.
+
+**Two new TOLERANCE_LOG entries:** T-FP8-REF and T-FP4-REF (both byte-exact).
+
+Iter 7 commits:
+  - c818b6c1 — parametrize Tier 4b FP8/FP4 smokes + add byte-equal independent reference dequant
+  - (pending commit) — iter 7 docs update (STATUS, SUMMARY, PROGRESS, INVARIANTS, TOLERANCE_LOG)
+
 ## v8 iter 6 — last `attention_decode_step` 5e-2 holdout tightened
 
 **Headline:** `TestDecodeRollingParityLong` was the last test still asserting

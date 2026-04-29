@@ -157,3 +157,28 @@ risk in PROD_TOPOLOGY_RISKS.md item 1.
 **Default:** exact int equality.
 **Looser:** *set* equality of selected indices per (batch, seq) position (ignoring -1 sentinels).
 **Evidence:** `lax.top_k` and `torch.topk` may break score-ties in different orders when two scores are bit-equal in fp32. Set-equality is the appropriate invariant — the question is "did we pick the same K compressed positions to attend to," not "in what order." If a real bug were present (e.g. wrong compressor output), the SETS would differ.
+
+## T-FP8-REF — FP8 dequant byte-equality vs independent numpy reference (Tier 4b, `TestFp8DequantIndependentReference`): byte-exact (v8 iter 7)
+**Where:** `TestFp8DequantIndependentReference::test_byte_equal_against_numpy_reference[layers.0.attn.{wq_a,wkv}]`.
+**Asserted quantity:** `loader_bf16.view(uint16) == reference_bf16.view(uint16)` element-wise across the full tensor.
+**Reference:** bit-level e4m3fn decode in numpy (sign + exp + mantissa arithmetic, FN-variant NaN at saturated `0x7F`/`0xFF`), bit-level e8m0fnu decode (`np.exp2(byte - 127)`), block scale upsample via `np.kron(scale, np.ones((128,128)))` instead of torch's `repeat_interleave`.
+**Loader:** `weight.float() * scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)`, then `.bfloat16()`.
+**Default:** byte-exact in bf16 (16/16 bits identical per element).
+**Evidence (measured 2026-04-29 v8 iter 7):**
+  - `layers.0.attn.wq_a` (1024 × 4096, ~4 MB): byte-equal across all 4,194,304 elements.
+  - `layers.0.attn.wkv`  (512  × 4096, ~2 MB): byte-equal across all 2,097,152 elements.
+  - The two paths share only the final torch `.bfloat16()` RTNE cast — they diverge in everything else (dtype-cast vs bit-decode, `repeat_interleave` vs `kron`). Byte-equal across both code paths means: (a) torch's e4m3fn `.float()` agrees with the FP8 spec; (b) scale-block axes are correct; (c) no off-by-one in scale broadcast.
+  - A regression here would indicate the loader has diverged from the FP8 spec — a real bug, not a precision drift. There is no acceptable looser bound.
+
+## T-FP4-REF — FP4 dequant byte-equality vs independent sign-magnitude reference (Tier 4b, `TestFp4DequantIndependentReference`): byte-exact (v8 iter 7)
+**Where:** `TestFp4DequantIndependentReference::test_byte_equal_against_numpy_reference[layers.{2,0}.ffn.experts.0.{w1,w2}]`.
+**Asserted quantity:** `loader_bf16.view(uint16) == reference_bf16.view(uint16)` element-wise.
+**Reference:** sign-magnitude FP4 nibble decode using an 8-entry magnitude table `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` indexed by the low 3 bits, with conditional negate from the sign bit (the high bit). Includes the spec-correct -0 → +0 canonicalization (DeepSeek's codebook collapses nibble 8 to +0.0; see INVARIANTS.md::I38). Scale upsample via `np.repeat`, not `torch.repeat_interleave`.
+**Loader:** 16-entry `_FP4_TABLE_T` lookup keyed by the full nibble.
+**Default:** byte-exact in bf16.
+**Evidence (measured 2026-04-29 v8 iter 7):**
+  - `layers.2.ffn.experts.0.w1` (2048 × 4096 logical, packed 2048×2048 int8, ~4 MB): byte-equal.
+  - `layers.0.ffn.experts.0.w2` (4096 × 2048 logical, ~4 MB): byte-equal.
+  - The two paths share *only* the magnitude set; addressing patterns are deliberately different (table lookup vs sign-magnitude reconstruction). Byte-equality means: (a) sign bit is at position 3 of the nibble (high bit), (b) low nibble decodes to `unpacked[2k]` and high nibble to `unpacked[2k+1]`, (c) the FP4_TABLE encodes the canonical magnitude set in the documented order, (d) e8m0fnu scales broadcast correctly along the IN axis with `fp4_block=32`.
+  - The reference initially produced -0.0 (bf16 `0x8000`) where the loader produced +0.0 (bf16 `0x0000`) for nibble-8 inputs (~0.6% of expert weight bytes). This is the spec choice documented at INVARIANTS.md::I38: DeepSeek's FP4_TABLE has `0.0` at both indices 0 and 8 (the negative-zero slot is unused). The reference canonicalizes to match.
+  - A regression here would indicate one of: nibble-order swap, sign-bit position error, magnitude-table corruption, or scale-axis misalignment. No acceptable looser bound.
