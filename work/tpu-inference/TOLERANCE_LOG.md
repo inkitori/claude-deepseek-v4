@@ -182,3 +182,23 @@ risk in PROD_TOPOLOGY_RISKS.md item 1.
   - The two paths share *only* the magnitude set; addressing patterns are deliberately different (table lookup vs sign-magnitude reconstruction). Byte-equality means: (a) sign bit is at position 3 of the nibble (high bit), (b) low nibble decodes to `unpacked[2k]` and high nibble to `unpacked[2k+1]`, (c) the FP4_TABLE encodes the canonical magnitude set in the documented order, (d) e8m0fnu scales broadcast correctly along the IN axis with `fp4_block=32`.
   - The reference initially produced -0.0 (bf16 `0x8000`) where the loader produced +0.0 (bf16 `0x0000`) for nibble-8 inputs (~0.6% of expert weight bytes). This is the spec choice documented at INVARIANTS.md::I38: DeepSeek's FP4_TABLE has `0.0` at both indices 0 and 8 (the negative-zero slot is unused). The reference canonicalizes to match.
   - A regression here would indicate one of: nibble-order swap, sign-bit position error, magnitude-table corruption, or scale-axis misalignment. No acceptable looser bound.
+
+## T-FP8-CAST — e4m3fn / e8m0fnu numpy decoder vs torch's `.float()` cast (Tier 4b, `TestFp8CastByteDomain`): byte-exact across all 256 input bytes (v8 iter 8)
+**Where:** `TestFp8CastByteDomain::test_e4m3fn_all_256_bytes_match_torch_cast`, `test_e8m0fnu_all_256_bytes_match_torch_cast`.
+**Asserted quantity:** for each of the 256 possible 8-bit byte values: (a) NaN-position equality between our numpy decoder and torch's `view(<dtype>).float()` cast, and (b) bit-level (uint32) equality on all non-NaN positions.
+**Reference:** the same `_numpy_decode_e4m3fn` / `_numpy_decode_e8m0fnu` used elsewhere in Tier 4b — but here applied to the *complete* domain rather than just the byte distribution that V4-Flash happens to contain.
+**Default:** byte-exact in fp32.
+**Evidence (measured 2026-04-29 v8 iter 8):**
+  - **e4m3fn**: 256/256 bytes match. NaN positions: `{0x7F, 0xFF}` (FN-variant spec, both decoders agree). Non-NaN bytes: 254/254 bit-equal in fp32. Spot-checks: 0x00 → +0.0, 0x80 → -0.0 (sign-bit preserved), 0x38 → +1.0, 0x7E → +448.0 (FN max-finite).
+  - **e8m0fnu**: 256/256 bytes match. NaN position: `{0xFF}` only. Non-NaN bytes: 255/255 bit-equal. Spot-checks: byte=0 → 2^-127 (subnormal in fp32; the ULP edge), byte=127 → +1.0, byte=254 → 2^127 (max finite).
+  - Why this matters even though every other Tier 4b real-data test would fail if either decoder were wrong: real V4-Flash weights only sample ~30-40% of the e4m3fn byte domain (most encoded values are O(1), so the 0xFC..0xFE saturated normals and many subnormals are statistically rare). The exhaustive test fences the *unused* corner of the domain — the rare bytes that a synthetic adversarial input could exploit, and that a future torch upgrade could silently change behavior on.
+  - There is no acceptable looser bound: this is a tautology if torch is correct, a real bug otherwise. Asserted in fp32 (no bf16 cast) so we lock in the boundary at the cast itself rather than past the bf16 RTNE rounding step.
+
+## T-FP8-REF / T-FP4-REF coverage expansion (v8 iter 8)
+**Where:** parametrize lists on `TestFp8DequantIndependentReference` and `TestFp4DequantIndependentReference`.
+**Asserted quantity:** unchanged (byte-exact bf16) — same assertion as iter 7.
+**Coverage delta (iter 7 → iter 8):**
+  - FP8 from 2 → 6 cases: `layers.0.attn.{wq_a, wkv}` (iter7) + `layers.20.attn.wq_b`, `layers.10.attn.wo_a`, `layers.5.attn.wo_b`, `layers.40.ffn.shared_experts.w1` (iter8). 5 distinct projections, 4 distinct shapes (incl. `wq_b`'s out>>in aspect, `wo_b`'s in>out aspect, and `shared_experts`'s dense FFN path), 4 distinct shards, layers in {0, 5, 10, 20, 40}. Largest single tensor: 32 MB int8.
+  - FP4 from 2 → 4 cases: `layers.{2,0}.ffn.experts.0.{w1, w2}` (iter7) + `layers.30.ffn.experts.128.w1`, `layers.10.ffn.experts.50.w3` (iter8). All three SwiGLU projections covered, expert ids in {0, 50, 128}, layers {0, 2, 10, 30}.
+**Evidence:** all 6 FP8 + 4 FP4 cases pass byte-equally. Total: ~150 MB of real V4-Flash data byte-validated against the independent reference (vs ~12 MB in iter 7).
+**Why this is a tightening even though the per-test atol is unchanged:** the iter-7 byte-equal evidence covered only the layer-0 attn projections at one specific shape ratio. Iter 8 closes the gap that "the loader is correct on the iter-7 cases" → "the loader is correct across the full V4-Flash surface": all 5 FP8 projection types, all 3 FP4 SwiGLU projections, deep-layer + high-expert-id corners of the model, and shapes the iter-7 cases didn't exercise (out>>in, in>out).

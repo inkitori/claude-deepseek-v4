@@ -1,4 +1,4 @@
-# DeepSeek V4 v8 status (host-direct on v6e-32; iter 7 polish — Tier 4b expanded with byte-equal independent reference dequant)
+# DeepSeek V4 v8 status (host-direct on v6e-32; iter 8 polish — Tier 4b 256-byte exhaustive cast parity + cross-tensor real-data byte-equal expansion)
 TPU preflight: ok (4 v6e chips, logs/tpu-preflight.log)
 Host: TPU v6e-32 single-VM (4 local chips of 32 GB HBM each = 128 GB total HBM,
   708 GB host RAM). No docker. Real V4-Flash weights mounted via gcsfuse at
@@ -14,8 +14,11 @@ Latest passing tier: T1-T7 + B1 multi-seq dispatch + T4b on real V4-Flash
   compressor-decode-step parity (atol=1e-5); iter 6 tightened
   TestDecodeRollingParityLong (5e-2 -> 1e-4); iter 7 expanded Tier 4b
   real-V4-Flash dequant coverage from 2 single-tensor smokes to 8 parametrized
-  smokes + 4 byte-equal independent-reference checks. T8 (deploy gate) BLOCKED
-  on HBM OOM (architectural; see BLOCKERS.md::T8-HBM-OOM).
+  smokes + 4 byte-equal independent-reference checks; **iter 8 adds 256-byte
+  exhaustive cast parity (`TestFp8CastByteDomain`, e4m3fn + e8m0fnu) and
+  expands the byte-equal independent-reference parametrize to 6 FP8 + 4 FP4
+  cases on real V4-Flash data**. T8 (deploy gate) BLOCKED on HBM OOM
+  (architectural; see BLOCKERS.md::T8-HBM-OOM).
 
 Tier 1: 25/25  (T1 attention: 5e-2 -> 1e-3; T2 block: 5e-2 -> 2e-2;
   T2 MoE: 5e-2 -> 5e-3; MoE-hash kept at 5e-2 — all tightenings backed
@@ -26,12 +29,16 @@ Tier 2 hardening (v3 + v8 long-context + iter 4 256/768): 19/19 — 11 from v3,
   SWA + HCA), all at the tightened atol=1e-4 bound (was 5e-2).
 Tier 3: 10/10  (V4-Flash full + 2-layer compile; V4-Pro skipped — no v4_pro fixture)
 Tier 4: 2/2    (HF->JAX name mapping)
-Tier 4b: 13/13 (was 3/3 in iter 6) — real V4-Flash byte-equal bf16 shard +
-  4 FP8 attn smokes (was 1) + 4 FP4 expert smokes (was 1) + 2 FP8
-  byte-equal-vs-numpy-reference + 2 FP4 byte-equal-vs-sign-magnitude-reference,
-  all on the gcsfuse-mounted snapshot. The reference tests catch FP8/FP4 spec
-  divergence at the bit level — see TOLERANCE_LOG::T-FP8-REF / T-FP4-REF
-  and INVARIANTS::I36-I38.
+Tier 4b: 21/21 (was 13/13 in iter 7) — real V4-Flash byte-equal bf16 shard +
+  4 FP8 attn smokes + 4 FP4 expert smokes + **6 FP8 byte-equal-vs-numpy-reference**
+  (was 2; +`wq_b`, `wo_a`, `wo_b`, `shared_experts.w1`) +
+  **4 FP4 byte-equal-vs-sign-magnitude-reference** (was 2; +`experts.128.w1`
+  on layer 30, +`experts.50.w3` on layer 10) + **2 NEW byte-domain
+  exhaustive-cast tests** (`TestFp8CastByteDomain`: e4m3fn 256/256 bytes
+  bit-equal vs torch's `.float()` cast; e8m0fnu 256/256 bytes bit-equal).
+  All on the gcsfuse-mounted snapshot. The exhaustive byte-domain tests
+  fence the unused corner of the FP8 input domain — see TOLERANCE_LOG::
+  T-FP8-CAST and INVARIANTS::I39-I42.
 Tier 5: 1/1    (vllm serve /v1/completions byte-equal — synthetic tiny_v4_bf16)
 Tier 6: 1/1    (TPU-only — `JAX_PLATFORMS=tpu pytest TestRealTpuTinyForward`)
 Tier 7: 1/1    (forward on tiny_v4_quant ≡ forward on tiny_v4_groundtruth —
@@ -56,7 +63,7 @@ W5 deploy gate: BLOCKED on HBM topology — see Tier 8 above and BLOCKERS::T8-HB
   The deploy gate cannot pass on a 4-chip slice; the user's deployment target
   must be the full 32-chip v6e-32 slice (8 hosts) to fit V4-Flash bf16.
 
-Tolerance tightenings (cumulative through iter 7 — every entry has measured-worst evidence in TOLERANCE_LOG.md):
+Tolerance tightenings (cumulative through iter 8 — every entry has measured-worst evidence in TOLERANCE_LOG.md):
   - T1 attention prefill (3 tests): 5e-2 -> 1e-3 (worst 7.63e-6 / 45 seeds; 130x margin).
   - T2 block forward (4 tests): 5e-2 -> 2e-2 (worst 7.81e-3 / 80 seeds; 2.5x margin).
   - T2 MoE forward: 5e-2 -> 5e-3 (worst 4.88e-4 / 10 seeds; 10x margin).
@@ -71,7 +78,7 @@ Tolerance tightenings (cumulative through iter 7 — every entry has measured-wo
     5e-2 -> 1e-4 (worst 7.63e-6; 13x margin). Last 5e-2 holdout on the
     attention_decode_step codepath (the only 5e-2 left is the intentionally-kept
     moe_hash_layer test from iter 4, observed 4.20e-2 — too close to tighten).
-  - **iter 7: Tier 4b real-V4-Flash dequant byte-equal coverage** — independent
+  - iter 7: Tier 4b real-V4-Flash dequant byte-equal coverage — independent
     numpy references (bit-level e4m3fn/e8m0fnu decode + np.kron block scale;
     sign-magnitude FP4 nibble decomposition with -0->+0 canonicalization) match
     the loader byte-equally on `layers.0.attn.{wq_a,wkv}` (FP8) and
@@ -79,30 +86,44 @@ Tolerance tightenings (cumulative through iter 7 — every entry has measured-wo
     tolerance tightening (these were never tolerance-bounded — the smoke tests
     only verified plausibility); the reference tests upgrade them to
     spec-correctness. See TOLERANCE_LOG::T-FP8-REF / T-FP4-REF.
+  - **iter 8: Tier 4b 256-byte exhaustive cast parity + cross-tensor real-data
+    byte-equal expansion** — `TestFp8CastByteDomain` covers all 256 e4m3fn
+    bytes + all 256 e8m0fnu bytes with bit-exact equality vs torch's `.float()`
+    cast (NaN positions agree on the FN/e8m0 specs; non-NaN values bit-equal in
+    fp32). The byte-equal real-data parametrize lists go from 2 → 6 cases for
+    FP8 (5 distinct projections, 4 distinct shapes incl. wq_b out>>in / wo_b
+    in>out / shared_experts dense FFN; layers {0,5,10,20,40}) and 2 → 4 cases
+    for FP4 (all 3 SwiGLU projections; expert ids in {0,50,128}; layers
+    {0,2,10,30}). ~104 MB FP8 + ~16 MB FP4 of real V4-Flash bf16 output bytes
+    independently validated (vs ~12 MB total in iter 7). See TOLERANCE_LOG::
+    T-FP8-CAST and the iter-8 expansion entry.
 
-New invariants from iter 7 (INVARIANTS.md):
-  - I36 — FP8 dequant byte-equal to bit-level reference on real V4-Flash.
-  - I37 — FP4 dequant byte-equal to sign-magnitude reference on real V4-Flash.
-  - I38 — DeepSeek's FP4 codebook collapses nibble 8 to +0.0 (not -0.0).
+New invariants from iter 8 (INVARIANTS.md):
+  - I39 — e4m3fn 256-byte cast: numpy ref ≡ torch cast bit-for-bit.
+  - I40 — e8m0fnu 256-byte cast: numpy ref ≡ torch cast bit-for-bit.
+  - I41 — FP8 dequant byte-equal coverage spans 6 distinct real V4-Flash tensors.
+  - I42 — FP4 dequant byte-equal coverage spans 4 distinct real V4-Flash expert tensors.
 
-Patches committed this iter (v8 iter 7):
-  - (pending commit): iter 7 docs (STATUS/SUMMARY/PROGRESS/INVARIANTS/TOLERANCE_LOG)
+Patches committed this iter (v8 iter 8):
+  - (pending commit): iter 8 polish — 256-byte exhaustive byte-domain parity
+    + parametrize expansion on Tier 4b independent-reference tests.
+  - (pending commit): iter 8 docs (STATUS / SUMMARY / PROGRESS / DECISIONS /
+    INVARIANTS / TOLERANCE_LOG).
+  - 5ceb3e32 v8 iter 7 docs: STATUS/SUMMARY/PROGRESS/INVARIANTS/TOLERANCE_LOG reflect Tier 4b byte-equal expansion
   - c818b6c1 v8 iter 7 polish: parametrize Tier 4b FP8/FP4 smokes + add byte-equal independent reference dequant
   - dcc10282 v8 iter 6 final: resume hint documents end-state (91+1/6 skipped)
   - 3b7530c8 v8 iter 6 docs: STATUS/SUMMARY/PROGRESS reflect rolling-long tightening
   - 33f4032d v8 iter 6 polish: tighten TestDecodeRollingParityLong (5e-2 -> 1e-4)
-  - a761bf99 v8 iter 5 docs: STATUS/SUMMARY/PROGRESS reflect compressor-decode tightening
-  - e5712207 v8 iter 5 polish: tighten compressor decode-step parity (5e-2 -> 1e-5)
 
 Full CPU run target: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/jax/test_deepseek_v4.py`
-  -> **101 passed, 6 skipped** at iter 7 bounds (was 91+6 in iters 4-6; +10 new
-  tests in iter 7: 6 from parametrize expansion of FP8/FP4 smokes + 4
-  byte-equal independent-reference cases).
+  -> **109 passed, 6 skipped** at iter 8 bounds (was 101+6 in iter 7; +8 new
+  tests in iter 8: 2 byte-domain exhaustive-cast tests + 4 new FP8 byte-equal
+  cases + 2 new FP4 byte-equal cases).
   Skipped: 5 V4-Pro RealConfigCompile tests (no v4_pro fixture on this host)
   + 1 TPU-only forward (TestRealTpuTinyForward, needs JAX_PLATFORMS=tpu).
 TPU spot-check target: `JAX_PLATFORMS=tpu pytest tests/models/jax/test_deepseek_v4.py::TestRealTpuTinyForward`
-  -> 1 passed (~21 s). Confirmed post iter 7 — iter 7 only touches Tier 4b
-  CPU-side dequant tests, so no impact on T6.
+  -> 1 passed (~21 s). Confirmed post iter 8 — iter 8 only touches Tier 4b
+  CPU-side tests, so no impact on T6.
 
 If killed now, next session must:
   (1) read BLOCKERS.md::T8-HBM-OOM end-to-end (it's still the headline);

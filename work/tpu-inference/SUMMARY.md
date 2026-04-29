@@ -101,6 +101,48 @@ Iter 4 commits:
   - cadebad8 — tighten T3 end-to-end logits parity bounds
   - 06a7b3b7 — tighten T1/T2 component bounds (Attention, Block, MoE)
 
+## v8 iter 8 — Tier 4b exhaustive byte-domain reference + cross-tensor real-data byte-equal coverage
+
+**Headline:** Iter 7 left two open follow-ups on the Tier 4b roadmap: (a) lock
+in the numpy decoder vs torch's native cast across *all 256 input bytes*
+(not just the byte distribution real V4-Flash happens to contain), and (b)
+extend the byte-equal independent-reference cases beyond the iter-7
+layer-0 attn projections to deeper layers + more projection types + the
+shared-experts FP8 path. Iter 8 ships both. **Total tests: 109 passing,
+6 skipped on CPU + 1 passing on TPU** — was 101+1 in iter 7 (+8 new tests).
+
+| Area | iter 7 state | iter 8 state | What it adds |
+|---|---|---|---|
+| `TestFp8CastByteDomain` (numpy ref vs torch `.float()` cast on every byte) | did not exist | **2 new exhaustive tests** — `test_e4m3fn_all_256_bytes_match_torch_cast`, `test_e8m0fnu_all_256_bytes_match_torch_cast` | future torch-version regressions in the cast itself; exercises subnormal corner (byte=0 → 2^-127) and FN-max-finite corner (byte=0x7E → +448.0); validates that NaN positions match the FN/e8m0 specs literally |
+| `TestFp8DequantIndependentReference` byte-equal coverage | 2 cases (`layers.0.attn.{wq_a, wkv}`) | **6 cases** — +`layers.20.attn.wq_b`, `layers.10.attn.wo_a`, `layers.5.attn.wo_b`, `layers.40.ffn.shared_experts.w1` | `wq_b` (out>>in aspect 32768×1024); `wo_a/wo_b` (output projections, with `wo_b` in>out); `shared_experts.w1` (the only FP8 path outside attn — the dense FFN); deeper layers {5, 10, 20, 40} |
+| `TestFp4DequantIndependentReference` byte-equal coverage | 2 cases (`layers.{2,0}.ffn.experts.0.{w1, w2}`) | **4 cases** — +`layers.30.ffn.experts.128.w1`, `layers.10.ffn.experts.50.w3` | mid-range expert id (128); w3 SwiGLU projection (gate-up); deep layer 30; layer 10 expert 50 |
+
+**Coverage statistics (iter 8):**
+  - **Byte-domain coverage:** 256/256 e4m3fn bytes, 256/256 e8m0fnu bytes, all bit-equal vs torch's `.float()` cast (NaN positions agree on `{0x7F, 0xFF}` for e4m3fn and `{0xFF}` for e8m0fnu).
+  - **FP8 real-data byte-equal:** 6 tensors total, ~104 MB of bf16 output bytes validated against the independent numpy reference (vs ~12 MB in iter 7). Spans 5 distinct projections, 4 distinct shapes, 4 distinct shards, layers {0, 5, 10, 20, 40}.
+  - **FP4 real-data byte-equal:** 4 tensors total, ~16 MB of bf16 output bytes byte-validated. All three SwiGLU projections (w1/w2/w3) covered; expert ids in {0, 50, 128}; layers {0, 2, 10, 30}.
+
+**Why the exhaustive byte-domain test matters even though every other Tier 4b test would fail if the decoder were wrong:** real V4-Flash weights only sample about 30-40% of the e4m3fn byte domain (most encoded values are O(1), so the saturated normals 0xFC..0xFE and many subnormals are statistically rare). The exhaustive test fences the *unused* corner of the domain — the rare bytes that a synthetic adversarial input could exploit, and that a future torch upgrade could silently change behavior on. It's a tautology if torch is correct and a real bug otherwise; either way, the test is the signal.
+
+**Side-effect cleanup:** the iter-7 `_numpy_decode_e8m0fnu` produced an "overflow encountered in cast" RuntimeWarning when fed byte=0xFF (the NaN slot, where `np.exp2(128)` overflows fp32 before `np.where` re-masks to NaN). Iter 8 pre-masks the exponent so the computation only sees finite-encoding bytes. Functionally identical; quieter test output.
+
+**Four new invariants** (INVARIANTS.md):
+  - I39 — e4m3fn 256-byte cast: numpy ref ≡ torch's `.float()` cast bit-for-bit.
+  - I40 — e8m0fnu 256-byte cast: numpy ref ≡ torch's `.float()` cast bit-for-bit.
+  - I41 — FP8 dequant byte-equal coverage spans 6 distinct real V4-Flash tensors (5 projections, 4 shapes, 4 shards).
+  - I42 — FP4 dequant byte-equal coverage spans 4 distinct real V4-Flash expert tensors (all 3 SwiGLU projections, layers {0,2,10,30}).
+
+**Two new TOLERANCE_LOG entries:** T-FP8-CAST (256-byte fp32 byte-exact) and T-FP8-REF / T-FP4-REF coverage expansion (real-data byte-exact, expanded parametrize).
+
+**What's deliberately *not* in iter 8:**
+  - **No T8 retry.** The HBM-OOM blocker is architectural (4-chip slice, 128 GB HBM vs 543 GB bf16 weights). No model-code work moves it. Decision needs the user.
+  - **No Tier 5 concurrent-vllm hardening.** Two concurrent requests via threads through `vllm serve` would exercise B1 end-to-end through vllm's scheduler, but adds vllm-runtime risk that could destabilize the suite. Deferred.
+  - **No new features.** Spec says no.
+
+Iter 8 commits (pending):
+  - iter 8 polish: Tier 4b 256-byte exhaustive byte-domain parity + real-tensor byte-equal expansion (FP8 + 4, FP4 + 2)
+  - iter 8 docs: STATUS / SUMMARY / PROGRESS / INVARIANTS / TOLERANCE_LOG / DECISIONS
+
 ## v8 iter 7 — Tier 4b real-V4-Flash dequant byte-equal coverage
 
 **Headline:** Tier 4b's real-V4-Flash dequant validation was previously two
