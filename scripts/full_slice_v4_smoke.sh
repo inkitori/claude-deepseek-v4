@@ -47,19 +47,50 @@ export TRANSFORMERS_OFFLINE=1
 # attention DP topology (`enable_dp_attention=true` requires this).
 export NEW_MODEL_DESIGN=1
 
+# Slice-aware loader: each host reads only its row range. Default 1.
+# Set V4_LOADER_SLICE_AWARE=0 to fall back to full-tensor dequant per host.
+export V4_LOADER_SLICE_AWARE="${V4_LOADER_SLICE_AWARE:-1}"
+
 # Optional opt-in: parallel CPU dequant inside iter_v4_safetensors_dequant_torch.
-# Default 0 = current sequential behavior. Set V4_LOADER_PREFETCH_WORKERS=4..8
-# at the shell to overlap dequant with TPU placement and parallelize across
-# cores per host. Forwarded to Ray workers via VLLM_RAY_EXTRA_ENV_VARS_TO_COPY.
+# Default 0 = sequential. Set to 4-8 to overlap dequant with TPU placement.
+# Note: empirically this didn't help on real V4 because placement (PCIe), not
+# CPU dequant, is the bottleneck. Kept as a knob for future work.
 export V4_LOADER_PREFETCH_WORKERS="${V4_LOADER_PREFETCH_WORKERS:-0}"
-existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-if [ -n "$existing_extra" ]; then
-    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},V4_LOADER_PREFETCH_WORKERS"
-else
-    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="V4_LOADER_PREFETCH_WORKERS"
+
+# Persistent JAX compile cache: every Ray worker reuses XLA-compiled modules
+# across launches as long as the cache dir is reachable. Per-host (not GCS),
+# so each worker has its own cache. Survives process restarts; lost if the
+# worker host is rebuilt. Set V4_JAX_CACHE_DIR= to disable.
+export V4_JAX_CACHE_DIR="${V4_JAX_CACHE_DIR:-/tmp/jax-compile-cache-v4}"
+if [ -n "$V4_JAX_CACHE_DIR" ]; then
+    mkdir -p "$V4_JAX_CACHE_DIR"
+    export JAX_COMPILATION_CACHE_DIR="$V4_JAX_CACHE_DIR"
 fi
 
-echo "[smoke] launching vllm serve | log=$LOG | prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
+# XLA: parallelize compile passes across CPU cores. Modest 10-30% compile
+# speedup. Off by default in tpu-inference; turning it on for our smoke.
+existing_xla="${XLA_FLAGS:-}"
+xla_extra="--xla_tpu_impure_hlo_parallel_compile=true"
+if [ -n "$existing_xla" ]; then
+    export XLA_FLAGS="$existing_xla $xla_extra"
+else
+    export XLA_FLAGS="$xla_extra"
+fi
+
+# Forward these to Ray workers (vLLM only carries over a curated env-var
+# set by default; non-VLLM_/HF_ vars need explicit opt-in).
+existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS"
+if [ -n "$existing_extra" ]; then
+    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
+else
+    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${new_extra}"
+fi
+
+echo "[smoke] launching vllm serve | log=$LOG"
+echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
+echo "[smoke]   jax_cache=$JAX_COMPILATION_CACHE_DIR"
+echo "[smoke]   xla_flags=$XLA_FLAGS"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
     --tensor-parallel-size 32 \

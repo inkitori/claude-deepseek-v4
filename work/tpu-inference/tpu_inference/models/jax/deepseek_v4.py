@@ -927,6 +927,7 @@ def _build_class():
             """
             from tpu_inference.models.jax.deepseek_v4_loader import (
                 iter_v4_safetensors_dequant_torch, place_torch_as_jax_sharded,
+                iter_v4_safetensors_specs, place_spec_as_jax_sharded,
             )
             current = self.params_v.get_value()
 
@@ -990,53 +991,87 @@ def _build_class():
             #    on each Ray worker independently.
             import sys as _sys
             import time as _time
+            import os as _os
             placed_paths: set = set()
             skipped: List[str] = []
             t0 = _time.time()
             t_last = t0
             placed_count = 0
+
+            # Default-on slice-aware path: each host reads only its row range.
+            # Set V4_LOADER_SLICE_AWARE=0 to fall back to the full-dequant
+            # path (useful for parity testing or if a future refactor breaks
+            # slice-aware in a corner case).
+            slice_aware = _os.environ.get("V4_LOADER_SLICE_AWARE", "1") == "1"
             print(
                 f"[deepseek_v4] load_weights_from_dir: streaming "
-                f"{checkpoint_dir!r} (mesh={self.mesh})",
+                f"{checkpoint_dir!r} (mesh={self.mesh}, "
+                f"slice_aware={slice_aware})",
                 file=_sys.stderr, flush=True,
             )
-            for hf_name, torch_t in iter_v4_safetensors_dequant_torch(checkpoint_dir):
-                jax_path = map_hf_name_to_jax_path(hf_name)
-                if jax_path is None or jax_path.endswith("<scale>"):
-                    skipped.append(hf_name)
-                    del torch_t
-                    continue
-                leaf = path_to_leaf.get(jax_path)
-                if leaf is None:
-                    # Path not present in this config (e.g. MTP layers when
-                    # num_nextn_predict_layers == 0). Drop the tensor.
-                    skipped.append(hf_name)
-                    del torch_t
-                    continue
-                target_shape = tuple(leaf.shape)
-                target_dtype = jnp.dtype(leaf.dtype)
-                arr = place_torch_as_jax_sharded(
-                    torch_t, target_dtype, target_shape, self.mesh,
-                )
-                # Drop CPU buffer before assigning so peak host RAM tracks
-                # one tensor at a time.
-                del torch_t
-                _assign(jax_path, arr)
-                placed_paths.add(jax_path)
-                placed_count += 1
-                if placed_count % 200 == 0:
-                    now = _time.time()
-                    rate = 200.0 / max(now - t_last, 1e-9)
-                    print(
-                        f"[deepseek_v4] placed {placed_count} tensors "
-                        f"({rate:.1f}/s, last={hf_name})",
-                        file=_sys.stderr, flush=True,
+
+            if slice_aware:
+                for spec in iter_v4_safetensors_specs(checkpoint_dir):
+                    jax_path = map_hf_name_to_jax_path(spec.hf_name)
+                    if jax_path is None or jax_path.endswith("<scale>"):
+                        skipped.append(spec.hf_name)
+                        continue
+                    leaf = path_to_leaf.get(jax_path)
+                    if leaf is None:
+                        skipped.append(spec.hf_name)
+                        continue
+                    target_shape = tuple(leaf.shape)
+                    target_dtype = jnp.dtype(leaf.dtype)
+                    arr = place_spec_as_jax_sharded(
+                        spec, target_dtype, target_shape, self.mesh,
                     )
-                    t_last = now
+                    _assign(jax_path, arr)
+                    placed_paths.add(jax_path)
+                    placed_count += 1
+                    if placed_count % 200 == 0:
+                        now = _time.time()
+                        rate = 200.0 / max(now - t_last, 1e-9)
+                        print(
+                            f"[deepseek_v4] placed {placed_count} tensors "
+                            f"({rate:.1f}/s, last={spec.hf_name})",
+                            file=_sys.stderr, flush=True,
+                        )
+                        t_last = now
+            else:
+                for hf_name, torch_t in iter_v4_safetensors_dequant_torch(checkpoint_dir):
+                    jax_path = map_hf_name_to_jax_path(hf_name)
+                    if jax_path is None or jax_path.endswith("<scale>"):
+                        skipped.append(hf_name)
+                        del torch_t
+                        continue
+                    leaf = path_to_leaf.get(jax_path)
+                    if leaf is None:
+                        skipped.append(hf_name)
+                        del torch_t
+                        continue
+                    target_shape = tuple(leaf.shape)
+                    target_dtype = jnp.dtype(leaf.dtype)
+                    arr = place_torch_as_jax_sharded(
+                        torch_t, target_dtype, target_shape, self.mesh,
+                    )
+                    del torch_t
+                    _assign(jax_path, arr)
+                    placed_paths.add(jax_path)
+                    placed_count += 1
+                    if placed_count % 200 == 0:
+                        now = _time.time()
+                        rate = 200.0 / max(now - t_last, 1e-9)
+                        print(
+                            f"[deepseek_v4] placed {placed_count} tensors "
+                            f"({rate:.1f}/s, last={hf_name})",
+                            file=_sys.stderr, flush=True,
+                        )
+                        t_last = now
             elapsed = _time.time() - t0
             print(
                 f"[deepseek_v4] load_weights_from_dir done: placed="
-                f"{placed_count} skipped={len(skipped)} elapsed={elapsed:.1f}s",
+                f"{placed_count} skipped={len(skipped)} elapsed={elapsed:.1f}s "
+                f"(slice_aware={slice_aware})",
                 file=_sys.stderr, flush=True,
             )
 

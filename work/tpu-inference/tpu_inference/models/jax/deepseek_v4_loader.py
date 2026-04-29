@@ -41,6 +41,7 @@ our path is simpler since we go straight to bf16).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -687,3 +688,295 @@ def iter_v4_safetensors_dequant_torch(
                     done, pending = wait(pending, return_when=FIRST_COMPLETED)
                     for fut in done:
                         yield fut.result()
+
+
+# ============================================================
+# Slice-aware loader (each host reads only the rows it owns)
+# ============================================================
+#
+# Motivation: in the v6e-32 deploy, every host independently dequantizes the
+# full 543 GB V4-Flash bf16 expansion even though each host only places 1/8
+# of the rows into its local devices' HBM. That's 8× redundant CPU dequant
+# AND 8× redundant PCIe pressure. The slice-aware path computes each host's
+# row range up front, reads only those bytes from the safetensors mmap, and
+# dequants only those rows. The output is byte-identical to the full path
+# (per-row dequant for fp4/fp8/bf16).
+#
+# Constraints handled:
+#   * fp8 scale shape is [out/block, in/block] (block=128 in real V4): we
+#     align the host row range to block boundaries on read and trim after.
+#   * fp4 scale shape is [out, in/fp4_block]: row sharding maps directly.
+#   * non-axis-0 sharding (rare for V4): falls back to full-tensor read.
+#   * mesh=None or fully-replicated (norms, biases): full-tensor read on
+#     every host, same as the old path (these leaves are tiny).
+# ------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class V4WeightSpec:
+    """Metadata for one V4-Flash weight without any tensor data attached.
+
+    The slice-aware loader yields these from `iter_v4_safetensors_specs` and
+    reads the actual bytes lazily via `read_dequant_slice(spec, r_start,
+    r_stop)` once the partition spec for the leaf is known. That way each
+    Ray worker only pages in the bytes for the rows its local devices own.
+    """
+    hf_name: str
+    shard_path: str
+    kind: str  # "bf16", "raw", "fp8", "fp4"
+    scale_key: Optional[str]
+    scale_shard_path: Optional[str]
+    fp8_block: int
+    fp4_block: int
+
+
+def iter_v4_safetensors_specs(
+    checkpoint_dir: str,
+    quant_meta: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Iterator[V4WeightSpec]:
+    """Yield a `V4WeightSpec` for every dequantizable weight in the checkpoint.
+
+    Reads `config.json` + `model.safetensors.index.json` (or scans the shard
+    directory) to determine where each weight lives, but does not read any
+    tensor *data*. The caller is expected to invoke `read_dequant_slice`
+    with a row range to actually fault in bytes.
+    """
+    from safetensors import safe_open
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    with open(cfg_path) as f:
+        hf_config = json.load(f)
+    qc = detect_quant_config(hf_config)
+    qmeta_path = os.path.join(checkpoint_dir, "quant_meta.json")
+    if quant_meta is None and os.path.exists(qmeta_path):
+        with open(qmeta_path) as f:
+            quant_meta = json.load(f)
+    quant_meta = quant_meta or {}
+
+    name_to_shard: Dict[str, str] = {}
+    idx_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            idx = json.load(f)
+        for nm, sh in idx["weight_map"].items():
+            name_to_shard[nm] = os.path.join(checkpoint_dir, sh)
+    else:
+        for fn in sorted(os.listdir(checkpoint_dir)):
+            if fn.endswith(".safetensors"):
+                p = os.path.join(checkpoint_dir, fn)
+                with safe_open(p, framework="pt") as fh:
+                    for nm in fh.keys():
+                        name_to_shard[nm] = p
+
+    # We need each weight's on-disk dtype to determine kind. Open each shard
+    # once for that read — much cheaper than per-tensor dtype inspection.
+    name_to_dtype: Dict[str, Any] = {}
+    shard_to_names: Dict[str, List[str]] = {}
+    for nm, sp in name_to_shard.items():
+        shard_to_names.setdefault(sp, []).append(nm)
+    for sp, names in shard_to_names.items():
+        with safe_open(sp, framework="pt") as f:
+            for nm in names:
+                name_to_dtype[nm] = f.get_slice(nm).get_dtype()
+
+    def _kind_of(name: str) -> str:
+        meta_entry = quant_meta.get(name)
+        if meta_entry is not None:
+            return meta_entry["kind"]
+        d = name_to_dtype[name]
+        # safetensors dtype strings: "F8_E4M3" / "I8" / "BF16" / "F32" etc.
+        if "F8_E4M3" in str(d):
+            return "fp8"
+        if str(d) == "I8" and "experts" in name:
+            return "fp4"
+        return "bf16"
+
+    for hf_name in sorted(name_to_shard.keys()):
+        if hf_name.endswith(".scale"):
+            continue
+        kind = _kind_of(hf_name)
+        if kind in ("bf16", "raw"):
+            yield V4WeightSpec(
+                hf_name=hf_name,
+                shard_path=name_to_shard[hf_name],
+                kind=kind,
+                scale_key=None,
+                scale_shard_path=None,
+                fp8_block=qc["fp8_block"],
+                fp4_block=qc["fp4_block"],
+            )
+            continue
+        scale_key = (hf_name[:-len(".weight")] + ".scale"
+                     if hf_name.endswith(".weight") else hf_name + ".scale")
+        scale_shard_path = name_to_shard.get(scale_key)
+        if scale_shard_path is None:
+            raise ValueError(
+                f"Missing scale {scale_key!r} for {kind!r} weight {hf_name!r}")
+        yield V4WeightSpec(
+            hf_name=hf_name,
+            shard_path=name_to_shard[hf_name],
+            kind=kind,
+            scale_key=scale_key,
+            scale_shard_path=scale_shard_path,
+            fp8_block=qc["fp8_block"],
+            fp4_block=qc["fp4_block"],
+        )
+
+
+def read_dequant_slice(
+    spec: V4WeightSpec,
+    row_start: int,
+    row_stop: int,
+) -> torch.Tensor:
+    """Read+dequant rows [row_start:row_stop] of a V4 weight to bf16.
+
+    For axis-0 (out-axis) sharding this is the cheap path: the safetensors
+    library mmaps each shard, so the kernel only faults in the byte range
+    we actually touch. Output bf16 shape: [row_stop - row_start, in_logical].
+    """
+    from safetensors import safe_open
+    with safe_open(spec.shard_path, framework="pt") as f:
+        weight_slice = f.get_slice(spec.hf_name)
+        w = weight_slice[row_start:row_stop, ...]
+
+    if spec.kind in ("bf16", "raw"):
+        return dequant_weight(w, None, spec.kind)
+
+    if spec.kind == "fp8":
+        # Scale is [out/block, in/block] — we need rows
+        # [row_start//block : row_stop//block] but only when both bounds are
+        # block-aligned. Caller must align in that case.
+        bk = spec.fp8_block
+        if row_start % bk != 0 or row_stop % bk != 0:
+            raise ValueError(
+                f"fp8 row range [{row_start}, {row_stop}) must be aligned to "
+                f"fp8_block={bk}; weight={spec.hf_name!r}")
+        with safe_open(spec.scale_shard_path, framework="pt") as f:
+            s = f.get_slice(spec.scale_key)[row_start // bk : row_stop // bk, :]
+        return dequant_weight(
+            w, s, "fp8", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
+
+    if spec.kind == "fp4":
+        # Scale is [out, in/fp4_block] — straightforward axis-0 slice.
+        with safe_open(spec.scale_shard_path, framework="pt") as f:
+            s = f.get_slice(spec.scale_key)[row_start:row_stop, :]
+        return dequant_weight(
+            w, s, "fp4", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
+
+    raise ValueError(f"unknown kind {spec.kind!r}")
+
+
+def _host_row_range(sharding: NamedSharding,
+                    target_shape: Tuple[int, ...]) -> Optional[Tuple[int, int]]:
+    """Return (host_start, host_stop) on axis 0 if all addressable devices on
+    this host shard along axis 0; otherwise None (fall back to full-read).
+    """
+    addressable = sharding.addressable_devices_indices_map(target_shape)
+    if not addressable:
+        return None
+    starts = []
+    stops = []
+    for idxs in addressable.values():
+        s0 = idxs[0]
+        if not isinstance(s0, slice):
+            return None
+        # Slices on non-axis-0 must be full-extent for slice-aware to be
+        # correct (we only chunk on axis 0).
+        for i, sl in enumerate(idxs[1:], start=1):
+            if not isinstance(sl, slice):
+                return None
+            full_dim = target_shape[i]
+            if sl.start not in (0, None) or (sl.stop or full_dim) != full_dim:
+                return None
+        starts.append(0 if s0.start is None else s0.start)
+        stops.append(target_shape[0] if s0.stop is None else s0.stop)
+    return (min(starts), max(stops))
+
+
+def place_spec_as_jax_sharded(
+    spec: V4WeightSpec,
+    target_dtype,
+    target_shape: Tuple[int, ...],
+    mesh,
+) -> jnp.ndarray:
+    """Slice-aware placement counterpart to `place_torch_as_jax_sharded`.
+
+    When the leaf is sharded along axis 0 (the common case for V4-Flash with
+    `attn_dp=32` on the largest dim), only reads the rows the local host's
+    devices need. Falls back to the full-tensor path when the leaf is
+    replicated, sharded on a non-axis-0 dim, or unaligned for fp8.
+    """
+    target = jnp.dtype(target_dtype)
+    out_dim = target_shape[0] if target_shape else 1
+
+    def _full() -> torch.Tensor:
+        return read_dequant_slice(spec, 0, out_dim)
+
+    if mesh is None or not target_shape:
+        t = _full()
+        np_arr = _torch_to_numpy_preserve(t)
+        if np_arr.dtype != target:
+            np_arr = np_arr.astype(target)
+        return jnp.asarray(np_arr)
+
+    spec_p = pick_partition_spec(target_shape, mesh)
+    sharding = NamedSharding(mesh, spec_p)
+    sharded_axis = next((i for i, ax in enumerate(spec_p) if ax is not None), None)
+
+    if sharded_axis != 0:
+        # Replicated or non-axis-0 sharded: read full, slice in callback.
+        t = _full()
+        np_arr = _torch_to_numpy_preserve(t)
+        if np_arr.dtype != target:
+            np_arr = np_arr.astype(target)
+
+        def cb_full(idx):
+            return np.asarray(np_arr[idx])
+
+        return jax.make_array_from_callback(target_shape, sharding, cb_full)
+
+    rng = _host_row_range(sharding, target_shape)
+    if rng is None:
+        # Sharding too irregular for our slice-aware path: full read.
+        t = _full()
+        np_arr = _torch_to_numpy_preserve(t)
+        if np_arr.dtype != target:
+            np_arr = np_arr.astype(target)
+        def cb_full(idx):
+            return np.asarray(np_arr[idx])
+        return jax.make_array_from_callback(target_shape, sharding, cb_full)
+
+    host_start, host_stop = rng
+
+    # fp8 needs block alignment on the row axis. Expand to the nearest block
+    # boundaries on read, then trim.
+    if spec.kind == "fp8":
+        bk = spec.fp8_block
+        a_start = (host_start // bk) * bk
+        a_stop = ((host_stop + bk - 1) // bk) * bk
+        a_stop = min(a_stop, out_dim)
+        if a_start != host_start or a_stop != host_stop:
+            t_full = read_dequant_slice(spec, a_start, a_stop)
+            t = t_full[host_start - a_start : host_start - a_start + (host_stop - host_start)]
+        else:
+            t = read_dequant_slice(spec, host_start, host_stop)
+    else:
+        t = read_dequant_slice(spec, host_start, host_stop)
+
+    local_np = _torch_to_numpy_preserve(t)
+    if local_np.dtype != target:
+        local_np = local_np.astype(target)
+
+    def cb(idx):
+        s = idx[0]
+        rel_lo = (s.start or 0) - host_start
+        rel_hi = (s.stop or out_dim) - host_start
+        sub = local_np[rel_lo:rel_hi]
+        # Apply the trailing slices (these are full-dim per `_host_row_range`'s
+        # contract, but pass them through anyway so the runtime gets exact
+        # shape parity).
+        if len(idx) > 1:
+            sub = sub[(slice(None),) + tuple(idx[1:])]
+        return np.asarray(sub)
+
+    return jax.make_array_from_callback(target_shape, sharding, cb)
+
