@@ -47,7 +47,19 @@ export TRANSFORMERS_OFFLINE=1
 # attention DP topology (`enable_dp_attention=true` requires this).
 export NEW_MODEL_DESIGN=1
 
-echo "[smoke] launching vllm serve | log=$LOG"
+# Optional opt-in: parallel CPU dequant inside iter_v4_safetensors_dequant_torch.
+# Default 0 = current sequential behavior. Set V4_LOADER_PREFETCH_WORKERS=4..8
+# at the shell to overlap dequant with TPU placement and parallelize across
+# cores per host. Forwarded to Ray workers via VLLM_RAY_EXTRA_ENV_VARS_TO_COPY.
+export V4_LOADER_PREFETCH_WORKERS="${V4_LOADER_PREFETCH_WORKERS:-0}"
+existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
+if [ -n "$existing_extra" ]; then
+    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},V4_LOADER_PREFETCH_WORKERS"
+else
+    export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="V4_LOADER_PREFETCH_WORKERS"
+fi
+
+echo "[smoke] launching vllm serve | log=$LOG | prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
     --tensor-parallel-size 32 \

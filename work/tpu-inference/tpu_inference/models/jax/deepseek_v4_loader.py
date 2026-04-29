@@ -605,35 +605,94 @@ def iter_v4_safetensors_dequant_torch(
         with safe_open(sh, framework="pt") as fh:
             return fh.get_tensor(scale_key)
 
-    for sp in sorted(shard_to_names.keys()):
-        with safe_open(sp, framework="pt") as f:
+    def _produce_one(shard_path: str, hf_name: str) -> Tuple[str, torch.Tensor]:
+        """Read + dequant one tensor. Self-contained so it is safe to call
+        concurrently from a thread pool — opens its own `safe_open` handle
+        (mmap setup is cheap; safetensors reads are mmap'd, GIL-releasing)."""
+        with safe_open(shard_path, framework="pt") as f:
             local_keys = set(f.keys())
-            for hf_name in sorted(shard_to_names[sp]):
-                if hf_name.endswith(".scale"):
-                    continue
-                t = f.get_tensor(hf_name)
-                kind = _determine_kind(hf_name, t.dtype)
-                if kind in ("bf16", "raw"):
-                    deq = dequant_weight(t, None, kind)
-                else:
-                    if hf_name.endswith(".weight"):
-                        scale_key = hf_name[:-len(".weight")] + ".scale"
+            t = f.get_tensor(hf_name)
+            kind = _determine_kind(hf_name, t.dtype)
+            if kind in ("bf16", "raw"):
+                return hf_name, dequant_weight(t, None, kind)
+            if hf_name.endswith(".weight"):
+                scale_key = hf_name[:-len(".weight")] + ".scale"
+            else:
+                scale_key = hf_name + ".scale"
+            if scale_key in local_keys:
+                scale_t = f.get_tensor(scale_key)
+            else:
+                scale_t = _fetch_scale(scale_key)
+            if scale_t is None:
+                raise ValueError(
+                    f"Missing scale for {kind!r} weight {hf_name!r}")
+            return hf_name, dequant_weight(
+                t, scale_t, kind,
+                fp8_block=qc["fp8_block"], fp4_block=qc["fp4_block"])
+
+    work: List[Tuple[str, str]] = []
+    for sp in sorted(shard_to_names.keys()):
+        for hf_name in sorted(shard_to_names[sp]):
+            if hf_name.endswith(".scale"):
+                continue
+            work.append((sp, hf_name))
+
+    # Default 0 = current sequential behavior (no thread pool, no extra mmap
+    # opens). Set V4_LOADER_PREFETCH_WORKERS=4..8 to overlap dequant with
+    # downstream TPU placement and parallelize CPU dequant across cores.
+    try:
+        n_workers = max(0, int(os.environ.get("V4_LOADER_PREFETCH_WORKERS", "0")))
+    except ValueError:
+        n_workers = 0
+
+    if n_workers == 0:
+        # Sequential: open each shard once and amortize the mmap cost.
+        print(f"[deepseek_v4_loader] iter: sequential ({len(work)} tensors)",
+              flush=True)
+        for sp in sorted(shard_to_names.keys()):
+            with safe_open(sp, framework="pt") as f:
+                local_keys = set(f.keys())
+                for hf_name in sorted(shard_to_names[sp]):
+                    if hf_name.endswith(".scale"):
+                        continue
+                    t = f.get_tensor(hf_name)
+                    kind = _determine_kind(hf_name, t.dtype)
+                    if kind in ("bf16", "raw"):
+                        deq = dequant_weight(t, None, kind)
                     else:
-                        scale_key = hf_name + ".scale"
-                    if scale_key in local_keys:
-                        scale_t = f.get_tensor(scale_key)
-                    else:
-                        scale_t = _fetch_scale(scale_key)
-                    if scale_t is None:
-                        raise ValueError(
-                            f"Missing scale for {kind!r} weight {hf_name!r}")
-                    deq = dequant_weight(t, scale_t, kind,
-                                         fp8_block=qc["fp8_block"],
-                                         fp4_block=qc["fp4_block"])
-                    del scale_t
-                del t
-                yield hf_name, deq
-                # Caller is expected to have consumed `deq` and let it fall
-                # out of scope before the next iteration. We don't hold a
-                # reference here past the yield.
-                del deq
+                        if hf_name.endswith(".weight"):
+                            scale_key = hf_name[:-len(".weight")] + ".scale"
+                        else:
+                            scale_key = hf_name + ".scale"
+                        if scale_key in local_keys:
+                            scale_t = f.get_tensor(scale_key)
+                        else:
+                            scale_t = _fetch_scale(scale_key)
+                        if scale_t is None:
+                            raise ValueError(
+                                f"Missing scale for {kind!r} weight {hf_name!r}")
+                        deq = dequant_weight(t, scale_t, kind,
+                                             fp8_block=qc["fp8_block"],
+                                             fp4_block=qc["fp4_block"])
+                        del scale_t
+                    del t
+                    yield hf_name, deq
+                    del deq
+    else:
+        # Parallel: ThreadPoolExecutor with a sliding window so peak memory
+        # is bounded to ~in_flight_max dequantized tensors at once.
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        in_flight_max = max(n_workers * 2, 8)
+        print(f"[deepseek_v4_loader] iter: prefetch workers={n_workers} "
+              f"in_flight={in_flight_max} ({len(work)} tensors)", flush=True)
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            pending = set()
+            idx = 0
+            while idx < len(work) or pending:
+                while len(pending) < in_flight_max and idx < len(work):
+                    sp, nm = work[idx]
+                    pending.add(ex.submit(_produce_one, sp, nm))
+                    idx += 1
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    yield fut.result()
