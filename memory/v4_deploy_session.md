@@ -45,6 +45,27 @@ CODEX_PLAN.md::"Ray setup" section. Then relaunch
 `scripts/full_slice_v4_smoke.sh` and watch
 `/home/enyouki/claude-deepseek-v4/logs/full-slice-v4-smoke-<TS>.log`.
 
+**Update at 23:00 UTC:** Ray cluster rebuilt, smoke re-launched
+(pid file at `logs/full-slice-v4-smoke.pid`, log
+`logs/full-slice-v4-smoke-20260429T223800Z.log`). Loader is healthy:
+mesh `attn_dp=32` correct, 23400/33000 tensors placed at 19/s on layer
+29/43 by minute 20, no errors. ETA ~28 min total load.
+
+Pushed to `origin/main` (`inkitori/claude-deepseek-v4`):
+  * `97111371` — main streaming loader rewrite + 2 bug fixes
+  * `fed58cfa` — opt-in prefetch-pool (env: V4_LOADER_PREFETCH_WORKERS,
+    default 0; verified byte-identical vs sequential on tiny_v4_quant
+    355 tensors). Forwarded to Ray workers via
+    VLLM_RAY_EXTRA_ENV_VARS_TO_COPY (vLLM mechanism).
+  * `48b3277a` — `scripts/full_slice_v4_smoke_check.sh`: post-startup
+    polls /v1/models, fires the deterministic Paris completion twice,
+    asserts byte-identical + contains "Paris".
+
+For retries that need a faster load, set
+`V4_LOADER_PREFETCH_WORKERS=4..8` before invoking the smoke script.
+
+SSH to remote git: key at `~/.ssh/id_ed25519`, passphrase known to user.
+
 **Performance concern:** First successful run (before pkill killed Ray)
 showed only ONE Ray worker at 100% CPU + 10 GB RES, others idle, log
 silent for 5+ minutes mid-load. Each host independently dequantizes the
