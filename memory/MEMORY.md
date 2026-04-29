@@ -1,1 +1,1 @@
-- [Project: tpu-inference DeepSeek V4 work](project_v4_status.md) — overnight session built JAX V4 impl on `deepseek-v4` branch in work/tpu-inference; tested on tiny config 2026-04-28
+- [Project: tpu-inference DeepSeek V4 work](project_v4_status.md) — JAX V4 impl as subtree at work/tpu-inference; v8 prompt targets B1 multi-seq fix + Tier 8 real-weight vllm-serve gate on v6e-32 host (no docker, gcsfuse weights)

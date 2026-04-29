@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live monitor for the claude-overnight container.
+# Live monitor for the host-direct claude-overnight loop.
 #
 # Usage:
 #   ./monitor.sh           # default: every tool call (Bash, Read, Edit, Write, ...)
@@ -8,9 +8,8 @@
 #   ./monitor.sh results   # tool results — what each tool call returned to the model
 #   ./monitor.sh all       # chronological feed: tool calls + narration + tool results + thinking-marker
 #   ./monitor.sh stream    # raw stream-json (verbose)
-#   ./monitor.sh status    # one-shot snapshot: container, resources, commits, PROGRESS.md
-#   ./monitor.sh stats     # live `docker stats` (cpu/mem/pids)
-#   ./monitor.sh shell     # exec into the running container as your user
+#   ./monitor.sh status    # one-shot snapshot: loop, resources, commits, PROGRESS.md
+#   ./monitor.sh tail      # tail -F the latest iter log
 #
 # NOTE on "what the model is thinking":
 #   With --effort xhigh the model uses extended thinking, but Anthropic's API
@@ -23,9 +22,7 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGS="$REPO_DIR/logs"
-NAME="${NAME:-claude-overnight}"
-
-if docker info >/dev/null 2>&1; then DOCKER=docker; else DOCKER="sudo docker"; fi
+PID_FILE="$LOGS/loop.pid"
 
 latest_log() {
     ls -1t "$LOGS"/iter-*.log 2>/dev/null | head -1
@@ -35,6 +32,7 @@ wait_for_log() {
     while [ -z "$(latest_log)" ]; do
         echo "(no iter log yet — first-run setup may still be in progress)"
         echo "  setup progress:  tail -f $LOGS/setup.log"
+        echo "  loop wrapper:    tail -f $LOGS/loop.out"
         sleep 5
     done
 }
@@ -150,20 +148,42 @@ stream)
     tail -n 50 -F "$log"
     ;;
 
+tail)
+    wait_for_log
+    log="$(latest_log)"
+    echo "tailing $log"
+    tail -n 50 -F "$log"
+    ;;
+
 status)
-    echo "=== container ==="
-    $DOCKER ps -a --filter "name=$NAME" --format \
-        'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}' 2>/dev/null
+    echo "=== loop ==="
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        pid="$(cat "$PID_FILE")"
+        echo "alive pid=$pid  uptime=$(ps -o etime= -p "$pid" | tr -d ' ')"
+    else
+        echo "(no loop running — start with ./run.sh)"
+    fi
     echo
     echo "=== resources ==="
-    $DOCKER stats --no-stream "$NAME" 2>/dev/null || echo "(container not running)"
+    df -h "$REPO_DIR" / /dev/shm 2>/dev/null | head -5
+    echo
+    free -h | head -2
+    echo
+    echo "=== preflight ==="
+    [ -f "$LOGS/tpu-preflight.log" ] && head -1 "$LOGS/tpu-preflight.log" || echo "(none)"
     echo
     echo "=== iter logs (most recent 5) ==="
     ls -lh "$LOGS"/iter-*.log 2>/dev/null | tail -5 || echo "(none yet)"
     echo
-    echo "=== commits in tpu-inference ==="
-    git -C "$REPO_DIR/work/tpu-inference" log --oneline -15 2>/dev/null || \
-        echo "(repo not cloned yet)"
+    echo "=== commits in repo ==="
+    git -C "$REPO_DIR" log --oneline -10 2>/dev/null
+    echo
+    echo "=== STATUS.md ==="
+    if [ -f "$REPO_DIR/work/tpu-inference/STATUS.md" ]; then
+        cat "$REPO_DIR/work/tpu-inference/STATUS.md"
+    else
+        echo "(not yet created)"
+    fi
     echo
     echo "=== PROGRESS.md (last 30 lines) ==="
     if [ -f "$REPO_DIR/work/tpu-inference/PROGRESS.md" ]; then
@@ -171,14 +191,6 @@ status)
     else
         echo "(not yet created)"
     fi
-    ;;
-
-stats)
-    $DOCKER stats "$NAME"
-    ;;
-
-shell)
-    $DOCKER exec -it -u "$(id -u):$(id -g)" "$NAME" bash
     ;;
 
 *)

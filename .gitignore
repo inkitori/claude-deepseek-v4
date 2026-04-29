@@ -11,13 +11,16 @@ __pycache__/
 *.pyo
 *.swp
 
-# Heavy venv from docker run (rebuild via setup, not committed)
+# Heavy venv (rebuilt by scripts/setup.sh; not committed)
 work/vllm_env/
 
 # Per-iteration logs (keep logs/ as a placeholder dir)
 logs/iter-*.log
 logs/*.log
+logs/*.out
+logs/*.pid
 
-# Local scratch / outputs
+# Local scratch / outputs (synthetic + single-shard real bytes)
+work/scratch/
 scratch/
 *.safetensors
