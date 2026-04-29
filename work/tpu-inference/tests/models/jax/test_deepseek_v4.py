@@ -1351,7 +1351,13 @@ class TestDecodeAttentionParity:
             t2j(x_step), start_pos, params_j, fc, jax_state,
         )
         diff = maxabs(y_j, o_t)
-        assert diff <= 5e-2, f"layer={layer_id} start_pos={start_pos}: decode step output diff {diff}"
+        # v8 iter 4 tightening: was 5e-2; observed worst 3.8e-6 across the
+        # 9 parametrized points. 1e-4 keeps a 25x margin while making the
+        # test catch real regressions. See TOLERANCE_LOG.md "Decode step".
+        assert diff <= 1e-4, (
+            f"layer={layer_id} start_pos={start_pos}: decode step output "
+            f"diff {diff}"
+        )
 
 
 class TestDecodeRollingParity:
@@ -1389,7 +1395,11 @@ class TestDecodeRollingParity:
                 t2j(x_step), sp, params_j, fc, jax_state,
             )
             diff = maxabs(y_j, o_t)
-            assert diff <= 5e-2, f"step k={k} (sp={sp}): rolling decode diff {diff}"
+            # v8 iter 4 tightening: was 5e-2; observed worst 3.8e-6 across
+            # all (layer, P, K) combos. 1e-4 keeps a 25x margin.
+            assert diff <= 1e-4, (
+                f"step k={k} (sp={sp}): rolling decode diff {diff}"
+            )
 
 
 # =============================================================
@@ -2048,17 +2058,17 @@ class TestQuantToParamsApply:
         ids = jnp.zeros((1, 16), dtype=jnp.int32) + jnp.arange(16, dtype=jnp.int32) % cfg.vocab_size
         l_q = deepseek_v4_forward_prefill(ids, p_q, swa_q, comp_q, cfg)
         l_gt = deepseek_v4_forward_prefill(ids, p_gt, swa_gt, comp_gt, cfg)
-        # Since dequant is bit-exact, logits should also be bit-exact.
-        # We allow a tiny floor for fp32 accumulation order if any.
-        diff = float(np.abs(np.asarray(l_q) - np.asarray(l_gt)).max())
-        # Tier 7 spec said atol=0.1 — but since loader bit-equality is
-        # achieved, the difference should be ~0 modulo fp32 reduction order.
-        assert diff <= 0.1, f"Tier 7: max logits diff {diff} (atol 0.1)"
-        # Stronger: argmax must match.
-        argmax_q = np.asarray(l_q.argmax(axis=-1))
-        argmax_gt = np.asarray(l_gt.argmax(axis=-1))
-        agree = float((argmax_q == argmax_gt).mean())
-        assert agree >= 0.95, f"argmax agreement {agree} < 0.95"
+        # Since the loader is byte-equal across quant and groundtruth
+        # (TestFp8Dequant proves max_diff == 0.0 across 355 tensors), the
+        # forward output is byte-equal too — both sides run the same Python
+        # source on the same JAX device with byte-identical bf16 weights.
+        # See TOLERANCE_LOG.md T7 (v8 iter 4 tightening: 0.1 -> byte-exact).
+        l_q_n, l_gt_n = np.asarray(l_q), np.asarray(l_gt)
+        diff = float(np.abs(l_q_n - l_gt_n).max())
+        assert diff == 0.0, f"Tier 7: logits diverged (max abs diff {diff})"
+        assert np.array_equal(l_q_n, l_gt_n), (
+            "Tier 7: logits not byte-equal despite max-abs == 0"
+        )
 
 
 class TestCompressorDecodeStep:
@@ -2192,7 +2202,11 @@ class TestDecodeAttentionParityExtended:
             t2j(x_step), start_pos, params_j, fc, jax_state,
         )
         diff = maxabs(y_j, o_t)
-        assert diff <= 5e-2, (
+        # v8 iter 4 tightening: was 5e-2, observed worst 3.8e-6 across the
+        # 8 parametrized points. 1e-4 keeps a 25x margin while making the
+        # test catch real regressions instead of waving them through.
+        # See TOLERANCE_LOG.md "Decode step (extended)".
+        assert diff <= 1e-4, (
             f"layer={layer_id} sp={start_pos} (max_seq_len={max_seq_len}): "
             f"decode step output diff {diff}"
         )
@@ -2209,9 +2223,12 @@ class TestDecodeRollingEquivalenceWithPrefill:
     pure circular buffer with no compressor entanglement; CSA / HCA layers
     are covered by the per-step rolling tests above.
 
-    Tolerance: atol=2e-2 (TOLERANCE_LOG T8) — bf16 RoPE-write accumulation
-    over 32 sequential per-step writes drifts by up to a few ULPs from a
-    bulk prefill that fuses the 32 writes."""
+    Tolerance: byte-exact (v8 iter 4 tightening; was atol=2e-2). The 32
+    sequential decode writes turn out to be byte-identical to the bulk
+    prefill writes — both paths invoke the same per-position RoPE kernel
+    with the same freqs slice and the same input row, just batched
+    differently. Measured 0.0 max-abs across 8 random seeds. See
+    TOLERANCE_LOG.md T8."""
 
     def test_swa_decode_state_equals_prefill_state_after_32_steps(self):
         torch.manual_seed(7)
@@ -2247,9 +2264,13 @@ class TestDecodeRollingEquivalenceWithPrefill:
         kvc_decode = np.asarray(jax_state.kv_cache).astype(np.float32)
 
         diff = float(np.abs(kvc_prefill - kvc_decode).max())
-        assert diff <= 2e-2, (
-            f"SWA kv_cache after 32 decode steps differs from prefill state: "
-            f"max abs diff {diff} (tolerance 2e-2 per TOLERANCE_LOG T8)"
+        assert diff == 0.0, (
+            f"SWA kv_cache after 32 decode steps must byte-match prefill "
+            f"state; got max abs diff {diff}"
+        )
+        assert np.array_equal(kvc_prefill, kvc_decode), (
+            "SWA kv_cache after 32 decode steps not byte-equal to prefill "
+            "state despite max-abs == 0"
         )
 
 

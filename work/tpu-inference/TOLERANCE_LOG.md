@@ -40,35 +40,66 @@ of the same Python source. Bugs that would manifest only on TPU (e.g. dtype
 lowering quirks, sharding-axis name mismatches) are documented as residual
 risk in PROD_TOPOLOGY_RISKS.md item 1.
 
-## T7 — Quant vs groundtruth logit parity (`TestQuantToParamsApply`): `atol=0.1`
+## T7 — Quant vs groundtruth logit parity (`TestQuantToParamsApply`): byte-exact (v8 iter 4 tightening from atol=0.1)
 **Where:** `tests/models/jax/test_deepseek_v4.py::TestQuantToParamsApply::test_forward_logits_quant_vs_groundtruth`.
 **Default:** bf16 atol/rtol = 1e-2.
-**Looser bound:** atol=0.1.
-**Evidence:** The loader's bit-exact output (`max_diff == 0.0` across 355
-tensors, see `TestFp8Dequant`) means the bf16 weight tensors are byte-equal
-on both quant and groundtruth paths. Forward-pass logits should therefore be
-identical modulo fp32 reduction order in matmuls. The atol=0.1 budget is the
-same as Tier 2's end-to-end logits parity bound, providing a safety margin
-that would catch any non-trivial loader bug.
+**Effective bound:** byte-exact (`np.array_equal` AND max-abs == 0).
+**Evidence (measured 2026-04-29 v8 iter 4):**
+- `TestFp8Dequant` proves the loader is byte-equal across 355 tensors
+  (`max_diff == 0.0`), so the bf16 weight tensors are bit-identical
+  between the quant and groundtruth checkpoints.
+- Both sides run the same `deepseek_v4_forward_prefill` Python source on
+  the same JAX device with byte-identical inputs and weights. There is
+  no fp32 reduction-order divergence to absorb — the ops are issued in
+  the same order by the same trace.
+- Measurement on the host (16-token forward, vocab=1024, output dtype
+  fp32): `max_abs_diff = 0.0`, `argmax_agree = 1.0`, `np.array_equal = True`.
+- The 0.1 budget came from a now-stale prior assumption that the loader
+  might lose precision; it does not. Byte-exactness is the right invariant.
 
-## T8 — SWA decode-state ≡ prefill-state after 32 sequential decodes: `atol=2e-2`
+## T8 — SWA decode-state ≡ prefill-state after 32 sequential decodes: byte-exact (v8 iter 4 tightening from atol=2e-2)
 **Where:** `tests/models/jax/test_deepseek_v4.py::TestDecodeRollingEquivalenceWithPrefill::test_swa_decode_state_equals_prefill_state_after_32_steps`.
 **Default:** bf16 atol/rtol = 1e-2.
-**Looser bound:** atol=2e-2.
-**Evidence:**
-- The prefill path runs RoPE on a `[B, S=32, head_dim]` tensor in one fused
-  call; the decode path runs RoPE 32 times on `[B, 1, head_dim]` inputs with
-  the same (per-position) freqs slice.
-- bf16 cast and complex-pair multiply have ~1 ULP rounding per position.
-  Across 32 sequential per-step writes the accumulated rounding diff vs the
-  bulk-write path can reach ~1.5e-2.
-- 2e-2 is conservative: empirically observed max abs diff is ~1.0e-2 with
-  the seed-7 random inputs in the test, leaving margin for other random seeds.
-- This bound is independent of TOLERANCE T1/T2/T3 — those measure attention
-  *output*; T8 measures the kv_cache *buffer* directly.
-- Spec resume mandate explicitly allowed this: "32-step rolling-decode test:
-  state-after-32-decodes ≡ state-after-prefill-of-the-same-prefix (allow
-  atol=2e-2 for accumulation drift, document in TOLERANCE_LOG.md)".
+**Effective bound:** byte-exact (`np.array_equal` AND max-abs == 0).
+**Evidence (measured 2026-04-29 v8 iter 4):**
+- Across 8 random seeds (7, 1, 2, 3, 5, 11, 13, 17) for the input
+  sequence: max abs diff = `0.0` for every seed.
+- Why the original 2e-2 budget was unnecessary: both the prefill kv-write
+  loop and the decode-step kv-write share the same per-position write
+  expression (RoPE-rotate the row, store into circular buffer slot). The
+  prefill loop is just an unrolled batch of those same writes; XLA emits
+  byte-identical lowerings for each element. There is no batched-vs-
+  sequential rounding drift in this code path — the prior estimate was
+  pessimistic.
+- This holds even though the bf16 RoPE multiply technically has ~1 ULP
+  rounding per element: that rounding is deterministic and identical on
+  both sides because the inputs and freqs slices are identical.
+- The byte-exact bound now catches any future regression that introduces
+  a real difference between the prefill and decode write paths (e.g. a
+  fused vs unfused RoPE divergence).
+
+## Decode step parity (Tier 2 hardening — `TestDecodeAttentionParity`, `TestDecodeRollingParity`, `TestDecodeAttentionParityExtended`): `atol=1e-4` (v8 iter 4 tightening from atol=5e-2)
+**Where:**
+  - `TestDecodeAttentionParity::test_decode_step_parity` (9 points: SWA/CSA/HCA at sp ∈ {1,4,7,8,9,16,32}).
+  - `TestDecodeRollingParity::test_rolling_decode_parity` (5 (P,K) combos, K up to 16).
+  - `TestDecodeAttentionParityExtended::test_decode_step_parity_extended` (8 points incl. sp ∈ {500, 1023}).
+**Default:** bf16 atol/rtol = 1e-2.
+**Looser bound:** atol=1e-4.
+**Evidence (measured 2026-04-29 v8 iter 4):**
+- Worst observed across all three test classes' parametrized points
+  (22 measurements total): `3.81e-6` (= 2 ULPs of bf16 in the
+  attention-output magnitude range).
+- Old budget was 5e-2 — about 13,000× looser than necessary, so it
+  didn't catch a real per-layer regression.
+- 1e-4 keeps a 25× margin over the observed worst, which leaves room
+  for: (a) other random seeds we did not enumerate, (b) future torch
+  reference fixes that change tie-breaking, (c) bf16 quirks at corner
+  start_pos values inside the SWA wraparound. Tighter than 1e-4 risks
+  flakes; looser than 1e-4 hides real bugs.
+- The full attention forward (Tier 1, `TestAttentionComponent`) still
+  uses `atol=5e-2` because that path involves the much bigger Sinkhorn
+  + mHC + low-rank-O combine chain. Decode step is a much shorter
+  matmul chain and the budget reflects that.
 
 ## T4 — Indexer top-k SET equality (Tier 1, `TestIndexerComponent`)
 **Where:** `TestIndexerComponent::test_indexer_prefill_matches_torch_topk`.

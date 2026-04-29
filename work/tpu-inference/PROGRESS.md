@@ -191,3 +191,20 @@ If killed now, next session must: read `logs/T8-eager-result-*.json` (latest); i
 **If killed now:** the headline is BLOCKERS.md::T8-HBM-OOM. The deploy gate cannot pass on this 4-chip slice; V4-Flash bf16 = 543 GB > 128 GB HBM. The functional core (math + decode + dequant + multi-seq dispatch + nnx port + load_weights wiring) is correct and validated on synthetic + real-shard paths. To exercise T8, either (A) the host loop launches vllm-tpu across all 8 hosts of the v6e-32 slice, or (B) we add native FP4/FP8 storage on TPU + on-the-fly dequant, or (C) per-layer host-RAM offload. None of these are model-code work.
 
 **If we have more session time:** the spec's "finish early" guidance says don't add features; tighten T5/T6/T7/T8 tolerances, add more decode parity points, polish SUMMARY.md. But T8 has no tolerance to tighten (it's blocked, not loose). Useful targets: more decode parity at sp ∈ {500, 1023}, tighter T7 atol bounds with measurement evidence in TOLERANCE_LOG.
+
+---
+
+RESUMED at 2026-04-29 16:08 UTC (v8 iter 4 — finish-early polish). TPU preflight ok=true, n_tpu=4. GCS mounted; v4-flash snapshot resolves. Synthetic fixtures intact. Working tree clean (only `scripts/setup.sh` modified at parent repo). Baseline reconfirmed: **87 passed, 6 skipped** in 3:45 — zero regressions vs v8 iter 3 final (b55e5a30). TPU T6 spot-check: **1/1** in 25s.
+
+State of the world: B1 done, T8 architecturally blocked on HBM (4-chip slice can't fit 543 GB bf16 V4-Flash). Per spec's "If you finish early" guidance: do NOT add features; tighten tolerances, add more decode parity points, polish SUMMARY.md.
+
+Plan for iter 4:
+  (1) survey TOLERANCE_LOG.md to find loosest budgets
+  (2) measure observed atol on T7 (FP4/FP8 dequant equivalence), T2 long-context decode
+  (3) tighten one or two budgets with TOLERANCE_LOG entries citing measured values
+  (4) extend decode parity at 1–2 more start_pos values to fill gaps in {0..1023}
+  (5) polish SUMMARY.md "v8 iter 4 — what's verified, residual risk"
+  (6) re-run full suite to confirm no regressions; commit each green step
+
+If killed now: see prior resume hint (post-v8 iter 3); current iter is pure polish so killing mid-iter doesn't lose anything substantive. Nothing in this iter touches W5/T8 architectural blocker.
+
