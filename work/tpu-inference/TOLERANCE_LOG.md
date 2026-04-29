@@ -86,21 +86,30 @@ risk in PROD_TOPOLOGY_RISKS.md item 1.
   a real difference between the prefill and decode write paths (e.g. a
   fused vs unfused RoPE divergence).
 
-## Decode step parity (Tier 2 hardening — `TestDecodeAttentionParity`, `TestDecodeRollingParity`, `TestDecodeAttentionParityExtended`): `atol=1e-4` (v8 iter 4 tightening from atol=5e-2)
+## Decode step parity (Tier 2 hardening — `TestDecodeAttentionParity`, `TestDecodeRollingParity`, `TestDecodeAttentionParityExtended`, `TestDecodeRollingParityLong`): `atol=1e-4` (v8 iter 4 + iter 6 tightening from atol=5e-2)
 **Where:**
-  - `TestDecodeAttentionParity::test_decode_step_parity` (9 points: SWA/CSA/HCA at sp ∈ {1,4,7,8,9,16,32}).
-  - `TestDecodeRollingParity::test_rolling_decode_parity` (5 (P,K) combos, K up to 16).
-  - `TestDecodeAttentionParityExtended::test_decode_step_parity_extended` (8 points incl. sp ∈ {500, 1023}).
+  - `TestDecodeAttentionParity::test_decode_step_parity` (9 points: SWA/CSA/HCA at sp ∈ {1,4,7,8,9,16,32}). [iter 4]
+  - `TestDecodeRollingParity::test_rolling_decode_parity` (5 (P,K) combos, K up to 16). [iter 4]
+  - `TestDecodeAttentionParityExtended::test_decode_step_parity_extended` (8 points incl. sp ∈ {500, 1023}). [iter 4]
+  - `TestDecodeRollingParityLong::test_rolling_decode_parity_long` (3 (layer, P, K) combos: SWA P=1 K=31, SWA P=16 K=32, CSA P=1 K=31). [iter 6]
 **Default:** bf16 atol/rtol = 1e-2.
 **Looser bound:** atol=1e-4.
-**Evidence (measured 2026-04-29 v8 iter 4):**
-- Worst observed across all three test classes' parametrized points
-  (22 measurements total): `3.81e-6` (= 2 ULPs of bf16 in the
+**Evidence (measured 2026-04-29 v8 iter 4 + iter 6):**
+- Worst observed across the first three test classes' parametrized points
+  (iter 4, 22 measurements): `3.81e-6` (= 2 ULPs of bf16 in the
   attention-output magnitude range).
+- Worst observed across `TestDecodeRollingParityLong` (iter 6,
+  scripts/measure_rolling_long_parity.py: 3 configs × 6 seeds × up to 32
+  rolling-decode steps each ≈ 500 step-level measurements): `7.63e-6` at
+  layer=0 P=1 K=31 seed=7 step k=26. Same bf16 ULP regime as the iter-4
+  classes; the longer rolling chain (K up to 32 steps) does not
+  materially compound the per-step error.
 - Old budget was 5e-2 — about 13,000× looser than necessary, so it
-  didn't catch a real per-layer regression.
-- 1e-4 keeps a 25× margin over the observed worst, which leaves room
-  for: (a) other random seeds we did not enumerate, (b) future torch
+  didn't catch a real per-layer regression. `TestDecodeRollingParityLong`
+  was the last 5e-2 holdout on the `attention_decode_step` codepath
+  after iter 4.
+- 1e-4 keeps a 13–25× margin over the observed worst, which leaves
+  room for: (a) other random seeds we did not enumerate, (b) future torch
   reference fixes that change tie-breaking, (c) bf16 quirks at corner
   start_pos values inside the SWA wraparound. Tighter than 1e-4 risks
   flakes; looser than 1e-4 hides real bugs.

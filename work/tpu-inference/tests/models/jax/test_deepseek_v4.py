@@ -2423,7 +2423,12 @@ class TestDecodeRollingParityLong:
                 t2j(x_step), sp, params_j, fc, jax_state,
             )
             diff = maxabs(y_j, o_t)
-            assert diff <= 5e-2, (
+            # v8 iter 6 tightening: was 5e-2; observed worst 7.63e-6 across
+            # 3 configs × 6 seeds × up to 32 decode steps (~500 measurements,
+            # scripts/measure_rolling_long_parity.py). 13× margin under 1e-4.
+            # Same path as TestDecodeAttentionParity / TestDecodeRollingParity
+            # which iter 4 already tightened to 1e-4.
+            assert diff <= 1e-4, (
                 f"layer={layer_id} P={P} K={K} step k={k} sp={sp}: "
                 f"rolling decode diff {diff}"
             )
