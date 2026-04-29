@@ -159,3 +159,15 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 \
   pytest tests/models/test_deepseek_v4.py::TestB1MultiSeqDispatch -v
 ```
 If it passes, run the full suite to check for regressions, then commit (`B1: per-seq dispatch in __call__ — multi-seq logits match serial single-seq`). If it fails, debug — don't `git checkout` away from your iter-1 reasoning unless you're sure it's wrong.
+
+---
+
+RESUMED at 2026-04-29 12:04 UTC (v8 iter 2 — pick up B1 WIP from iter 1). TPU preflight ok (4 v6e chips). GCS mount UP at `~/.cache/huggingface/hub/`; real V4-Flash snapshot has 46 model-*.safetensors and DeepSeek's `inference/` ref code. Synthetic fixtures `tiny_v4_{bf16,quant,groundtruth}` populated under `work/scratch/`. Disk ~71 GB free (~28% used). The two WIP files from iter 1 (deepseek_v4.py + test_deepseek_v4.py) are intact. **`TestConcurrentMultiSeqDispatch` (3 tests) passes** as-written on this host (cpu, simulated 8-device) in 44s. Plan: (1) confirm full suite green via the v6 invocation; (2) commit B1 + B1 tests; (3) push; (4) attack W5 Tier 8 eager-mode `vllm serve deepseek-ai/DeepSeek-V4-Flash`.
+
+If killed now, next session must: run `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32 pytest tests/models/test_deepseek_v4.py -q` (expect ≥83+1; will be 86+1 after B1 commits) — if green, commit "B1: per-seq dispatch in __call__ — multi-seq matches serial" then continue to W5.
+
+---
+
+RESUMED at 2026-04-29 15:30 UTC (v8 iter 3 — pick up after B1 committed; T8 first attempt hit fp8 rejection). B1 is committed and pushed (25ad1a11). The first T8 eager attempt produced `logs/T8-eager-result-20260429T120533Z.json` with `ok:false reason:server_not_ready`; the underlying vllm-serve log shows `pydantic_core._pydantic_core.ValidationError: deepseek_v4_fp8 quantization is currently not supported in tpu`. Root cause: `tpu_inference/platforms/tpu_platform.py:94` lists `supported_quantization = ["tpu_int8", "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4"]` — `deepseek_v4_fp8` is missing. The JAX V4 path doesn't use vllm's torch DeepseekV4FP8Config/FusedMoE machinery (our W4 deepseek_v4_loader handles dequant in JAX), so the right fix is to add `deepseek_v4_fp8` to the TPU `supported_quantization` whitelist. Plan: (1) verify baseline still green on host (in case iter 2's commit broke anything); (2) patch the supported_quantization list; (3) re-run T8 eager smoke; (4) iterate on whatever next failure mode appears.
+
+If killed now, next session must: read `logs/T8-eager-result-*.json` (latest); if `ok:true`, mark W5 done; otherwise read the underlying serve log, document new failure surface in BLOCKERS.md, attempt up to 3 fixes, then move to non-dependent work.

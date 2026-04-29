@@ -92,7 +92,14 @@ class TpuPlatform(Platform):
     simple_compile_backend: str = "openxla"
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4",
+        # DeepSeek V4: weights ship as FP8 (linear/dense) + FP4 (MoE experts).
+        # The TPU JAX path (tpu_inference/models/jax/deepseek_v4*.py) does
+        # dequantization in `deepseek_v4_loader` rather than going through
+        # vllm's torch DeepseekV4FP8Config / FusedMoE machinery, so passing
+        # vllm's `verify_quantization` whitelist is the only thing required
+        # to let the engine reach our load_weights path.
+        "deepseek_v4_fp8",
     ]
 
     additional_env_vars: list[str] = [
