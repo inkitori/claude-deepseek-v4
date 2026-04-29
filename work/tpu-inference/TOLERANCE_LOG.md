@@ -109,6 +109,40 @@ risk in PROD_TOPOLOGY_RISKS.md item 1.
   + mHC + low-rank-O combine chain. Decode step is a much shorter
   matmul chain and the budget reflects that.
 
+## T-CDS — Compressor decode-step parity (`TestCompressorDecodeStep`, `TestCompressorDecodeStepExtended`): `atol=1e-5` (v8 iter 5 tightening from atol=5e-2)
+**Where:**
+  - `TestCompressorDecodeStep::test_compressor_decode_step_parity` (6 points:
+    ratio ∈ {4, 128} × sp covering pre-compression, mid-window, exact-event,
+    deep).
+  - `TestCompressorDecodeStepExtended::test_compressor_decode_step_parity_extended`
+    (3 deeper points: ratio=4 sp=63 (16th compress event), ratio=4 sp=64
+    (post-event), ratio=128 sp=255 (2nd compress event)).
+**Asserted quantities:** `kv_compressed` (only on compress events), `kv_state`,
+  `score_state` (over finite torch positions only).
+**Default:** fp32 ULP-floor (~e-7), since both reference (torch) and our
+  implementation cast to fp32 internally for the score/kv accumulator math
+  before re-quantizing the new compressed position to bf16.
+**Looser bound:** atol=1e-5.
+**Evidence (measured 2026-04-29 v8 iter 5, scripts/measure_compressor_decode_parity.py):**
+  - 72 measurements (9 configs × 8 seeds {0,1,2,3,5,7,11,13}).
+  - Worst `kv_compressed`: **0.0** (across 24 hits — 3 compress configs ×
+    8 seeds: ratio=4 sp=7, ratio=4 sp=63, ratio=128 sp=255). bf16 → fp32
+    cast on both sides converges to bit-identical RoPE+RMSNorm output here.
+  - Worst `kv_state`: **7.15e-7** (ratio=4, P=4, sp=4, seed=3). 14× margin
+    under 1e-5.
+  - Worst `score_state`: **5.96e-7** (ratio=128, P=128, sp=128, seed=13).
+    17× margin under 1e-5.
+  - Old budget was 5e-2 — about 70,000× looser than necessary on
+    state-tensor parity. The compressor's score/kv accumulator is fp32
+    end-to-end on both sides; the state-tensor parity should be at fp32
+    ULP, not at bf16 noise. The 5e-2 placeholder would have hidden a
+    fp32-vs-bf16 accumulator regression silently.
+- 1e-5 leaves comfortable headroom for: (a) future torch reference
+  changes to RoPE / softmax tie-breaking; (b) tiny seed-to-seed
+  fluctuation past the 8-seed sample we enumerated; (c) cross-platform
+  numpy / numpy-to-jax bridge differences. Tighter than 1e-5 risks
+  flakes; looser than 1e-5 hides real fp32 accumulator regressions.
+
 ## T4 — Indexer top-k SET equality (Tier 1, `TestIndexerComponent`)
 **Where:** `TestIndexerComponent::test_indexer_prefill_matches_torch_topk`.
 **Default:** exact int equality.

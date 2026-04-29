@@ -2132,7 +2132,9 @@ class TestCompressorDecodeStep:
         else:
             assert did, f"JAX did not compress but torch did at sp={start_pos}"
             diff = maxabs(kv_compressed_j, kv_t)
-            assert diff <= 5e-2, f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
+            # Measured worst across 24 hits (3 compress configs × 8 seeds): 0.0.
+            # Tightened from 5e-2 to 1e-5 (TOLERANCE_LOG entry T-CDS).
+            assert diff <= 1e-5, f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
 
         # State after step must match torch.
         diff_kvst = float(np.abs(np.asarray(new_kvst) -
@@ -2146,8 +2148,11 @@ class TestCompressorDecodeStep:
             diff_sc = float(np.abs(sc_j[finite_mask] - sc_t[finite_mask]).max())
         else:
             diff_sc = 0.0
-        assert diff_kvst <= 5e-2, f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
-        assert diff_sc <= 5e-2, f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
+        # Measured worst across 72 points (9 configs × 8 seeds):
+        # kv_state 7.15e-7, score_state 5.96e-7 — both at fp32 ULP. Tightened
+        # from 5e-2 to 1e-5 (TOLERANCE_LOG T-CDS).
+        assert diff_kvst <= 1e-5, f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
+        assert diff_sc <= 1e-5, f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
 
 
 # =============================================================
@@ -2358,7 +2363,8 @@ class TestCompressorDecodeStepExtended:
                 f"ratio={ratio} sp={start_pos}"
             )
             diff = maxabs(kv_compressed_j, kv_t)
-            assert diff <= 5e-2, (
+            # See TOLERANCE_LOG T-CDS — measured worst 0.0 / 24 points.
+            assert diff <= 1e-5, (
                 f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
             )
         diff_kvst = float(np.abs(np.asarray(new_kvst) -
@@ -2370,10 +2376,12 @@ class TestCompressorDecodeStepExtended:
             diff_sc = float(np.abs(sc_j[finite_mask] - sc_t[finite_mask]).max())
         else:
             diff_sc = 0.0
-        assert diff_kvst <= 5e-2, (
+        # See TOLERANCE_LOG T-CDS — measured worst 7.15e-7 (kv_state) /
+        # 5.96e-7 (score_state) across 72 points (9 configs × 8 seeds).
+        assert diff_kvst <= 1e-5, (
             f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
         )
-        assert diff_sc <= 5e-2, (
+        assert diff_sc <= 1e-5, (
             f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
         )
 
