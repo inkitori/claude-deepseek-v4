@@ -190,24 +190,104 @@ fixtures: **64 passed, 20 skipped**.
 
 ---
 
-## T8-mount-missing — STATUS: open, host-side credential
+## T8-mount-missing — RESOLVED IN v8 ITER 2 (host-side)
 
-**Status (v8, 2026-04-29):** Tier 8 (real-weight `vllm serve
-deepseek-ai/DeepSeek-V4-Flash` deploy gate) is **blocked**: the
-HuggingFace cache at `~/.cache/huggingface/hub/` is empty (only the
-local xet placeholder), and the GCS mount at `/tmp/gcs/bucket/` is
-present but **permission-denied** to this UID. The expected
-`models--deepseek-ai--DeepSeek-V4-Flash/snapshots/...` directory does
-not resolve.
+**Status (v8 iter 2, 2026-04-29 ~12:00 UTC):** the host loop mounted
+gcsfuse at `~/.cache/huggingface/hub/` and the real V4-Flash snapshot
+resolves at
+`~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/fd53f944496234770ba80e15004f9b6d269a71f5/`
+(config.json + 46 model-*.safetensors + DeepSeek's `inference/`
+reference code).
 
-The v8 spec is explicit: **do not attempt to remount**. Mounting
-requires bucket creds in `.env` and is a host-side concern.
-Tier 8 is therefore **skipped on this run**.
+`mountpoint -q ~/.cache/huggingface/hub` returns 0; total checkpoint
+size is ~156 GB (FP4 experts + FP8 dense + bf16 embed/LM-head).
 
-**What unblocks this:** the host runs `scripts/mount_gcs.sh` (or its
-equivalent) to mount the bucket with credentials, OR the host pre-stages
-the V4-Flash checkpoint at
-`~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/`.
+This unblocks T8 *as far as reaching `load_weights`*. The next blocker
+is HBM topology (see T8-HBM-OOM below).
 
-**Pseudocode for the next session (when mount lands):** see the v8 spec
-"W5 — Tier 8 real-weight deploy gate" section. The runbook is verbatim.
+---
+
+## T8-HBM-OOM — STATUS: open, architectural (4-chip slice insufficient)
+
+**Status (v8 iter 3, 2026-04-29 15:22 UTC):** Tier 8 deploy gate
+**fails at HBM allocation** on this 4-chip v6e host. Captured failure
+in `logs/T8-eager-serve-20260429T152129Z.log`:
+
+```
+ValueError: RESOURCE_EXHAUSTED: E0100: RuntimeBufferAllocationFailure:
+Error allocating device buffer: Attempting to allocate 16.00M.
+That was not possible. There are 15.47M free.; (0x1x0_HBM0)
+```
+
+The OOM fires the moment `DeepseekV4ForCausalLM.load_weights` →
+`load_weights_from_dir` → `jax.tree_util.tree_map(_materialize, ...)`
+calls `jnp.zeros(leaf.shape, leaf.dtype)` for the abstract param tree.
+**No real weights have been touched yet** at the moment of failure;
+materializing the empty bf16 param tree alone exhausts chip-0 HBM.
+
+**Why this fires before any real load.** Without explicit
+`jax.sharding.NamedSharding` on the `nnx.Param` leaves, `jnp.zeros`
+defaults to `jax.devices()[0]` — i.e. all 540 GB of bf16 weights are
+attempted on a single 32 GB chip.
+
+**Why even with sharding it would still OOM on this host.**
+
+  - Real V4-Flash on disk: 156 GB FP4/FP8.
+  - Dequantized to bf16 (current loader path): **543 GB**.
+  - This 4-chip v6e slice: 4 × 32 GB = **128 GB total HBM**.
+  - 543 GB / 4 (perfectly sharded) = 135 GB per chip — still > 32 GB.
+  - 156 GB / 4 (native FP4/FP8 sharded) = 39 GB per chip — still > 32 GB.
+
+The math does not close on a 4-chip slice. The Tier 3 budget tests
+(documented at PROGRESS.md Phase 4) showed V4-Flash at 17 GB/device on
+a *32-chip* mesh — which is the slice the user's deployment is
+actually targeting.
+
+**What this means for the deploy gate.**
+
+Tier 8 cannot pass on this single-VM 4-chip view of the v6e-32 slice.
+The full slice (8 hosts × 4 chips = 32 chips × 32 GB = 1024 GB) does
+fit V4-Flash bf16 with substantial headroom; the budget is documented
+in PROD_TOPOLOGY_RISKS.md as the production target.
+
+**Three orthogonal pieces of work would unblock T8 here:**
+
+  1. **Multi-host topology.** Launch vllm-tpu across all 8 hosts of the
+     v6e-32 slice (current invocation only sees 4 chips because the loop
+     runs per-host, not as a coordinator). This is host-loop / launcher
+     work, not model-code work.
+
+  2. **Native FP4/FP8 storage on TPU.** Keep weights packed during
+     `load_weights` (no bf16 dequant) and dequantize on-the-fly inside
+     each matmul. Reduces resident weight memory by 4-8×. Requires
+     either a Pallas kernel or qwix-style quant rules, plus reworking
+     `apply_weights_to_param_tree` to keep `(packed, scale)` tuples.
+     Substantial new work.
+
+  3. **Per-layer host-RAM offload.** Stream one block's worth of
+     weights from host RAM to TPU at a time, materializing only the
+     active layer's params on-chip. Host RAM is 708 GB on this VM —
+     room for the full bf16 model. Requires per-layer state in
+     `__call__` and adds ~1 layer-transfer of latency per token. Big
+     rewrite.
+
+**Sharding annotations alone (without (1) or (2) or (3)) do not
+unblock T8 on a 4-chip slice.** The math doesn't close; see above.
+
+**Recommended next session:** confirm with the user whether (a) the
+deploy target is the full 32-chip slice (in which case the host-loop
+multi-host launch is the next unblock), or (b) we should sink time
+into native FP4/FP8 storage (option 2) for 4-chip viability.
+
+**What still works on this 4-chip host:**
+
+  - Tier 4b on the real V4-Flash bf16 embed shard: **PASSING** with the
+    `work/scratch/v4_flash` symlink to the gcsfuse mount. Validates the
+    loader's bf16 path on real data byte-equally.
+  - Tiers 1, 2, 2-hardening, 3, 4, 5 (synthetic), 6 (synthetic on TPU),
+    7 (synthetic FP4/FP8 dequant ≡ groundtruth) are all GREEN.
+  - B1 multi-seq dispatch (3 new tests): GREEN.
+
+The functional core (forward math + decode + dequant + multi-seq
+dispatch + nnx port + load_weights wiring) is correct. The deploy gate
+is purely a memory-topology gate, not a correctness gate.

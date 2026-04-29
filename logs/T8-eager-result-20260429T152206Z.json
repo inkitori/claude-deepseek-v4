@@ -1,0 +1,42 @@
+{
+  "ok": false,
+  "reason": "hbm_oom_during_load_weights",
+  "captured_at_iso": "2026-04-29T15:22:06Z",
+  "iter": "v8 iter 3",
+  "host": {
+    "n_chips": 4,
+    "chip_kind": "TPU v6e (32 GB HBM each)",
+    "host_ram_gb": 708
+  },
+  "checkpoint": {
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "snapshot": "fd53f944496234770ba80e15004f9b6d269a71f5",
+    "n_safetensors_shards": 46,
+    "on_disk_native_quant_gb": 156,
+    "bf16_dequant_gb": 543
+  },
+  "vllm_serve_invocation": "scripts/t8_eager_smoke.sh 18083 (NEW_MODEL_DESIGN=1, --tensor-parallel-size 4, --max-model-len 256, --max-num-seqs 1, --enforce-eager, --additional_config enable_dp_attention=true)",
+  "captured_traceback_excerpt": "ValueError: RESOURCE_EXHAUSTED: E0100: RuntimeBufferAllocationFailure: Error allocating device buffer: Attempting to allocate 16.00M. That was not possible. There are 15.47M free.; (0x1x0_HBM0)",
+  "stack_top_frame": "tpu_inference/models/jax/deepseek_v4.py:909 -> load_weights_from_dir -> tree_map -> jnp.zeros for the abstract param tree (no real weights touched yet at OOM moment)",
+  "root_cause": "params_v has no jax.sharding.NamedSharding annotations -> jnp.zeros defaults to jax.devices()[0]; even with sharding, V4-Flash (543 GB bf16 / 156 GB FP4-FP8 native) exceeds 4*32=128 GB total HBM on this 4-chip slice.",
+  "blocker_doc": "work/tpu-inference/BLOCKERS.md::T8-HBM-OOM",
+  "serve_log": "logs/T8-eager-serve-20260429T152129Z.log",
+  "what_works_on_4_chips": [
+    "T1 components (25/25)",
+    "T2 logits parity (8/8) + 11 hardening (CPU)",
+    "T3 compile-only V4-Flash + sim v6e-32 (10/10)",
+    "T4 HF->JAX name mapping (2/2)",
+    "T4b real V4-Flash bf16 shard byte-equal round-trip (1/1) on gcsfuse-mounted snapshot",
+    "T5 synthetic vllm serve curl roundtrip (1/1) on tiny_v4_bf16",
+    "T6 real-TPU compile + tiny forward (1/1) on TPU v6e",
+    "T7 FP4/FP8 dequant equivalence (1/1) on tiny_v4_quant",
+    "B1 multi-seq dispatch (3/3) — concurrent_decode_two_seqs, single_seq_via_metadata_matches_no_metadata, three_seqs_concurrent"
+  ],
+  "what_unblocks_t8": [
+    "(A) Multi-host launcher across all 8 hosts of the v6e-32 slice (32 chips * 32 GB = 1024 GB total HBM, where V4-Flash bf16 fits with headroom -- the Tier 3 budget tests measured 17 GB/device on a 32-device mesh)",
+    "(B) Native FP4/FP8 storage on TPU (no bf16 dequant) plus on-the-fly dequant in matmul; reduces resident weight memory 4-8x. Substantial new work (Pallas kernel or qwix-style quant rules + apply_weights_to_param_tree rework to keep (packed, scale) tuples).",
+    "(C) Per-layer host-RAM offload (708 GB host RAM fits full bf16 model). Requires per-layer state in __call__ and adds ~1 layer-transfer of latency per token."
+  ],
+  "decision": "Documented in BLOCKERS.md::T8-HBM-OOM; T8 architecturally blocked on this 4-chip view of the slice. The functional core (math, decode, dequant, multi-seq, nnx port, load_weights wiring) is correct and validated on synthetic + real-shard paths.",
+  "deploy_gate_status_for_user": "Tier 8 cannot pass on this 4-chip host. To exercise the deploy gate, the host loop must launch vllm-tpu across all 8 hosts of the v6e-32 slice (option A above) -- this is launcher / coordinator work, not model-code work."
+}

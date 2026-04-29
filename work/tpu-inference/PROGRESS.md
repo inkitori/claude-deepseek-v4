@@ -171,3 +171,23 @@ If killed now, next session must: run `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_h
 RESUMED at 2026-04-29 15:30 UTC (v8 iter 3 — pick up after B1 committed; T8 first attempt hit fp8 rejection). B1 is committed and pushed (25ad1a11). The first T8 eager attempt produced `logs/T8-eager-result-20260429T120533Z.json` with `ok:false reason:server_not_ready`; the underlying vllm-serve log shows `pydantic_core._pydantic_core.ValidationError: deepseek_v4_fp8 quantization is currently not supported in tpu`. Root cause: `tpu_inference/platforms/tpu_platform.py:94` lists `supported_quantization = ["tpu_int8", "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4"]` — `deepseek_v4_fp8` is missing. The JAX V4 path doesn't use vllm's torch DeepseekV4FP8Config/FusedMoE machinery (our W4 deepseek_v4_loader handles dequant in JAX), so the right fix is to add `deepseek_v4_fp8` to the TPU `supported_quantization` whitelist. Plan: (1) verify baseline still green on host (in case iter 2's commit broke anything); (2) patch the supported_quantization list; (3) re-run T8 eager smoke; (4) iterate on whatever next failure mode appears.
 
 If killed now, next session must: read `logs/T8-eager-result-*.json` (latest); if `ok:true`, mark W5 done; otherwise read the underlying serve log, document new failure surface in BLOCKERS.md, attempt up to 3 fixes, then move to non-dependent work.
+
+---
+
+## Phase v8 iter 3 (2026-04-29 ~15:30–16:10 UTC)
+
+- [x] Baseline reconfirmed clean: **73 passed, 14 skipped** in 3:05 (no regressions vs iter 2's B1-augmented baseline).
+- [x] Symlinked `work/scratch/v4_flash` -> gcsfuse snapshot dir; re-run baseline now **81 passed, 6 skipped** (3:44). The 6 remaining skips are 5 V4-Pro RealConfigCompile (no v4_pro fixture) + 1 TPU-only `TestRealTpuTinyForward` (runs separately under `JAX_PLATFORMS=tpu`, where it passes — 1/1).
+- [x] **Tier 5 (synthetic vllm serve)** confirmed still GREEN on this host: 1/1 in 1:06.
+- [x] **Tier 4b on real V4-Flash bf16 shard** GREEN through gcsfuse mount (1/1 in 18s).
+- [x] **Tier 8 attempt 1** (commit 25ad1a11 baseline) — vllm pydantic rejects `deepseek_v4_fp8` quant. Captured at logs/T8-eager-serve-20260429T120533Z.log.
+- [x] **Tier 8 attempt 2** (after dd731cf2: TpuPlatform supported_quantization += deepseek_v4_fp8) — vllm pydantic now accepts the quant name; gate moves to VllmConfig "MLA models require enable_dp_attention". Script was missing the `--additional_config` flag. Captured at logs/T8-eager-serve-20260429T151831Z.log.
+- [x] **Tier 8 attempt 3** (after a249970f: t8_eager_smoke.sh adds enable_dp_attention) — vllm advances past pydantic; tpu_inference's separate `get_tpu_quantization_config` rejects with NotImplementedError "deepseek_v4_fp8 quantization method not supported. Supported methods are dict_keys([None, 'fp8'])". Captured at logs/T8-eager-serve-20260429T151926Z.log.
+- [x] **Tier 8 attempt 4** (after f2f5a8e8: deepseek_v4_fp8 -> UnquantizedConfig in TPU quant registry) — engine init advances all the way to `model.load_weights(rng)`, then OOMs at `jnp.zeros` materializing the abstract bf16 param tree on chip 0. **Architectural truth confirmed:** V4-Flash 543 GB bf16 cannot fit 4 v6e chips × 32 GB HBM = 128 GB even with perfect sharding (135 GB/chip > 32 GB). Captured at logs/T8-eager-serve-20260429T152129Z.log; structured result at logs/T8-eager-result-20260429T152206Z.json. Documented in BLOCKERS.md::T8-HBM-OOM with three orthogonal unblock paths.
+- [x] STATUS.md / SUMMARY.md / BLOCKERS.md / PROGRESS.md (this file) updated. v8 iter 3 ends with W5 deploy gate **architecturally blocked**; the deploy target must be the full 32-chip v6e-32 slice (multi-host launcher work) to fit V4-Flash bf16.
+
+## Resume hint (post-v8 iter 3)
+
+**If killed now:** the headline is BLOCKERS.md::T8-HBM-OOM. The deploy gate cannot pass on this 4-chip slice; V4-Flash bf16 = 543 GB > 128 GB HBM. The functional core (math + decode + dequant + multi-seq dispatch + nnx port + load_weights wiring) is correct and validated on synthetic + real-shard paths. To exercise T8, either (A) the host loop launches vllm-tpu across all 8 hosts of the v6e-32 slice, or (B) we add native FP4/FP8 storage on TPU + on-the-fly dequant, or (C) per-layer host-RAM offload. None of these are model-code work.
+
+**If we have more session time:** the spec's "finish early" guidance says don't add features; tighten T5/T6/T7/T8 tolerances, add more decode parity points, polish SUMMARY.md. But T8 has no tolerance to tighten (it's blocked, not loose). Useful targets: more decode parity at sp ∈ {500, 1023}, tighter T7 atol bounds with measurement evidence in TOLERANCE_LOG.

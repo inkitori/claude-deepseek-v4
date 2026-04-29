@@ -1,11 +1,56 @@
-# DeepSeek V4 implementation — autonomous overnight session summary (v6)
+# DeepSeek V4 implementation — autonomous overnight session summary (v8)
 
-**Branch:** `deepseek-v4`. Six autonomous sessions on 2026-04-28:
-v1 (08:36–09:46 UTC, prefill-only),
+**Branch:** `main` (subtree). Sessions on 2026-04-28 / 2026-04-29:
+v1 (2026-04-28 08:36–09:46 UTC, prefill-only),
 v2 (17:14–17:50 UTC, +decode +dequant +TPU smoke),
 v3 (19:03 UTC, +vllm-serve probe characterization +decode hardening),
 v4/v5 (20:09–21:21 UTC, nnx.Module port of DeepseekV4ForCausalLM),
-v6 (21:39 UTC onward, **W2 unblock + W3 wiring + Tier 5 GREEN**).
+v6 (21:39 UTC onward, **W2 unblock + W3 wiring + Tier 5 GREEN**),
+v7 (22:19 UTC, finish-early hardening),
+**v8** (2026-04-29 host-direct on v6e-32: **B1 multi-seq + T8 architectural truth**).
+
+## v8 — what's new since v7
+
+**Headline:** B1 (concurrent multi-sequence decode dispatch) is GREEN, with 3
+new regression tests. **T8 (real-weight deploy gate) is architecturally
+blocked on HBM topology** — V4-Flash bf16 (543 GB) cannot fit on this
+4-chip v6e-32 view (128 GB total HBM); the deploy target must be the full
+32-chip slice (1024 GB). Captured OOM evidence and three orthogonal
+unblock paths documented in BLOCKERS.md::T8-HBM-OOM.
+
+| Area | v7 state | v8 state |
+|---|---|---|
+| B1 multi-seq dispatch | residual blocker (single-seq only) | **DONE** — `__call__` extracts per-seq segments from `attention_metadata.query_start_loc` and dispatches each through `transformer_body_forward` independently. 3 new tests in `TestConcurrentMultiSeqDispatch`: concurrent_decode_two_seqs (each seq's logits match a serial single-seq run), single_seq_via_metadata_matches_no_metadata (fallback path equality), three_seqs_concurrent. Eager-only Python loop; jit support deferred. |
+| Tier 8 (real V4-Flash deploy gate) | not attempted | **architecturally blocked** (4-chip slice can't fit V4-Flash). Three patches landed to clear the gates upstream of HBM (`deepseek_v4_fp8` whitelisted in TPU platform; mapped to UnquantizedConfig in TPU quant registry; t8_eager_smoke.sh adds `--additional_config enable_dp_attention=true`). After those: vllm advances through engine init, mesh creation, model loader dispatch — and OOMs at the very first `jnp.zeros` materializing the bf16 param tree. Captured at logs/T8-eager-serve-20260429T152129Z.log. |
+| Tier 4b on **real** V4-Flash bf16 shard | passing on local `/mnt/scratch/` | **passing on gcsfuse-mounted snapshot** — the v8 host symlinks `work/scratch/v4_flash` -> `~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/fd53f944.../`, so the real-shard byte-equal round-trip exercises the loader's bf16 path on real data without local download. |
+| Total tests | 83 passing, 1 skipped (TPU-only) | **81 passing on CPU + 1 passing on TPU = 82** with **6 skipped** on CPU (5 V4-Pro RealConfigCompile, 1 TPU-only forward). Two new B1 tests + one new B1 metadata test = +3 since v7. The "skip" delta vs v7 (was 1, now 6) is entirely V4-Pro-fixture-dependent — this host has V4-Flash but not V4-Pro on the gcsfuse mount, so V4-Pro Tier 3 cleanly skips. |
+| Patches landed (v8 iter 3) | n/a | dd731cf2 (TpuPlatform supported_quantization += deepseek_v4_fp8), a249970f (T8 script flag fix), f2f5a8e8 (TPU quant registry mapping). Plus B1 at 25ad1a11 from iter 2. |
+
+**The architectural truth uncovered by v8 iter 3:** Tier 8 cannot pass on
+a single 4-chip v6e-32 host. V4-Flash native quant size is 156 GB; bf16
+dequant is 543 GB; the 4-chip slice has 128 GB total HBM. Even with
+perfect sharding (135 GB/chip bf16 or 39 GB/chip native), we exceed the
+32 GB-per-chip HBM budget. **The user's expectation of "this v6e-32 TPU
+host" must be interpreted as the full 32-chip slice (8 hosts), not this
+single VM's 4 chips. The Tier 3 budget tests measured 17 GB/device on a
+32-device mesh — which is the slice the deployment targets.**
+
+Three orthogonal unblock paths are recorded in BLOCKERS.md::T8-HBM-OOM:
+
+  1. **Multi-host launcher** (host-loop work, not model-code) — coordinate
+     vllm-tpu across all 8 hosts of the v6e-32 slice. This is the
+     production target.
+  2. **Native FP4/FP8 storage on TPU** (substantial new work) — keep
+     weights packed; dequantize on-the-fly in matmul. Reduces resident
+     weight memory 4-8×.
+  3. **Per-layer host-RAM offload** (big rewrite) — stream one layer's
+     weights from host RAM (708 GB) to TPU at a time. Adds
+     ~1 layer-transfer of latency per token.
+
+**Sharding annotations alone do not unblock T8 on a 4-chip slice.** The
+math doesn't close.
+
+## v6 — what's new since v3/v5
 
 ## v6 — what's new since v3/v5
 
