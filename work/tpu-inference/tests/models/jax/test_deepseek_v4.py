@@ -2157,6 +2157,19 @@ class TestDecodeAttentionParityExtended:
         (3, 128, 512),
         # HCA deep — past the first compression event.
         (3, 192, 512),
+        # v8 long-context additions per spec post-v3 resume hint
+        # (sp ∈ {500, 1023}): exercise the decode path past the initial
+        # compression schedule to catch state-buffer wraparound bugs that
+        # only surface deep in a sequence.
+        # SWA at sp=500: 62 wraparounds of window=8.
+        (0, 500, 512),
+        # CSA at sp=500: 125 compressions accumulated.
+        (2, 500, 512),
+        # HCA at sp=500: 3 compressions accumulated; deep past 1st event.
+        (3, 500, 512),
+        # SWA at sp=1023: max-context single-step parity, 127 window
+        # wraparounds. The SWA path is the cheapest end-of-context probe.
+        (0, 1023, 1024),
     ])
     def test_decode_step_parity_extended(self, layer_id, start_pos, max_seq_len):
         attn, args = _build_attn_for_decode(
