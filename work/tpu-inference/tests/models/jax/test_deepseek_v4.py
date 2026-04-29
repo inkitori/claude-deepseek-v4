@@ -1842,25 +1842,36 @@ class TestRealShardRoundTrip:
 
 
 class TestRealFp8DequantSmoke:
-    """Tier 4b extension (v8 iter 3): exercise the FP8 dequant path on a
-    real V4-Flash tensor. The tiny_v4_quant fixture validates the recipe;
-    this test confirms the same code handles real V4-Flash FP8 (block=128)
-    without producing NaN/inf or all-zeros.
+    """Tier 4b extension (v8 iter 3, expanded iter 7): exercise the FP8
+    dequant path on real V4-Flash tensors. The tiny_v4_quant fixture
+    validates the recipe; this test confirms the same code handles real
+    V4-Flash FP8 (block=128) without producing NaN/inf or all-zeros.
 
     The bf16 round-trip in TestRealShardRoundTrip only covers the
     embedding (which is stored as bf16, no scale). Dense layers like
     `layers.0.attn.wq_a.{weight,scale}` are FP8 e4m3fn + e8m0fnu scale
     at block=128 — the production path. Without this smoke we have no
     real-data evidence for the FP8 dequant path.
+
+    v8 iter 7: parametrized across 4 distinct attn projections at
+    different layers (layers 0/10/30 + multiple projection heads).
+    Each tensor is small enough (≤4 MB int8) that all 4 cases together
+    add <2 s of gcsfuse IO on a warm mount.
     """
 
     REAL_DIR = _scratch("v4_flash")
     INDEX = _scratch("v4_flash/model.safetensors.index.json")
-    # Pick a small FP8-quantized weight in shard 2 (layer 0 attn q_a).
-    # Shape [1024, 4096], scale [8, 32], block=128.
-    TENSOR_BASE = "layers.0.attn.wq_a"
 
-    def test_real_fp8_dequant_produces_finite_nontrivial_bf16(self):
+    # Mix of attn projections + layers. wq_a / wkv at layers 0,10,30 keeps
+    # IO under ~12 MB total while exercising 3 distinct shapes (8x32,
+    # 4x32 scale grids) and 3 distinct shards.
+    @pytest.mark.parametrize("tensor_base", [
+        "layers.0.attn.wq_a",   # shape [1024, 4096], shard 2 (existing case)
+        "layers.0.attn.wkv",    # shape [512,  4096], shard 2 (different out_dim)
+        "layers.10.attn.wq_a",  # shape [1024, 4096], shard 12 (later layer)
+        "layers.30.attn.wkv",   # shape [512,  4096], shard 32 (deep layer + diff shape)
+    ])
+    def test_real_fp8_dequant_produces_finite_nontrivial_bf16(self, tensor_base):
         if not os.path.exists(self.INDEX):
             pytest.skip("V4-Flash safetensors index not present")
         from safetensors import safe_open
@@ -1869,8 +1880,8 @@ class TestRealFp8DequantSmoke:
         )
         with open(self.INDEX) as f:
             mapping = json.load(f)["weight_map"]
-        w_name = self.TENSOR_BASE + ".weight"
-        s_name = self.TENSOR_BASE + ".scale"
+        w_name = tensor_base + ".weight"
+        s_name = tensor_base + ".scale"
         if w_name not in mapping or s_name not in mapping:
             pytest.skip(f"{w_name} / {s_name} not in real V4-Flash index")
         if mapping[w_name] != mapping[s_name]:
@@ -1930,21 +1941,34 @@ class TestRealFp8DequantSmoke:
 
 
 class TestRealFp4DequantSmoke:
-    """Tier 4b extension (v8 iter 3): exercise the FP4 dequant path on a
-    real V4-Flash expert tensor. The synthetic tiny_v4_quant fixture uses
-    fp4_block=8, but real V4-Flash uses fp4_block=32 — this test confirms
-    the loader's recipe (FP4_TABLE codebook + e8m0 scale) handles the
-    production block size without producing NaN/inf or all-zeros.
+    """Tier 4b extension (v8 iter 3, expanded iter 7): exercise the FP4
+    dequant path on real V4-Flash expert tensors. The synthetic
+    tiny_v4_quant fixture uses fp4_block=8, but real V4-Flash uses
+    fp4_block=32 — this test confirms the loader's recipe (FP4_TABLE
+    codebook + e8m0 scale) handles the production block size without
+    producing NaN/inf or all-zeros.
 
-    Picks `layers.2.ffn.experts.0.w1` (shard 4): packed int8 [2048, 2048],
-    scale e8m0fnu [2048, 128] -> fp4_block = 4096 / 128 = 32.
+    v8 iter 7: parametrized across 4 distinct expert tensors covering
+    all three projections (w1/w2/w3), multiple expert indices, and
+    layers spanning 2..42. Each tensor is ~4 MB int8; total IO ≤ 16 MB
+    on warm gcsfuse cache.
     """
 
     REAL_DIR = _scratch("v4_flash")
     INDEX = _scratch("v4_flash/model.safetensors.index.json")
-    TENSOR_BASE = "layers.2.ffn.experts.0.w1"
 
-    def test_real_fp4_dequant_produces_finite_nontrivial_bf16(self):
+    # Picked to maximize diversity of layer / expert / projection while
+    # keeping each tensor in a single shard (verified via the index).
+    # All have packed shape [out, in/2] with fp4_block=32 per V4-Flash
+    # spec; w1/w3 are [2048, 2048] (-> in_logical=4096), w2 is
+    # [4096, 1024] (-> in_logical=2048) reflecting the SwiGLU layout.
+    @pytest.mark.parametrize("tensor_base", [
+        "layers.2.ffn.experts.0.w1",     # existing case (shard 4)
+        "layers.0.ffn.experts.0.w2",     # w2 projection (different shape)
+        "layers.5.ffn.experts.10.w1",    # later layer + expert 10
+        "layers.42.ffn.experts.255.w3",  # deepest layer + last expert + w3
+    ])
+    def test_real_fp4_dequant_produces_finite_nontrivial_bf16(self, tensor_base):
         if not os.path.exists(self.INDEX):
             pytest.skip("V4-Flash safetensors index not present")
         from safetensors import safe_open
@@ -1953,8 +1977,8 @@ class TestRealFp4DequantSmoke:
         )
         with open(self.INDEX) as f:
             mapping = json.load(f)["weight_map"]
-        w_name = self.TENSOR_BASE + ".weight"
-        s_name = self.TENSOR_BASE + ".scale"
+        w_name = tensor_base + ".weight"
+        s_name = tensor_base + ".scale"
         if w_name not in mapping or s_name not in mapping:
             pytest.skip(f"{w_name} / {s_name} not in real V4-Flash index")
         if mapping[w_name] != mapping[s_name]:
@@ -2015,6 +2039,261 @@ class TestRealFp4DequantSmoke:
         assert zeros_count > 0, (
             "FP4 dequant produced no exact zeros — codebook lookup likely "
             "off; FP4_TABLE indices 0 and 8 both decode to 0.0"
+        )
+
+
+# ------------------------------------------------------------
+# Tier 4b — independent reference dequant (v8 iter 7)
+# ------------------------------------------------------------
+#
+# The smoke tests above prove the loader produces *plausible* output
+# (finite, non-trivial std, expected magnitude range, has zeros). They
+# do NOT prove the loader produces the *correct* values. The smoke could
+# pass even with subtle bugs like:
+#   - FP4 nibble-order swap (loader puts low nibble at index 2k+1 instead of 2k)
+#   - FP8 scale-block axis flip (block stride along out vs in axis)
+#   - e8m0 bias off-by-one (interpret byte as unbiased exponent)
+#
+# These tests close that gap by re-implementing both dequants from the
+# spec in pure numpy with a deliberately different addressing pattern
+# (sign-magnitude FP4 decode vs the loader's 16-entry FP4_TABLE lookup;
+# bit-by-bit e4m3fn decode vs torch's `.float()` cast). They then assert
+# byte-equality of the bf16 outputs — exact match in all 16 bits per
+# element. Any divergence indicates a real loader bug, not a tolerance
+# issue.
+#
+# These run on the same real V4-Flash tensors as the smoke tests above
+# (warm gcsfuse cache after that suite ran), so IO cost is ~zero.
+
+
+def _numpy_decode_e4m3fn(buf: np.ndarray) -> np.ndarray:
+    """Independent reference for torch's `float8_e4m3fn -> float32` cast.
+
+    The "FN" variant per OFP8 spec:
+      - bit 7: sign
+      - bits 3..6: 4-bit biased exponent (bias = 7)
+      - bits 0..2: 3-bit mantissa
+      - exp == 0:  subnormal,   value = (-1)^s * 2^-6 * (mant/8)
+      - 0 < exp < 15: normal,   value = (-1)^s * 2^(exp-7) * (1 + mant/8)
+      - exp == 15, mant == 7: NaN (no Inf in FN variant)
+      - exp == 15, mant <  7: normal  (uses the "F"-half of the 0xFC..0xFE)
+
+    Args:
+      buf: uint8 numpy array of e4m3fn-packed bytes.
+    Returns:
+      float32 numpy array with the decoded values. NaN is preserved.
+    """
+    buf = buf.astype(np.uint8)
+    sign = (buf >> 7) & 1
+    exp = (buf >> 3) & 0xF
+    mant = buf & 0x7
+    # Use float64 throughout so the (1 + mant/8) and 2^(exp-7) products
+    # are exact (all values are dyadic). Cast to fp32 at the end.
+    mant_f = mant.astype(np.float64)
+    exp_i = exp.astype(np.int32)
+    subnormal = (mant_f / 8.0) * (2.0 ** -6)
+    normal = (1.0 + mant_f / 8.0) * np.exp2(exp_i - 7)
+    out = np.where(exp == 0, subnormal, normal)
+    out = np.where(sign == 1, -out, out)
+    out = np.where((exp == 15) & (mant == 7), np.nan, out)
+    return out.astype(np.float32)
+
+
+def _numpy_decode_e8m0fnu(buf: np.ndarray) -> np.ndarray:
+    """Independent reference for torch's `float8_e8m0fnu -> float32` cast.
+
+    e8m0fnu has 8 bits of unbiased-by-127 exponent, no sign, no mantissa.
+    Byte 0xFF encodes NaN. Real V4-Flash scale tensors do not contain
+    0xFF (all scales are finite); we still propagate it as NaN for
+    completeness.
+
+    Returns float32 array with values 2^(byte - 127) for byte != 0xFF.
+    """
+    buf = buf.astype(np.uint8)
+    out = np.exp2(buf.astype(np.int32) - 127).astype(np.float32)
+    out = np.where(buf == 0xFF, np.nan, out)
+    return out
+
+
+class TestFp8DequantIndependentReference:
+    """Tier 4b extension (v8 iter 7): byte-equal comparison between the
+    loader's `dequant_fp8_to_bf16` and a pure-numpy reference that
+    decodes e4m3fn / e8m0fnu from raw bits. Independent in code path
+    (no `weight.float()`, no torch tensor indexing); shared with the
+    loader only on the final bf16 RTNE rounding step (we use torch
+    for that on both sides since numpy lacks native bf16).
+
+    A failure here means the loader's recipe diverges from the spec —
+    a real bug, not a precision issue.
+    """
+
+    REAL_DIR = _scratch("v4_flash")
+    INDEX = _scratch("v4_flash/model.safetensors.index.json")
+
+    @pytest.mark.parametrize("tensor_base", [
+        "layers.0.attn.wq_a",   # 4 MB — same tensor as smoke
+        "layers.0.attn.wkv",    # 2 MB — different shape
+    ])
+    def test_byte_equal_against_numpy_reference(self, tensor_base):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            dequant_fp8_to_bf16,
+        )
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        w_name = tensor_base + ".weight"
+        s_name = tensor_base + ".scale"
+        if w_name not in mapping or s_name not in mapping:
+            pytest.skip(f"{w_name} not in V4-Flash index")
+        if mapping[w_name] != mapping[s_name]:
+            pytest.skip("weight + scale across different shards")
+        shard_path = os.path.join(self.REAL_DIR, mapping[w_name])
+        with safe_open(shard_path, framework="pt") as f:
+            w = f.get_tensor(w_name)
+            s = f.get_tensor(s_name)
+
+        # Loader path.
+        loader_bf16 = dequant_fp8_to_bf16(w, s, block=128)
+
+        # Reference path: decode raw bytes via numpy, multiply, then
+        # round to bf16 via torch.
+        w_bytes = w.view(torch.uint8).numpy()
+        s_bytes = s.view(torch.uint8).numpy()
+        w_f32 = _numpy_decode_e4m3fn(w_bytes)
+        s_f32 = _numpy_decode_e8m0fnu(s_bytes)
+        # Upsample scale [So, Si] to [out, in] by repeating each block.
+        # np.kron(s, ones((b,b))) is functionally equivalent to torch's
+        # repeat_interleave(b, dim=0).repeat_interleave(b, dim=1) — a
+        # different code path producing the same fp32 byte pattern.
+        s_full = np.kron(s_f32, np.ones((128, 128), dtype=np.float32))
+        ref_fp32 = w_f32 * s_full
+        # No NaNs expected on real V4-Flash weights — assert this so
+        # silent NaN-propagation doesn't mask a comparison miss.
+        assert np.isfinite(ref_fp32).all(), (
+            f"reference produced NaN/Inf — V4-Flash {tensor_base} should "
+            f"contain only finite e4m3fn values"
+        )
+        ref_bf16 = torch.from_numpy(ref_fp32).bfloat16()
+
+        # Byte-level comparison (bf16 reinterpreted as uint16).
+        loader_u16 = loader_bf16.contiguous().view(torch.uint16).numpy()
+        ref_u16 = ref_bf16.contiguous().view(torch.uint16).numpy()
+        assert np.array_equal(loader_u16, ref_u16), (
+            f"{tensor_base}: loader and numpy reference diverged in bf16 bytes. "
+            f"Loader uses torch's e4m3fn->fp32 cast and repeat_interleave; "
+            f"reference uses bit-level decode and np.kron. Divergence implies "
+            f"one path is mis-interpreting the FP8 spec."
+        )
+
+
+class TestFp4DequantIndependentReference:
+    """Tier 4b extension (v8 iter 7): byte-equal comparison between the
+    loader's `dequant_fp4_to_bf16` and a pure-numpy reference that
+    decodes FP4 nibbles via sign-magnitude decomposition (different
+    addressing pattern from the loader's 16-entry FP4_TABLE lookup).
+
+    The loader uses a single 16-entry `_FP4_TABLE_T` indexed by the full
+    nibble. The reference splits each nibble into a sign bit and a 3-bit
+    magnitude index, looks the magnitude up in an 8-entry table, and
+    negates conditionally. Both are mathematically equivalent for the
+    DeepSeek FP4 codebook; structural divergence (e.g., sign bit at the
+    wrong position, magnitude table off-by-one) would produce different
+    bytes here.
+
+    Note on negative-zero: the DeepSeek codebook collapses nibble 8
+    (sign=1, mag_idx=0) to +0.0, not -0.0. The reference must follow
+    this spec choice — without canonicalizing -0 to +0 we'd diverge
+    only in the sign bit of zeros (bf16 0x8000 vs 0x0000), which
+    happens for ~0.6% of real V4-Flash FP4 weights (every nibble-8 byte).
+    """
+
+    REAL_DIR = _scratch("v4_flash")
+    INDEX = _scratch("v4_flash/model.safetensors.index.json")
+
+    # 8-entry magnitude table — independent of the loader's 16-entry table.
+    _FP4_MAGNITUDES = np.array(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32,
+    )
+
+    @classmethod
+    def _decode_nibbles(cls, nibbles_uint8: np.ndarray) -> np.ndarray:
+        """nibbles_uint8: uint8 array with values in [0, 15]. Returns fp32."""
+        sign = (nibbles_uint8 >> 3) & 1
+        mag_idx = nibbles_uint8 & 0x7
+        mag = cls._FP4_MAGNITUDES[mag_idx]
+        val = np.where(sign == 1, -mag, mag).astype(np.float32)
+        # DeepSeek's FP4_TABLE collapses nibble 8 (sign=1, mag=0) to +0.0,
+        # not -0.0 — the negative-zero slot is unused. Canonicalize here
+        # so byte-equality with the loader's table-lookup output holds.
+        val = np.where(mag == 0.0, np.float32(0.0), val)
+        return val
+
+    @pytest.mark.parametrize("tensor_base", [
+        "layers.2.ffn.experts.0.w1",     # 4 MB — same tensor as smoke
+        "layers.0.ffn.experts.0.w2",     # 4 MB — different projection
+    ])
+    def test_byte_equal_against_numpy_reference(self, tensor_base):
+        if not os.path.exists(self.INDEX):
+            pytest.skip("V4-Flash safetensors index not present")
+        from safetensors import safe_open
+        from tpu_inference.models.jax.deepseek_v4_loader import (
+            dequant_fp4_to_bf16,
+        )
+        with open(self.INDEX) as f:
+            mapping = json.load(f)["weight_map"]
+        w_name = tensor_base + ".weight"
+        s_name = tensor_base + ".scale"
+        if w_name not in mapping or s_name not in mapping:
+            pytest.skip(f"{w_name} not in V4-Flash index")
+        if mapping[w_name] != mapping[s_name]:
+            pytest.skip("weight + scale across different shards")
+        shard_path = os.path.join(self.REAL_DIR, mapping[w_name])
+        with safe_open(shard_path, framework="pt") as f:
+            w = f.get_tensor(w_name)
+            s = f.get_tensor(s_name)
+
+        out_dim, in_packed = w.shape
+        in_logical = 2 * in_packed
+        fp4_block = in_logical // s.shape[1]
+        assert fp4_block == 32, f"expected fp4_block=32, got {fp4_block}"
+
+        # Loader path.
+        loader_bf16 = dequant_fp4_to_bf16(w, s, fp4_block=fp4_block)
+
+        # Reference path. Reinterpret int8 bytes as uint8 so nibble
+        # arithmetic is well-defined for negative-signed bytes too.
+        w_bytes = w.view(torch.uint8).numpy()
+        low_nibbles = w_bytes & 0x0F
+        high_nibbles = (w_bytes >> 4) & 0x0F
+        low_vals = self._decode_nibbles(low_nibbles)   # [out, in_packed]
+        high_vals = self._decode_nibbles(high_nibbles)
+        # Interleave into [out, in_logical] with low at index 2k, high at 2k+1.
+        unpacked = np.empty((out_dim, in_logical), dtype=np.float32)
+        unpacked[:, 0::2] = low_vals
+        unpacked[:, 1::2] = high_vals
+
+        # Decode scale via independent e8m0fnu reference, broadcast across blocks.
+        s_bytes = s.view(torch.uint8).numpy()
+        s_f32 = _numpy_decode_e8m0fnu(s_bytes)  # [out, in_logical/fp4_block]
+        s_full = np.repeat(s_f32, fp4_block, axis=1)  # [out, in_logical]
+        ref_fp32 = unpacked * s_full
+        assert np.isfinite(ref_fp32).all(), (
+            f"reference produced NaN/Inf — real FP4 expert weights should "
+            f"never contain 0xFF e8m0fnu scales"
+        )
+        ref_bf16 = torch.from_numpy(ref_fp32).bfloat16()
+
+        # Byte-level comparison.
+        loader_u16 = loader_bf16.contiguous().view(torch.uint16).numpy()
+        ref_u16 = ref_bf16.contiguous().view(torch.uint16).numpy()
+        assert np.array_equal(loader_u16, ref_u16), (
+            f"{tensor_base}: loader and numpy reference diverged in bf16 bytes. "
+            f"Loader uses 16-entry FP4_TABLE indexing; reference uses "
+            f"sign-magnitude decomposition. Divergence implies one path is "
+            f"mis-interpreting the FP4 codebook layout (e.g. sign-bit "
+            f"position, nibble order, or scale-block axis)."
         )
 
 
