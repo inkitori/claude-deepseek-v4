@@ -49,8 +49,23 @@ source "$VENV/bin/activate"
 
 if ! python -c "import vllm" 2>/dev/null; then
     log "installing vllm (TPU target) — this takes several minutes"
+    # vllm uses setuptools-scm, which fails here because work/vllm/ is a
+    # subtree of the parent repo (no own .git). The escape hatch is the
+    # SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM env var; we tag it with the
+    # pinned upstream commit for traceability.
+    pinned_commit="$(tr -d '[:space:]' < "$WORK/vllm.commit" 2>/dev/null || true)"
+    if [ -z "$pinned_commit" ]; then
+        log "FATAL: $WORK/vllm.commit is missing or empty"
+        exit 1
+    fi
+    # vllm's setup.py reads VLLM_VERSION_OVERRIDE before falling through to
+    # setuptools-scm. setuptools-scm fails here because work/vllm/ is a
+    # subtree of the parent repo (no own .git) — so we set the override.
+    pretend_version="0.0.0+g${pinned_commit}"
+    log "vllm VLLM_VERSION_OVERRIDE: $pretend_version"
     (
         cd "$WORK/vllm"
+        export VLLM_VERSION_OVERRIDE="$pretend_version"
         uv pip install -r requirements/tpu.txt --torch-backend=cpu
         VLLM_TARGET_DEVICE=tpu uv pip install -e .
     ) 2>&1 | tee -a "$SETUP_LOG"

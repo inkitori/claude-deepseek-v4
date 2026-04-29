@@ -42,6 +42,25 @@ import torch
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
+
+def _scratch(name):
+    """Resolve a scratch fixture path. The v8 host loop stages fixtures under
+    ``work/scratch/`` (the tpu-inference subtree's repo-level scratch dir).
+    Earlier sessions used ``/mnt/scratch/`` — kept as a fallback so tests run
+    on either layout. Falls back to env override ``V4_SCRATCH_DIR``."""
+    env = os.environ.get("V4_SCRATCH_DIR")
+    candidates = []
+    if env:
+        candidates.append(os.path.join(env, name))
+    candidates.append(os.path.join("/mnt/scratch", name))
+    repo_scratch = os.path.normpath(
+        os.path.join(str(_HERE), "..", "..", "..", "..", "scratch"))
+    candidates.append(os.path.join(repo_scratch, name))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[-1]
+
 from _deepseek_v4_reference import (Transformer as TorchTransformer,
                                     ModelArgs as TorchArgs,
                                     Compressor as TorchCompressor,
@@ -740,8 +759,8 @@ class TestEndToEnd:
 
 
 _HF_CONFIG_PATHS = {
-    "V4-Flash": "/mnt/scratch/v4_flash/config.json",
-    "V4-Pro": "/mnt/scratch/v4_pro/config.json",
+    "V4-Flash": _scratch("v4_flash/config.json"),
+    "V4-Pro": _scratch("v4_pro/config.json"),
 }
 
 
@@ -906,8 +925,8 @@ class TestWeightLoaderSmoke:
     Skips if the safetensors index isn't present at /mnt/scratch/v4_flash/.
     """
 
-    INDEX_PATH = "/mnt/scratch/v4_flash/model.safetensors.index.json"
-    SHARD_PATH = "/mnt/scratch/v4_flash/model-00001-of-00046.safetensors"
+    INDEX_PATH = _scratch("v4_flash/model.safetensors.index.json")
+    SHARD_PATH = _scratch("v4_flash/model-00001-of-00046.safetensors")
 
     def _load_index(self):
         import json
@@ -1191,7 +1210,7 @@ class TestRealTpuTinyForward:
     """Tier 6: compile + run a tiny forward on real TPU using the
     pre-staged tiny_v4_bf16 fixture. Skips when TPU is unavailable."""
 
-    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+    BF16_DIR = _scratch("tiny_v4_bf16")
 
     def _get_tpu_devices(self):
         try:
@@ -1274,10 +1293,14 @@ class TestVllmServeRoundtrip:
     the deepseek_v4_loader path through DeepseekV4ForCausalLM.load_weights.
     """
 
-    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+    BF16_DIR = _scratch("tiny_v4_bf16")
     PORT = 18080
     READY_TIMEOUT_S = 240
-    PREFLIGHT_LOG = "/workspace/logs/tpu-preflight.log"
+    PREFLIGHT_LOG = os.environ.get(
+        "TPU_PREFLIGHT_LOG",
+        os.path.normpath(os.path.join(str(_HERE),
+                                      "..", "..", "..", "..", "..",
+                                      "logs", "tpu-preflight.log")))
 
     def _has_tpu(self):
         # We deliberately do NOT call `jax.devices("tpu")` here — that
@@ -1454,8 +1477,8 @@ class TestFp8Dequant:
     """Unit-level FP8 dequant: loader produces bit-identical bf16 to a
     pre-staged groundtruth on the tiny synthetic fixture."""
 
-    QUANT = "/mnt/scratch/tiny_v4_quant"
-    GT = "/mnt/scratch/tiny_v4_groundtruth"
+    QUANT = _scratch("tiny_v4_quant")
+    GT = _scratch("tiny_v4_groundtruth")
 
     def _skip_if_missing(self):
         if not (os.path.exists(self.QUANT) and os.path.exists(self.GT)):
@@ -1489,7 +1512,7 @@ class TestDeepseekV4ForCausalLMHelpers:
     (load_weights_from_dir + forward_prefill) work end-to-end on
     tiny_v4_bf16. Full vllm-runtime __call__ is blocked on B1+B2."""
 
-    BF16_DIR = "/mnt/scratch/tiny_v4_bf16"
+    BF16_DIR = _scratch("tiny_v4_bf16")
 
     def test_forward_prefill_helper(self):
         if not os.path.exists(self.BF16_DIR):
@@ -1555,6 +1578,8 @@ class TestDeepseekV4ForCausalLMHelpers:
         This is the exact gate that vllm hits at
         tpu_inference/models/common/model_loader.py:244 and that v3 captured
         as BLOCKERS B2."""
+        if not os.path.exists(self.BF16_DIR):
+            pytest.skip(f"{self.BF16_DIR} not present")
         from types import SimpleNamespace
         from flax import nnx
         from tpu_inference.models.jax.deepseek_v4 import DeepseekV4ForCausalLM
@@ -1577,8 +1602,8 @@ class TestRealShardRoundTrip:
     loader. embed.weight is bf16 with no scale, so byte-equality against the
     direct safetensors read validates the bf16 path end-to-end."""
 
-    SHARD = "/mnt/scratch/v4_flash/model-00001-of-00046.safetensors"
-    CHECKPOINT_DIR = "/mnt/scratch/v4_flash"
+    SHARD = _scratch("v4_flash/model-00001-of-00046.safetensors")
+    CHECKPOINT_DIR = _scratch("v4_flash")
 
     def test_real_bf16_shard_byte_equal(self):
         if not os.path.exists(self.SHARD):
@@ -1613,8 +1638,8 @@ class TestQuantToParamsApply:
     loader's fault.
     """
 
-    QUANT = "/mnt/scratch/tiny_v4_quant"
-    GT = "/mnt/scratch/tiny_v4_groundtruth"
+    QUANT = _scratch("tiny_v4_quant")
+    GT = _scratch("tiny_v4_groundtruth")
 
     def _skip_if_missing(self):
         if not (os.path.exists(self.QUANT) and os.path.exists(self.GT)):

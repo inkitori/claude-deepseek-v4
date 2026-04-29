@@ -2,10 +2,11 @@
 all return the same completion if the model truly is per-sequence
 deterministic. If they still diverge, the bug is in shared in-process
 state, not cross-rank divergence."""
+import os
 import json, urllib.request, concurrent.futures
 
 URL = "http://localhost:18082/v1/completions"
-MODEL = "/mnt/scratch/tiny_v4_bf16"
+MODEL = os.environ.get("V4_SCRATCH_MODEL", os.path.expanduser("~/claude-deepseek-v4/work/scratch/tiny_v4_bf16"))
 
 
 def post(prompt, max_tokens=8, seed=0, temperature=0.0):

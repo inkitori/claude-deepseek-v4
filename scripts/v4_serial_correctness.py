@@ -1,9 +1,10 @@
 """With --max-num-seqs=1, every request runs serially regardless of
 client concurrency. Verify the math is fully correct in this mode."""
+import os
 import json, urllib.request, concurrent.futures
 
 URL = "http://localhost:18081/v1/completions"
-MODEL = "/mnt/scratch/tiny_v4_bf16"
+MODEL = os.environ.get("V4_SCRATCH_MODEL", os.path.expanduser("~/claude-deepseek-v4/work/scratch/tiny_v4_bf16"))
 
 
 def post(prompt, max_tokens=8, seed=0, temperature=0.0):

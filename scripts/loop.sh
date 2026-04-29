@@ -58,31 +58,63 @@ git config --global safe.directory '*'      >/dev/null 2>&1 || true
 mkdir -p "$LOGS"
 
 # ----- ssh-agent: unlock the key once so post-iter `git push` works -----
-ensure_ssh_agent() {
-    if [ -n "${SSH_AUTH_SOCK:-}" ] && ssh-add -l 2>/dev/null | grep -q ed25519; then
-        echo "[loop] ssh-agent already has ed25519 key" | tee -a "$LOOP_LOG"
+SPAWNED_AGENT=0
+
+try_existing_agent() {
+    # Try the env first, then any agent socket the user already has.
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && SSH_AUTH_SOCK="$SSH_AUTH_SOCK" ssh-add -l >/dev/null 2>&1; then
+        export SSH_AUTH_SOCK
         return 0
     fi
-    eval "$(ssh-agent -s)" >/dev/null
-    if [ -x "$HOME/.ssh/ssh_askpass_helper.sh" ]; then
-        SSH_ASKPASS="$HOME/.ssh/ssh_askpass_helper.sh" \
-            SSH_ASKPASS_REQUIRE=force \
-            DISPLAY=:0 \
-            ssh-add "$HOME/.ssh/id_ed25519" </dev/null >/dev/null 2>&1
-    else
-        ssh-add "$HOME/.ssh/id_ed25519" </dev/null >/dev/null 2>&1 || true
+    local sock
+    for sock in $(find /tmp -maxdepth 2 -user "$USER" -name 'agent.*' -type s 2>/dev/null); do
+        if SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1; then
+            export SSH_AUTH_SOCK="$sock"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_ssh_agent() {
+    if try_existing_agent; then
+        echo "[loop] reusing existing ssh-agent at $SSH_AUTH_SOCK (key already loaded)" | tee -a "$LOOP_LOG"
+        return 0
     fi
-    if ssh-add -l 2>/dev/null | grep -q ed25519; then
+
+    # Spawn a fresh agent
+    local agent_out
+    agent_out="$(ssh-agent -s 2>/dev/null)"
+    eval "$agent_out" >/dev/null
+    SPAWNED_AGENT=1
+    echo "[loop] spawned ssh-agent pid=${SSH_AGENT_PID:-?} sock=${SSH_AUTH_SOCK:-?}" | tee -a "$LOOP_LOG"
+
+    # Unlock the key. Use the askpass helper if present; the helper file
+    # itself holds the passphrase (mode 700, in ~/.ssh).
+    local add_out add_rc
+    if [ -x "$HOME/.ssh/ssh_askpass_helper.sh" ]; then
+        add_out="$(SSH_ASKPASS="$HOME/.ssh/ssh_askpass_helper.sh" \
+            SSH_ASKPASS_REQUIRE=force \
+            DISPLAY="${DISPLAY:-:0}" \
+            setsid -w ssh-add "$HOME/.ssh/id_ed25519" </dev/null 2>&1)"
+        add_rc=$?
+    else
+        add_out="$(ssh-add "$HOME/.ssh/id_ed25519" </dev/null 2>&1)"
+        add_rc=$?
+    fi
+
+    if ssh-add -l >/dev/null 2>&1; then
         echo "[loop] ssh-agent unlocked ed25519 key (pid=${SSH_AGENT_PID:-?})" | tee -a "$LOOP_LOG"
         echo "${SSH_AGENT_PID:-}" > "$LOGS/ssh-agent.pid"
     else
-        echo "[loop] WARN: could not unlock ssh key — git push will be skipped" | tee -a "$LOOP_LOG"
+        echo "[loop] WARN: could not unlock ssh key (rc=$add_rc) — git push will be skipped" | tee -a "$LOOP_LOG"
+        echo "[loop] ssh-add output: $add_out" | tee -a "$LOOP_LOG"
     fi
 }
 
-# Kill the ssh-agent we spawned (if any) on loop exit.
+# Kill only the ssh-agent we ourselves spawned (don't kill the user's existing one).
 cleanup() {
-    if [ -n "${SSH_AGENT_PID:-}" ]; then
+    if [ "$SPAWNED_AGENT" = "1" ] && [ -n "${SSH_AGENT_PID:-}" ]; then
         kill "$SSH_AGENT_PID" 2>/dev/null || true
     fi
 }
@@ -119,29 +151,44 @@ push_now() {
 sleep_secs_for_limit() {
     local logfile="$1"
     local default_secs=3600   # 60 min fallback
-    local now reset_epoch sleep_secs reset_str
+    local now reset_epoch sleep_secs
 
-    # Pull lines that mention reset/limit, take the last one.
-    reset_str="$(grep -oE 'reset(s| at)? [^"\\]+' "$logfile" 2>/dev/null | tail -1)"
-    if [ -z "$reset_str" ]; then
-        reset_str="$(grep -oE 'available again at [^"\\]+' "$logfile" 2>/dev/null | tail -1)"
-    fi
+    # Try a few timestamp shapes that appear in Claude's limit messages,
+    # then progressively-trimmed prefixes. First parse that works wins.
+    local candidates
+    candidates="$(
+        grep -oE '(reset(s| at)?|available again at|will reset at|will be available at) [^"]+' "$logfile" 2>/dev/null \
+          | sed -E 's/^(reset(s| at)?|available again at|will reset at|will be available at) +//'
+        # Also pull bare ISO timestamps
+        grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?( ?(UTC|Z|[+-][0-9]{2}:?[0-9]{2}))?' "$logfile" 2>/dev/null
+        # And clock+TZ shapes like "1:30pm PST" / "13:30 UTC"
+        grep -oE '[0-9]{1,2}(:[0-9]{2})? ?(am|pm|AM|PM)? ?(UTC|PT|ET|PST|EST|EDT|PDT)' "$logfile" 2>/dev/null
+    )"
 
-    if [ -n "$reset_str" ]; then
-        # Strip the "reset at " / "resets " / "available again at " prefix
-        local time_part
-        time_part="$(echo "$reset_str" | sed -E 's/^(reset(s| at)?|available again at) +//')"
-        # Try `date -d` (handles many natural-language forms)
-        reset_epoch="$(date -d "$time_part" +%s 2>/dev/null || true)"
-        if [ -n "$reset_epoch" ]; then
-            now="$(date +%s)"
-            sleep_secs=$(( reset_epoch - now + 300 ))   # +5min safety margin
-            if [ "$sleep_secs" -gt 0 ] && [ "$sleep_secs" -lt 21600 ]; then
-                echo "$sleep_secs"
-                return
+    while IFS= read -r raw; do
+        [ -z "$raw" ] && continue
+        # Try the raw string, then progressively shorter prefixes
+        # (drop everything from the first period or comma onward).
+        local trials=(
+            "$raw"
+            "$(echo "$raw" | sed -E 's/[,.].*$//')"
+            "$(echo "$raw" | awk '{print $1, $2, $3}')"
+            "$(echo "$raw" | awk '{print $1, $2}')"
+            "$(echo "$raw" | awk '{print $1}')"
+        )
+        for t in "${trials[@]}"; do
+            [ -z "$t" ] && continue
+            reset_epoch="$(date -d "$t" +%s 2>/dev/null || true)"
+            if [ -n "$reset_epoch" ]; then
+                now="$(date +%s)"
+                sleep_secs=$(( reset_epoch - now + 300 ))   # +5min safety
+                if [ "$sleep_secs" -gt 60 ] && [ "$sleep_secs" -lt 21600 ]; then
+                    echo "$sleep_secs"
+                    return
+                fi
             fi
-        fi
-    fi
+        done
+    done <<< "$candidates"
 
     echo "$default_secs"
 }

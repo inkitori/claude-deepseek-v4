@@ -37,6 +37,7 @@ dump state_dict() so naming + shapes match real V4 exactly.
 """
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -45,10 +46,10 @@ from pathlib import Path
 import torch
 from safetensors.torch import safe_open, save_file
 
-ROOT = Path("/home/enyouki/claude-overnight")
+ROOT = Path(os.environ.get("V4_REPO_ROOT", str(Path(__file__).resolve().parent.parent)))
 WORK = ROOT / "work" / "tpu-inference"
-REAL_FLASH = Path("/mnt/scratch/claude-overnight/v4_flash")
-OUT_DIR = Path("/mnt/scratch/claude-overnight")
+REAL_FLASH = Path(os.environ.get("V4_REAL_FLASH", str(ROOT / "work" / "scratch" / "v4_flash_singleshard")))
+OUT_DIR = Path(os.environ.get("V4_SCRATCH_DIR", str(ROOT / "work" / "scratch")))
 
 # Real V4 uses fp8_block_size=128 and fp4_block_size=32 (input axis only). We
 # scale down 4x so the tiny model's smallest quantizable dim (q_lora_rank=128)

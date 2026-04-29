@@ -1,8 +1,9 @@
 """Diagnose concurrent-decode behavior under V4 (B1 territory)."""
+import os
 import json, urllib.request, concurrent.futures, time
 
 URL = "http://localhost:18080/v1/completions"
-MODEL = "/mnt/scratch/tiny_v4_bf16"
+MODEL = os.environ.get("V4_SCRATCH_MODEL", os.path.expanduser("~/claude-deepseek-v4/work/scratch/tiny_v4_bf16"))
 
 
 def post(prompt, **kw):

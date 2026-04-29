@@ -153,3 +153,61 @@ and the V3 MLA path is unchanged. Only V4 takes the new override branch.
 on TPU. CPU regression suite (83 tests) has no V3 path, so V3 isn't
 re-validated here, but the override is gated on `model_type == "deepseek_v4"`
 which is mutually exclusive with V3.
+
+---
+
+## T5/T6/T7-fixtures-missing — STATUS: open, host-side
+
+**Status (v8, 2026-04-29):** synthetic fixtures `tiny_v4_bf16`,
+`tiny_v4_quant`, `tiny_v4_groundtruth` are **not present** under
+`work/scratch/` (which is the v8 host's substitute for the v6 era's
+`/mnt/scratch/`). Tests that depend on them **skip** cleanly:
+
+  - `TestVllmServeRoundtrip` (Tier 5)
+  - `TestRealTpuTinyForward` (Tier 6)
+  - `TestFp8Dequant` (Tier 7 unit)
+  - `TestQuantVsGroundtruthLogits` (Tier 7 forward parity)
+  - `TestRealShardRoundTrip` (Tier 4b)
+  - `TestRealConfigCompile` (Tier 3 — depends on `v4_flash/config.json` /
+    `v4_pro/config.json` — these also live under scratch)
+  - `TestDeepseekV4ForCausalLMHelpers` (W3 helpers needing config.json)
+
+The fixture-build helper at the repo root is
+`scripts/make_tiny_v4_checkpoint.py`. Per the v8 spec we **do not run
+it ourselves** unless explicitly authorized. The host loop is the
+appropriate caller.
+
+**What unblocks this:** the host loop runs
+`python scripts/make_tiny_v4_checkpoint.py` (or its equivalent) to
+populate `work/scratch/tiny_v4_*` and `work/scratch/v4_flash/`.
+
+**What still works without fixtures:** Tier 1 (25 component tests),
+Tier 2 (8 logits-parity), Tier 2 hardening (11 decode parity), Tier 3
+budget tests on simulated meshes that don't need the config (the v6e-32
+sim ones), Tier 4 (HF-name → JAX-path mapping uses
+the safetensors index when present, skips otherwise). Total without
+fixtures: **64 passed, 20 skipped**.
+
+---
+
+## T8-mount-missing — STATUS: open, host-side credential
+
+**Status (v8, 2026-04-29):** Tier 8 (real-weight `vllm serve
+deepseek-ai/DeepSeek-V4-Flash` deploy gate) is **blocked**: the
+HuggingFace cache at `~/.cache/huggingface/hub/` is empty (only the
+local xet placeholder), and the GCS mount at `/tmp/gcs/bucket/` is
+present but **permission-denied** to this UID. The expected
+`models--deepseek-ai--DeepSeek-V4-Flash/snapshots/...` directory does
+not resolve.
+
+The v8 spec is explicit: **do not attempt to remount**. Mounting
+requires bucket creds in `.env` and is a host-side concern.
+Tier 8 is therefore **skipped on this run**.
+
+**What unblocks this:** the host runs `scripts/mount_gcs.sh` (or its
+equivalent) to mount the bucket with credentials, OR the host pre-stages
+the V4-Flash checkpoint at
+`~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/`.
+
+**Pseudocode for the next session (when mount lands):** see the v8 spec
+"W5 — Tier 8 real-weight deploy gate" section. The runbook is verbatim.

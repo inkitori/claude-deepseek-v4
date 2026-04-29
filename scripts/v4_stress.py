@@ -8,6 +8,7 @@ assume what the model outputs — the v6 commit baked in its observed
 behavioral invariants that any working causal LM must satisfy.
 """
 
+import os
 from __future__ import annotations
 import concurrent.futures
 import json
@@ -16,7 +17,7 @@ import time
 import urllib.request
 
 PORT = 18080
-MODEL = "/mnt/scratch/tiny_v4_bf16"
+MODEL = os.environ.get("V4_SCRATCH_MODEL", os.path.expanduser("~/claude-deepseek-v4/work/scratch/tiny_v4_bf16"))
 URL = f"http://localhost:{PORT}/v1/completions"
 
 
