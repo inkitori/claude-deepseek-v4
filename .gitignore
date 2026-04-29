@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.pem
+
+# Claude Code local settings
+.claude/
+
+# Build/runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+
+# Heavy venv from docker run (rebuild via setup, not committed)
+work/vllm_env/
+
+# Per-iteration logs (keep logs/ as a placeholder dir)
+logs/iter-*.log
+logs/*.log
+
+# Local scratch / outputs
+scratch/
+*.safetensors

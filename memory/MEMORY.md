@@ -1,0 +1,1 @@
+- [Project: tpu-inference DeepSeek V4 work](project_v4_status.md) — overnight session built JAX V4 impl on `deepseek-v4` branch in work/tpu-inference; tested on tiny config 2026-04-28
