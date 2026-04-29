@@ -77,10 +77,21 @@ else
     export XLA_FLAGS="$xla_extra"
 fi
 
+# Bump Ray's compiled-graph channel timeout. Default is 300 seconds, which
+# trips during the first inference if jit_run_model recompiles for the
+# request shape (already burned us once at 5m1s). 1 hour gives the cold
+# path room while still failing fast on actual hangs.
+export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-3600}"
+
+# Cache even small / fast-to-compile modules. Default JAX policy skips
+# them, but on a flagship MoE every cache hit shaves real seconds.
+export JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
+export JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS="${JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS:-0}"
+
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
@@ -91,6 +102,7 @@ echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 echo "[smoke]   jax_cache=$JAX_COMPILATION_CACHE_DIR"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
+echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
     --tensor-parallel-size 32 \
