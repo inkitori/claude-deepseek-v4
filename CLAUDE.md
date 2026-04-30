@@ -185,11 +185,25 @@ when you touch.
 
 ## Current state (READ BEFORE LAUNCHING)
 
-**Tier 8 deploy gate is GREEN as of 2026-04-30 04:22Z.** A cold
-`./run.sh serve` against real V4-Flash weights now reaches
-`Application startup complete` and answers
-`/v1/completions` with deterministic `Paris` for "The capital of
-France is" — `scripts/full_slice_v4_smoke_check.sh` exits 0.
+**Tier 8 deploy gate is GREEN.** A cold `./run.sh serve` against
+real V4-Flash weights reaches `Application startup complete` and
+answers `/v1/completions` with deterministic `Paris` for "The
+capital of France is" — `scripts/full_slice_v4_smoke_check.sh`
+exits 0.
+
+`/v1/chat/completions` now also returns coherent (non-garbled)
+English with `--chat-template scripts/v4_chat_template.jinja`
+applied (verified 2026-04-30 06:38Z smoke). Chat lands in a
+larger prefill bucket (1024-token total vs 256 for completions
+with a 5-token prompt) and on a tight HBM budget the engine
+takes the OOM-defragment-retry path before the program loads,
+adding ~30 s to first-chat latency. Smoke probe is informational
+(`CHAT_REQUIRED=0` default); set `CHAT_REQUIRED=1` to fail the
+gate on empty chat. There's no robust content assertion yet —
+the model's first 16 tokens to "What is the capital of France?
+Answer with just the city name." returned `France` (a coherent
+but wrong answer, not garbage), so the smoke logs the response
+but doesn't assert on text.
 
 End-to-end timing on the verifying run (cache-cold):
   * weight load + inline MoE consolidation: 4 min 49 s
@@ -203,12 +217,19 @@ optimized** (~2.7× smaller). XLA accounting was clean — no
 `CompileTimeHbmOom`, no `RuntimeBufferAllocationFailure`.
 
 What landed to unblock it:
-  1. **Freqs cap by `max_model_len`**
+  1. **Freqs cap by vLLM's prefill bucket ceiling**
      (`deepseek_v4.py::_effective_freqs_seq_len`). V4-Flash's
      `max_position_embeddings = 1 048 576` was producing a
      `f32[1M, 32]` freqs_compressed table that XLA pinned as a
-     1 GB argument per chip. Capping at `max_model_len=256`
-     shrinks it to KB. -1 GB / chip resident.
+     1 GB argument per chip. The cap is now
+     `max(max_model_len, max_num_batched_tokens × dp_size)` —
+     vLLM's TPU runner pads prefill to that ceiling
+     (`runner/tpu_runner.py:469`), and capping below it produces
+     `cannot reshape array of shape (256, 32)` mid-prefill on any
+     prompt that lands in a bucket bigger than `max_model_len`
+     (e.g. 18-token chat prompt → 1024-token bucket). Final
+     freqs table is ~2 MB, well under the 1 GB ceiling that
+     motivated the original cap.
   2. **Inline MoE consolidation**
      (`deepseek_v4.py::_maybe_consolidate`). As soon as a
      `(layer, wname)` group's 256 expert weights are placed, the
@@ -239,11 +260,32 @@ execute; on cache-warm restarts (post-bootstrap) the compile-cache
 should let first-curl finish in seconds.
 
 Still loose ends worth tracking:
-  * **Activation budget headroom is unmeasured.** We compiled
-    cleanly under `max-model-len=256, max-num-seqs=1`. Bumping
-    either knob raises HLO temp roughly linearly; we don't yet
-    know how far we can push before a new OOM. Iter that lifts
-    the cap should re-run the smoke.
+  * **Chat-completions activation HBM is on the edge.** The
+    1024-token chat prefill bucket triggers
+    `RuntimeProgramAllocationFailure` (~1.94 GB program memory
+    requested vs ~1.83 GB reservable) on the first chat curl,
+    then succeeds via TpuLoadedExecutable's
+    `ExecutePrepareWithOomRetries` defragment-and-retry path.
+    Adds ~30 s to first-chat latency but the request completes.
+    Repeat chat calls hit the cache and execute in <1 s. Worth
+    finding ~110 MB of headroom (smaller `max_num_batched_tokens`?
+    Different bucket layout? More aggressive HBM compaction at
+    request boundaries?) so the retry isn't needed.
+  * **No robust chat-completions content assertion.** The smoke
+    chat probe currently logs the response and only fails on an
+    empty body when `CHAT_REQUIRED=1`. The model's first ~16
+    tokens at temp=0/seed=0 don't reliably contain a fixed
+    string (verified: it answered `France` for "What is the
+    capital of France?" with `Answer with just the city name`).
+    A reliable content probe would need either a longer
+    `max_tokens` budget, a constrained-generation request, or a
+    different prompt class (e.g. arithmetic).
+  * **Activation budget for /v1/completions headroom is
+    unmeasured.** We compiled cleanly under
+    `max-model-len=256, max-num-seqs=1`. Bumping either knob
+    raises HLO temp roughly linearly; we don't yet know how far
+    we can push before a new OOM. Iter that lifts the cap
+    should re-run the smoke.
   * ~~**Cross-host JAX cache sharing (lane 2 from the original
     plan)**~~ RESOLVED — verified unsound 2026-04-30 via
     `scripts/full_slice_v4_cache_fingerprint.sh`. SPMD compiles

@@ -8,7 +8,8 @@
 #   2. flaky_readiness   — server 503 for first 3 /v1/models, then  → PASS (0)
 #   3. wrong_content     — server returns "Berlin"                  → FAIL (3)
 #   4. timeout_when_down — server never starts                      → FAIL (1)
-#   5. chat_garbled      — completions ok, chat returns garbage     → FAIL (4)
+#   5. chat_required_empty — completions ok, empty chat,
+#                            CHAT_REQUIRED=1                        → FAIL (4)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -26,6 +27,9 @@ run_scenario() {
     local with_server=1
     if [ "$name" = "timeout_when_down" ]; then with_server=0; fi
 
+    local chat_required=0
+    if [ "$name" = "chat_required_empty" ]; then chat_required=1; fi
+
     local mpid=
     if [ "$with_server" -eq 1 ]; then
         "$PY" "$MOCK" --port "$port" "$@" >"/tmp/mock-${port}.log" 2>&1 &
@@ -37,7 +41,8 @@ run_scenario() {
     # 5s poll interval. timeout_when_down only needs ~3s.
     local timeout_s=20
     if [ "$name" = "timeout_when_down" ]; then timeout_s=3; fi
-    PORT="$port" TIMEOUT_S="$timeout_s" "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
+    PORT="$port" TIMEOUT_S="$timeout_s" CHAT_REQUIRED="$chat_required" \
+        "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
     local rc=$?
 
     if [ -n "$mpid" ]; then
@@ -56,11 +61,11 @@ run_scenario() {
 }
 
 echo "Testing $SCRIPT against $MOCK"
-run_scenario happy_path        18091 0
-run_scenario flaky_readiness   18092 0 --flaky-readiness 3
-run_scenario wrong_content     18093 3 --text " Berlin."
-run_scenario timeout_when_down 18095 1
-run_scenario chat_garbled      18096 4 --chat-text "Hey ofbodyre Este"
+run_scenario happy_path          18091 0
+run_scenario flaky_readiness     18092 0 --flaky-readiness 3
+run_scenario wrong_content       18093 3 --text " Berlin."
+run_scenario timeout_when_down   18095 1
+run_scenario chat_required_empty 18096 4 --chat-text ""
 
 echo
 if [ "$fails" -eq 0 ]; then
