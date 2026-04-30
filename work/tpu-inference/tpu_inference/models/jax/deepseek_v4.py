@@ -802,20 +802,44 @@ def _v4_constrain_packed_replicated(
     physical-mesh check. Inside `run_model`'s JIT (which is dispatched
     under `nnx.merge`'s mesh context), the constraint takes effect."""
     try:
-        # `jax.experimental.mesh_utils.thread_resources` and the
-        # `jax.sharding.use_mesh` helpers expose the active mesh; the
-        # cheapest cross-version test is to ask jax for the current
-        # physical mesh via the public `jax.sharding.get_abstract_mesh`
-        # API (jax >= 0.5) or fall back to assuming we're inside one.
-        # If no mesh is active, with_sharding_constraint raises and we
-        # let the exception propagate — that should never happen in
-        # production paths (run_model is always under a mesh).
         spec = jax.sharding.PartitionSpec()
         return [lax.with_sharding_constraint(b, spec) for b in buffers]
     except Exception:
         # Tests outside a mesh context fall through unchanged — the
         # constraint only matters under SPMD anyway.
         return buffers
+
+
+def _v4_force_kv_caches_read(
+    buffers: List[jnp.ndarray],
+    kv_caches: List[jnp.ndarray],
+) -> List[jnp.ndarray]:
+    """Fold an opaque-zero multiplication of `kv_caches[i]` into each
+    `buffers[i]`. The compute output equals `buffers[i]` byte-for-byte
+    (since `opaque_zero * kv = 0` then `pb + 0 = pb` at runtime) but the
+    HLO has a real read of `kv_caches[i]` and a real elementwise add —
+    so XLA cannot elide the donation-aliased write of the output buffer.
+
+    Why this exists: iter-5g/5h Bug B. The prefill orchestrator's compute
+    is independent of `kv_caches` input (`transformer_body_init_state_to_buffer`
+    derives output entirely from `input_ids`/`params`/`freqs`). Under
+    XLA TPU SPMD with `donate_argnums=2` (`model_loader.py:340`), the
+    cached prefill artifact's R2 execution produces output values that
+    differ from R1's despite identical compute. Hypothesis: XLA elides
+    writes to the donated buffer when output value is statically derivable
+    without reading the input — leaving parts of the donated buffer at R1's
+    last-decode contents on R2. Forcing a value-neutral dependence on
+    `kv_caches` makes elision impossible. The CPU virtual-mesh test
+    `/tmp/test_v4_iter5j_kv_caches_dep.py` shows this matters only on TPU
+    (CPU XLA drops the unused `kv_caches` from the entry signature
+    entirely; TPU XLA keeps them due to SPMD's more conservative DCE).
+    """
+    opaque_zero = lax.optimization_barrier(
+        jnp.zeros((), dtype=jnp.float32))
+    return [
+        b + opaque_zero * kv.astype(jnp.float32)
+        for b, kv in zip(buffers, kv_caches)
+    ]
 
 
 def deepseek_v4_run_with_decode_state(
@@ -914,6 +938,11 @@ def deepseek_v4_run_with_decode_state(
             kv_caches, start_pos=start_pos,
             state_max_seq_len=state_max_seq_len,
         )
+        # iter-5j: fold opaque-zero kv_caches read into new_buffers so XLA
+        # cannot elide the donation-aliased writes. Decode already reads
+        # kv_caches semantically (prev_buffers), but the bug is in WRITE
+        # elision under donation, not read elision.
+        new_buffers = _v4_force_kv_caches_read(new_buffers, kv_caches)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
         if V4_DECODE_STATE_DIAG:
             jax.debug.print(
@@ -965,6 +994,14 @@ def deepseek_v4_run_with_decode_state(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
+    # iter-5j: fold opaque-zero kv_caches read into packed_buffers so XLA
+    # cannot elide the donation-aliased writes (Bug B). Without this, XLA
+    # has no compute-level dep on kv_caches input and may statically
+    # determine output bytes match donated input bytes (when both are zero
+    # or otherwise predictable), elide the write, and leave R1's last-
+    # decode contents bleeding into R2's prefill output. See
+    # `_v4_force_kv_caches_read` docstring for full hypothesis.
+    packed_buffers = _v4_force_kv_caches_read(packed_buffers, kv_caches)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
     if V4_DECODE_STATE_DIAG:
         jax.debug.print(
