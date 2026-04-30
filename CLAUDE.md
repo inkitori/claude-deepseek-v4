@@ -183,58 +183,77 @@ when you touch.
 
 ## Current state (READ BEFORE LAUNCHING)
 
-`./run.sh serve` reaches `Application startup complete` (load ~4 min).
-The first `/v1/completions` call still fails with
-`CompileTimeHbmOom`, but **the OOM has moved deeper** in the XLA
-pipeline — it's no longer the original "stack-then-all-gather"
-symptom. As of 2026-04-30 the lane-1 fix
-(`with_sharding_constraint(P('attn_dp', None, None))` on the stacked
-W1/W2/W3 in `deepseek_v4_moe.py::moe_forward`) is in tree and verified
-in two ways:
+**Tier 8 deploy gate is GREEN as of 2026-04-30 04:22Z.** A cold
+`./run.sh serve` against real V4-Flash weights now reaches
+`Application startup complete` and answers
+`/v1/completions` with deterministic `Paris` for "The capital of
+France is" — `scripts/full_slice_v4_smoke_check.sh` exits 0.
 
-  1. CPU compile-only validation (`/tmp/test_moe_compile.py`,
-     32 virtual CPU devices, real V4-Flash shapes): **0 all-gathers**
-     on the stacked W tensors, compiles in <1 sec.
-  2. Real TPU smoke (2026-04-30 run): **`HLO_PASSES` finished after
-     20m9s with no OOM** (vs the previous fail-during-HLO_PASSES).
-     The compile then progressed to `BACKEND_PASSES`, where it OOM'd
-     after another 14 min:
+End-to-end timing on the verifying run (cache-cold):
+  * weight load + inline MoE consolidation: 4 min 49 s
+  * `Application startup complete`: ~10 s after load
+  * first `/v1/completions` cold compile (two shape buckets,
+    prefill + decode, no cache): 49 s + 47 s ≈ **96 s total**
+  * deterministic curl response: byte-identical across two repeats
 
-     ```
-     CompileTimeHbmOom: Used 52.75G of 31.25G hbm.
-     Exceeded hbm capacity by 21.51G.
-     ```
+`jit_run_model` HLO size dropped from **~103k instructions → 47k
+optimized** (~2.7× smaller). XLA accounting was clean — no
+`CompileTimeHbmOom`, no `RuntimeBufferAllocationFailure`.
 
-     XLA's own pre-OOM accounting (`hlo_passes.cc:5703`):
-     ```
-     post optimization rematerialization limit 11.64G =
-       95% hbm (29.68G) - (arguments (28.13G) - aliased_output (11.09G))
-                       - overlays (1.00G)
-     ```
-     i.e. **per-chip memory plan needs ~52 GB but only 31.25 GB HBM**.
+What landed to unblock it:
+  1. **Freqs cap by `max_model_len`**
+     (`deepseek_v4.py::_effective_freqs_seq_len`). V4-Flash's
+     `max_position_embeddings = 1 048 576` was producing a
+     `f32[1M, 32]` freqs_compressed table that XLA pinned as a
+     1 GB argument per chip. Capping at `max_model_len=256`
+     shrinks it to KB. -1 GB / chip resident.
+  2. **Inline MoE consolidation**
+     (`deepseek_v4.py::_maybe_consolidate`). As soon as a
+     `(layer, wname)` group's 256 expert weights are placed, the
+     loader stacks them into a single `[E, inter, dim]` jax.Array
+     sharded `P('attn_dp', None, None)` and nulls out the per-leaf
+     references. Eliminates the 126 × 128 MiB MoE all-to-all
+     buffers that dominated `BACKEND_PASSES` HLO-temp on the
+     previous OOM (~16 GB / chip saved). Doing this incrementally
+     — not as a post-load pass — is critical: post-load, HBM is
+     fragmented across 33 000+ small allocations and the
+     consolidate's 256 MB transient OOMs (we burned an iter
+     learning that). Doing it as soon as a group is full means we
+     only ever hold one group's per-leaf set alongside its stacked
+     tensor at a time.
+  3. **`MoEParams` carries optional `w1_stacked / w2_stacked /
+     w3_stacked` fields**
+     (`deepseek_v4_moe.py`). `moe_forward` branches on
+     `params.w1_stacked is not None` — when present, reads the
+     stacked tensors directly, skipping the per-call
+     `jnp.stack(experts[*].wN)` that previously forced the
+     all-to-all on every forward × layer × stack. The per-expert
+     fallback path stays intact for synthetic-fixture tests.
 
-The 28.13 GB of "arguments" is far above the expected ~17 GB of
-sharded weights (543 GB / 32 chips). That extra ~11 GB is the
-remaining mystery — likely some combination of (a) weights that are
-fully replicated rather than sharded (audit `pick_partition_spec` +
-loader output for `spec=P()` placements on big tensors), (b) the
-KV cache layout doubling something, (c) MLA latent buffers that
-allocate per-chip even with `enable_dp_attention=true`. The
-`max-model-len=256, max-num-seqs=1` knobs in the launcher are
-already minimal — KV cache itself is in the MB range, so it's not
-the cap.
+### What's now possible / what's still loose
 
-### Lane-1 follow-on already in tree (not yet TPU-validated)
+Ground-truth latency is sub-100 s cold compile + sub-second
+execute; on cache-warm restarts (post-bootstrap) the compile-cache
+should let first-curl finish in seconds.
 
-`deepseek_v4_moe.py::moe_forward` now also carries a `_shard_e_mid`
-helper (`P(None, 'attn_dp', None)`) applied to the four E-axis
-intermediates `gate_NEi / up_NEi / h_NEi / out_NEd`. Without those
-constraints XLA could decide to all-gather the einsum output back to
-fully-replicated `[N, E, K]` per chip (~256 MiB for [128, 256, 2048]
-bf16) and squeeze the activation budget further. CPU compile-only
-test still shows 0 all-gathers + identical HLO size — the constraints
-are being honored on CPU. Whether they help the BACKEND_PASSES OOM
-on TPU is **unverified**; the next iteration's smoke is the test.
+Still loose ends worth tracking:
+  * **Activation budget headroom is unmeasured.** We compiled
+    cleanly under `max-model-len=256, max-num-seqs=1`. Bumping
+    either knob raises HLO temp roughly linearly; we don't yet
+    know how far we can push before a new OOM. Iter that lifts
+    the cap should re-run the smoke.
+  * **Cross-host JAX cache sharing (lane 2 from the original
+    plan)** is still untouched. Each host compiles independently;
+    a `scripts/full_slice_v4_share_cache.sh` rsync'ing host 0's
+    cache after one good launch would 8× brand-new-slice
+    first-launch on a freshly bootstrapped slice.
+  * **`Involuntary full rematerialization` warnings** still appear
+    in the compile log on `f32[128, 16]` reshards (`{devices=[1,32]}
+    → {devices=[16,1,2]} last_tile_dim_replicate`). They didn't
+    block the compile this iter, but each one wastes activation
+    budget; a future iter should pin a `with_sharding_constraint`
+    upstream so XLA doesn't have to do the inefficient
+    replicate-then-partition.
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
@@ -406,19 +425,27 @@ scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
   reference loop (maxabs=0 across 5 seeds on synthetic fixture);
   HLO instruction count drops 4.6× (477k → 103k). ✓ correctness.
 * **MoE stacked-weight sharding constraint**
-  (`_shard_e_first` / `_shard_e_last`): forces W1/W2/W3 to be
-  E-sharded across `attn_dp`, eliminating the original 4 GiB
-  all-gather per stack. ✓ HLO_PASSES no longer OOMs (smoke 2026-04-30
-  passed HLO_PASSES in 20m9s); ✗ BACKEND_PASSES still OOMs at
-  52.75 GB / 31.25 GB on real V4-Flash (separate root cause — see
-  Current state above).
-* **MoE einsum-intermediate sharding constraint** (`_shard_e_mid`):
-  added 2026-04-30; CPU compile-only verified, **not yet TPU
-  validated**. Targets a class of XLA decisions that could
-  re-replicate the [N, E, K] tensors after the stacked W tensors
-  are honored.
-* **Persistent JAX compile cache**: wired; not yet populated because
-  no successful compile has completed end-to-end on real V4-Flash. ⚠
+  (`_shard_e_first` / `_shard_e_last` / `_shard_e_mid`): forces
+  W1/W2/W3 to be E-sharded across `attn_dp`, eliminating the
+  original 4 GiB all-gather per stack. Now mostly superseded by
+  inline consolidation (constraints are still applied as defense
+  in depth on the per-expert fallback path).
+* **Inline MoE consolidation at load**
+  (`deepseek_v4.py::_maybe_consolidate`): the 256 per-expert
+  weights of each `(layer, wname)` group are stacked into a single
+  E-sharded `[E, inter, dim]` jax.Array as soon as the 256th is
+  placed; per-leaf references are then nulled. Drops the per-call
+  all-to-all storm entirely — `jit_run_model` HLO instructions
+  47k optimized vs 103k previously. ✓ Smoke green 2026-04-30.
+* **Freqs cap by `max_model_len`**: `_effective_freqs_seq_len()`
+  uses `vllm_config.model_config.max_model_len` instead of
+  `cfg.max_position_embeddings`, shrinking the YaRN freqs table
+  from 1 GB / chip to KB. ✓ Smoke green 2026-04-30.
+* **Persistent JAX compile cache**: wired; populated by the
+  2026-04-30 successful smoke. Subsequent launches on the same
+  worker host should hit the cache and skip the ~96 s compile.
+  Lane 2 (`scripts/full_slice_v4_share_cache.sh` to rsync host 0's
+  cache to other 7 hosts) is the next compile-time win.
 
 ## Pitfalls already learned (don't repeat)
 
