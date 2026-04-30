@@ -495,6 +495,210 @@ def transformer_body_decode_step(
     return h, new_states
 
 
+# ------------------------------------------------------------
+# Packed decode-state buffers (S1 — engine plumbing)
+# ------------------------------------------------------------
+#
+# To thread `AttentionDecodeState` through vLLM's `kv_caches: List[jax.Array]`
+# (the only carrier that survives the JIT'd `run_model` donation), each
+# layer's 6-field dataclass has to flatten into a single jax.Array. Pack
+# everything as fp32 — the score buffers genuinely need fp32 precision
+# (compressor's softmax-state accumulator), and the bf16 fields (`kv_cache`,
+# `indexer_kv_cache`) round-trip exactly through fp32 → bf16 cast. fp32 is
+# a 2× HBM cost on the bf16 fields but at MAX_LEN=256 / max_num_seqs=1 the
+# total per-layer state is ~50 KB even after the doubling, well below any
+# meaningful HBM budget. Per-slot indexing (max_num_seqs > 1) is added on
+# top of this packed-flat layout in iter-4 by stacking slots on a leading
+# axis.
+
+# Per-field metadata: (name, shape, dtype). Shape's leading axis is the
+# decode-state's batch dim B. Tuple-of-tuples so the layout is hashable
+# (Python static under jit).
+_DECODE_STATE_FIELD_NAMES = (
+    "kv_cache",
+    "compressor_kv_state",
+    "compressor_score_state",
+    "indexer_kv_state",
+    "indexer_score_state",
+    "indexer_kv_cache",
+)
+
+
+def _layer_decode_state_layout(
+    layer_params: BlockParams,
+    cfg_index_head_dim: int,
+    state_max_seq_len: int,
+    batch_size: int = 1,
+) -> Tuple[Tuple[str, Tuple[int, int, int], "jnp.dtype"], ...]:
+    """Return the per-field layout `((name, shape, dtype), ...)` for one
+    layer's `AttentionDecodeState`. Mirrors `attention_init_state_from_prefill`
+    field-shape decisions exactly so the packed buffer can losslessly round-
+    trip a state produced by either the prefill-init or decode-step paths.
+
+    Layers with `compress_ratio == 0` (pure SWA) emit zero-sized placeholders
+    for the compressor / indexer fields; layers with `ratio > 0 and indexer
+    is None` zero-size only the indexer fields. This keeps the packed buffer
+    schema uniform across layer types — the layout's total element count
+    differs per layer but every layer has all 6 named fields.
+    """
+    p = layer_params.attn
+    win = p.window_size
+    ratio = p.compress_ratio
+    Dh = p.head_dim
+    extra = (state_max_seq_len // ratio) if ratio else 0
+    coff = 2 if ratio == 4 else 1
+
+    # kv_cache (always populated; bf16).
+    kv_cache_shape = (batch_size, win + extra, Dh)
+
+    # compressor_kv_state / compressor_score_state — populated when ratio>0.
+    if ratio > 0:
+        comp_state_shape = (batch_size, coff * ratio, coff * Dh)
+    else:
+        comp_state_shape = (batch_size, 0, 0)
+
+    # indexer_kv_state / indexer_score_state / indexer_kv_cache — populated
+    # only for ratio==4 layers that have an indexer.
+    if ratio == 4 and p.indexer is not None and cfg_index_head_dim > 0:
+        idx_state_shape = (batch_size, coff * ratio, coff * cfg_index_head_dim)
+        idx_cache_shape = (batch_size, state_max_seq_len // ratio, cfg_index_head_dim)
+    else:
+        idx_state_shape = (batch_size, 0, 0)
+        idx_cache_shape = (batch_size, 0, 0)
+
+    return (
+        ("kv_cache", kv_cache_shape, jnp.bfloat16),
+        ("compressor_kv_state", comp_state_shape, jnp.float32),
+        ("compressor_score_state", comp_state_shape, jnp.float32),
+        ("indexer_kv_state", idx_state_shape, jnp.float32),
+        ("indexer_score_state", idx_state_shape, jnp.float32),
+        ("indexer_kv_cache", idx_cache_shape, jnp.bfloat16),
+    )
+
+
+def _layer_packed_size(layout) -> int:
+    """Total fp32 elements needed to hold one layer's packed state. Caller
+    pre-allocates a `[packed_size]` (or `[max_num_seqs, packed_size]`) fp32
+    buffer per layer."""
+    n = 0
+    for _, shape, _ in layout:
+        n += int(_prod(shape))
+    return n
+
+
+def _pack_layer_state(state: AttentionDecodeState, layout) -> jnp.ndarray:
+    """Flatten one layer's `AttentionDecodeState` into a 1D fp32 array. Order
+    of fields matches `_DECODE_STATE_FIELD_NAMES`. bf16 fields are upcast
+    to fp32 (lossless) for uniform-dtype storage; the unpack step casts back."""
+    parts = []
+    for name, shape, dtype in layout:
+        arr = getattr(state, name)
+        # The state's actual array may have a zero-element placeholder shape
+        # (e.g. (B, 0, 0)) for fields that don't apply to this layer. The
+        # layout's shape matches by construction — flatten to fp32 directly.
+        flat = arr.reshape(-1).astype(jnp.float32)
+        parts.append(flat)
+    return jnp.concatenate(parts, axis=0) if parts else jnp.zeros((0,), dtype=jnp.float32)
+
+
+def _unpack_layer_state(packed: jnp.ndarray, layout) -> AttentionDecodeState:
+    """Inverse of `_pack_layer_state`. Slices the flat fp32 array by the
+    per-field offsets, reshapes to each field's shape, and casts back to
+    the field's natural dtype. The packed buffer must have been produced
+    by `_pack_layer_state` against the same `layout`."""
+    fields: Dict[str, jnp.ndarray] = {}
+    offset = 0
+    for name, shape, dtype in layout:
+        n = int(_prod(shape))
+        if n == 0:
+            fields[name] = jnp.zeros(shape, dtype=dtype)
+            continue
+        chunk = jax.lax.dynamic_slice_in_dim(packed, offset, n, axis=0)
+        fields[name] = chunk.reshape(shape).astype(dtype)
+        offset += n
+    return AttentionDecodeState(**fields)
+
+
+def transformer_body_layout(
+    params: TransformerParams,
+    cfg: DeepseekV4Config,
+    state_max_seq_len: int,
+    batch_size: int = 1,
+) -> List[Tuple]:
+    """Per-layer packed-state layout for the whole transformer body. Index
+    `i` of the result describes layer `i`'s `AttentionDecodeState` field
+    shapes and dtypes. The caller uses this to pre-allocate per-layer
+    `[max_num_seqs, packed_size_i]` fp32 buffers and to drive `_pack_*` /
+    `_unpack_*`."""
+    return [
+        _layer_decode_state_layout(
+            layer,
+            cfg_index_head_dim=cfg.index_head_dim,
+            state_max_seq_len=state_max_seq_len,
+            batch_size=batch_size,
+        )
+        for layer in params.layers
+    ]
+
+
+def transformer_body_init_state_to_buffer(
+    input_ids: jnp.ndarray,            # [B, T] int32
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+    state_max_seq_len: int,
+) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
+    """Run a prefill of `input_ids` and return `(h, packed_buffers)` where
+    `packed_buffers[i]` is the 1D fp32 packed `AttentionDecodeState` for
+    layer `i`. Wraps `transformer_body_init_state_from_prefill` with the
+    pack step. Output `h` is byte-equivalent to `transformer_body_forward`
+    on the same input (same as the underlying primitive).
+
+    Iter-4 calls this on the prefill branch of `__call__` and writes each
+    `packed_buffers[i]` into the corresponding slot of `kv_caches[i]`."""
+    h, states = transformer_body_init_state_from_prefill(
+        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+        state_max_seq_len=state_max_seq_len,
+    )
+    layouts = transformer_body_layout(
+        params, cfg, state_max_seq_len, batch_size=int(input_ids.shape[0]))
+    packed_buffers = [_pack_layer_state(s, lo) for s, lo in zip(states, layouts)]
+    return h, packed_buffers
+
+
+def transformer_body_decode_step_from_buffer(
+    input_ids_step: jnp.ndarray,       # [B, 1] int32
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+    prev_buffers: List[jnp.ndarray],
+    start_pos: int,
+    state_max_seq_len: int,
+) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
+    """One decode step driven by per-layer packed-state buffers. Wraps
+    `transformer_body_decode_step` with unpack-before / pack-after.
+    Returns `(h: [B, 1, hc, D], new_buffers: List[jnp.ndarray])`.
+
+    Iter-4 calls this on the continuation branch of `__call__`, with
+    `prev_buffers[i]` read from `kv_caches[i]` and the returned buffers
+    written back. `start_pos` must equal the absolute position of the new
+    token — the Python staticness propagates from `attention_decode_step`."""
+    layouts = transformer_body_layout(
+        params, cfg, state_max_seq_len,
+        batch_size=int(input_ids_step.shape[0]))
+    prev_states = [_unpack_layer_state(b, lo)
+                   for b, lo in zip(prev_buffers, layouts)]
+    h, new_states = transformer_body_decode_step(
+        input_ids_step, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+        prev_states, start_pos,
+    )
+    new_buffers = [_pack_layer_state(s, lo)
+                   for s, lo in zip(new_states, layouts)]
+    return h, new_buffers
+
+
 def deepseek_v4_forward_prefill(
     input_ids: jnp.ndarray,        # [B, S] int32
     params: TransformerParams,

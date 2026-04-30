@@ -100,6 +100,10 @@ from tpu_inference.models.jax.deepseek_v4 import (
     kv_cache_bytes_per_layer, map_hf_name_to_jax_path,
     transformer_body_forward, transformer_body_decode_step,
     transformer_body_init_state_from_prefill,
+    transformer_body_layout, transformer_body_init_state_to_buffer,
+    transformer_body_decode_step_from_buffer,
+    _pack_layer_state, _unpack_layer_state, _layer_packed_size,
+    _layer_decode_state_layout,
 )
 
 
@@ -1678,6 +1682,173 @@ class TestTransformerBodyDecodeRoundTrip:
         assert d_step <= 5e-3, (
             f"T={T}: decode-step output diverged from full prefill at "
             f"position T (max abs diff {d_step})")
+
+
+class TestPackedDecodeStateBuffer:
+    """S1 engine-plumbing primitives: validate that the per-layer
+    `_pack_layer_state` / `_unpack_layer_state` round-trip an
+    `AttentionDecodeState` losslessly, and that
+    `transformer_body_init_state_to_buffer` +
+    `transformer_body_decode_step_from_buffer` reproduce the same hidden
+    output as the unpacked `transformer_body_init_state_from_prefill` +
+    `transformer_body_decode_step` chain (already pinned by
+    `TestTransformerBodyDecodeRoundTrip`).
+
+    The promise: iter-4 can write each layer's `packed_buffers[i]` into
+    `kv_caches[i]` on prefill, donate them through the JIT'd run_model,
+    and on the next decode call read them back, advance one position,
+    and write the new packed state back — without any change to the
+    underlying decode-state math.
+
+    Tolerance: ≤1e-7 round-trip on the pack/unpack itself (lossless
+    fp32→bf16→fp32 cast is exact for bf16 source), and the same
+    ≤5e-3 budget as `TestTransformerBodyDecodeRoundTrip` for the
+    end-to-end decode-step parity (no new error sources are introduced
+    by pack/unpack)."""
+
+    @staticmethod
+    def _build_pair(seed: int = 0):
+        torch.manual_seed(seed)
+        args = make_tiny_args(max_seq_len=64)
+        model = TorchTransformer(args)
+        from _deepseek_v4_reference.model import init_model_random
+        init_model_random(model, seed=seed)
+        params, cfg = _torch_transformer_to_jax_params_and_cfg(model)
+        swa = jnp.empty((0,), dtype=jnp.complex64)
+        comp = jnp.empty((0,), dtype=jnp.complex64)
+        swa_layer = next(
+            (l for l in model.layers if l.attn.compress_ratio == 0), None)
+        comp_layer = next(
+            (l for l in model.layers if l.attn.compress_ratio > 0), None)
+        if swa_layer is not None:
+            swa = t2j(swa_layer.attn.freqs_cis).astype(jnp.complex64)
+        if comp_layer is not None:
+            comp = t2j(comp_layer.attn.freqs_cis).astype(jnp.complex64)
+        return model, params, cfg, swa, comp
+
+    def test_pack_unpack_round_trip_preserves_state(self):
+        """Pack then unpack each layer's state. Each field must compare
+        bit-equal (after the bf16↔fp32 round-trip — bf16 source casts
+        losslessly through fp32 and back)."""
+        model, params, cfg, swa, comp = self._build_pair(seed=11)
+        torch.manual_seed(123)
+        T = 16
+        ids = torch.randint(
+            0, model.args.vocab_size, (1, T), dtype=torch.int64)
+        ids_j = t2j(ids).astype(jnp.int32)
+        _, states = transformer_body_init_state_from_prefill(
+            ids_j, params, swa, comp, cfg,
+            state_max_seq_len=model.args.max_seq_len,
+        )
+        for layer_i, (layer, state) in enumerate(zip(params.layers, states)):
+            layout = _layer_decode_state_layout(
+                layer, cfg.index_head_dim,
+                state_max_seq_len=model.args.max_seq_len,
+                batch_size=int(ids_j.shape[0]),
+            )
+            packed = _pack_layer_state(state, layout)
+            assert packed.dtype == jnp.float32
+            assert packed.shape == (_layer_packed_size(layout),)
+            roundtrip = _unpack_layer_state(packed, layout)
+            for name, _, dtype in layout:
+                orig = getattr(state, name)
+                back = getattr(roundtrip, name)
+                assert back.dtype == dtype, (
+                    f"layer={layer_i} field={name}: dtype mismatch "
+                    f"(orig {orig.dtype}, back {back.dtype})")
+                assert back.shape == orig.shape, (
+                    f"layer={layer_i} field={name}: shape mismatch "
+                    f"(orig {orig.shape}, back {back.shape})")
+                if int(np.prod(orig.shape)) == 0:
+                    continue
+                # Bit-exact round-trip: bf16 → fp32 → bf16 round-trips
+                # losslessly for any bf16 source, and fp32 → fp32 is the
+                # identity. Use `jnp.array_equal` rather than
+                # `max(abs(diff))` because `compressor_score_state` is
+                # init'd to -inf and `abs(-inf - (-inf)) == NaN` would
+                # spuriously fail an otherwise-equal comparison.
+                eq = bool(jnp.all(orig.astype(jnp.float32)
+                                   == back.astype(jnp.float32)))
+                assert eq, (
+                    f"layer={layer_i} field={name}: pack/unpack drifted "
+                    f"(orig and back not bit-equal)")
+
+    @pytest.mark.parametrize("T", [4, 16])
+    def test_buffer_decode_matches_full_prefill(self, T):
+        """End-to-end: prefill via `transformer_body_init_state_to_buffer`
+        on `ids[:, :T]`, then one decode step via
+        `transformer_body_decode_step_from_buffer` at start_pos=T. The
+        new-token hidden state must match a fresh prefill on
+        `ids[:, :T+1]` at its last position. Same ≤5e-3 budget as the
+        underlying primitives — pack/unpack adds no error."""
+        model, params, cfg, swa, comp = self._build_pair(seed=0)
+        torch.manual_seed(T + 17)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + 1), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+
+        h_full = transformer_body_forward(
+            ids_full_j, params, swa, comp, cfg)
+
+        h_pref, buffers = transformer_body_init_state_to_buffer(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=model.args.max_seq_len,
+        )
+        d_pref = float(jnp.max(
+            jnp.abs(h_pref.astype(jnp.float32)
+                    - h_full[:, :T].astype(jnp.float32))))
+        assert d_pref <= 1e-3, (
+            f"T={T}: init_state_to_buffer perturbed forward output "
+            f"(max abs diff {d_pref})")
+
+        h_step, _ = transformer_body_decode_step_from_buffer(
+            ids_full_j[:, T:T + 1], params, swa, comp, cfg,
+            buffers, start_pos=T,
+            state_max_seq_len=model.args.max_seq_len,
+        )
+        d_step = float(jnp.max(
+            jnp.abs(h_step.astype(jnp.float32)
+                    - h_full[:, T:T + 1].astype(jnp.float32))))
+        assert d_step <= 5e-3, (
+            f"T={T}: buffer-decode output diverged from full prefill at "
+            f"position T (max abs diff {d_step})")
+
+    def test_buffer_multi_step_matches_prefill_sequence(self):
+        """Stress: prefill on T tokens, then run N=3 sequential decode
+        steps via the buffer wrapper. Each step's hidden state must match
+        the corresponding position in a fresh prefill of the full
+        T+N-token sequence. This proves the buffer schema correctly
+        carries cross-step state — a single-step test could mask a bug
+        where pack/unpack truncates a tail field but the first decode
+        only reads the head."""
+        model, params, cfg, swa, comp = self._build_pair(seed=2)
+        T = 12
+        N = 3
+        torch.manual_seed(T + N + 31)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + N), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+
+        h_full = transformer_body_forward(
+            ids_full_j, params, swa, comp, cfg)
+
+        _, buffers = transformer_body_init_state_to_buffer(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=model.args.max_seq_len,
+        )
+        for step in range(N):
+            pos = T + step
+            h_step, buffers = transformer_body_decode_step_from_buffer(
+                ids_full_j[:, pos:pos + 1], params, swa, comp, cfg,
+                buffers, start_pos=pos,
+                state_max_seq_len=model.args.max_seq_len,
+            )
+            d = float(jnp.max(
+                jnp.abs(h_step.astype(jnp.float32)
+                        - h_full[:, pos:pos + 1].astype(jnp.float32))))
+            assert d <= 5e-3, (
+                f"step {step} (pos={pos}): buffer-driven decode diverged "
+                f"from full prefill (max abs diff {d})")
 
 
 # =============================================================

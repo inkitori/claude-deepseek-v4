@@ -376,17 +376,74 @@ decode) + MoE + HC × all layers) end-to-end. Tolerance budget
 is ≈ 6 layers × 1e-4/layer accumulated bf16 noise; observed
 worst across 4 T cases ≪ 5e-3.
 
-**Next iter starts at:** thread state through `__call__`.
+**Iter 2026-04-30 (pack/unpack schema):** the missing engine
+plumbing primitive — concrete pack/unpack helpers that flatten
+`AttentionDecodeState` into a single `jax.Array` per layer — now
+landed and tested. Six new helpers in
+`models/jax/deepseek_v4.py`:
 
-The math is now ready. The remaining surgery is engine
-plumbing — figuring out where per-layer
-`List[AttentionDecodeState]` lives and how it persists across
-JIT'd `model_fn(state, kv_caches, input_ids, …)` calls. Today
-V4's `kv_caches` is a passthrough (INVARIANTS I34); the model's
-`nnx.Variable`s are read inside JIT but mutations are lost
-because `tpu_inference/models/common/model_loader.py:332`
-returns `(kv_cache, hidden, aux)` and doesn't capture the
-mutated nnx state. Two implementation options:
+* `_layer_decode_state_layout(layer_params, cfg_index_head_dim,
+  state_max_seq_len, batch_size=1)` — returns the per-field
+  layout `((name, shape, dtype), ...)` for one layer's
+  `AttentionDecodeState`. Mirrors `attention_init_state_from_prefill`
+  field decisions exactly. SWA/CSA/HCA all populate the same 6
+  named fields with zero-sized placeholders for unused fields,
+  so the schema is uniform across layer types (total element
+  count differs).
+* `_layer_packed_size(layout)` — total fp32 elements for one
+  layer's packed state.
+* `_pack_layer_state(state, layout)` — flatten one layer's
+  `AttentionDecodeState` into a 1D fp32 array. bf16 fields
+  (`kv_cache`, `indexer_kv_cache`) upcast losslessly to fp32;
+  fp32 fields are stored directly. Score-state's `-inf` init
+  preserved.
+* `_unpack_layer_state(packed, layout)` — inverse: slice by
+  field offsets, reshape, cast back to natural dtype.
+* `transformer_body_layout(params, cfg, state_max_seq_len,
+  batch_size=1)` — per-layer layouts for the whole transformer
+  body (drives buffer allocation in iter-4).
+* `transformer_body_init_state_to_buffer(input_ids, params, ...,
+  state_max_seq_len)` — prefill that returns
+  `(h, packed_buffers)`. Wraps
+  `transformer_body_init_state_from_prefill` + pack.
+* `transformer_body_decode_step_from_buffer(input_ids_step,
+  params, ..., prev_buffers, start_pos, state_max_seq_len)` —
+  one decode step driven by per-layer packed buffers. Wraps
+  unpack + `transformer_body_decode_step` + pack.
+
+Pinned by `TestPackedDecodeStateBuffer` in
+`tests/models/jax/test_deepseek_v4.py` (4 cases):
+  * pack/unpack round-trip is bit-exact across all 6 fields on
+    every layer (including `compressor_score_state`'s -inf
+    entries — verified via `jnp.array_equal` rather than
+    `abs(diff)` because `abs(-inf - (-inf)) == NaN`)
+  * one decode step from a packed buffer matches a fresh prefill
+    on `ids[:, :T+1]`'s last position at T ∈ {4, 16}
+    (≤ 5e-3, same budget as the underlying primitives — pack/
+    unpack adds no error)
+  * 3 sequential decode steps from a packed buffer (T=12, N=3)
+    match the corresponding positions in a full T+N prefill —
+    rules out a tail-field truncation bug that single-step would
+    miss
+
+Total round-trip overhead: pack/unpack are pure JAX ops
+(reshape + cast + concat + dynamic_slice); they add no error
+and inline cleanly into surrounding JIT. Per-layer packed size
+on a tiny config layer is a few KB; on real V4-Flash with
+`MAX_LEN=256, MAX_SEQS=1`: SWA layer ≈ 16K fp32 elements (64
+KB), CSA layer ≈ 50K (200 KB), HCA layer ≈ 65K (260 KB). Total
+across ~50 layers ≈ 10 MB before sharding, well below any HBM
+budget.
+
+**Iter-4 starts at:** wire packed buffers into `__call__` via
+`kv_caches`. The math + pack/unpack schema is ready; the
+remaining surgery is engine plumbing.
+
+V4's `kv_caches` is a passthrough today (INVARIANTS I34); the
+model's `nnx.Variable`s are read inside JIT but mutations are
+lost because `tpu_inference/models/common/model_loader.py:332`
+returns `(kv_cache, hidden, aux)` without capturing the mutated
+nnx state. Two implementation options:
 
   **Option A — use `kv_caches` as the carrier (preferred).**
   vLLM allocates `kv_caches: List[jax.Array]` per layer and
@@ -395,18 +452,13 @@ mutated nnx state. Two implementation options:
   tpu-inference models (e.g. `llama3.py:338-344`) is exactly
   this: read `kv_cache = kv_caches[i]`, run the layer with it,
   write `kv_caches[i] = new_kv_cache`, return the updated list.
-  V4's `AttentionDecodeState` is a 6-field dataclass; pack it
-  into the per-layer buffer (concatenate fields at known offsets,
-  or keep `kv_caches[i]` as a tuple-of-arrays — JIT inputs can
-  be pytrees). vLLM's V4 kv_cache spec is "an inert placeholder"
-  per `kv_cache_manager.py:73`, so we have layout freedom; we
-  just need to override the spec / buffer shape so the allocated
-  per-layer buffer is at least as large as our packed state.
-  Today's spec uses `head_dim, num_kv_heads=1` with V4's tiny
-  `head_dim=128` → ~few KB/layer/block — likely undersized.
-  Probable approach: extend `kv_cache_manager._create_attention_spec`
-  to size each layer for the union of all 6 AttentionDecodeState
-  fields (or, equivalently, override `KVCacheSpec.page_size_padded`).
+  vLLM's V4 kv_cache spec is "an inert placeholder" per
+  `kv_cache_manager.py:73`, so we have layout freedom; just
+  need to size + dtype the per-layer buffer to match our
+  packed state. **The dtype matters:** the packed buffer is
+  fp32 (score state is fp32 with -inf init; can't downgrade).
+  Today vLLM's spec uses `cache_dtype=bfloat16` (`DEFAULT_KV_CACHE_DTYPE`
+  at `runner/kv_cache.py:33`).
 
   **Option B — return state from `run_model` and thread via
   the runner.** Add a 4th output tuple element holding the new
@@ -416,34 +468,42 @@ mutated nnx state. Two implementation options:
   the contract with non-V4 models that share the same model_fn
   signature. Defer unless A turns out infeasible.
 
-* Recommended next-iter scope (one iter):
-  1. Extend `kv_cache_manager.py` so V4's per-layer
-     `KVCacheSpec.page_size_padded` is sized for the packed
-     `AttentionDecodeState`. Validate by inspecting allocated
-     `kv_caches[i].shape` after engine init in a smoke launch.
-  2. Add `_pack_state` / `_unpack_state` helpers next to the
-     transformer-body decode primitives (concat all 6 fields
-     into a single `[B, total_floats]` array per layer, with
-     known offsets). State pytree shape is uniform across
-     layers so packing is one schema.
-  3. Branch `__call__`: detect prefill-vs-continuation from
-     `attention_metadata.query_start_loc` + `seq_lens`. Track
-     per-slot `_decode_advanced_to_v` (per-slot int32) — store
-     it inside the kv_caches buffer too, or as the leading
-     slot of each layer's packed state.
-  4. On continuation: read `kv_caches[i]` → unpack → one
-     decode step → repack → write back. On fresh prefill: run
-     `transformer_body_init_state_from_prefill` and pack the
-     returned states into `kv_caches`.
-  5. Validate via path #3 (`lower().compile()` on real config)
-     — per-layer state at MAX_LEN=256/MAX_SEQS=1 is ~50 KB
-     × 50 layers × 32 chips after sharding ≈ 80 MB total HBM
-     budget; should fit comfortably in the existing 31.25 GiB
-     budget.
+* Recommended iter-4 scope (one iter):
+  1. Extend `kv_cache_manager._create_attention_spec` for V4 so
+     each layer's `KVCacheSpec.page_size_padded` is the packed
+     state's total bytes (per-layer; CSA layers > SWA layers
+     so the spec is per-layer-class, not uniform). Override
+     `dtype=jnp.float32` on the V4 branch — score state needs
+     fp32, and the existing bf16 default would lose -inf.
+     `_layer_packed_size(layout)` (already landed) gives the
+     element count; multiply by 4 bytes/element for size.
+  2. Branch `__call__` (`models/jax/deepseek_v4.py:1507`) on
+     prefill-vs-continuation. Signal: every-token-of-seq case
+     `query_start_loc[s+1] - query_start_loc[s]` > 1 → prefill;
+     == 1 with `seq_lens[s] > 1` → decode. Use
+     `attention_metadata.input_positions[query_start_loc[s]]`
+     as `start_pos` for the decode step.
+  3. On prefill (single-seq smoke today): call
+     `transformer_body_init_state_to_buffer(...)`, write the
+     resulting `packed_buffers[i]` into `kv_caches[i]` (slot 0
+     for max_num_seqs=1). On decode: read `kv_caches[i]`,
+     pass through `transformer_body_decode_step_from_buffer(...)`,
+     write the new packed buffer back.
+  4. Multi-seq slot indexing: defer to S2's iter. For now,
+     allocate `kv_caches[i]` as `[max_num_seqs=1, packed_size_i]`
+     and use slot 0.
+  5. Validate via `eval_shape` / `lower().compile()` on real
+     V4-Flash config under virtual CPU mesh
+     (`scripts/full_slice_v4_*` patterns from prior B3 work):
+     no shape mismatches, no extra all-gathers from the new
+     pack/unpack, fp32 per-layer state actually allocates the
+     fp32 dtype (verify via `kv_caches[0].dtype`).
   6. Real-smoke gate: deterministic " Paris" still passes AND
      a multi-token decode (e.g. max_tokens=10) returns coherent
      output. Throughput improvement is the prize; correctness
-     is the gate.
+     is the gate. (Smoke check today emits one token; need to
+     extend or add `max_tokens=10` curl to actually exercise
+     the decode path.)
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1072,7 +1132,26 @@ when the timeout SIGTERMs the iter.
   T ∈ {4,8,16,24} on the 6-layer tiny config (3 SWA + 2 CSA +
   2 HCA pattern). Pinned by `TestTransformerBodyDecodeRoundTrip`.
   ✓ math, ✗ runtime integration (S1 — `__call__` is the
-  remaining surgery; see S1's "Next iter starts at").
+  remaining surgery; see S1's "Iter-4 starts at").
+* **Packed decode-state buffers** (`_layer_decode_state_layout`,
+  `_pack_layer_state`, `_unpack_layer_state`,
+  `transformer_body_init_state_to_buffer`,
+  `transformer_body_decode_step_from_buffer` in
+  `models/jax/deepseek_v4.py`): one layer's 6-field
+  `AttentionDecodeState` flattens losslessly into a single 1D
+  fp32 array via `_pack_layer_state`; the inverse via
+  `_unpack_layer_state` is bit-exact (verified including
+  `compressor_score_state`'s -inf entries via `jnp.array_equal`).
+  Stitched into the transformer-body decode round-trip: prefill
+  via `init_state_to_buffer` then 3 sequential decode steps via
+  `decode_step_from_buffer` reproduce a fresh T+N prefill within
+  ≤ 5e-3, the same budget as the non-buffer primitives. Pinned
+  by `TestPackedDecodeStateBuffer` (4 cases: round-trip + 2
+  single-step + 1 multi-step). The pack/unpack ops are pure JAX
+  (reshape+cast+concat+dynamic_slice) and inline cleanly into
+  surrounding JIT — no extra error sources. ✓ math + schema, ✗
+  runtime integration (S1 iter-4 wires these into
+  `__call__` via `kv_caches`).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
