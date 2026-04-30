@@ -1,25 +1,83 @@
-# Blockers (archived)
+# Production-readiness blockers
 
-This file tracked deferred / partially-open items from the prior
-overnight sessions (v3–v8). The structural blockers that prevented
-`vllm serve` from reaching `/v1/completions` (B1 multi-seq dispatch,
-B4 vLLM MLA-classification gate, etc.) are all resolved on the
-current main branch; the iterate loop runs end-to-end.
+This file is a short pointer at the prioritized work list. The
+authoritative backlog with file:line references and full
+rationale lives in **[../../CLAUDE.md](../../CLAUDE.md)**
+"Production-readiness backlog". Read that first.
 
-The current real blockers, prioritized:
+## Status
 
-1. **First-curl latency.** Cold compile takes ~10–15 min on a clean
-   `/tmp/jax-compile-cache-v4`. The vectorized MoE dropped HLO
-   instruction count 4.6× (477k → 103k) but XLA's TPU compile is
-   super-linear, so the absolute time is still long. See `prompt.md`
-   "Your job — primary objective" for the four attack lanes.
+The Tier-8 deploy gate is GREEN as of 2026-04-30 — `./run.sh
+serve` plus `scripts/full_slice_v4_smoke_check.sh` returns
+`PASS: deterministic completion contains 'Paris'` reliably,
+cold compile ~97s, warm-cache curl sub-second. Older blockers
+(B1 multi-seq dispatch, B4 vLLM MLA-classification gate, the
+MoE-vectorize HBM OOM, the 126 `Involuntary full
+rematerialization` warnings on `compressor.ape`) are all
+resolved. History lives in `git log`.
 
-2. **SPMD `Involuntary full rematerialization` warnings.** Every one
-   of these in the smoke log is XLA giving up on a sharding spec
-   (e.g. `[1,32] -> [16,1,2]`) and falling back to replicate +
-   re-partition. They lengthen compile and add slow runtime barriers.
+## Current production-readiness blockers (in priority order)
 
-For day-to-day operational state and "what's been verified", read
-[`../../CLAUDE.md`](../../CLAUDE.md). The historical narrative
-(B1–B4, W1–W4, Tier 1–8 mythology) is preserved in `git log` if you
-need it.
+### Tier S — silent correctness bombs (fix first)
+
+* **S1.** Decode is not real decode — every step recomputes
+  prefill on the full prompt+generated context. Headline bug;
+  unblocks A1, B1, S5.
+* **S2.** Multi-sequence dispatch is a Python loop in eager
+  mode; doesn't jit; one user blocks all others.
+* **S3.** `--reasoning-parser deepseek_v4` and
+  `--tool-call-parser deepseek_v4` not enabled in the smoke
+  launcher. The parsers exist upstream — one-line launcher fix.
+* **S4.** Chat template (`scripts/v4_chat_template.jinja`)
+  covers chat-mode only. Think-mode, tool-calling, tool-result
+  round-trip, and `latest_reminder` injection are missing.
+* **S5.** MTP speculative-decoding hook not wired into
+  `tpu_inference/runner/speculative_decoding_manager.py`. 1.5–2×
+  decode throughput on the table.
+* **S6.** Sampling parameters (`temperature>0`, `top_p`,
+  `top_k`, penalties, `n>1`, `logprobs`) untested under load.
+* **S7.** Streaming (SSE) responses unverified.
+
+### Tier A — production deployment infra
+
+* **A1.** `MAX_LEN=256, MAX_SEQS=1` hard-coded in the smoke
+  launcher (depends on S1).
+* **A2.** Persistent compile cache is host-local and ephemeral.
+* **A3.** No engine crash recovery / drain-on-SIGTERM.
+* **A4.** No metrics / observability (vLLM's `--enable-metrics`
+  not set).
+* **A5.** No TLS / authentication / per-key rate limiting.
+* **A6.** Single slice — no horizontal scale.
+
+### Tier B — known performance work
+
+* **B1.** Sparse-attention Pallas kernel
+  (`layers/jax/attention/deepseek_v4_attention.py:131` is
+  fully-materialized; correctness over perf per DECISIONS D2).
+* **B2.** True sparse MoE dispatch via existing
+  `kernels/megablox/gmm.py` (today's `moe_forward` is
+  vectorized-dense; 32× over true sparse for top_k=8 / E=256).
+* **B3.** SPMD `Involuntary full rematerialization` warning
+  audit. `compressor.ape` family already eliminated; sweep the
+  rest.
+* **B4.** AOT compile + binary persist (per-host because of
+  the cache-fingerprint finding).
+
+### Tier C — quality gates
+
+C1 lm-eval-harness scores, C2 long-context functional, C3 math
+regression under load, C4 tokenizer edges, C5 refusal
+preservation. **C1 is the gate for claiming "we serve
+V4-Flash" honestly.**
+
+### Tier D — code-hygiene
+
+D1 test bloat consolidation
+(`tests/models/jax/test_deepseek_v4.py` is 2997 LOC, 30
+classes; ~4× peer models), D2 stale comment cleanup
+(`__call__` docstring at `models/jax/deepseek_v4.py:1395-1409`
+references archived B1).
+
+For full rationale, file:line references, and verification
+patterns for each item, read **CLAUDE.md "Production-readiness
+backlog"**.

@@ -40,7 +40,12 @@ than generalizing V3's machinery.
 
 **Implications:** When `ragged_paged_attention` adds support for
 top-k + attn_sink + dual-buffer KV, the V4 attention can swap to it
-for a perf win without changing the math.
+for a perf win without changing the math. The current
+fully-materialized `sparse_attn` is correctness-only; a real Pallas
+kernel is backlog item B1 (CLAUDE.md "Production-readiness
+backlog"). Similarly, `kernels/megablox/gmm.py` is the path forward
+for sparse MoE dispatch (B2) once V4's hash-routing variant is
+integrated.
 
 ## D3 — Tiny config matches V4-Flash structure (alternating CSA/HCA layers)
 
@@ -65,5 +70,8 @@ input_ids)` to `model.mtp[0]` and comparing logits.
 **Why:** MTP is a real production code path in V4 and adds new
 params (`e_proj`, `h_proj`, `enorm`, `hnorm`, `hc_head_fn/scale/base`).
 Forward equivalence is verifiable on the tiny fixture; vLLM's
-speculative-decoding hook integration is downstream work outside the
-math-correctness goal.
+speculative-decoding hook integration was originally downstream
+work, but is now active backlog item S5 (CLAUDE.md
+"Production-readiness backlog") since the math foundation is
+solid and 1.5–2× decode throughput is on the table once S1
+(real decode plumbing) lands.

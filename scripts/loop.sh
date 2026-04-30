@@ -236,12 +236,6 @@ while true; do
     [ "$rc" = "124" ] && echo "[loop] iter $iter hit ${ITER_TIMEOUT_SEC}s timeout" | tee -a "$log"
     echo "=== iter $iter end exit=$rc @ $end_ts ===" | tee -a "$log"
 
-    status_file="$WORK/tpu-inference/STATUS.md"
-    if [ -f "$status_file" ]; then
-        echo "[loop] STATUS@$(date -u +%H%MZ): $(grep -E '^Latest|^TPU|^Tier|^W[1-4]|^B[0-9]' "$status_file" | tr '\n' ' | ')" \
-            | tee -a "$LOOP_LOG"
-    fi
-
     # Push whatever the agent committed this iter (best-effort, non-blocking)
     push_now || true
 

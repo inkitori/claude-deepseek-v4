@@ -1,15 +1,23 @@
 # claude-deepseek-v4 — agent runbook
 
 You're picking up a TPU-inference effort: get
-`vllm serve deepseek-ai/DeepSeek-V4-Flash` running end-to-end on a
-**v6e-32 TPU slice** (TP=32, 8 hosts × 4 chips). The model is a
-flagship MoE — 256 FP4 experts + MLA attention + dense FP8 — about
-543 GiB bf16-expanded.
+`vllm serve deepseek-ai/DeepSeek-V4-Flash` deployable on a
+**v6e-32 TPU slice** (TP=32, 8 hosts × 4 chips) at production
+quality. The model is a flagship MoE — 256 FP4 experts + MLA
+attention + dense FP8 — about 543 GiB bf16-expanded.
+
+The Tier-8 deploy gate is GREEN (`/v1/completions` returns
+deterministic `Paris` for "The capital of France is", cold compile
+~97s, warm-cache curl sub-second). The work now is converting that
+demo into something that handles real concurrent OpenRouter-grade
+traffic without silent correctness regressions. That backlog lives
+in **"Production-readiness backlog"** below.
 
 The single non-negotiable goal is **fast, mathematically correct
-inference with the real V4-Flash weights**. Synthetic-fixture tests
-are the fast iteration loop; real-weight `vllm serve` is the gate
-that defines "done".
+inference with the real V4-Flash weights**, served via the
+OpenAI-compatible HTTP endpoint to many concurrent users.
+Synthetic-fixture tests are the fast iteration loop; real-weight
+`vllm serve` is the gate that defines "done".
 
 ## Minimum-delta rule (READ THIS FIRST)
 
@@ -27,40 +35,37 @@ Concrete rules:
    `layers/jax/moe/deepseek_v4_moe.py`. New helpers go in those
    files unless they're genuinely independent and reusable.
 2. **Don't add new test classes for variants of an existing case.**
-   Add a parametrized test or fold into the existing class. Pattern
-   to avoid: `TestDecodeAttentionParity` + `TestDecodeAttentionParityExtended`
-   + `TestDecodeRollingParityLong` (each ~50 lines doing the same
-   shape of check). Prior sessions already accreted ~33 test classes
-   in `tests/models/jax/test_deepseek_v4.py` (3185 LOC, 5–10× the
-   size of any peer model's test file). Consolidate when you touch.
+   Add a parametrized test or fold into the existing class.
 3. **Reuse upstream layers.** Before writing a V4-specific helper,
-   check if `layers/jax/{attention,moe,...}/` already has a
-   primitive that does what you need (`dense_moe_fwd`, `sparse_attn`,
-   `rms_norm`, etc.). The custom `deepseek_v4_attention.py` and
-   `deepseek_v4_moe.py` exist because V4's MLA + sqrtsoftplus + hash
-   routing genuinely don't fit the generic helpers — but verify
-   that's still true for any *new* helper before duplicating.
-4. **Don't add files outside the V4 namespace.** Anything that
-   touches the runtime (`runner/`, `worker/`, `platforms/`) should
-   be a last resort, not a first resort, and needs explicit
-   justification in the commit message.
-5. **Delete dead code as you go.** If a TODO has been resolved, drop
-   it. If a "tier"/"keystone"/"sentinel" comment refers to a
+   check if `layers/jax/{attention,moe,...}/` or `kernels/` already
+   has a primitive (`dense_moe_fwd`, `sparse_attn`, `rms_norm`,
+   `megablox/gmm`, `ragged_paged_attention/v3`, etc.). The custom
+   `deepseek_v4_attention.py` and `deepseek_v4_moe.py` exist because
+   V4's MLA + sqrtsoftplus + hash routing + top-k + sink don't fit
+   the generic helpers — but verify that's still true for any *new*
+   helper before duplicating.
+4. **Touch the runtime sparingly.** Anything that touches the
+   runtime (`runner/`, `worker/`, `platforms/`) should be a last
+   resort, not a first resort. The two existing V4 runtime hooks
+   (`kv_cache_manager.py`'s deepseek_v4 model_type override, the
+   `deepseek_v4_fp8` quantization stub in `tpu_platform.py`) are
+   the entire delta and should stay that small.
+5. **Delete dead code as you go.** If a TODO has been resolved,
+   drop it. If a "tier"/"keystone"/"sentinel" comment refers to a
    superseded plan, remove it. Comments rot; code stays.
-6. **No re-export shim files.** `tests/models/test_deepseek_v4.py`
-   exists only to re-export from `tests/models/jax/test_deepseek_v4.py`
-   because some prior autonomous-task spec expected that path. It's
-   a candidate for removal once you confirm nothing CI-relevant
-   imports it.
+6. **No re-export shim files** and no doc-stub files that just
+   point at this runbook (PROGRESS.md / SUMMARY.md / FAILURES.md /
+   STATUS.md / STUCK.md / CODEX_PLAN.md / PROD_TOPOLOGY_RISKS.md
+   were all that pattern; if they reappear, delete them).
 
 When in doubt: the smaller change wins. A revert + minimal patch
 beats a refactor + the same fix.
 
 This file is the durable operational knowledge that's not obvious
 from the code: cluster layout, the iterate loop, env knobs, orphan
-state surfaces, and pitfalls that have already cost real time. Read
-it once before doing anything; everything below has been learned
-by burning iterations.
+state surfaces, the prioritized backlog, and pitfalls that have
+already cost real time. Read it once before doing anything;
+everything below has been learned by burning iterations.
 
 ## Cluster topology
 
@@ -113,7 +118,9 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
   ready, fires the deterministic "capital of France" completion
   twice, asserts byte-identical responses + that the text contains
   "Paris". Has a self-test at `scripts/test_smoke_check_harness.sh`
-  (uses `scripts/_mock_openai_server.py` — no TPU needed).
+  (uses `scripts/_mock_openai_server.py` — no TPU needed). Also
+  fires a `/v1/chat/completions` probe (informational by default,
+  `CHAT_REQUIRED=1` to make missing/empty fail).
 * **`full_slice_v4_warm_cache.sh`** — runs the smoke + check, then
   cleans up. Use once on a fresh VM (or after a `/tmp` wipe) to
   populate the JAX compile cache; subsequent real launches' first
@@ -146,6 +153,8 @@ launcher echoes the active values at startup so you can confirm.
 
 | env var | default | what it does |
 |---|---|---|
+| `MAX_LEN` | `256` | `--max-model-len` passed to vllm serve. Production needs this lifted (see backlog A1); each step up surfaces fresh activation-HBM tightness. |
+| `MAX_SEQS` | `1` | `--max-num-seqs` passed to vllm serve. Production needs this lifted (backlog S2/A1). Today S2 is unjit'd, so each extra seq is a sequential Python loop in eager mode — bumping without S2 won't help throughput. |
 | `V4_LOADER_SLICE_AWARE` | `1` | Each host reads only the rows its local devices own (vs full-tensor read on every host). |
 | `V4_LOADER_PLACE_WORKERS` | `8` | Threads driving `place_spec_as_jax_sharded` per host. Most per-tensor work releases the GIL (safetensors mmap reads + JAX C calls), so parallelism is real. Set to `1` for single-thread parity testing. |
 | `V4_LOADER_PREFETCH_WORKERS` | `0` | Thread-pool prefetch in the non-slice-aware iterator. Empirically didn't help on real V4 (placement is the bottleneck, not dequant). Knob retained for future work. |
@@ -154,56 +163,14 @@ launcher echoes the active values at startup so you can confirm.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s skips small inits (`jit_sample`, etc.). |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
-
-## Known bloat / consolidation candidates
-
-These are concrete pieces of accreted size that future cleanup
-passes should target. The math + serve work without them; they're
-just noise the next reader has to wade through.
-
-* **`tests/models/jax/test_deepseek_v4.py` (2997 LOC, 30 classes).**
-  Still ~4× the size of any peer model's test file
-  (`test_qwen2_5_vl.py` is the next biggest at 764). The biggest
-  remaining wins are the FP8/FP4 dequant classes, which overlap in
-  coverage:
-  - `TestRealFp8DequantSmoke` (NaN/finiteness checks) is strictly
-    weaker than `TestFp8DequantIndependentReference` (byte-equal vs
-    independent numpy reference). Same for the FP4 pair. Either drop
-    the smokes or fold them into the reference classes as a second
-    test method.
-  - `TestFp8Dequant` (synthetic-fixture full-loader bit-identical)
-    and `TestFp8CastByteDomain` (256-byte numpy-vs-torch parity) are
-    distinct concepts — keep both.
-  - `TestFp4CodebookReference` exhaustively enumerates the 16-entry
-    codebook — distinct from the byte-equal real-data tests.
-* **`deepseek_v4.py` has 26 top-level entities vs `deepseek_v3.py`'s
-  12.** Some is legitimate (MTP, hash routing, MLA variants), but
-  worth scanning for helpers that could use upstream primitives.
-
-Numbers above are snapshots; re-measure with `wc -l` and `grep -c "^class Test"`
-when you touch.
+| `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
 
 ## Current state (READ BEFORE LAUNCHING)
 
-**Tier 8 deploy gate is GREEN.** A cold `./run.sh serve` against
-real V4-Flash weights reaches `Application startup complete` and
-answers `/v1/completions` with deterministic `Paris` for "The
-capital of France is" — `scripts/full_slice_v4_smoke_check.sh`
-exits 0.
-
-`/v1/chat/completions` now also returns coherent (non-garbled)
-English with `--chat-template scripts/v4_chat_template.jinja`
-applied (verified 2026-04-30 06:38Z smoke). Chat lands in a
-larger prefill bucket (1024-token total vs 256 for completions
-with a 5-token prompt) and on a tight HBM budget the engine
-takes the OOM-defragment-retry path before the program loads,
-adding ~30 s to first-chat latency. Smoke probe is informational
-(`CHAT_REQUIRED=0` default); set `CHAT_REQUIRED=1` to fail the
-gate on empty chat. There's no robust content assertion yet —
-the model's first 16 tokens to "What is the capital of France?
-Answer with just the city name." returned `France` (a coherent
-but wrong answer, not garbage), so the smoke logs the response
-but doesn't assert on text.
+**Tier 8 deploy gate is GREEN as of 2026-04-30 04:22Z.** Cold
+`./run.sh serve` → load weights → cold compile → first
+`/v1/completions` returns deterministic `Paris` for "The capital of
+France is" — `scripts/full_slice_v4_smoke_check.sh` exits 0.
 
 End-to-end timing on the verifying run (cache-cold):
   * weight load + inline MoE consolidation: 4 min 49 s
@@ -216,130 +183,525 @@ End-to-end timing on the verifying run (cache-cold):
 optimized** (~2.7× smaller). XLA accounting was clean — no
 `CompileTimeHbmOom`, no `RuntimeBufferAllocationFailure`.
 
-What landed to unblock it:
-  1. **Freqs cap by vLLM's prefill bucket ceiling**
-     (`deepseek_v4.py::_effective_freqs_seq_len`). V4-Flash's
-     `max_position_embeddings = 1 048 576` was producing a
-     `f32[1M, 32]` freqs_compressed table that XLA pinned as a
-     1 GB argument per chip. The cap is now
-     `max(max_model_len, max_num_batched_tokens × dp_size)` —
-     vLLM's TPU runner pads prefill to that ceiling
-     (`runner/tpu_runner.py:469`), and capping below it produces
-     `cannot reshape array of shape (256, 32)` mid-prefill on any
-     prompt that lands in a bucket bigger than `max_model_len`
-     (e.g. 18-token chat prompt → 1024-token bucket). Final
-     freqs table is ~2 MB, well under the 1 GB ceiling that
-     motivated the original cap.
-  2. **Inline MoE consolidation**
-     (`deepseek_v4.py::_maybe_consolidate`). As soon as a
-     `(layer, wname)` group's 256 expert weights are placed, the
-     loader stacks them into a single `[E, inter, dim]` jax.Array
-     sharded `P('attn_dp', None, None)` and nulls out the per-leaf
-     references. Eliminates the 126 × 128 MiB MoE all-to-all
-     buffers that dominated `BACKEND_PASSES` HLO-temp on the
-     previous OOM (~16 GB / chip saved). Doing this incrementally
-     — not as a post-load pass — is critical: post-load, HBM is
-     fragmented across 33 000+ small allocations and the
-     consolidate's 256 MB transient OOMs (we burned an iter
-     learning that). Doing it as soon as a group is full means we
-     only ever hold one group's per-leaf set alongside its stacked
-     tensor at a time.
-  3. **`MoEParams` carries optional `w1_stacked / w2_stacked /
-     w3_stacked` fields**
-     (`deepseek_v4_moe.py`). `moe_forward` branches on
-     `params.w1_stacked is not None` — when present, reads the
-     stacked tensors directly, skipping the per-call
-     `jnp.stack(experts[*].wN)` that previously forced the
-     all-to-all on every forward × layer × stack. The per-expert
-     fallback path stays intact for synthetic-fixture tests.
+`/v1/chat/completions` returns 200 OK with the byte-equivalent
+chat template applied (`scripts/v4_chat_template.jinja`). The chat
+probe in `smoke_check` is informational by default — see backlog
+S3/S4 for what's still loose on the chat path.
 
-### What's now possible / what's still loose
+The smoke is `MAX_LEN=256, MAX_SEQS=1, --enforce-eager`. That's
+the demo configuration, not the production configuration. See the
+backlog below for what's required to widen it.
 
-Ground-truth latency is sub-100 s cold compile + sub-second
-execute; on cache-warm restarts (post-bootstrap) the compile-cache
-should let first-curl finish in seconds.
+## Production-readiness backlog (READ BEFORE PICKING WORK)
 
-Still loose ends worth tracking:
-  * **Chat-completions activation HBM is on the edge.** The
-    1024-token chat prefill bucket triggers
-    `RuntimeProgramAllocationFailure` (~1.94 GB program memory
-    requested vs ~1.83 GB reservable) on the first chat curl,
-    then succeeds via TpuLoadedExecutable's
-    `ExecutePrepareWithOomRetries` defragment-and-retry path.
-    Adds ~30 s to first-chat latency but the request completes.
-    Repeat chat calls hit the cache and execute in <1 s. Worth
-    finding ~110 MB of headroom (smaller `max_num_batched_tokens`?
-    Different bucket layout? More aggressive HBM compaction at
-    request boundaries?) so the retry isn't needed.
-  * **No robust chat-completions content assertion.** The smoke
-    chat probe currently logs the response and only fails on an
-    empty body when `CHAT_REQUIRED=1`. The model's first ~16
-    tokens at temp=0/seed=0 don't reliably contain a fixed
-    string (verified: it answered `France` for "What is the
-    capital of France?" with `Answer with just the city name`).
-    A reliable content probe would need either a longer
-    `max_tokens` budget, a constrained-generation request, or a
-    different prompt class (e.g. arithmetic).
-  * **Activation budget for /v1/completions headroom is
-    unmeasured.** We compiled cleanly under
-    `max-model-len=256, max-num-seqs=1`. Bumping either knob
-    raises HLO temp roughly linearly; we don't yet know how far
-    we can push before a new OOM. Iter that lifts the cap
-    should re-run the smoke.
-  * ~~**Cross-host JAX cache sharing (lane 2 from the original
-    plan)**~~ RESOLVED — verified unsound 2026-04-30 via
-    `scripts/full_slice_v4_cache_fingerprint.sh`. SPMD compiles
-    produce host-specific binaries: same JAX cache filename appears
-    on all 8 hosts but with 8 distinct sha256s. Rsync'ing host 0's
-    cache to workers would serve them code compiled for host 0's
-    chip topology coords. The fingerprint script remains as a
-    diagnostic for future cache debugging.
-  * ~~`Involuntary full rematerialization` warnings~~ FIXED
-    (2026-04-30T044814Z smoke). The 126 baseline warnings on
-    `compressor.ape` / `indexer.compressor.ape` resharding from
-    `{devices=[1,32]}` were eliminated by `_replicate(params.ape)`
-    (a no-op-outside-mesh `with_sharding_constraint(_, P())`)
-    inside `compressor_prefill` and `compressor_decode_step` in
-    `deepseek_v4_attention.py`. Smoke is text-identical and
-    cold-compile time is unchanged (~97 s). HLO instruction count
-    is unchanged (47k optimized) — the savings were activation HBM,
-    not graph size.
+This is the prioritized list of what stands between Tier-8-GREEN
+demo serving and OpenRouter-grade production. Items earlier in
+the list block items later, and items earlier have higher
+correctness or throughput leverage. Pick the first uncompleted
+item; if you can't make progress, document why in the commit
+message and move down.
+
+### Tier S — silent correctness bombs (fix before perf)
+
+These are issues where the smoke goes green but the model isn't
+doing what users will actually ask of it. Fix these *first*.
+
+#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context
+
+This is the headline correctness/perf bug. `__call__` in
+`work/tpu-inference/tpu_inference/models/jax/deepseek_v4.py:1363`
+always routes to `transformer_body_forward` →
+`block_forward` → `attention_prefill`. The decode-step kernels
+are fully implemented and correctness-tested
+(`attention_decode_step` at
+`layers/jax/attention/deepseek_v4_attention.py:710`,
+`TestDecodeRollingParity` at
+`tests/models/jax/test_deepseek_v4.py:1390` — 1e-4 vs torch
+reference) but **never invoked** by the production `__call__`.
+
+The `__call__` docstring at `deepseek_v4.py:1403` admits this:
+"vllm in `--enforce-eager` paged-KV-disabled mode passes the full
+prompt+generated context on each step, which makes this correct".
+
+Net effect: every decode step is O((prompt + generated)²) in
+attention compute and re-runs the full MoE per step instead of
+O(1)/step over a cached state. Throughput at 1k context is
+~10–50× worse than it should be; at 100k+ context decode is
+non-functional, not just slow. V4-Flash's 1M-token claim is
+unreachable on the current path.
+
+What to do:
+* Thread `AttentionDecodeState`
+  (`deepseek_v4_attention.py:659`) through `nnx.Variable` storage
+  on the model instance. The state is per-(layer, batch-slot) so
+  it lives alongside `params_v` rather than in vllm's
+  `kv_caches` list (which is a passthrough placeholder for V4 —
+  see INVARIANTS I34).
+* In `__call__`, branch on `attention_metadata.input_positions`
+  per active sequence: `>0` ⇒ run a decode step using
+  `attention_decode_step` per layer, mutating the state in
+  place; `==0 .. N-1` ⇒ prefill a fresh state.
+* Persist the new state back into `params_v`'s pytree leaves so
+  the next call sees it. Verify byte-equivalence vs a
+  prefill-only forward over the concatenated prompt+generated
+  on at least 2 sequences from `TestConcurrentMultiSeqDispatch`.
+* Validate via path #3 (`lower().compile()`) before launching a
+  real smoke; the compile-time HBM accounting will tell you if
+  the per-batch state allocations push you over 31.25 GiB / chip.
+
+This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
+becomes worthwhile), and S5 (MTP speculative decoding becomes
+meaningful).
+
+#### S2. Multi-sequence dispatch is a Python loop in eager mode
+
+`__call__` at `deepseek_v4.py:1438-1475` runs each active
+sequence sequentially through `transformer_body_forward`. The
+multi-seq tests at `tests/models/jax/test_deepseek_v4.py:822`
+(`TestConcurrentMultiSeqDispatch`) verify per-seq isolation
+correctness, not throughput.
+
+Production needs a ragged-batch jit'd kernel. The
+ragged-paged-attention v3 kernel at
+`work/tpu-inference/tpu_inference/kernels/ragged_paged_attention/v3/kernel.py`
+exists but doesn't support V4's top-k + attn_sink + dual-buffer
+KV layout (see DECISIONS D2). Either extend that kernel or jit
+V4's path with `lax.dynamic_slice` per active seq slot padded to
+a static bound.
+
+Until S2 lands, `--max-num-seqs=1` in
+`scripts/full_slice_v4_smoke.sh` is forced — one user blocks all
+others.
+
+S2 can land independently of S1 but they multiply each other:
+real concurrency only matters once decode is fast.
+
+#### S3. `--reasoning-parser deepseek_v4` and `--tool-call-parser deepseek_v4` are NOT enabled in the smoke launcher
+
+`work/vllm/vllm/reasoning/__init__.py:31-32` already registers
+`deepseek_v4 → deepseek_v3_reasoning_parser` (handles
+`<think>...</think>` block extraction →
+`reasoning_content` field). `work/vllm/vllm/tool_parsers/deepseekv4_tool_parser.py`
+already exists with tests at
+`work/vllm/tests/tool_parsers/test_deepseekv4_tool_parser.py`.
+
+But neither flag is passed by `scripts/full_slice_v4_smoke.sh`.
+Without `--reasoning-parser deepseek_v4` and
+`--enable-auto-tool-choice --tool-call-parser deepseek_v4`,
+every chat request that emits `<think>` blocks or DSML tool
+calls returns them as raw text in `content` instead of
+populating `reasoning_content` / `tool_calls`. Most clients
+(OpenRouter, OpenAI SDK, downstream agents) treat this as
+malformed output.
+
+This is a one-line launcher fix + a smoke_check addition that
+asserts a `/v1/chat/completions` request with a
+think-mode-triggering prompt produces a non-empty
+`reasoning_content` field. Do that *first* in any iter that
+touches the chat surface — the test alone catches future
+regressions.
+
+#### S4. Chat template covers chat-mode only — think and tool modes silently produce wrong tokens
+
+`scripts/v4_chat_template.jinja` is byte-identical to
+`encode_messages(thinking_mode="chat")` for the user / assistant
+/ system subset only. The reference encoder is at
+`<hf-cache>/snapshots/<sha>/encoding/encoding_dsv4.py`. Each of
+the four missing scopes needs a Jinja translation + a
+byte-parity validation test against `encode_messages(...)`:
+
+* `tools` array → tools encoded with the wrong delimiters →
+  model ignores tool definitions
+* `tool` role / `tool_calls` from prior assistant turns → don't
+  round-trip → multi-turn tool-using conversations break
+* `thinking_mode="think_high"` / `"think_max"` → must emit
+  `<think>` instead of an immediate `</think>` → reasoning is
+  currently always suppressed
+* `latest_reminder` injection → DeepSeek's quick-instruction
+  guidance is missing → quality regression on tasks that depend
+  on it
+
+Re-validation pattern is the snippet at the top of CLAUDE.md's
+"Chat template" section.
+
+#### S5. MTP speculative decoding hook is not wired
+
+`work/tpu-inference/tpu_inference/runner/speculative_decoding_manager.py:71-89`
+only handles `ngram` and `eagle3` methods. There is no
+`deepseek_v4_mtp` proposer. But:
+
+* `deepseek_v4_mtp_forward` at
+  `models/jax/deepseek_v4.py:370` exists and is unit-tested
+* MTP weights are loaded (`deepseek_v4.py:561` builds
+  `mtp_blocks`)
+* DECISIONS D4 explicitly notes "vLLM's speculative-decoding
+  hook integration is downstream work outside the math-correctness
+  goal."
+
+Implementation:
+* Add `DeepseekV4MTPProposer` in
+  `tpu_inference/spec_decode/jax/` calling
+  `deepseek_v4_mtp_forward` to draft `n_mtp_layers=1` extra
+  tokens per step.
+* Wire into `speculative_decoding_manager.execute_draft_model`.
+* Engine plumbing:
+  `--speculative-config '{"method":"deepseek_v4_mtp","num_speculative_tokens":1}'`.
+
+1.5–2× decode throughput once S1 lands.
+
+#### S6. Sampling parameters are untested under load
+
+The path is standard — V4 inherits tpu-inference's
+`sampling.py` + `rejection_sampler.py` via `compute_logits` at
+`deepseek_v4.py:1528`. But the only thing the smoke check fires
+is `temperature=0, seed=0`. Nothing exercises temperature>0,
+top_p, top_k, frequency/presence penalties, stop sequences,
+multiple completions (`n>1`), or logprobs.
+
+Add a sampling matrix to `smoke_check` (or a
+`tests/test_v4_sampling_e2e.py` against the running smoke)
+before claiming production readiness. Each combination has
+known quirks under vLLM's TPU runner.
+
+#### S7. Streaming (SSE) is unverified
+
+vLLM's framework supports `stream: true` natively;
+tpu-inference shouldn't need V4-specific changes. But the
+smoke_check only fires non-streaming requests. Add a streaming
+probe: assert TTFT < N seconds, ITL < M ms, and that the
+reassembled stream matches the non-streaming output.
+OpenRouter-style clients default to streaming.
+
+### Tier A — production-deployment infra (model is correct but infra isn't)
+
+#### A1. `MAX_LEN=256, MAX_SEQS=1` is hard-coded in the smoke launcher
+
+Activation HBM scales roughly linearly with both. The whole
+CSA/HCA + indexer machinery — V4-Flash's value proposition — is
+currently unexercised at scale. First experiment: `MAX_LEN=4096
+MAX_SEQS=4` and capture the HLO temp profile to see how much
+headroom remains. Then push toward 1M context. **Depends on S1**:
+without real decode, lifting `MAX_LEN` is meaningless because
+attention compute scales O(L²) per step.
+
+#### A2. Persistent compile cache is host-local and ephemeral
+
+`~/.cache/vllm/xla_cache` is on each host's local disk (not
+shared, not GCS, cross-host rsync verified unsound — see
+optimization-knobs row above). Most cloud VMs clear `/tmp` on
+reboot; some clear `~/.cache`. A host swap = 5–10 min cold
+penalty.
+
+* Move the cache to a path on a verified-durable mount.
+* Add a one-shot bootstrap step that runs
+  `scripts/full_slice_v4_warm_cache.sh` per host on first boot
+  of a new worker.
+* AOT precompile + binary persist
+  (`jit().lower().compile()` + serialize) is the next-level
+  fix; per-host because of the cache fingerprint finding. Could
+  drop cold compile from 97s to ~5s/host.
+
+#### A3. No engine crash recovery
+
+If `VLLM::EngineCore` dies, the api-server is a husk and
+`./run.sh stop` is required. CLAUDE.md pitfall #2 documents the
+libtpu lockfile orphaning.
+
+* Supervisor (systemd unit, k8s liveness probe, or
+  `scripts/supervise.sh`) that runs `full_slice_v4_reset.sh` +
+  relaunches on detected EngineCore death.
+* Tie supervision to vLLM's `/health`, not just process liveness.
+* Drain on SIGTERM: api-server should refuse new requests and
+  let in-flight ones finish before exit (today `./run.sh stop`
+  SIGKILLs mid-request).
+
+#### A4. No metrics / observability
+
+vLLM's `--enable-metrics` is not currently set. Without it: no
+TTFT, no ITL, no throughput, no queue depth, no KV utilization,
+no error rate. Pass the flag; scrape into Prometheus + Grafana
+or push to whatever observability backend is real. Per-host TPU
+utilization needs separate observability (libtpu-side metrics or
+`gcloud monitoring`).
+
+#### A5. No TLS / authentication / rate limiting
+
+Currently `0.0.0.0:18081` plain HTTP, no auth. For OpenRouter-
+grade exposure: TLS termination at a reverse proxy, per-API-key
+auth (vLLM's single-key flag isn't sufficient — multi-tenant
+needs LiteLLM or a custom frontend), per-key rate limiting. Run
+vLLM as a non-root systemd unit, not from `$HOME`.
+
+#### A6. Single slice — no horizontal scale
+
+One v6e-32 slice ceilings on per-key concurrency at whatever
+S2's eventual ragged-batch implementation tops out at. Multi-
+slice requires: a model-aware load balancer that sticks
+per-conversation sessions to one slice (so KV cache hits hold),
+per-slice health monitoring, and shared model-weight storage
+(the GCS bucket already is that).
+
+### Tier B — known performance work
+
+#### B1. Sparse-attention Pallas kernel
+
+`sparse_attn` at
+`layers/jax/attention/deepseek_v4_attention.py:131` is
+fully-materialized `jnp.take_along_axis` + dense einsum +
+softmax. DECISIONS D2 documents this as correctness-over-perf.
+Real Pallas kernel: gather kv only for top-k indices in TPU
+SRAM, fuse the sink term into the softmax denominator, avoid
+materializing the `[B, M, K, D]` gather buffer. 2–5× decode
+latency improvement once S1 unlocks the regime where this
+matters. Multi-week effort.
+
+#### B2. True sparse MoE dispatch
+
+`moe_forward` at
+`layers/jax/moe/deepseek_v4_moe.py:156` is "vectorized dense":
+every token sees every expert via masked einsum. FLOP cost is
+`top_k * E` higher than necessary — for `top_k=8, E=256` that's
+32× over true sparse. Wire the existing
+`tpu_inference/kernels/megablox/gmm.py` (grouped matmul) into
+V4's MoE. Hash-routing layers (INVARIANTS I18) need a different
+treatment — `tid2eid` lookup is per-token, but the dispatch
+pattern is the same.
+
+#### B3. SPMD `Involuntary full rematerialization` audit
+
+Each warning in the smoke log is XLA giving up on a sharding
+spec and falling back to replicate + re-partition. They lengthen
+compile and add slow runtime barriers.
+
+```
+grep "Involuntary full rematerialization" \
+    logs/full-slice-v4-smoke-*.log
+```
+
+Group by sharding pair, fix the worst offenders by adding
+`with_sharding_constraint` or `_replicate` calls. The
+`compressor.ape` family was already eliminated by a `_replicate`
+in `compressor_prefill`/`compressor_decode_step`; same pattern
+likely applies to others.
+
+#### B4. AOT compile + binary persist
+
+`jit().lower().compile()` → serialize → load. Per-host because
+of the cache fingerprint finding (see A2). Could drop cold
+compile from 97s to ~5s/host. Defer until B1+B2 land — there's
+no point persisting a sub-optimal binary.
+
+### Tier C — quality gates (don't claim "we serve V4" without these)
+
+#### C1. Benchmark vs DeepSeek's reference scores
+
+MMLU, HellaSwag, GSM8K, HumanEval, MATH — match V4-Flash's
+published scores within tolerance. Use `lm-eval-harness`. Each
+run is hours at production batch sizes; needs S2 (multi-seq
+concurrent) to be tractable in wall-clock. **This is the gate
+that lets you claim "we serve V4-Flash" honestly.** Without it,
+a silent kernel divergence (e.g. unnoticed bf16 vs fp32 cast in
+the MoE down-projection) could cost a meaningful fraction of
+model quality and the "Paris" smoke wouldn't catch it.
+
+#### C2. Long-context functional test
+
+Even before perf-tuning long context: a single request with
+`max-model-len=131072` that asserts coherent output. V4-Flash's
+compressor + indexer machinery is currently completely
+unexercised in production paths. Suggested: needle-in-a-haystack
+at 4k, 16k, 64k, 256k, 1M. Each context size needs the bumped
+`MAX_LEN` (A1, which depends on S1).
+
+#### C3. Math regression suite under load
+
+Random sampling, long contexts, tool calls, multi-turn —
+verify outputs stay within reference tolerance under
+temperature>0 and concurrent load. Catches regressions where
+greedy decoding looks fine but sampling has a subtle skew.
+
+#### C4. Tokenizer edge cases
+
+Non-ASCII (Chinese, Arabic, emoji), leading whitespace,
+multilingual code blocks, very-long single tokens. The V4
+tokenizer config's BOS handling
+(`v4_chat_template.jinja:11` has `add_bos_token=false` so the
+template emits BOS itself) is fragile — verify each role
+transition encodes byte-identically to `encode_messages()`.
+
+#### C5. Refusal/safety behavior preservation
+
+V4 was tuned for specific refusal patterns. After kernel
+rewrites this often regresses (low-bit MoE quant especially can
+shift the safety tuning). Run a small refusal-eval set (a few
+dozen prompts spanning the model card's tested categories)
+before each significant change to S1/B2.
+
+### Tier D — code-hygiene / janitorial
+
+#### D1. Test bloat
+
+`tests/models/jax/test_deepseek_v4.py` is **2997 LOC, 30 test
+classes** (~4× the next biggest model's test file). Concrete
+fold-ins:
+* `TestRealFp8DequantSmoke` is strictly weaker than
+  `TestFp8DequantIndependentReference`. Fold the smoke into the
+  reference class as a second test method or drop it.
+* `TestRealFp4DequantSmoke` ↔ `TestFp4DequantIndependentReference`
+  — same.
+* `TestFp8Dequant` (synthetic-fixture full-loader bit-identical)
+  and `TestFp8CastByteDomain` (256-byte numpy-vs-torch parity)
+  are distinct concepts — keep both.
+* `TestFp4CodebookReference` exhaustively enumerates the 16-entry
+  codebook — distinct from the byte-equal real-data tests.
+
+Re-measure before claiming progress: `wc -l` and
+`grep -c "^class Test"`.
+
+#### D2. Stale comment cleanup
+
+The `__call__` docstring at `deepseek_v4.py:1395-1409` talks
+about "Tier 8 first pass" and "BLOCKERS.md B1 followup" —
+Tier-8 is green, B1 is archived. Update the docstring to reflect
+the *current* contract (still prefill-stateless decode, but say
+so as the contract not as a deferred item).
+
+## Iteration discipline (READ — applies to humans + agents alike)
+
+**Do NOT use `./run.sh serve` as your inner test loop.** Each
+attempt is 25–45 min (4 min load + 10–30 min cold compile + curl
+wait). That budget is fixed by XLA, not by anything we can
+shorten in a single iteration. Prior sessions burned real time
+treating it as if it should be fast. Use the fastest validation
+that catches the bug class you're working on:
+
+1. **Standalone math scripts** under `/tmp/` (~10–30s) — pattern:
+   `/tmp/test_moe_vectorize.py` validated the vectorized MoE
+   math vs the per-expert reference on 5 seeds in ~10s.
+2. **Tiny-fixture pytest classes** in
+   `tests/models/jax/test_deepseek_v4.py` (~30s–2min on CPU).
+3. **`eval_shape` / `lower().compile()` on the real config**
+   (~1–3min). Catches sharding bugs + HLO-emit failures (like
+   the original HBM OOM) without paying the runtime compile
+   cost. Pattern:
+   `XLA_FLAGS=--xla_force_host_platform_device_count=32
+   JAX_PLATFORMS=cpu` to compile against a virtual mesh.
+4. **Real `./run.sh serve`** only when 1–3 are green. Budget at
+   most 1–2 of these per session.
+
+### Real-smoke phase budgets (don't bail too early!)
+
+When you have to run the real smoke (path #4), each phase has a
+*known* duration. Silence during a phase is normal as long as
+it's the right kind of silence:
+
+| Phase | Expected duration | What you should see | Bail signal |
+|---|---|---|---|
+| **vLLM startup + Ray cluster init** | ~30s | `Init mesh \| mesh=Mesh(...)`, `Init kv-cache`, route registration | No log activity for >2 min, OR `Worker exit type: SYSTEM_ERROR`. |
+| **Weight load** | ~4 min | `[deepseek_v4] placed N tensors (R/s, ...)` heartbeat every ~7s, then `load_weights_from_dir done` | No heartbeat for >2 min, OR `placed N` count stops growing. |
+| **`capture_model` precompile** | ~30s | A handful of small `running hlo passes for N instructions, module: jit_*` lines, each tiny | Any `RESOURCE_EXHAUSTED` / `CompileTimeHbmOom`. |
+| **`Application startup complete`** | fires immediately after capture_model | Single line | If absent >2 min after capture_model finishes. |
+| **`jit_run_model` cold compile** | **10–30 min** on cold cache; **~97s** on warm cache. | One `running hlo passes for ~100k instructions, module: jit_run_model`, then long silence punctuated by `HLO PostOptimizationPipeline` lines and SPMD warnings. The silence is normal — XLA's late codegen passes don't emit progress. | Three or more separate `slow_operation_alarm.cc` warnings (each fires after a single pass exceeds 5 min). One alarm = one slow pass; that alone is *not* enough to bail. Also: any `RESOURCE_EXHAUSTED` / `Worker exit`. |
+| **First curl returning** | sub-second after compile finishes | `INFO 127.0.0.1:... "POST /v1/completions" 200 OK` and the `[smoke-check] response 1: ...` line | Curl 900s timeout fires, OR the engine crashes mid-execute. |
+
+**Rule of thumb during real smoke:** silence in the
+`jit_run_model` phase ≤ ~25 min is *expected*, not stuck.
+**Don't bail before 25 min unless the iter timeout is closing
+in.** The 90-min ITER_TIMEOUT_SEC has plenty of slack for one
+full smoke + one bail.
+
+**Concurrent work while compile runs:** the compile is going to
+take however long it takes. Spend that time productively —
+sketch the next-lane fix in a `/tmp/` standalone test, audit
+warning families in the smoke log, consolidate test bloat (test
+edits don't conflict with the running smoke). Don't just sit in
+a Monitor.
+
+**Quick-test rule (still applies for code edits, NOT for smoke):**
+if a CPU pytest / `lower().compile()` probe takes >5 min without
+a useful signal, kill it and rethink — that *is* stuck.
+
+### Iter-timeout management
+
+`ITER_TIMEOUT_SEC=5400` (90 min). If you're approaching the
+deadline without a result:
+
+1. **At T-15 min:** stop launching new long-running steps. Commit
+   whatever code change you've made so far (with a "WIP:" prefix
+   describing what was tried + what's still unverified) so iter
+   N+1 can pick up from the same on-disk state.
+2. **At T-5 min:** reset the cluster + push the WIP commit. Don't
+   risk the iter being killed mid-`./run.sh serve`.
+
+Better to have a checkpointed WIP commit than to lose the diff
+when the timeout SIGTERMs the iter.
+
+## What's been verified
+
+* **Streaming sharded loader** (no zero-tree OOM). ✓
+* **Slice-aware load**: each host reads only its row range. ✓
+  Parity-verified on tiny fixture.
+* **Multi-threaded placement** (`V4_LOADER_PLACE_WORKERS=8`). ✓
+  Parity-verified on tiny fixture.
+* **safetensors handle cache** (`_safe_open_cache`): eliminates
+  per-tensor mmap+header reopen — observed ~6× load speedup
+  (23 t/s → 140 t/s on real V4-Flash, ~4 min total load down
+  from ~25 min). ✓
+* **Vectorized MoE forward** (math byte-equal to per-expert
+  reference on 5 seeds, maxabs=0; HLO instructions 4.6× smaller).
+  ✓ correctness, ✗ optimal flops (B2).
+* **Inline MoE consolidation at load** (the 256 per-expert
+  weights of each `(layer, wname)` group are stacked into a
+  single E-sharded `[E, inter, dim]` jax.Array as soon as the
+  256th is placed; per-leaf references are then nulled). Drops
+  the per-call all-to-all storm —
+  `jit_run_model` HLO instructions 47k optimized vs 103k
+  previously. ✓
+* **MoE stacked-weight sharding constraint**
+  (`_shard_e_first` / `_shard_e_last` / `_shard_e_mid`): forces
+  W1/W2/W3 to be E-sharded across `attn_dp`, eliminating the
+  original 4 GiB all-gather per stack. Mostly superseded by
+  inline consolidation (constraints stay as defense in depth on
+  the per-expert fallback path). ✓
+* **Freqs cap by `max_model_len`**: `_effective_freqs_seq_len()`
+  uses `vllm_config.model_config.max_model_len` instead of
+  `cfg.max_position_embeddings`, shrinking the YaRN freqs table
+  from 1 GB / chip to KB. ✓
+* **Persistent JAX compile cache**: wired; populated under
+  `~/.cache/vllm/xla_cache` on every host. Subsequent launches
+  on the same worker host skip the ~96 s compile. ✓
+  (Cross-host sharing is unsound — verified.)
+* **Decode-step kernels** (`attention_decode_step`,
+  `compressor_decode_step`, `indexer_decode_step`): all match
+  the torch reference to 1e-4 across the parametrized
+  `TestDecodeAttentionParity` /
+  `TestDecodeRollingParity` matrix. ✓ math, ✗ runtime
+  integration (S1 — they aren't called by `__call__`).
+* **MTP forward**: `deepseek_v4_mtp_forward` math validated on
+  tiny fixture. ✓ math, ✗ runtime integration (S5).
+* **Chat template (chat-mode subset)**: byte-equivalent to
+  `encode_messages(thinking_mode="chat")` on representative
+  inputs. ✓ for chat-mode only — see S4 for the missing scopes.
 
 ## Chat template (chat-completions)
 
-V4-Flash deliberately ships **no Jinja `chat_template`** — `tokenizer_config.json`
-omits the field and the upstream HF README says so explicitly:
+V4-Flash deliberately ships **no Jinja `chat_template`** —
+`tokenizer_config.json` omits the field and the upstream HF
+README points users at the Python encoder at
+`<snapshot>/encoding/encoding_dsv4.py`. Without a template, vllm
+falls back to a generic format and `/v1/chat/completions` returns
+garbage.
 
-> This release does not include a Jinja-format chat template. Instead, we
-> provide a dedicated `encoding` folder with Python scripts and test cases…
+`scripts/v4_chat_template.jinja` is the byte-equivalent Jinja
+translation of `encode_messages(thinking_mode="chat")` for the
+system / user / assistant subset. The smoke launcher passes it
+via `--chat-template`; the `smoke_check` runs an informational
+chat probe. **Scope is chat-mode only** (no thinking, no tools,
+no tool results, no `latest_reminder`, no quick-instruction
+tasks) — backlog item S4 covers the missing scopes.
 
-The Python encoder is at `<snapshot>/encoding/encoding_dsv4.py`. Without
-a template, vllm falls back to a generic format and `/v1/chat/completions`
-returns garbage (e.g. `"Hey ofbodyre\n\nEste["`).
+To re-validate the existing scope vs `encode_messages()`:
 
-`scripts/v4_chat_template.jinja` is the byte-equivalent Jinja translation
-of `encode_messages(thinking_mode="chat")` for the system / user /
-assistant subset that `/v1/chat/completions` exercises. The smoke
-launcher passes it via `--chat-template`; the smoke_check runs a chat
-probe that asserts the response contains "Paris" (exit 4 if not).
-
-Format produced for `[{user: "hi"}]`:
-```
-<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>
-```
-The trailing `</think>` is *deliberate* — chat mode (Non-think) closes
-the thinking block immediately so the model emits content directly. To
-enable Think High / Think Max modes, the template would need to emit
-`<think>` instead and request-side handling of the thinking output.
-
-**Scope of the current template:** chat-mode only (no thinking, no
-tools, no tool results, no `latest_reminder`, no quick-instruction
-tasks). Tools in particular need DSML-format encoding + parsing on
-both sides — that's a future enhancement; the public chat endpoint
-works without it.
-
-**Validation:** byte-parity vs `encode_messages()` was checked across
-8 representative cases when the template was added. To re-validate:
 ```python
 import sys, os
 SNAP = "<hf-cache>/snapshots/<sha>"
@@ -356,160 +718,8 @@ assert encode_messages(msgs, thinking_mode="chat") == \
                              tokenize=False, add_generation_prompt=True)
 ```
 
-`vllm chat` CLI needs `--url http://localhost:18081/v1` since the smoke
-launcher binds 18081 (not vllm's default 8000).
-
-## Iteration discipline (READ — applies to humans + agents alike)
-
-**Do NOT use `./run.sh serve` as your inner test loop.** Each attempt
-is 25–45 min (4 min load + 10–30 min cold compile + curl wait). That
-budget is fixed by XLA, not by anything we can shorten in a single
-iteration. Prior sessions burned real time treating it as if it
-should be fast. Use the fastest validation that catches the bug
-class you're working on:
-
-1. **Standalone math scripts** under `/tmp/` (~10–30s) — example
-   pattern: `/tmp/test_moe_vectorize.py` validated the vectorized
-   MoE math vs the per-expert reference on 5 seeds in ~10s.
-2. **Tiny-fixture pytest classes** in
-   `tests/models/jax/test_deepseek_v4.py` (~30s–2min on CPU).
-3. **`eval_shape` / `lower().compile()` on the real config**
-   (~1–3min). Catches sharding bugs + HLO-emit failures (like
-   the current HBM OOM!) without paying the runtime compile cost.
-   The agent has used `XLA_FLAGS=--xla_force_host_platform_device_count=32`
-   + `JAX_PLATFORMS=cpu` to compile against a virtual mesh — that
-   pattern works and surfaces all-gather sizes from HLO inspection
-   in seconds.
-4. **Real `./run.sh serve`** only when 1–3 are green. Budget at
-   most 1–2 of these per session.
-
-### Real-smoke phase budgets (don't bail too early!)
-
-When you have to run the real smoke (path #4), each phase has a
-*known* duration. Silence during a phase is normal as long as it's
-the right kind of silence. Use these to decide if something's
-genuinely stuck vs. just paying the cost:
-
-| Phase | Expected duration | What you should see | Bail signal |
-|---|---|---|---|
-| **vLLM startup + Ray cluster init** | ~30s | `Init mesh \| mesh=Mesh(...)`, `Init kv-cache`, route registration | No log activity for >2 min, OR `Worker exit type: SYSTEM_ERROR`. |
-| **Weight load** | ~4 min | `[deepseek_v4] placed N tensors (R/s, ...)` heartbeat every ~7s, then `load_weights_from_dir done` | No heartbeat for >2 min, OR `placed N` count stops growing. |
-| **`capture_model` precompile** | ~30s | A handful of small `running hlo passes for N instructions, module: jit_*` lines (`jit__threefry_seed`, `jit__allocate`, `jit_iota`, `jit_unpack_arrays`, etc.), each tiny | Any `RESOURCE_EXHAUSTED` / `CompileTimeHbmOom`. |
-| **`Application startup complete`** | fires immediately after capture_model | Single line | If absent >2 min after capture_model finishes. |
-| **`jit_run_model` cold compile** | **10–30 min** | One `running hlo passes for ~100k instructions, module: jit_run_model`, then **long silence punctuated by `HLO PostOptimizationPipeline` lines and SPMD warnings**. The silence is normal — XLA's late codegen passes don't emit progress. | Three or more separate `slow_operation_alarm.cc` warnings (each fires after a single pass exceeds 5 min). One alarm = one slow pass; that alone is *not* enough to bail. Also: any `RESOURCE_EXHAUSTED` / `Worker exit`. |
-| **First curl returning** | sub-second after compile finishes | `INFO 127.0.0.1:... "POST /v1/completions" 200 OK` and the `[smoke-check] response 1: ...` line | Curl 900s timeout fires, OR the engine crashes mid-execute. |
-
-**Rule of thumb during real smoke:** silence in the `jit_run_model`
-phase ≤ ~25 min is *expected*, not stuck. **Don't bail before 25
-min unless the iter timeout is closing in.** The 90-min
-ITER_TIMEOUT_SEC has plenty of slack for one full smoke + one bail.
-
-**Concurrent work while compile runs:** the compile is going to
-take 10–30 min no matter what you do. Spend that time productively
-— don't just sit in a Monitor. Good uses of the wait window:
-
-* Sketch the next-lane fix (lane 2 cache-rsync helper, lane 3
-  SPMD remat-warning audit) in a `/tmp/` standalone test so it's
-  ready to ship the moment the current smoke confirms.
-* Audit the `Involuntary full rematerialization` warnings
-  accumulating in the smoke log — each one points at a
-  resharding inefficiency you can fix on a future iter.
-* Consolidate test bloat (CLAUDE.md "Known bloat" list) — test
-  edits don't conflict with the running smoke.
-
-**Quick-test rule (still applies for code edits, NOT for smoke):**
-if a CPU pytest / `lower().compile()` probe takes >5 min without a
-useful signal, kill it and rethink — that *is* stuck.
-
-### Iter-timeout management
-
-`ITER_TIMEOUT_SEC=5400` (90 min). If you're approaching the deadline
-without a result:
-
-1. **At T-15 min:** stop launching new long-running steps. Commit
-   whatever code change you've made so far (with a "WIP:" prefix
-   describing what was tried + what's still unverified) so iter N+1
-   can pick up from the same on-disk state.
-2. **At T-5 min:** reset the cluster + push the WIP commit. Don't
-   risk the iter being killed mid-`./run.sh serve`.
-
-Better to have a checkpointed WIP commit than to lose the diff
-when the timeout SIGTERMs the iter.
-
-### Next attack lanes (in rough ROI order)
-
-Tier 8 deploy gate is GREEN (cold compile ~97 s, warm-cache curl
-sub-second). The OOM and the rematerialization warnings are both
-fixed. Remaining work is compile-time + headroom:
-
-1. **Bump `max-model-len` / `max-num-seqs` and re-smoke.** We compiled
-   under `max-model-len=256, max-num-seqs=1`; activation HBM scales
-   roughly linearly with both. We don't yet know the per-chip
-   activation ceiling. The iter that lifts the cap should re-run the
-   smoke and watch for new OOMs (BACKEND_PASSES temp).
-
-2. **AOT precompile + binary persist.** `jit().lower().compile()`
-   serialized + loaded on subsequent launches. Real XLA-versioning
-   risk and SPMD compiles are per-host (per the fingerprint finding),
-   so AOT artifacts would also need a host-0-only-then-broadcast guard
-   — i.e. each host needs its own AOT artifact captured during a
-   warm-up pass.
-
-3. ~~**Verify cross-host JAX cache sharing**~~ — RESOLVED unsound
-   2026-04-30. See "Still loose ends" above for the fingerprint
-   evidence.
-
-Validation after any change:
-```bash
-JAX_PLATFORMS=cpu work/vllm_env/bin/python3 -m pytest \
-    work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestMoEComponent -x -q
-work/vllm_env/bin/python3 /tmp/test_moe_compile.py     # if MoE-related
-scripts/full_slice_v4_reset.sh
-scripts/full_slice_v4_sync.sh
-scripts/full_slice_v4_smoke.sh
-scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
-```
-
-## What's been optimized + verified (load path only)
-
-* **Streaming sharded loader** (no zero-tree OOM). ✓
-* **Slice-aware load**: each host reads only its row range. ✓
-  Parity-verified on tiny fixture.
-* **Multi-threaded placement** (`V4_LOADER_PLACE_WORKERS=8`). ✓
-  Parity-verified on tiny fixture.
-* **safetensors handle cache** (`_safe_open_cache`): eliminates
-  per-tensor mmap+header reopen — observed ~6× load speedup
-  (23 t/s → 140 t/s on real V4-Flash, ~4 min total load down from
-  ~25 min). ✓
-* **Vectorized MoE forward**: math byte-equivalent to the per-expert
-  reference loop (maxabs=0 across 5 seeds on synthetic fixture);
-  HLO instruction count drops 4.6× (477k → 103k). ✓ correctness.
-* **MoE stacked-weight sharding constraint**
-  (`_shard_e_first` / `_shard_e_last` / `_shard_e_mid`): forces
-  W1/W2/W3 to be E-sharded across `attn_dp`, eliminating the
-  original 4 GiB all-gather per stack. Now mostly superseded by
-  inline consolidation (constraints are still applied as defense
-  in depth on the per-expert fallback path).
-* **Inline MoE consolidation at load**
-  (`deepseek_v4.py::_maybe_consolidate`): the 256 per-expert
-  weights of each `(layer, wname)` group are stacked into a single
-  E-sharded `[E, inter, dim]` jax.Array as soon as the 256th is
-  placed; per-leaf references are then nulled. Drops the per-call
-  all-to-all storm entirely — `jit_run_model` HLO instructions
-  47k optimized vs 103k previously. ✓ Smoke green 2026-04-30.
-* **Freqs cap by `max_model_len`**: `_effective_freqs_seq_len()`
-  uses `vllm_config.model_config.max_model_len` instead of
-  `cfg.max_position_embeddings`, shrinking the YaRN freqs table
-  from 1 GB / chip to KB. ✓ Smoke green 2026-04-30.
-* **Persistent JAX compile cache**: wired; populated under
-  `~/.cache/vllm/xla_cache` on every host (set by tpu_inference's
-  `compilation_manager.py`, *not* by the smoke launcher's
-  `JAX_COMPILATION_CACHE_DIR`, which it overrides). Subsequent
-  launches on the same worker host hit the cache and skip the
-  ~96 s compile (observed 2026-04-30: `Application startup
-  complete` fires within seconds of weight load on a warm host,
-  curl returns sub-second). Cross-host sharing was investigated
-  and verified unsound — see "Still loose ends" above.
+`vllm chat` CLI needs `--url http://localhost:18081/v1` since
+the smoke launcher binds 18081 (not vllm's default 8000).
 
 ## Pitfalls already learned (don't repeat)
 
@@ -543,55 +753,78 @@ scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
    — use `V4_XLA_FLAGS=...` to opt in.
 
 5. **First inference is slow on a fresh launch.** The first
-   `/v1/completions` call triggers compilation of `jit_run_model`
-   (the V4 forward pass, ~103k HLO instructions post-MoE-vectorize).
+   `/v1/completions` call triggers compilation of `jit_run_model`.
    Expect 5–15 min on a cold compile cache, ~30–60s on a warm
    cache. Don't use a 60s curl timeout — the smoke check defaults
    to 900s.
 
-   To warm the cache at bootstrap time (one-time +10-15 min cost,
+   To warm the cache at bootstrap time (one-time +10–15 min cost,
    then every subsequent first-curl is sub-minute), set
-   `WARM_CACHE_ON_BOOTSTRAP=1` in `.env` before `./run.sh bootstrap`.
-   `scripts/full_slice_v4_warm_cache.sh` is the underlying helper.
+   `WARM_CACHE_ON_BOOTSTRAP=1` in `.env` before
+   `./run.sh bootstrap`. `scripts/full_slice_v4_warm_cache.sh` is
+   the underlying helper.
 
 6. **`--enforce-eager` does not skip XLA compile.** That flag only
    affects vLLM's CUDA-graph-equivalent path. The TPU forward is
    JAX/`tpu-inference` and ALWAYS jit-compiles via XLA.
 
 7. **vLLM's `capture_model` can multiply compile cost.** Without
-   `--enforce-eager`, vLLM precompiles many shape buckets up front
-   — for V4-Flash that's many × the single-shape compile time.
-   `--enforce-eager` (already in the smoke launcher) skips that
-   pre-compile and lets the first request pay the single-shape
-   compile cost lazily.
+   `--enforce-eager`, vLLM precompiles many shape buckets up
+   front. `--enforce-eager` (already in the smoke launcher) skips
+   that pre-compile and lets the first request pay the
+   single-shape compile cost lazily.
 
 8. **`JAX_COMPILATION_CACHE_DIR` does nothing under vLLM.**
    `tpu_inference/runner/compilation_manager.py:53` calls
    `jax.config.update("jax_compilation_cache_dir",
-   vllm_envs.VLLM_XLA_CACHE_PATH)` during engine init, *overriding*
-   whatever the launcher set. The real cache always lives at
-   `~/.cache/vllm/xla_cache` (or `VLLM_XLA_CACHE_PATH`). The smoke
-   launcher had a `V4_JAX_CACHE_DIR=/tmp/jax-compile-cache-v4`
-   that was a no-op for ~24h before being noticed — verify cache
-   activity by `ls -la ~/.cache/vllm/xla_cache` after a smoke, not
-   by the launcher's echoed path.
+   vllm_envs.VLLM_XLA_CACHE_PATH)` during engine init,
+   *overriding* whatever the launcher set. The real cache always
+   lives at `~/.cache/vllm/xla_cache` (or `VLLM_XLA_CACHE_PATH`).
+   Verify cache activity by `ls -la ~/.cache/vllm/xla_cache`
+   after a smoke, not by the launcher's echoed path.
+
+9. **The `/v1/chat/completions` first-call OOM-retry is normal.**
+   The chat path lands in a 1024-token prefill bucket vs 256 for
+   completions; on a tight HBM budget the engine sometimes hits
+   `RESOURCE_EXHAUSTED: RuntimeProgramAllocationFailure` and
+   recovers via `TpuLoadedExecutable::ExecutePrepareWithOomRetries`
+   which defragments and retries. Adds ~30s to first-chat
+   latency; subsequent chat calls are fast. Not a bug; just
+   noisy. The `smoke_check` chat probe is informational by
+   default for this reason.
 
 ## Layout
 
-* `work/tpu-inference/` — JAX V4 implementation. Git subtree of the
-  upstream `tpu-inference` repo. The DeepSeek V4 model lives at
+* `work/tpu-inference/` — JAX V4 implementation. Git subtree of
+  the upstream `tpu-inference` repo. The DeepSeek V4 model lives
+  at
   `work/tpu-inference/tpu_inference/models/jax/deepseek_v4*.py`;
   the MoE math at
   `work/tpu-inference/tpu_inference/layers/jax/moe/deepseek_v4_moe.py`;
   attention at
   `work/tpu-inference/tpu_inference/layers/jax/attention/deepseek_v4_attention.py`.
-* `work/vllm/` — vLLM source tree. Don't edit upstream files unless
-  you've read `work/vllm/AGENTS.md` (it forbids ad-hoc PRs).
-* `scripts/` — operational helpers; per-host entry points all start
-  with `full_slice_v4_`.
-* `logs/` — `.gitignore`d; smoke logs accumulate here.
+* `work/vllm/` — vLLM source tree. Don't edit upstream files
+  unless you've read `work/vllm/AGENTS.md` (it forbids ad-hoc
+  PRs). Reasoning + tool parsers for `deepseek_v4` already exist
+  upstream; the smoke launcher just doesn't enable them yet (S3).
+* `scripts/` — operational helpers; per-host entry points all
+  start with `full_slice_v4_`.
+* `logs/` — `.gitignore`d; smoke + iter logs accumulate here.
 * `README.md` — fresh-VM bringup (one-shot via `./run.sh`).
 * `.env.example` — every env var documented.
+* `prompt.md` — the prompt the autonomous loop hands to
+  `claude -p` each iter. Read CLAUDE.md (this file) first; the
+  prompt only points back here.
+
+Durable docs in `work/tpu-inference/`:
+* `INVARIANTS.md` — math invariants. Each broken invariant is a
+  shipping bug.
+* `DECISIONS.md` — durable architectural decisions (not
+  per-session).
+* `BLOCKERS.md` — short pointer to the production-readiness
+  backlog above.
+* `TINY_CONFIG.md`, `TOLERANCE_LOG.md`, `V3_TO_V4_DIFF.md` —
+  math reference, don't decay.
 
 ## Sanity check on a fresh VM
 
@@ -620,4 +853,6 @@ tail -f logs/full-slice-v4-smoke-*.log
 scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
 ```
 
-Update this file as you learn more.
+Update this file as you learn more — but updates are for *durable*
+operational knowledge. Per-session decisions go in commit
+messages.

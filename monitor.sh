@@ -8,7 +8,7 @@
 #   ./monitor.sh results   # tool results — what each tool call returned to the model
 #   ./monitor.sh all       # chronological feed: tool calls + narration + tool results + thinking-marker
 #   ./monitor.sh stream    # raw stream-json (verbose)
-#   ./monitor.sh status    # one-shot snapshot: loop, resources, commits, PROGRESS.md
+#   ./monitor.sh status    # one-shot snapshot: loop, resources, commits, latest smoke
 #   ./monitor.sh tail      # tail -F the latest iter log
 #
 # NOTE on "what the model is thinking":
@@ -178,18 +178,16 @@ status)
     echo "=== commits in repo ==="
     git -C "$REPO_DIR" log --oneline -10 2>/dev/null
     echo
-    echo "=== STATUS.md ==="
-    if [ -f "$REPO_DIR/work/tpu-inference/STATUS.md" ]; then
-        cat "$REPO_DIR/work/tpu-inference/STATUS.md"
+    echo "=== latest smoke result ==="
+    if [ -f "$REPO_DIR/logs/full-slice-v4-smoke.pid" ]; then
+        latest_smoke=$(ls -1t "$REPO_DIR"/logs/full-slice-v4-smoke-*.log 2>/dev/null | head -1)
+        if [ -n "$latest_smoke" ]; then
+            echo "log=$latest_smoke"
+            grep -aE "POST /v1/(completions|chat)|Application startup complete|HbmOom|Worker exit" \
+                "$latest_smoke" | tail -10
+        fi
     else
-        echo "(not yet created)"
-    fi
-    echo
-    echo "=== PROGRESS.md (last 30 lines) ==="
-    if [ -f "$REPO_DIR/work/tpu-inference/PROGRESS.md" ]; then
-        tail -30 "$REPO_DIR/work/tpu-inference/PROGRESS.md"
-    else
-        echo "(not yet created)"
+        echo "(no smoke recorded)"
     fi
     ;;
 

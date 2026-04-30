@@ -132,11 +132,16 @@ with `PASS: deterministic completion contains 'Paris'`.
 
 ## Status
 
-Loading: 35020 V4-Flash tensors stream-load + per-host slice-aware
-in ~4 minutes on the v6e-32 slice (~140 t/s/host). MoE forward is
-vectorized (3 einsums per layer, not 256+ matmuls). Persistent JAX
-compile cache populates after the first successful curl; subsequent
-launches' first `/v1/completions` is sub-minute.
+Tier-8 deploy gate **GREEN** as of 2026-04-30: cold
+`./run.sh serve` returns deterministic `Paris` for "The capital of
+France is" via `/v1/completions`; cold compile ~97s, warm-cache
+curl sub-second. Loading is ~4 min for 35020 tensors; the MoE
+forward is vectorized + inline-consolidated at load; the
+persistent JAX compile cache populates per-host after first
+success.
 
-See [CLAUDE.md](CLAUDE.md) for current verified-working state and
-known issues.
+That's the demo path. For OpenRouter-grade production serving,
+the prioritized work list — multi-seq decode, real concurrency,
+chat/tool/reasoning surfaces, eval gates — lives in
+[CLAUDE.md](CLAUDE.md) "Production-readiness backlog". Read that
+before picking up any work.

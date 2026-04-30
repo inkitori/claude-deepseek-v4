@@ -1380,33 +1380,33 @@ def _build_class():
             Returns `(kv_caches, hidden_TM, [])` with `hidden_TM` of shape
             `[T, hc*D]` (T = total tokens; hc*D collapsed by `head_hc`).
 
-            Multi-sequence dispatch (B1):
+            Contract: this body is **prefill-stateless**. Every call
+            recomputes attention over all `input_ids` positions from
+            scratch. Real decode (per-step state, O(1) attention compute
+            per generated token) is backlog item S1; the kernels exist
+            (`attention_decode_step`) but are not threaded through here
+            yet. Today this is correct because vllm runs in
+            `--enforce-eager` paged-KV-disabled mode and passes the full
+            prompt+generated context on every step — the cost is
+            O(L²)/step.
+
+            Multi-sequence dispatch:
               When `attention_metadata` carries a `query_start_loc` with
               more than one strictly-increasing segment, this dispatches
-              each sequence through `transformer_body_forward` independently
-              — so token i in sequence k attends only to other tokens of
-              seq k (positions [0, len_k)). The per-seq hidden states are
-              concatenated back in their original `input_ids` order before
-              the HC head mix.
+              each sequence through `transformer_body_forward`
+              independently — so token i in sequence k attends only to
+              other tokens of seq k (positions [0, len_k)). The per-seq
+              hidden states are concatenated back in their original
+              `input_ids` order before the HC head mix.
 
-              This is a Python loop over sequences (eager only). Under jit
-              the active-seq count would have to be padded to a static bound
-              with `lax.dynamic_slice` per slot — deferred. For the eager-
-              mode `--enforce-eager` deploy gate (Tier 8 first pass) and the
-              `TestConcurrentDecodeTwoSeqs` unit test, the Python loop is
-              correct and sufficient.
+              This is a Python loop over sequences (eager only). Backlog
+              item S2 is jit'ing the dispatch — under jit the active-seq
+              count would have to be padded to a static bound with
+              `lax.dynamic_slice` per slot.
 
-            Single-sequence (no metadata, or metadata with one segment) is
-            still handled by a single body call as before — exact-equal
-            output to the multi-seq path with `num_seqs=1`.
-
-            For decode steps with `input_positions[start] > 0` the V4 body
-            is stateless: this `__call__` recomputes attention over the
-            tokens vllm passed in this step only, so a multi-token decode
-            slice will see only those tokens (vllm in `--enforce-eager`
-            paged-KV-disabled mode passes the full prompt+generated context
-            on each step, which makes this correct; otherwise it remains
-            a future-work item — see BLOCKERS.md B1 followup).
+            Single-sequence (no metadata, or metadata with one segment)
+            falls through to a single body call — exact-equal output to
+            the multi-seq path with `num_seqs=1`.
             """
             ids = jnp.asarray(input_ids)
             if ids.ndim == 0:
