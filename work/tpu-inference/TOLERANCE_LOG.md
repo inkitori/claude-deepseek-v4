@@ -44,9 +44,8 @@ Every place where a numerical tolerance was loosened from the default (fp32 1e-5
 process, so a per-element TPU-vs-CPU comparison would need to span two
 subprocesses. The CPU forward is validated against torch reference at
 atol=0.1 in Tier 2; the TPU forward goes through the same `jax.jit` lowering
-of the same Python source. Bugs that would manifest only on TPU (e.g. dtype
-lowering quirks, sharding-axis name mismatches) are documented as residual
-risk in PROD_TOPOLOGY_RISKS.md item 1.
+of the same Python source. Real-TPU runtime correctness is gated by the
+`vllm serve` smoke check (see CLAUDE.md "iterate loop").
 
 ## T7 — Quant vs groundtruth logit parity (`TestQuantToParamsApply`): byte-exact (v8 iter 4 tightening from atol=0.1)
 **Where:** `tests/models/jax/test_deepseek_v4.py::TestQuantToParamsApply::test_forward_logits_quant_vs_groundtruth`.

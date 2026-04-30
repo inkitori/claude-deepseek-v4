@@ -15,10 +15,11 @@ reference at `_deepseek_v4_reference/`.
 
 Tier 4 (weight-loader smoke test) lives in `test_deepseek_v4_weights.py`.
 
-The JAX backend is forced to CPU (the dev box has no working TPU). Tier 3
+The JAX backend is forced to CPU so this file runs without TPU. Tier 3
 runs on CPU with `XLA_FLAGS=--xla_force_host_platform_device_count=N` to
-simulate v4-8 (N=8) and v6e-32 (N=32). See PROD_TOPOLOGY_RISKS.md for what
-this cannot validate.
+simulate v4-8 (N=8) and v6e-32 (N=32) — sharding-axis names + per-device
+byte budgets are validated; runtime TPU behavior (kernel correctness,
+cross-host SPMD) is gated separately by the real `vllm serve` smoke.
 """
 import os
 
@@ -984,8 +985,8 @@ class TestRealConfigCompile:
     The mesh kind chooses how many devices the abstract sharding is divided
     across. Both v4-8 (8 devices) and v6e-32-sim (32 devices) are simulated
     on CPU with `XLA_FLAGS=--xla_force_host_platform_device_count=N` set at
-    the top of this file. See PROD_TOPOLOGY_RISKS.md for what real-TPU
-    behavior this cannot validate.
+    the top of this file. Real-TPU runtime behavior is gated by the
+    `vllm serve` smoke (see CLAUDE.md "iterate loop").
     """
 
     @pytest.mark.parametrize("model_name", ["V4-Flash", "V4-Pro"])
@@ -1064,8 +1065,8 @@ class TestRealConfigCompile:
         print(f"[{model_name} @ {mesh_kind}] per-device KV @ 1M ctx (1 seq): {kv_per_dev / (1024**3):.2f} GB")
         # Sanity: per-device weights for V4-Pro on v6e-32 should be in tens of GB.
         if model_name == "V4-Pro" and mesh_kind == "v6e-32-sim":
-            # v6e has 32 GB HBM/chip; bf16 weights would be ~100 GB/chip with no fp4. Will OOM
-            # in production unless fp4/fp8 is applied. PROD_TOPOLOGY_RISKS.md documents this.
+            # v6e has 32 GB HBM/chip; bf16 weights would be ~100 GB/chip
+            # with no fp4. Will OOM in production unless fp4/fp8 is applied.
             print("WARNING: V4-Pro at bf16 will OOM on v6e-32 (32 GB HBM/chip) — needs FP4/FP8.")
 
     @pytest.mark.parametrize("model_name", ["V4-Flash", "V4-Pro"])

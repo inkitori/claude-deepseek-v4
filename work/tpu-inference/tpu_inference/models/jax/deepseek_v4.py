@@ -676,9 +676,8 @@ _register_pytree(TransformerParams,
 #           and segment-template may use {layer}, {expert} placeholders.
 #
 # We build this mapping once and use it both to validate that every name in
-# the HF index has a destination in our param tree (Tier 4) and as the
-# basis for a real-weight loader (out of scope for this PR — see
-# PROD_TOPOLOGY_RISKS.md item 6).
+# the HF index has a destination in our param tree and as the basis for the
+# real-weight loader in `deepseek_v4_loader.py`.
 
 import re
 
@@ -785,10 +784,7 @@ _QUANT_SUFFIXES = {".scale"}
 # math is in the functional core above (block_forward / attention_prefill /
 # moe_forward). The class exists primarily so that vLLM dispatch on the
 # `DeepseekV4ForCausalLM` architecture string finds *something* registered
-# and does NOT fall back to the vLLM-native PyTorch path. Full runtime
-# integration (paged-KV plumbing, sharded weight loading with FP4/FP8
-# dequantization, mesh-aware sharding annotations) is documented as
-# Phase 7+ work in PROD_TOPOLOGY_RISKS.md item 7.
+# and does NOT fall back to the vLLM-native PyTorch path.
 
 def _materialize_param_tree(abstract_tree):
     """Replace every ShapeDtypeStruct leaf with jnp.zeros(shape, dtype)."""
@@ -832,7 +828,7 @@ def _build_class():
         ceremony — V4's math runs through the existing functional core
         (`transformer_body_forward` / `head_forward`), which only needs the
         raw arrays. JaxAutoWeightsLoader-compatible per-weight Modules are
-        deferred (see PROD_TOPOLOGY_RISKS item 7).
+        deferred.
 
         Forward contract:
           * `__call__(kv_caches, input_ids, attention_metadata, ...)` runs
@@ -851,8 +847,10 @@ def _build_class():
           * paged-KV interoperation: `kv_caches` is passed through unchanged.
             V4's per-layer state lives in the model dataclass tree (no
             mutation across __call__ invocations).
-          * Sharding annotations on individual params (V3 has them; V4
-            does not yet — see PROD_TOPOLOGY_RISKS item 1).
+          * Per-leaf JaxModule sharding annotations à la V3 (V4 instead
+            applies sharding via `with_sharding_constraint` at the
+            functional-core boundary — see `_shard_e_first` /
+            `_shard_e_last` in `deepseek_v4_moe.py`).
         """
 
         def __init__(self, vllm_config, rng_key=None, mesh=None):
@@ -1614,8 +1612,8 @@ def map_hf_name_to_jax_path(name: str) -> Optional[str]:
     Names ending in `.scale` (FP4/FP8 quantization scales) return the path of
     the corresponding `.weight` plus a ".scale" suffix — the caller must
     dequantize using the scale and then place the dequantized array at the
-    base path. (For our Tier 4 smoke test we just verify name-coverage; we
-    do NOT dequantize — see PROD_TOPOLOGY_RISKS.md item 6.)
+    base path. (Dequantization itself happens in
+    `deepseek_v4_loader.dequant_fp4_to_bf16` / `dequant_fp8_to_bf16`.)
     """
     base = name
     suffix = ""
