@@ -80,14 +80,63 @@ This is the most common foot-gun in this repo.
 
 See CLAUDE.md "What's been optimized + verified" for the latest.
 
-## Your job
+## Your job — primary objective
 
-Whatever's still broken or suboptimal in the smoke path. Read
-CLAUDE.md "Status" section for what's currently in flight. If
-everything passes, the next priority is **reducing first-curl
-latency on a cold compile cache** — see
-[memory/feedback_ray_cleanup.md](memory/feedback_ray_cleanup.md)
-for prior-iteration lessons.
+**Make the first `/v1/completions` request after `./run.sh serve`
+return as fast as possible** while keeping the math correct.
+
+Current floor: ~5-15 min on cold compile cache (the V4 forward graph
+is ~103k HLO instructions post-MoE-vectorize, and XLA's TPU compile
+cost is super-linear in instruction count). On a warm cache, ~30-60s
+is realistic. **Sub-10s is the stretch goal.**
+
+Concrete things to attack, in rough ROI order:
+
+1. **Verify cross-host JAX cache sharing is safe.** Each of the 8
+   hosts currently compiles its own slice of the SPMD program;
+   `/tmp/jax-compile-cache-v4` is per-host. After a successful
+   compile, fingerprint the cache files (sha256 the .pb / .bin
+   contents on every host) — if host 0's matches hosts 1-7, write
+   a `scripts/full_slice_v4_share_cache.sh` helper that rsyncs
+   host 0's cache to all workers after a bootstrap-time warmup.
+   This makes brand-new-slice first-launch 8x faster on cold.
+   Uncertain: SPMD might bake in per-device identifiers that
+   break byte-equality. Verify before shipping.
+
+2. **Fix `Involuntary full rematerialization` warnings.** Every one
+   of these in the smoke log is XLA giving up on a sharding spec
+   (e.g. `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`).
+   Track down which leaf or activation is generating each one and
+   either pre-shard it correctly at load-time or annotate the
+   forward with `with_sharding_constraint`. Shrinks the HLO and
+   removes runtime barriers.
+
+3. **Reduce HLO instruction count further.** The vectorized MoE
+   already collapsed 256 expert kernels per layer into 3 einsums.
+   Look for similar patterns in attention (sparse_attn, indexer)
+   and the head — Python-level loops over heads / layers / hash
+   shards that XLA is unrolling. Consolidate where possible.
+
+4. **AOT precompile + persist as a binary.** Use
+   `jit().lower().compile()` to produce a serializable XLA
+   executable, then load it on subsequent launches without
+   re-tracing. Real work; non-trivial XLA-versioning risk.
+
+After each change, validate with the same loop:
+
+```bash
+./run.sh serve
+./scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
+```
+
+Report observed first-curl latency in the commit message so we can
+see the trend.
+
+## Secondary: keep cleaning up
+
+If first-curl is already optimal, fall back to consolidating the
+known-bloat targets in CLAUDE.md "Known bloat / consolidation
+candidates" — particularly the 3185-LOC test file with 33 classes.
 
 ## Commit + push hygiene
 

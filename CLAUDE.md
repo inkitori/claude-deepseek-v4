@@ -235,10 +235,15 @@ when you touch.
 
 5. **First inference is slow on a fresh launch.** The first
    `/v1/completions` call triggers compilation of `jit_run_model`
-   (the V4 forward pass). The vectorized MoE got the cold compile
-   from 30+ min down significantly; expect 5–15 min on a cold
-   cache, sub-minute on a warm cache. Don't use a 60s curl
-   timeout — the smoke check defaults to 900s.
+   (the V4 forward pass, ~103k HLO instructions post-MoE-vectorize).
+   Expect 5–15 min on a cold compile cache, ~30–60s on a warm
+   cache. Don't use a 60s curl timeout — the smoke check defaults
+   to 900s.
+
+   To warm the cache at bootstrap time (one-time +10-15 min cost,
+   then every subsequent first-curl is sub-minute), set
+   `WARM_CACHE_ON_BOOTSTRAP=1` in `.env` before `./run.sh bootstrap`.
+   `scripts/full_slice_v4_warm_cache.sh` is the underlying helper.
 
 6. **`--enforce-eager` does not skip XLA compile.** That flag only
    affects vLLM's CUDA-graph-equivalent path. The TPU forward is

@@ -105,4 +105,17 @@ fi
 log "starting Ray cluster across all 8 hosts"
 HEAD_IP="$HEAD_IP" WORKERS="$WORKERS" "$REPO/scripts/full_slice_v4_ray_restart.sh" 2>&1 | tail -10 | sed 's/^/  /'
 
+# ---- 5. Optionally warm the JAX compile cache --------------------------
+# Set WARM_CACHE_ON_BOOTSTRAP=1 in .env to fire one full smoke + curl
+# right now so the first "real" `./run.sh serve` hits a populated cache.
+# Adds ~10-15 min to bootstrap but every subsequent serve's first curl
+# is sub-minute instead of cold-compile (5-15 min).
+if [ "${WARM_CACHE_ON_BOOTSTRAP:-0}" = "1" ]; then
+    log "WARM_CACHE_ON_BOOTSTRAP=1 — running one warm-up serve cycle to populate"
+    log "  /tmp/jax-compile-cache-v4 on every host (~10-15 min one-time cost)"
+    "$REPO/scripts/full_slice_v4_warm_cache.sh" 2>&1 | tail -15 | sed 's/^/  /'
+else
+    log "skipping warm-cache (set WARM_CACHE_ON_BOOTSTRAP=1 in .env to enable)"
+fi
+
 log "complete — cluster ready. Next: ./run.sh serve"
