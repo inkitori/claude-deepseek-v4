@@ -1995,6 +1995,54 @@ class TestPackedDecodeStateBuffer:
             f"jit'd decode_step_from_buffer drifted from eager beyond "
             f"bf16-reorder budget (max abs {d_step})")
 
+    @pytest.mark.parametrize("L_real,T_pad", [(4, 16), (6, 32), (8, 32)])
+    def test_padded_prefill_must_be_sliced_to_real_seq_len(
+            self, L_real, T_pad):
+        """vLLM pads prefill input_ids to a token bucket. The orchestrator's
+        `transformer_body_init_state_to_buffer` is positional: feeding it
+        T_pad ids causes the SWA / compressor / indexer state to encode
+        kvs for positions [L_real:T_pad] as if they were real prompt
+        tokens. Decode at `start_pos=L_real` then attends to padding
+        kvs (and reads compressor slots that aggregate padding).
+
+        Pin: the runtime must slice ids to `[:L_real]` before invoking
+        the orchestrator — the sliced-prefill decode output matches a
+        fresh prefill on `L_real+1` tokens within the ≤5e-3 budget,
+        while the unsliced (padded) path can drift further."""
+        model, params, cfg, swa, comp = self._build_pair(seed=L_real * 7)
+        torch.manual_seed(L_real + T_pad + 17)
+        ids_real = torch.randint(
+            0, model.args.vocab_size, (1, L_real + 1), dtype=torch.int64)
+        torch.manual_seed(L_real + T_pad + 99)
+        pad_tail = torch.randint(
+            0, model.args.vocab_size,
+            (1, T_pad - L_real), dtype=torch.int64)
+        ids_padded = torch.cat([ids_real[:, :L_real], pad_tail], dim=1)
+        ids_real_j = t2j(ids_real).astype(jnp.int32)
+        ids_padded_j = t2j(ids_padded).astype(jnp.int32)
+        state_max = model.args.max_seq_len
+
+        h_full = transformer_body_forward(
+            ids_real_j, params, swa, comp, cfg)
+
+        # Sliced prefill (the runtime fix's behavior): orchestrator gets
+        # ids_padded[:, :L_real] — same as ids_real[:, :L_real].
+        _, buffers_sliced = transformer_body_init_state_to_buffer(
+            ids_padded_j[:, :L_real], params, swa, comp, cfg,
+            state_max_seq_len=state_max,
+        )
+        h_step_sliced, _ = transformer_body_decode_step_from_buffer(
+            ids_real_j[:, L_real:L_real + 1], params, swa, comp, cfg,
+            buffers_sliced, start_pos=L_real,
+            state_max_seq_len=state_max,
+        )
+        d_sliced = float(jnp.max(jnp.abs(
+            h_step_sliced.astype(jnp.float32)
+            - h_full[:, L_real:L_real + 1].astype(jnp.float32))))
+        assert d_sliced <= 5e-3, (
+            f"L={L_real} T_pad={T_pad}: sliced prefill -> decode at "
+            f"start_pos=L drifted from full prefill (max abs {d_sliced})")
+
     def test_buffer_decode_jit_cache_hits_across_positions(self):
         """One compile fits every decode position. With traced `start_pos`,
         running the decode step at multiple positions must reuse the same

@@ -1822,6 +1822,7 @@ def _build_class():
                     T = int(ids_2d.shape[-1])
                     state_max_seq_len = (
                         v4_state_max_seq_len_from_vllm_config(self.vllm_config))
+                    L_real = T
                     if is_decode:
                         start_pos = (
                             attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
@@ -1830,7 +1831,23 @@ def _build_class():
                         ids_for_orchestrator = ids_2d[:, 0:1]
                     else:
                         start_pos = jnp.int32(0)
-                        ids_for_orchestrator = ids_2d
+                        # vLLM pads prefill input_ids to a token bucket. The
+                        # orchestrator's SWA / compressor / indexer state
+                        # initialization is positional — if it sees T_pad
+                        # ids it treats positions [L_real:T_pad] as real
+                        # prompt tokens. Decode then attends to padding-token
+                        # kvs at SWA slots and reads compressor slots that
+                        # encode padding. Slice to the real prompt length.
+                        qsl_cpu = getattr(
+                            attention_metadata, "query_start_loc_cpu", None)
+                        if qsl_cpu is not None:
+                            try:
+                                import numpy as _np
+                                L_real = int(_np.asarray(qsl_cpu)[1])
+                            except Exception:  # noqa: BLE001
+                                L_real = T
+                        L_real = max(1, min(L_real, T))
+                        ids_for_orchestrator = ids_2d[:, :L_real]
                     kv_caches, h = deepseek_v4_run_with_decode_state(
                         kv_caches, ids_for_orchestrator, params,
                         freqs_swa, freqs_comp,
@@ -1841,6 +1858,13 @@ def _build_class():
                     )
                     if is_decode and T > 1:
                         pad_shape = (h.shape[0], T - 1, *h.shape[2:])
+                        pad = jnp.zeros(pad_shape, h.dtype)
+                        h = jnp.concatenate([h, pad], axis=1)
+                    elif (not is_decode) and T > L_real:
+                        # head_hc + lm_head expect h of shape [B, T_pad, ...];
+                        # the runtime selects logits at logits_indices (within
+                        # the real-prompt range) so padded slots are never read.
+                        pad_shape = (h.shape[0], T - L_real, *h.shape[2:])
                         pad = jnp.zeros(pad_shape, h.dtype)
                         h = jnp.concatenate([h, pad], axis=1)
                 else:
