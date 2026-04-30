@@ -214,27 +214,38 @@ tiny config but aren't wired in production.
 * iter-5g `with_sharding_constraint(P())` on packed buffers
   dodges the TPU `[USER]` FATAL on R2's cached prefill
   artifact re-execution.
+* iter-5j `_v4_force_kv_caches_read(buffers, kv_caches)`:
+  fold `pb + opaque_zero * kv` into each output buffer where
+  `opaque_zero = lax.optimization_barrier(jnp.zeros(()))`. The
+  compute output equals `pb` byte-for-byte (zero at runtime)
+  but XLA must emit a real read of `kv_caches[i]` and a real
+  elementwise add. Without this, XLA could elide the
+  donation-aliased write when output value is statically
+  derivable without reading the input — leaving prior-call
+  contents partly bleeding through.
 
-**Open: Bug B.** With `V4_DECODE_STATE=1` on real V4-Flash, R1
-and R2 share the first ~3 tokens then diverge despite identical
-input_ids/params/freqs. Source code says
-`transformer_body_init_state_to_buffer` has no data dependence
-on `kv_caches`, but the compiled artifact's compute clearly
-depends on prior-call buffer contents (XLA donation aliasing).
-Virtual-mesh CPU does NOT exhibit the divergence — Bug B is
-TPU-specific. Iter history: `git log --grep='S1 iter-'`.
+**Bug B FIXED by iter-5j (2026-04-30 ~20:03Z, smoke
+`logs/full-slice-v4-smoke-20260430T195032Z.log`):** R1 and R2
+both return ` Paris` byte-equal on real V4-Flash with
+`V4_DECODE_STATE=1`. Both HTTP 200, no FATAL, no divergence.
+The CPU virtual-mesh experiment
+(`/tmp/test_v4_iter5j_kv_caches_dep.py`) confirmed the
+mechanism: BEFORE iter-5j the HLO entry signature dropped
+`kv_caches` inputs entirely (XLA proved unused); AFTER it
+keeps them with explicit `input_output_alias={ {i}: (i, ...,
+may-alias) }` markers, while compute on CPU stays byte-equal
+between zeros and random `kv_caches` inputs (opaque_zero is
+0 at runtime).
 
-**Open paths (escalating cost):**
-1. Audit `_layer_packed_size` vs `_pack_layer_state` actual
-   output size — placeholder-field shape mismatch could leave
-   donated bytes unwritten.
-2. Re-run diag smoke (`V4_DECODE_STATE_DIAG=1`) firing only
-   R1 to adjudicate whether iter-5f's R2 sum drift was a
-   print-during-FATAL artifact vs real compute drift.
-3. Separate prefill JIT that doesn't take `kv_caches` as
-   input (touches `model_loader.py` `run_model` signature —
-   violates minimum-delta but eliminates donation-aliasing as
-   a mechanism). Last resort.
+The decode runtime is now real-V4-correct. **Remaining S1
+work**: per-position decode JIT cache misses (each new
+`start_pos` triggers a fresh ~50s compile because
+`decode_start_pos` is hashed into the cache key — see
+optimization-knobs row for `V4_DECODE_STATE`). Refactor
+decode kernels to accept traced `start_pos` for one-compile-
+fits-all positions (iter-5b "Tactical pick (a)"). Until then,
+warm-cache amortization + AOT precompile (A2 / B4) makes
+this a perf nit, not a correctness blocker.
 
 S1 unlocks A1 (`max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), S5 (MTP speculative decoding).
@@ -477,7 +488,12 @@ running smoke).
   `~/.cache/vllm/xla_cache` per host.
 * Decode-step kernels (`attention_decode_step`,
   `compressor_decode_step`, `indexer_decode_step`) match torch
-  reference at 1e-4. ✓ math, ✗ runtime integration (S1).
+  reference at 1e-4. ✓ math, ✓ runtime integration on real V4
+  (S1 iter-5j; engine returns deterministic ` Paris`
+  byte-equal across R1/R2 with `V4_DECODE_STATE=1`). Default
+  `V4_DECODE_STATE=0` keeps green-gate as the smoke-pinned
+  fallback until the per-position decode JIT-cache-miss
+  amortization is in place.
 * Transformer-body decode primitives + packed
   `AttentionDecodeState` buffers + orchestrator with JIT-
   correctness validation. Pinned by 37-test iter-5 suite.
