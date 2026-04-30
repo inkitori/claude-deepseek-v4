@@ -1,3 +1,1 @@
-- [Project: tpu-inference DeepSeek V4 work](project_v4_status.md) — JAX V4 impl as subtree at work/tpu-inference; v8 prompt targets B1 multi-seq fix + Tier 8 real-weight vllm-serve gate on v6e-32 host (no docker, gcsfuse weights)
-- [V4-Flash full-slice deploy (2026-04-29)](v4_deploy_session.md) — streaming/sharded loader + 2 bug fixes done; blocker: Ray cluster needs restart after pkill regex took out raylets; next: relaunch + watch placed-tensor heartbeat
 - [Feedback: Ray cleanup hygiene](feedback_ray_cleanup.md) — broad pkill regex matches raylet cmdline; kill by pid or narrow patterns only

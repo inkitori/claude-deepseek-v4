@@ -15,9 +15,10 @@ pkill -9 -f "EngineCore|RayWorkerWrapper|vllm"
 strings that match those patterns (substring `RayWorker*` shows up in
 internal raylet args). Running the broad regex on remote workers via
 ssh kills the raylet itself, the Ray cluster loses 7/8 nodes, the
-placement group leaks, and the full-slice deploy needs a `ray stop
---force` + restart sequence per CODEX_PLAN.md::"Ray setup". Cost the
-session ~10 min the first time it happened.
+placement group leaks, and the full-slice deploy needs a
+`ray stop --force` + restart sequence (see
+`scripts/full_slice_v4_ray_restart.sh`). Cost the session ~10 min the
+first time it happened.
 
 **How to apply:** When killing leftover vllm processes, prefer either:
 
