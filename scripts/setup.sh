@@ -27,7 +27,12 @@ log() { echo "[setup $(ts)] $*" | tee -a "$SETUP_LOG"; }
 
 log "repo=$REPO_DIR"
 
-for bin in uv git claude; do
+# Required everywhere (head + workers): venv builder + repo manager.
+# `claude` is NOT required here — only the head's loop.sh needs it,
+# and that script validates it separately. Keeping setup.sh
+# claude-free lets us reuse it for worker bootstrap via
+# scripts/full_slice_v4_bootstrap.sh.
+for bin in uv git; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         log "FATAL: '$bin' not on PATH"
         exit 1

@@ -54,11 +54,39 @@ status)
     fi
     exit 0
     ;;
-start)
+bootstrap)
+    # Fan out: clone-rsync + setup.sh + GCS mount + Ray start across all
+    # 8 hosts of a fresh v6e-32 slice. One-shot; idempotent on re-run.
+    [ -f "$REPO_DIR/.env" ] || { echo "missing $REPO_DIR/.env — copy .env.example first" >&2; exit 1; }
+    set -a; source "$REPO_DIR/.env"; set +a
+    exec "$REPO_DIR/scripts/full_slice_v4_bootstrap.sh"
+    ;;
+serve)
+    # One-shot full-slice serve: reset (cluster cleanup) + sync (push code
+    # to every worker) + smoke (launch vllm serve) + check (poll +
+    # validate the deterministic completion). Assumes ./run.sh bootstrap
+    # has already run on this slice.
+    "$REPO_DIR/scripts/full_slice_v4_reset.sh"
+    "$REPO_DIR/scripts/full_slice_v4_sync.sh"
+    "$REPO_DIR/scripts/full_slice_v4_smoke.sh"
+    echo
+    echo "Smoke launched. Validate with:"
+    echo "    ./scripts/full_slice_v4_smoke_check.sh"
+    echo "Tail with:"
+    echo "    tail -f \$(ls -1t $LOGS/full-slice-v4-smoke-*.log | head -1)"
+    exit 0
+    ;;
+agent|start)
     : # fall through
     ;;
 *)
-    echo "usage: $0 [start|stop|status]" >&2
+    echo "usage: $0 [bootstrap|serve|agent|stop|status]" >&2
+    echo
+    echo "  bootstrap  fan-out: setup all 8 hosts + start Ray (one-shot, fresh slice)"
+    echo "  serve      reset + sync + launch vllm serve on the v6e-32 slice"
+    echo "  agent      start the autonomous Claude Code loop on this host (default)"
+    echo "  stop       stop the agent loop"
+    echo "  status     check if the agent loop is running"
     exit 2
     ;;
 esac

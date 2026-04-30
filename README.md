@@ -9,62 +9,96 @@ upstream `tpu-inference` JAX backend needs to load and serve it.
 The single optimization goal is **fast, mathematically correct
 inference with the real V4-Flash weights**.
 
-## TL;DR — fresh-VM bringup
+## TL;DR — fresh-slice bringup
 
-You need: a TPU v6e-32 slice provisioned, a GCS bucket already staged
-with the V4-Flash HuggingFace cache layout (config + 46 safetensors
-shards), and SSH access between hosts.
+You need: a TPU **v6e-32** slice already provisioned (8 hosts × 4
+chips), SSH set up between the head and the 7 workers, a GCS bucket
+already staged with the V4-Flash HuggingFace cache layout (config +
+46 safetensors shards), and `uv` + `git` + `gcsfuse` installed on
+every host (your cloud-init / infra responsibility — see "External
+prereqs" below).
+
+On the **head** host (worker 0, conventionally `10.164.0.41`):
 
 ```bash
 git clone <this-repo> ~/claude-deepseek-v4
 cd ~/claude-deepseek-v4
 cp .env.example .env
-$EDITOR .env                     # fill in HF_TOKEN, GCS_BUCKET, etc.
-./run.sh                         # one-shot: setup -> mount -> preflight -> serve
+$EDITOR .env                       # fill in HF_TOKEN, GCS_BUCKET, etc.
+
+./run.sh bootstrap                 # one-shot: rsync + setup + GCS mount +
+                                   # Ray start across all 8 hosts. ~10 min.
+./run.sh serve                     # reset + sync + launch vllm serve.
+                                   # ~5 min load + ~5-15 min cold compile.
+./scripts/full_slice_v4_smoke_check.sh   # validates deterministic Paris
 ```
 
-`./run.sh` runs the full bringup: bootstrap the venv, mount the GCS
-bucket (if `MOUNT_GCS=1`), TPU pre-flight, then launch the smoke
-serve. Re-running it on the same host is safe (idempotent on the
-already-done parts).
-
-The first launch on a fresh VM compiles the V4 forward graph from
-scratch (~5–15 min depending on compile cache state). Every launch
-after that hits the persistent JAX compile cache and is sub-minute.
+After the first successful `serve`, the per-host JAX compile cache is
+populated; subsequent `./run.sh serve` cycles are sub-minute on the
+compile path.
 
 See [CLAUDE.md](CLAUDE.md) for the runbook (operational details,
 optimization knobs, pitfalls, and the **minimum-delta rule** — agents
 working on this repo should keep changes as small as possible while
-preserving correctness + speed; CLAUDE.md spells out the specifics).
+preserving correctness + speed).
 
-## What `./run.sh` does
+## `./run.sh` modes
 
-1. Reads `.env` (validates `CLAUDE_CODE_OAUTH_TOKEN`, `HF_TOKEN`).
-2. Runs `scripts/setup.sh` — bootstraps `work/vllm_env` (uv-managed
-   Python venv) with the right `vllm` + `tpu-inference` editable
-   installs. Idempotent.
-3. If `MOUNT_GCS=1`, runs `scripts/mount_gcs.sh` to gcsfuse-mount
-   the V4-Flash bucket onto `~/.cache/huggingface/hub`.
-4. Runs `scripts/preflight.sh` (JAX TPU sanity check, writes
-   `logs/tpu-preflight.log`).
-5. Launches a backgrounded agent loop that drives further
-   iterations (this repo is wired for an autonomous-agent workflow;
-   if you only want serve, run the smoke launcher directly — see
-   below).
+| Mode | What it does |
+|---|---|
+| `./run.sh bootstrap` | Fresh-slice fan-out: rsync this repo to all 7 workers, run `setup.sh` on each, mount GCS, start Ray. One-shot, idempotent. |
+| `./run.sh serve` | Cluster cleanup + source sync + launch `vllm serve` on the v6e-32 slice. Use after `bootstrap` (or after an iteration to relaunch). |
+| `./run.sh agent` | Start the autonomous `claude -p prompt.md` loop on **this host only**. Default if no arg given (back-compat). |
+| `./run.sh stop` | Stop the agent loop. |
+| `./run.sh status` | Check whether the agent loop is running. |
 
-## The serve loop (manual; what an iteration looks like)
+## External prereqs
 
-After the venv is bootstrapped, every change-then-test cycle is:
+The bootstrap script does **not** install OS-level dependencies. On
+every host (head + 7 workers) before running `./run.sh bootstrap`,
+you need:
 
-```bash
-scripts/full_slice_v4_reset.sh   # cluster cleanup; safe to re-run
-scripts/full_slice_v4_sync.sh    # mandatory after code edits — see CLAUDE.md
-scripts/full_slice_v4_smoke.sh   # launch vllm serve; writes pid + log
-scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
-```
+* **A Linux user with the same name on every host** (the script
+  assumes `enyouki@<ip>` SSH targets and `~/claude-deepseek-v4`
+  paths line up).
+* `uv` (Python package manager) on PATH.
+* `git` on PATH.
+* `gcsfuse` on PATH (only required if `MOUNT_GCS=1`).
+* SSH from the head reachable to every worker via
+  `~/.ssh/google_compute_engine` (the GCE-provisioned identity).
 
-Pass criterion: `full_slice_v4_smoke_check.sh` exits 0 with
-`PASS: deterministic completion contains 'Paris'`.
+On the head only, additionally:
+
+* `claude` CLI on PATH (only needed if you'll use `./run.sh agent`).
+* SSH agent unlocked for `id_ed25519` (only needed if you want
+  `./run.sh agent` to push commits to GitHub after each iter).
+
+## What each mode does (concretely)
+
+**`./run.sh bootstrap`** — one-shot fan-out across the slice:
+1. Reads `.env`.
+2. Runs `scripts/setup.sh` on the head (creates `work/vllm_env`,
+   installs vllm + tpu-inference editable from the worktree).
+3. For each of the 7 workers: rsyncs the repo (excluding venv +
+   logs + .env), copies `.env` over, runs `setup.sh` remotely.
+4. If `MOUNT_GCS=1`: gcsfuse-mounts the bucket on every host.
+5. Calls `scripts/full_slice_v4_ray_restart.sh` which `ray stop` +
+   `ray start`s all 8 hosts. Verifies `0.0/32.0 TPU` available.
+
+**`./run.sh serve`** — every change-then-test cycle:
+1. `scripts/full_slice_v4_reset.sh` (cluster orphan cleanup).
+2. `scripts/full_slice_v4_sync.sh` (rsync source to 7 workers).
+3. `scripts/full_slice_v4_smoke.sh` (launch `vllm serve`).
+4. Prints the log path; you validate with
+   `scripts/full_slice_v4_smoke_check.sh`.
+
+**`./run.sh agent`** — the autonomous-agent loop on this host
+only (single-VM dev workflow). Reads `.env`, runs `setup.sh`,
+optionally mounts GCS, runs preflight, then backgrounds
+`scripts/loop.sh` which calls `claude -p prompt.md` repeatedly.
+
+Pass criterion for serve: `full_slice_v4_smoke_check.sh` exits 0
+with `PASS: deterministic completion contains 'Paris'`.
 
 ## Layout
 
