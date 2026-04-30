@@ -131,6 +131,24 @@ bug and unblocks the most downstream work. If you genuinely
 can't make progress on the highest item, move down the list
 but document why in the commit message.
 
+**S1 is now mandatory next.** As of 2026-04-30, the loop has
+shipped S3 + S4 + S6 + S7 + B3 + D1 + D2 across 8 iters and
+built genuinely thorough verification scaffolding for the
+S-tier correctness surface. **Do not pick S5, S6 follow-ups,
+A-tier infra, B-tier perf, or C/D items in the next iter.**
+Start S1 (decode threading) directly. The codebase is now
+ready for it: S3/S6/S7 runtime probes will catch any
+regression in reasoning / sampling / streaming when S1 ships;
+B3 reduced compile noise; the V4 thinking-mode bug surfaced
+in iter-3 is hypothesized to root in S1's prefill-only path,
+so S1 may also fix that. If you genuinely cannot make
+progress on S1 *within this iter* (e.g. the state-threading
+surgery is too large for one iter and you must split), commit
+a "WIP: S1 ..." checkpoint with what landed plus a clear
+"next iter starts at ..." note. Do not pivot to a different
+backlog item to feel productive — S1 is the only acceptable
+work until it lands or has a documented multi-iter plan.
+
 ## Iteration discipline (READ — it's why prior sessions burned hours)
 
 **Do NOT use `./run.sh serve` as your tight inner test loop.**
