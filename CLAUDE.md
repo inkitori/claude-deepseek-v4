@@ -118,9 +118,19 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
   ready, fires the deterministic "capital of France" completion
   twice, asserts byte-identical responses + that the text contains
   "Paris". Has a self-test at `scripts/test_smoke_check_harness.sh`
-  (uses `scripts/_mock_openai_server.py` — no TPU needed). Also
-  fires a `/v1/chat/completions` probe (informational by default,
-  `CHAT_REQUIRED=1` to make missing/empty fail).
+  (uses `scripts/_mock_openai_server.py` — 9 scenarios, no TPU
+  needed). Also fires three optional probes, each gated by an env
+  knob so the default smoke stays cheap:
+  * `/v1/chat/completions` — `CHAT_REQUIRED=1` to fail on
+    missing/empty content (exit 4).
+  * Thinking-mode chat (`chat_template_kwargs={"thinking":true}`) —
+    `REASONING_REQUIRED=1` to fail when `message.reasoning` is empty
+    (exit 5). Pins S3's runtime — verifies the
+    `--reasoning-parser deepseek_v4` flag actually emits a
+    `<think>...</think>` block into the `reasoning` field.
+  * `/v1/completions` with `stream=true` — `STREAMING_REQUIRED=1`
+    to fail when the reassembled SSE chunks don't byte-equal the
+    non-streaming completion (exit 6). Pins S7.
 * **`full_slice_v4_warm_cache.sh`** — runs the smoke + check, then
   cleans up. Use once on a fresh VM (or after a `/tmp` wipe) to
   populate the JAX compile cache; subsequent real launches' first
@@ -164,6 +174,8 @@ launcher echoes the active values at startup so you can confirm.
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
 | `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
+| `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
+| `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
 
 ## Current state (READ BEFORE LAUNCHING)
 
@@ -284,12 +296,12 @@ others.
 S2 can land independently of S1 but they multiply each other:
 real concurrency only matters once decode is fast.
 
-#### S3. `--reasoning-parser deepseek_v4` and `--tool-call-parser deepseek_v4` enabled in smoke launcher (launcher portion DONE; runtime assertion deferred)
+#### S3. `--reasoning-parser deepseek_v4` and `--tool-call-parser deepseek_v4` enabled in smoke launcher (launcher + reasoning runtime probe DONE; tool-call runtime probe deferred)
 
 `work/vllm/vllm/reasoning/__init__.py:31-32` registers
 `deepseek_v4 → DeepSeekV3ReasoningParser` (handles
 `<think>...</think>` block extraction →
-`reasoning` / `reasoning_content` field).
+`reasoning` field on `ChatMessage`).
 `work/vllm/vllm/tool_parsers/deepseekv4_tool_parser.py`
 provides `DeepSeekV4ToolParser` (DSML tool tokens → `tool_calls`).
 Both are wired into `scripts/full_slice_v4_smoke.sh` via
@@ -298,18 +310,26 @@ Both are wired into `scripts/full_slice_v4_smoke.sh` via
 vLLM validates these names at startup and refuses to launch if
 they're misregistered, so the smoke gate green = parsers loaded.
 
-What's left for S3: a runtime assertion that a think-mode-triggering
-chat request produces a non-empty `reasoning` field. The chat path
-already respects `chat_template_kwargs={"thinking": true}` via the
-upstream `DeepseekV4Tokenizer` (see S4 below — the encoder emits
-`<｜Assistant｜><think>` instead of `</think>` when thinking is set).
-Add a smoke_check chat probe that sends `chat_template_kwargs={"thinking": true}`
-plus a reasoning-eliciting prompt and asserts the response's
-`reasoning` (or `reasoning_content`) field is non-empty. Same applies
-to a tool-using probe — assert `tool_calls` is non-empty when the
-prompt should trigger one. Probably gate behind a new env knob like
-`REASONING_REQUIRED=1` / `TOOLS_REQUIRED=1` so the default smoke
-stays cheap.
+**Reasoning runtime probe (DONE)**:
+`scripts/full_slice_v4_smoke_check.sh` accepts `REASONING_REQUIRED=1`,
+which fires a thinking-mode chat
+(`chat_template_kwargs={"thinking":true}` + a multiplication prompt)
+and asserts `message.reasoning` is non-empty (exit 5 on empty).
+Default off so the cheap smoke gate stays cheap. Mock-server
+self-test `scripts/test_smoke_check_harness.sh` covers
+both the present-reasoning and empty-reasoning paths
+(`reasoning_required_present` / `reasoning_required_empty`). The
+field on `ChatMessage` is `reasoning` (vLLM-specific, defined at
+`work/vllm/vllm/entrypoints/openai/chat_completion/protocol.py:64`),
+not `reasoning_content` — the latter is an *input* field used by
+vLLM's chat_utils to round-trip prior assistant turns.
+
+**Tool-call runtime probe (still TODO)**: an analogous
+`TOOLS_REQUIRED=1` probe that sends a request with `tools=[...]`
+plus a tool-eliciting user message and asserts
+`message.tool_calls` is non-empty. Prompt design is harder than
+reasoning (need to land on a prompt where the model reliably
+chooses to call a tool at temp=0); follow-up.
 
 Sanity check that the parsers are still wired (no TPU needed):
 
@@ -402,14 +422,31 @@ Add a sampling matrix to `smoke_check` (or a
 before claiming production readiness. Each combination has
 known quirks under vLLM's TPU runner.
 
-#### S7. Streaming (SSE) is unverified
+#### S7. Streaming (SSE) — equivalence probe DONE; latency budget probe still TODO
 
 vLLM's framework supports `stream: true` natively;
-tpu-inference shouldn't need V4-specific changes. But the
-smoke_check only fires non-streaming requests. Add a streaming
-probe: assert TTFT < N seconds, ITL < M ms, and that the
-reassembled stream matches the non-streaming output.
-OpenRouter-style clients default to streaming.
+tpu-inference shouldn't need V4-specific changes.
+
+**Stream-equals-non-stream probe (DONE)**:
+`scripts/full_slice_v4_smoke_check.sh` accepts `STREAMING_REQUIRED=1`,
+which re-fires the deterministic completion with `stream=true`,
+reassembles the SSE chunks (handles `data: {...}\n\n` lines and the
+terminating `data: [DONE]`), and asserts byte-equality vs the
+non-streaming output captured earlier in the same run (exit 6 on
+mismatch / no chunks). Default off. Mock + harness cover both
+match and mismatch paths
+(`streaming_required_match` / `streaming_required_mismatch` —
+the mismatch scenario uses `--stream-text " Berlin."` so the
+non-streaming Paris assertion still passes before the streaming
+probe fires).
+
+**Still TODO**: a latency-budget probe — assert TTFT < N seconds
+and ITL < M ms. Needs threshold tuning against a warm-cache run
+to pick numbers that don't false-positive on cold compile. Probably
+gate behind `STREAMING_LATENCY_REQUIRED=1` so the equivalence and
+latency probes can land independently. OpenRouter-style clients
+default to streaming, so latency-on-streaming is the production
+metric users actually feel.
 
 ### Tier A — production-deployment infra (model is correct but infra isn't)
 
@@ -719,8 +756,13 @@ when the timeout SIGTERMs the iter.
   `--enable-auto-tool-choice --tool-call-parser deepseek_v4` in
   `scripts/full_slice_v4_smoke.sh`). Registry lookup verified via
   the snippet in S3. vLLM validates parser names at startup, so
-  smoke-green = parsers loaded. ✓ wiring, ✗ runtime emission test
-  (S3 — runtime probe deferred).
+  smoke-green = parsers loaded. ✓ wiring; ✓ runtime probe scaffolded
+  (`REASONING_REQUIRED=1` smoke_check assertion + 9-scenario harness
+  self-test); ✗ runtime probe not yet exercised against real vLLM
+  (next smoke run with `REASONING_REQUIRED=1` will land it). See S3.
+* **Streaming probe scaffolded** (`STREAMING_REQUIRED=1` smoke_check
+  assertion + harness self-test covering match + mismatch). ✓ harness;
+  ✗ not yet exercised against real vLLM. See S7.
 
 ## Chat template (chat-completions)
 
@@ -834,7 +876,8 @@ the smoke launcher binds 18081 (not vllm's default 8000).
 * `work/vllm/` — vLLM source tree. Don't edit upstream files
   unless you've read `work/vllm/AGENTS.md` (it forbids ad-hoc
   PRs). Reasoning + tool parsers for `deepseek_v4` already exist
-  upstream; the smoke launcher just doesn't enable them yet (S3).
+  upstream and are enabled in the smoke launcher (`--reasoning-parser
+  deepseek_v4`, `--tool-call-parser deepseek_v4`).
 * `scripts/` — operational helpers; per-host entry points all
   start with `full_slice_v4_`.
 * `logs/` — `.gitignore`d; smoke + iter logs accumulate here.

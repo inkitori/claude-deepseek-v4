@@ -19,10 +19,25 @@
 # 16 tokens at temp=0/seed=0 don't reliably contain a fixed string,
 # even when the template is applied correctly).
 #
+# Two further probes are gated off by default and turn on individually:
+#   REASONING_REQUIRED=1 — fires a thinking-mode chat (chat_template_kwargs
+#       {"thinking": true}) with a reasoning-eliciting prompt and asserts
+#       message.reasoning is non-empty. Pins the S3 runtime: --reasoning-parser
+#       deepseek_v4 actually emitting <think>...</think> → reasoning field.
+#       Adds ~30s on cold cache (lands in chat path, may OOM-retry once).
+#       Exit 5 on empty reasoning.
+#   STREAMING_REQUIRED=1 — fires the /v1/completions probe a second time with
+#       stream=true, reassembles the SSE chunks, and asserts the reassembled
+#       text byte-equals the non-streaming response from the first probe.
+#       Pins S7: streaming path produces the same output as non-streaming.
+#       Exit 6 on mismatch / no chunks.
+#
 # Usage:
 #   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
 #   PORT=18082 scripts/full_slice_v4_smoke_check.sh
-#   CHAT_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh   # fail on empty chat
+#   CHAT_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on empty chat
+#   REASONING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on empty reasoning
+#   STREAMING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on stream/non-stream mismatch
 
 set -euo pipefail
 
@@ -41,6 +56,8 @@ TIMEOUT_S="${TIMEOUT_S:-1800}"
 # are sub-second.
 CURL_MAX_TIME="${CURL_MAX_TIME:-900}"
 CHAT_REQUIRED="${CHAT_REQUIRED:-0}"
+REASONING_REQUIRED="${REASONING_REQUIRED:-0}"
+STREAMING_REQUIRED="${STREAMING_REQUIRED:-0}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -71,12 +88,63 @@ fire_chat() {
               "$MODEL" "$SEED")"
 }
 
+# Reasoning probe: thinking-mode chat that should produce a non-empty
+# message.reasoning when --reasoning-parser deepseek_v4 is active. Multiplication
+# is the cheapest reasoning-eliciting prompt — short, deterministic, and the
+# <think> block almost always contains digits + intermediate products.
+fire_chat_thinking() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","messages":[{"role":"user","content":"What is 17 multiplied by 23? Show your reasoning step by step."}],"max_tokens":256,"temperature":0,"seed":%d,"chat_template_kwargs":{"thinking":true}}' \
+              "$MODEL" "$SEED")"
+}
+
+# Streaming probe: same prompt/params as fire_completion, but stream=true.
+# vLLM emits SSE on /v1/completions: lines of `data: {...}\n\n` plus a
+# terminating `data: [DONE]\n\n`. The -N flag turns off curl's output buffer.
+fire_completion_stream() {
+    curl -sf --max-time "$CURL_MAX_TIME" -N "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0,"seed":%d,"stream":true}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
+}
+
 extract_text() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['text'])"
 }
 
 extract_chat_message() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])"
+}
+
+extract_chat_reasoning() {
+    python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['message'].get('reasoning') or '')"
+}
+
+# Reassemble streaming completion deltas into a single text. Tolerates
+# `data: ` lines, the terminating `data: [DONE]`, and blank lines.
+reassemble_stream() {
+    python3 -c "
+import json, sys
+parts = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data: '):
+        continue
+    payload = line[len('data: '):]
+    if payload == '[DONE]':
+        break
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        continue
+    if not chunk.get('choices'):
+        continue
+    choice = chunk['choices'][0]
+    delta = choice.get('text', '') or (choice.get('delta') or {}).get('content', '') or ''
+    parts.append(delta)
+print(''.join(parts))
+"
 }
 
 main() {
@@ -119,6 +187,48 @@ main() {
         if [ "$CHAT_REQUIRED" = "1" ]; then
             echo "[smoke-check] FAIL: chat probe failed (CHAT_REQUIRED=1)" >&2
             exit 4
+        fi
+    fi
+
+    if [ "$REASONING_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/chat/completions thinking-mode probe (REASONING_REQUIRED=1)"
+        if RR="$(fire_chat_thinking 2>/dev/null)"; then
+            TR="$(printf '%s' "$RR" | extract_chat_reasoning 2>/dev/null || true)"
+            # Trim to first 80 chars for the log so a long <think> block doesn't drown it.
+            if [ "${#TR}" -gt 80 ]; then
+                echo "[smoke-check] reasoning prefix: ${TR:0:80}..."
+            else
+                echo "[smoke-check] reasoning: ${TR:-<empty>}"
+            fi
+            if [ -z "$TR" ]; then
+                echo "[smoke-check] FAIL: thinking-mode chat returned empty reasoning (REASONING_REQUIRED=1)" >&2
+                echo "[smoke-check]       --reasoning-parser deepseek_v4 is registered but produced no <think> output." >&2
+                exit 5
+            fi
+        else
+            echo "[smoke-check] FAIL: thinking-mode chat probe failed (curl non-zero, REASONING_REQUIRED=1)" >&2
+            exit 5
+        fi
+    fi
+
+    if [ "$STREAMING_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions streaming probe (STREAMING_REQUIRED=1)"
+        if RS="$(fire_completion_stream 2>/dev/null)"; then
+            TS="$(printf '%s' "$RS" | reassemble_stream 2>/dev/null || true)"
+            echo "[smoke-check] stream reassembled: ${TS:-<empty>}"
+            if [ -z "$TS" ]; then
+                echo "[smoke-check] FAIL: streaming probe produced no chunks (STREAMING_REQUIRED=1)" >&2
+                exit 6
+            fi
+            if [ "$TS" != "$T1" ]; then
+                echo "[smoke-check] FAIL: streaming output != non-streaming (STREAMING_REQUIRED=1)" >&2
+                echo "[smoke-check]       non-streaming: $T1" >&2
+                echo "[smoke-check]       streaming    : $TS" >&2
+                exit 6
+            fi
+        else
+            echo "[smoke-check] FAIL: streaming probe failed (curl non-zero, STREAMING_REQUIRED=1)" >&2
+            exit 6
         fi
     fi
 
