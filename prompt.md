@@ -69,6 +69,29 @@ keeping math correct and serve fast.
 When in doubt: the smaller change wins. Read CLAUDE.md's
 "Minimum-delta rule" section for full guidance.
 
+## Code style — match upstream tpu-inference
+
+This work targets eventual upstream PR. V4 source files should be
+**indistinguishable in style** from peer models in the repo
+(`qwen3.py`, `deepseek_v3.py`, `llama3.py`). A reviewer at
+`vllm-project/tpu-inference` should not be able to tell which
+lines came from an autonomous agent.
+
+* Brief docstrings (Args/Returns). No multi-paragraph rationale,
+  no "previous implementation was…" history.
+* Inline comments only when the WHY is non-obvious. **No
+  iter-narrative** ("iter-5h fix", "Tier-8 keystone", "Bug A
+  was…"). No section banners.
+* Trust internal call paths; validate only at the vLLM API
+  boundary, not at every helper.
+* Delete dead code; no backwards-compat shims for code that
+  never shipped.
+
+Before committing, do a 30-second diff against `qwen3.py` or
+`deepseek_v3.py`. If your file reads chattier, prune. Read
+CLAUDE.md's "Code style matches upstream" section for full
+guidance.
+
 ## Iterate loop
 
 Every change-then-test cycle, in order:
@@ -123,31 +146,39 @@ priority order:
 * **Tier D — janitorial.** D1 (test bloat consolidation), D2
   (stale comment cleanup).
 
-**Picking rule:** start with S3 if it isn't already done (it's
-a 10-minute warmup that ships real value — check the smoke
-launcher for `--reasoning-parser` and `--tool-call-parser`
-flags first). Then attack S1 — that's the headline correctness
-bug and unblocks the most downstream work. If you genuinely
-can't make progress on the highest item, move down the list
-but document why in the commit message.
+**Picking rule:** any unresolved Tier-S item beats every A/B/C/D
+item. Within Tier S, pick by current state — S1 correctness
+landed in iter-5j (real V4 smoke green with `V4_DECODE_STATE=1`),
+but S3 (thinking-mode broken on real V4) was hypothesized to
+root in S1 and needs verification. S2 is unblocked but separate.
 
-**S1 is now mandatory next.** As of 2026-04-30, the loop has
-shipped S3 + S4 + S6 + S7 + B3 + D1 + D2 across 8 iters and
-built genuinely thorough verification scaffolding for the
-S-tier correctness surface. **Do not pick S5, S6 follow-ups,
-A-tier infra, B-tier perf, or C/D items in the next iter.**
-Start S1 (decode threading) directly. The codebase is now
-ready for it: S3/S6/S7 runtime probes will catch any
-regression in reasoning / sampling / streaming when S1 ships;
-B3 reduced compile noise; the V4 thinking-mode bug surfaced
-in iter-3 is hypothesized to root in S1's prefill-only path,
-so S1 may also fix that. If you genuinely cannot make
-progress on S1 *within this iter* (e.g. the state-threading
-surgery is too large for one iter and you must split), commit
-a "WIP: S1 ..." checkpoint with what landed plus a clear
-"next iter starts at ..." note. Do not pivot to a different
-backlog item to feel productive — S1 is the only acceptable
-work until it lands or has a documented multi-iter plan.
+**Current high-leverage candidates (read CLAUDE.md backlog for
+full rationale):**
+
+* **S3 verification.** Run `REASONING_REQUIRED=1` +
+  `V4_DECODE_STATE=1` smoke. If thinking-mode still broken,
+  Tier-S correctness item is open and beats every perf item.
+* **Traced-`start_pos` refactor (S1 follow-on).** S1 shipped
+  with `decode_start_pos` as a Python int hashed into the JIT
+  cache key — fresh start_pos = ~50s compile. Refactor to
+  `jnp.int32` via `lax.dynamic_slice` / `lax.cond` for
+  one-compile-fits-all-positions. This is the actual throughput
+  unlock; S1 alone is correctness. Mentioned in iter-5b
+  planning notes as "Tactical pick (a)". Other models in this
+  repo (qwen3, deepseek_v3, llama3) all use traced positions
+  via `attn_metadata.input_positions`; V4 is the outlier
+  because of compressor compress-event / SWA wraparound /
+  indexer top-k branches.
+* **S2 (jit'd multi-seq dispatch).** Independent of decode
+  perf; blocks `--max-num-seqs > 1`.
+* **A1 (lift MAX_LEN/MAX_SEQS).** Now meaningful that S1
+  correctness landed.
+
+If you can't make progress on the highest-leverage item *within
+this iter* (e.g. the surgery splits across iters), commit a
+"WIP: <item> …" checkpoint with what landed + a clear "next
+iter starts at …" note rather than pivoting to a smaller item
+to feel productive.
 
 ## Iteration discipline (READ — it's why prior sessions burned hours)
 

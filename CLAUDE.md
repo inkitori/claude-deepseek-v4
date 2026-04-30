@@ -59,6 +59,39 @@ backlog reordering. If something was true for one iter and
 isn't anymore, remove it. The file targets ~500 lines; if it's
 ballooning, prune before adding.
 
+### 3. Code style matches upstream — this work targets eventual upstream PR
+
+V4 source files should be **indistinguishable in style** from
+their peer models in this repo (`qwen3.py`, `deepseek_v3.py`,
+`llama3.py`, `llama4.py`, `gemma4.py`). The minimum-delta rule
+covers *quantity*; this rule covers *style*. A reviewer at
+`vllm-project/tpu-inference` should not be able to tell which
+lines came from an autonomous agent.
+
+* **Docstrings**: brief Args/Returns blocks. No multi-paragraph
+  hypothesis-rationale, no "previous implementation was X"
+  history (that's a commit-message thing).
+* **Comments**: only when the WHY is non-obvious. No
+  iter-narrative references ("iter-5h fix", "Tier-8 keystone",
+  "Bug A was…"). No section banners (`# ===== gate =====`,
+  `# ----- expert -----`). Well-named identifiers do the WHAT
+  job already.
+* **Defensive programming**: trust internal call paths. Validate
+  only at the vLLM API boundary (e.g. `__call__` argument
+  shapes), not at every internal helper. Peer models don't add
+  belt-and-suspenders asserts; neither should V4.
+* **Backwards-compat shims**: none. V4 is new code; if a branch
+  is dead, delete it. No `# removed for X` placeholders, no
+  re-exports of types nothing imports, no `_unused_var` renames.
+* **Naming**: snake_case modules + functions, PascalCase
+  classes, verbatim from upstream where applicable
+  (`AttentionMetadata`, `compute_q_projection`, etc.).
+
+Before considering a piece of V4 work "done", do a 30-second
+diff-side-by-side with `qwen3.py` or `deepseek_v3.py`. If your
+file looks chattier, prune. If your function has a 30-line
+docstring and qwen3's equivalent has 4 lines, prune.
+
 ## Cluster topology
 
 * Slice: **v6e-32** = 8 hosts × 4 chips × 32 GB HBM = 992 GiB total.
@@ -156,7 +189,7 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `V4_DECODE_STATE` | `0` | S1 gate. `1` flips `__call__` to `deepseek_v4_run_with_decode_state` (orchestrator path threading packed `AttentionDecodeState` through `kv_caches`). Default `0` preserves the green gate. When `1`, every JIT trace into `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)`. |
 | `V4_DECODE_STATE_DIAG` | `0` | Adds `jax.debug.print` of kv_caches[0] sum + nonfinite-count at orchestrator entry/exit. Forwarded to workers. Use only when debugging Bug B (S1). |
 | `CHAT_REQUIRED` | `0` | smoke_check chat probe; exit 4 on missing/empty content. Adds ~30 s for first-chat OOM-retry (pitfall #9). |
-| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. **Currently fails on real V4** — see S3. |
+| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Passes under `V4_DECODE_STATE=1` (S1 iter-5j); fails under default `V4_DECODE_STATE=0` (broken-decode prefill-only path produces all-newlines). Pair with `REASONING_MAX_TOKENS=8` to bound per-position decode-compile cost when run under `V4_DECODE_STATE=1`. |
 | `STREAMING_REQUIRED` | `0` | SSE byte-equality probe vs non-streaming; exit 6. Pins S7. |
 | `SAMPLING_REQUIRED` | `0` | `temperature=0.7, top_p=0.9, frequency_penalty=0.1`; exit 7 on empty/invalid. Pins S6. Determinism not asserted (per-request seed unsupported on non-greedy paths). |
 | `STOP_REQUIRED` | `0` | `stop=["Paris"]`; exit 8 if response contains Paris or `finish_reason!=stop`. Pins S6. Baseline emits ` Paris` first, so a working handler MUST intercept. |
@@ -261,36 +294,45 @@ with `lax.dynamic_slice` per active seq. Until S2 lands,
 `--max-num-seqs=1` is forced. Independent of S1 but they
 multiply.
 
-#### S3. Reasoning + tool parsers — wired; thinking-mode produces broken output
+#### S3. Reasoning parser — FIXED by S1; tool-call runtime probe still TODO
 
 Smoke launcher passes `--reasoning-parser deepseek_v4`,
 `--enable-auto-tool-choice`, `--tool-call-parser deepseek_v4`.
 vLLM validates parser names at startup (smoke-green = parsers
-loaded).
+loaded). V4's reasoning parser is registered upstream as an
+alias for `DeepSeekV3ReasoningParser` (standard `<think>...</think>`
+extraction).
 
-**REAL V4 BUG (Tier-S correctness bomb that the original smoke
-gate silently missed):** thinking-mode chat
-(`chat_template_kwargs={"thinking":true}`) at `temperature=0,
-seed=0` returns N newlines (N == max_tokens, finish_reason=
-length) with empty `content` field. `temperature=0.7` produces
-incoherent random tokens (logits nearly uniform). Adding
-`reasoning_effort:"high"` does not help. Caught by
-`REASONING_REQUIRED=1`. Repro:
+**Thinking-mode bug FIXED by S1 iter-5j (2026-04-30 ~20:34Z,
+smoke `logs/full-slice-v4-smoke-20260430T201602Z.log` +
+`logs/smoke-check-iter5k-20260430T202223Z.log`):** under the
+green-gate baseline (`V4_DECODE_STATE=0`, prefill-recompute
+every step) thinking-mode chat at `temperature=0, seed=0`
+returned N newlines (all-whitespace, `finish_reason=length`)
+because the prefill-only path kept re-rolling from a
+flat-logits regime. With `V4_DECODE_STATE=1` (real decode,
+packed `AttentionDecodeState` threaded through `kv_caches`)
+the model emits real reasoning tokens. Verification:
 
 ```bash
-curl -s --max-time 600 http://127.0.0.1:18081/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash",
-       "messages":[{"role":"user","content":"What is 17 * 23?"}],
-       "max_tokens":96,"temperature":0,"seed":0,
-       "chat_template_kwargs":{"thinking":true}}'
+V4_DECODE_STATE=1 scripts/full_slice_v4_smoke.sh
+REASONING_REQUIRED=1 REASONING_MAX_TOKENS=8 \
+  scripts/full_slice_v4_smoke_check.sh
+# expect: "[smoke-check] reasoning (len=N>0): <real tokens>"
+#         "[smoke-check] PASS"
 ```
 
-Likely fixed by S1 (real decode) — the prefill-only path may
-keep re-rolling from a flat-logits regime. Other hypotheses:
-MoE expert routing dead in thinking-mode activations, FP4
-quant precision loss for the post-`<think>` path. Tool-call
-runtime probe (`TOOLS_REQUIRED`) still TODO.
+`REASONING_MAX_TOKENS=8` (vs the default 96) keeps the
+per-position decode-compile cost bounded under
+`V4_DECODE_STATE=1` until the JIT-cache-miss amortization is
+in place; len>0 still discriminates the bug since broken=
+all-whitespace.
+
+**Remaining S3 work**: tool-call runtime probe
+(`TOOLS_REQUIRED=1`) — assert a request with `tools=[...]`
+populates `tool_calls` rather than emitting raw DSML tokens
+in `content`. Parser is registered (`deepseekv4_tool_parser.py`
+in vLLM upstream) but not exercised end-to-end yet.
 
 Sanity check that parsers are still wired (no TPU needed):
 
@@ -534,7 +576,8 @@ running smoke).
 * Chat encoding byte-equal to V4-Flash reference encoder
   across all S4 scopes (`TestVllmChatTemplateParity`).
 * Reasoning + tool parser wiring (registry lookup ✓; runtime
-  reasoning probe scaffolded but **fails** — see S3).
+  reasoning probe ✓ under `V4_DECODE_STATE=1` — fixed by
+  S1 iter-5j; tool-call runtime probe still TODO, see S3).
 * Streaming probe (SSE = non-streaming byte-for-byte).
 * Sampling / stop / logprobs / top-k / presence / n>1 probes
   all pass on real V4.
