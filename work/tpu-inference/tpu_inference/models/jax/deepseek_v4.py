@@ -56,6 +56,8 @@ logger = init_logger(__name__)
 # `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real
 # packed-state decode); `0` keeps the prefill-recompute baseline.
 V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE", "0") == "1"
+logger.info("[V4_DECODE_STATE] module import: enabled=%s",
+            V4_DECODE_STATE_ENABLED)
 
 
 # ------------------------------------------------------------

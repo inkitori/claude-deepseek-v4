@@ -15,8 +15,8 @@ cold compile ~97s, warm-cache curl sub-second.
 
 * **Tier S — silent correctness bombs** (S2 multi-seq
   dispatch; S3 tool-call runtime probe; S5 MTP hook). S1 done
-  (env-gated behind `V4_DECODE_STATE=1`, default-flip needs
-  REASONING_REQUIRED reverification); S4/S6/S7 resolved.
+  (smoke launcher defaults `V4_DECODE_STATE=1`; basic Paris +
+  `REASONING_REQUIRED=1` both green); S4/S6/S7 resolved.
 * **Tier A — production infra** (A1 max-len lift depends on
   S1; A2–A6 cache durability, crash recovery, metrics, TLS,
   multi-slice).
