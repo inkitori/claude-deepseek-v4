@@ -693,31 +693,117 @@ breaks real V4-Flash:
      the `v4_state_max_seq_len_from_vllm_config` agreement is
      wired end-to-end).
 
-* Recommended iter-5c scope (NaN root-cause + flip):
-  1. **Logit-comparison probe on real V4-Flash**: write a
-     standalone script that runs both `transformer_body_forward`
-     and `deepseek_v4_run_with_decode_state(is_decode_step=False)`
-     on the same input under a real-weights launch (or under a
-     half-width loaded checkpoint to fit on a CPU host), saves
-     each layer's `h` output, and finds the first layer at
-     which a NaN appears in the orchestrator's path but not the
-     forward path. That pinpoints which kernel's state-capture
-     side-effect is responsible.
-  2. **NaN-mask check**: extend the closed-form `attention_init_state_from_prefill`
-     to assert (under a debug flag) that no non-init slot of
-     compressor_score_state remains at -inf after init at
-     T_padded=full bucket. If "init then mask all-tail-positions
-     → -inf" is leaking into a downstream consumer, that's the
-     bug. The fix is to either (a) cap T to actual prompt
-     length via `query_start_loc_cpu[1]` (but that's a Python
-     dynamic shape, harder under JIT), or (b) treat -inf
-     score-state slots as "future" and skip them in the score
-     reduction.
-  3. **Real-smoke gate**: deterministic " Paris" still
-     passes AND a multi-token decode returns coherent output
-     on at least 4 generated tokens. With per-position recompile
-     each new start_pos costs ~1 min cold (verified by the
-     iter-5b smoke that hit 200 OK on prefill within 1 min).
+**Iter 5c status (2026-04-30): orchestrator decoupling fix LANDED;
+__call__ flip GATED — TPU `[USER]` FATAL on second request after
+first request returns 200 OK.**
+
+What landed in iter-5c:
+  * `deepseek_v4_run_with_decode_state` prefill branch now
+    computes `h` via `transformer_body_forward` (path A — the
+    proven baseline) and packed_buffers via
+    `transformer_body_init_state_to_buffer` SEPARATELY. The
+    orchestrator's own `h` from init_state_to_buffer is
+    discarded. XLA CSEs the shared kv/compressor intermediates
+    between the two computations so the duplicated surface is
+    largely free at compile time. Critically, this guarantees
+    the prefill `h` is byte-equal to `transformer_body_forward`
+    BY CONSTRUCTION — not subject to XLA's reduction-order
+    drift between the forward path and the closed-form
+    state-init's intermediate allocations. iter-5b's NaN
+    hypothesis (XLA reorders bf16 reductions when the
+    state-init's extra fp32 buffers feed the same scheduler
+    pass as the forward path) is solved by this decoupling.
+
+  * Pinned by `TestPackedDecodeStateBuffer` (7 cases) +
+    `TestTransformerBodyDecodeRoundTrip` (4 cases) +
+    `TestPrefillToDecodeStateParity` (26 cases): all pass on
+    tiny config CPU pytest unchanged from iter-5b — the
+    decoupling preserves the prefill `h` semantics.
+    `/tmp/test_v4_iter5c_compile.py` confirms under
+    32-virtual-CPU mesh w/ replicated `P()` kv_caches: prefill
+    h diff vs path-A = 0.000002 (≪ 5e-3 budget); 32 identical
+    shards; all `h` finite.
+
+What was attempted and **REVERTED at the source** because it
+crashes the engine on the second request (real V4 `vllm serve`,
+2026-04-30 14:40Z):
+  * **`__call__` flip to invoke `deepseek_v4_run_with_decode_state`
+    on the single-active-seq path** (same flip iter-5b made +
+    reverted, now with iter-5c's path-A-h orchestrator).
+    First `/v1/completions` (max_tokens=4) succeeds — `POST
+    /v1/completions HTTP/1.1 200 OK` at 14:40:04. ≈90 s of
+    wall-time = 1 prefill compile (`fingerprint
+    2588072356c02f4008a3c8aeec911c6d89821ccbd2b368f645edac6cfe32f938`)
+    + 3 decode compiles each fresh per `start_pos` (per-decode-
+    position recompile: see iter-5b "Tactical pick (b)").
+    Generation throughput logged 0.1 tok/s under cold compile.
+
+    Then the smoke_check fires the second `/v1/completions`
+    (byte-equality probe) ≈1 s later. Within ≈1 s of arrival,
+    the TPU emits
+    `async_driver.cc:779] [/dev/vfio/2 tpu1:pe2:3] vf_id:0 !!!!
+    FATAL ERROR !!!! observed errors are: [USER]. Now taking a
+    TPU core dump...` — pure async-driver dump, no Python
+    traceback, engine actor dies. Subsequent requests 500.
+
+    Repro (after a fresh `vllm serve` with __call__ flipped):
+    ```bash
+    # First request — succeeds
+    curl -s --max-time 1500 \
+        http://127.0.0.1:18081/v1/completions \
+        -H "Content-Type: application/json" \
+        -d '{"model":"deepseek-ai/DeepSeek-V4-Flash",
+             "prompt":"The capital of France is",
+             "max_tokens":4,"temperature":0,"seed":0}'
+    # Second identical request — TPU [USER] FATAL within ~1s
+    ```
+
+    Same iter-5c log: `logs/full-slice-v4-smoke-20260430T143050Z.log`.
+
+  Hypotheses for the second-request crash (iter-5d's lane):
+    1. **kv_caches state leakage under JIT donation across
+       requests.** Request 1's last decode step writes packed
+       buffers into kv_caches. Request 2's prefill is supposed
+       to OVERWRITE these via the closed-form init's sparse
+       writes (slots not touched stay at the closed-form's
+       init values: zero or -inf), but under XLA's
+       `donate_argnums=2` the donated buffer is reused. If some
+       intermediate XLA pass reads-before-write on a slot that
+       was -inf or NaN-tainted from request 1, the bf16-cast
+       could surface a sentinel that triggers the TPU error.
+    2. **decode_start_pos meta_field stale across requests.**
+       The runner's `_maybe_set_v4_decode_start_pos` only sets
+       the field on the decode-shape branch and DOES NOT reset
+       it for prefill. If the same AttentionMetadata instance
+       is reused across requests (vs. freshly allocated per
+       request), request 2's prefill gets request 1's
+       last-decode `start_pos`. Even though `__call__`'s
+       `is_decode = (T==1) and (start_pos>0)` would still
+       correctly route a prefill (T=256, not 1) to the prefill
+       branch, the JIT cache key differs from request 1's
+       prefill (whose start_pos was 0) → fresh compile, possibly
+       triggering the TPU error.
+    3. **Buffer aliasing under iter-5c's doubled prefill.**
+       The decoupled prefill computes `h` AND `packed_buffers`
+       in the same JIT'd block. Under SPMD with `P()`-replicated
+       kv_caches output, XLA may decide to alias intermediate
+       buffers between the two sub-computations in a way that
+       interacts with the donated input on the second call.
+
+  Recommended iter-5d scope (in order of cheapness):
+    1. **Verify hypothesis 2** by adding a debug `jax.debug.print`
+       on `decode_start_pos` at __call__ entry. If non-zero on
+       request 2's prefill, fix tpu_runner's helper to reset
+       the field to 0 on the prefill branch.
+    2. **Verify hypothesis 1** by zeroing kv_caches BEFORE
+       request 2's prefill computation begins (instrument vLLM
+       runtime, or change orchestrator's prefill branch to
+       explicitly `jnp.zeros_like(kv_caches[i])` before the
+       sparse writes — just as a NaN-mitigation experiment).
+    3. **Verify hypothesis 3** by computing `transformer_body_forward`
+       FIRST in the orchestrator, materializing `h`, then
+       computing the state init in a SEPARATE JIT call.
+       (Probably overkill but bounds the search.)
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1409,6 +1495,30 @@ when the timeout SIGTERMs the iter.
   `IndivisibleError` on a 32-virtual-CPU mesh — JAX has no
   size-1-axis fallback. iter-5b uses replicated `P()` instead.
   ✓ helper + parity test, ✗ runtime allocation (iter-5b).
+* **Orchestrator path-A-h decoupling (S1 iter-5c)**:
+  `deepseek_v4_run_with_decode_state`'s prefill branch in
+  `models/jax/deepseek_v4.py` now computes `h` via
+  `transformer_body_forward` (path A — the green-gate baseline)
+  and packed_buffers via `transformer_body_init_state_to_buffer`
+  SEPARATELY; the orchestrator's own `h` from
+  init_state_to_buffer is discarded. Solves iter-5b's NaN
+  hypothesis (XLA reorders bf16 reductions when the closed-form
+  state-init's intermediate fp32 buffers feed the same scheduler
+  pass as the forward path). The forward `h` is now byte-equal
+  to `transformer_body_forward` BY CONSTRUCTION. Pinned by
+  `TestPackedDecodeStateBuffer` + `TestTransformerBodyDecodeRoundTrip`
+  + `TestPrefillToDecodeStateParity` (37 cases) on tiny config
+  CPU pytest. `/tmp/test_v4_iter5c_compile.py` confirms under
+  32-virtual-CPU mesh w/ replicated `P()` kv_caches: prefill
+  h diff vs path-A = 0.000002 (≪ 5e-3 budget); 32 identical
+  shards; all `h` finite. On real V4-Flash + `vllm serve`,
+  the FIRST `/v1/completions` returned 200 OK at 14:40:04
+  on 2026-04-30, indicating the prefill NaN regression is
+  fixed; the SECOND request triggered TPU `[USER]` FATAL —
+  see S1 iter-5c status above for the iter-5d hand-off.
+  ✓ orchestrator decoupling math + first-request prefill,
+  ✗ second-request stability (iter-5d to investigate before
+  re-flipping `__call__`).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream

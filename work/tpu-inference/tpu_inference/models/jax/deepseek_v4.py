@@ -1911,32 +1911,35 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5c: single-active-seq path threads packed
-                # `AttentionDecodeState` through `kv_caches`. The runner
-                # tags `attention_metadata.decode_start_pos` (Python-static
-                # meta_field) to N-1 on a decode step; default 0 = prefill.
-                # iter-5b flipped this to the orchestrator and produced NaN
-                # logits on real V4. iter-5c's orchestrator computes `h`
-                # via path A (`transformer_body_forward`) for forward
-                # output and uses the closed-form state init only for
-                # `kv_caches`, decoupling the forward reduction order
-                # from the state-init's intermediate allocations. See
-                # `deepseek_v4_run_with_decode_state` docstring.
-                start_pos = 0
-                if attention_metadata is not None:
-                    start_pos = int(getattr(
-                        attention_metadata, "decode_start_pos", 0))
-                T = int(ids_2d.shape[-1])
-                is_decode = (T == 1) and (start_pos > 0)
-                state_max_seq_len = v4_state_max_seq_len_from_vllm_config(
-                    self.vllm_config)
-                kv_caches, h = deepseek_v4_run_with_decode_state(
-                    kv_caches, ids_2d, params, freqs_swa, freqs_comp,
-                    self.config,
-                    state_max_seq_len=state_max_seq_len,
-                    is_decode_step=is_decode,
-                    start_pos=start_pos,
-                )
+                # S1 iter-5c (gated): the orchestrator was flipped here
+                # to thread packed `AttentionDecodeState` through
+                # `kv_caches`, and iter-5c's path-A-for-h decoupling
+                # (see `deepseek_v4_run_with_decode_state` docstring)
+                # made the FIRST `/v1/completions` curl return 200 OK
+                # on real V4-Flash (vs. iter-5b's NaN-logits). But a
+                # SECOND request immediately after triggered a TPU
+                # `[USER]` FATAL — engine death, observed
+                # 2026-04-30 14:40Z, log
+                # `logs/full-slice-v4-smoke-20260430T143050Z.log`.
+                # First-request prefill compile fingerprint
+                # `2588072356c02f4008a3c8aeec911c6d89821ccbd2b368f645edac6cfe32f938`,
+                # decode buckets compiled fresh per start_pos as
+                # designed. Second request hit TPU FATAL within ~1 s of
+                # `POST /v1/completions` arrival, no Python traceback
+                # — pure async-driver core dump.
+                #
+                # Until iter-5d (or later) diagnoses + fixes the
+                # second-request crash, __call__ stays on the pre-iter-5b
+                # path: `transformer_body_forward` for prefill (the
+                # green-gate baseline) and `kv_caches` passes through
+                # unchanged. The runtime infra from iter-5b
+                # (kv_cache_manager allocator, sharding override,
+                # decode_start_pos meta_field, runner tagging) and the
+                # iter-5c orchestrator decoupling stay landed —
+                # iter-5d's job is to flip __call__ once the
+                # second-request crash is resolved.
+                h = transformer_body_forward(
+                    ids_2d, params, freqs_swa, freqs_comp, self.config)
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,
