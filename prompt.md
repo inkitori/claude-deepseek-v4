@@ -80,6 +80,43 @@ This is the most common foot-gun in this repo.
 
 See CLAUDE.md "What's been optimized + verified" for the latest.
 
+## Top-priority known issue: `/v1/chat/completions` returns garbled text
+
+The Tier-8 deploy gate is GREEN for `/v1/completions` — it returns
+deterministic "Paris" reliably. **But `/v1/chat/completions` returns
+HTTP 200 with degenerate output** (e.g. `"Hey ofbodyre\n\nEste["` for
+`messages: [{role:"user",content:"hi"}]`). The model is correct;
+what's broken is the chat-template layer.
+
+**This is your #1 task right now.** See CLAUDE.md "Known issue:
+chat-completions returns garbled text" for the full diagnosis recipe
+(check `tokenizer.chat_template`, render it on a sample message, see
+if vllm's prompt formatting matches what V4-Flash was trained on).
+Most likely fix: pass `--chat-template <path-to-jinja>` to `vllm
+serve` via the smoke launcher. DeepSeek usually ships a template
+file in the HF repo; the gcsfuse-mounted snapshot dir is a good
+place to look first.
+
+Validation flow:
+
+1. Don't relaunch the full smoke unless you have to — `./run.sh serve`
+   is already up on port 18081 most of the time. Test
+   `/v1/chat/completions` directly:
+   ```bash
+   curl -sf http://localhost:18081/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":16,"temperature":0,"seed":0}'
+   ```
+   Expect coherent output mentioning "Paris" — not random tokens.
+2. `vllm chat --url http://localhost:18081/v1` should work once the
+   chat path is right (the connection-refused error users hit just
+   means they didn't pass `--url` and vllm chat tried the default
+   port 8000).
+
+Keep `/v1/completions` working — don't regress the smoke check.
+Add a chat-completions assertion to
+`scripts/full_slice_v4_smoke_check.sh` once you've verified the fix.
+
 ## Your job — primary objective
 
 **Make the first `/v1/completions` request after `./run.sh serve`

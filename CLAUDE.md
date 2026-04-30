@@ -150,8 +150,8 @@ launcher echoes the active values at startup so you can confirm.
 | `V4_LOADER_PLACE_WORKERS` | `8` | Threads driving `place_spec_as_jax_sharded` per host. Most per-tensor work releases the GIL (safetensors mmap reads + JAX C calls), so parallelism is real. Set to `1` for single-thread parity testing. |
 | `V4_LOADER_PREFETCH_WORKERS` | `0` | Thread-pool prefetch in the non-slice-aware iterator. Empirically didn't help on real V4 (placement is the bottleneck, not dequant). Knob retained for future work. |
 | `JAX_COMPILATION_CACHE_DIR` | `/tmp/jax-compile-cache-v4` | Local-disk persistent compile cache. Each host has its own; survives process restarts; lost if the worker host is rebuilt. **Not GCS** — the bucket the venv mounts is shared, do not write cache there without explicit user authorization. |
-| `JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES` | `0` | Cache even small modules (default 1 MB skips them). |
-| `JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
+| `JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES` | `0` | Cache even small modules. JAX 0.9 config name; `JAX_COMPILATION_CACHE_MIN_*` is silently ignored, leaving the cache empty. |
+| `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s drops everything except multi-second compiles — silently a no-op on the wrong env var name. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
 
@@ -259,6 +259,48 @@ Still loose ends worth tracking:
     cold-compile time is unchanged (~97 s). HLO instruction count
     is unchanged (47k optimized) — the savings were activation HBM,
     not graph size.
+
+## Known issue: chat-completions returns garbled text (chat-template missing/wrong)
+
+`/v1/completions` works deterministically — the smoke check exercises
+this path and it returns "Paris" reliably. **`/v1/chat/completions`
+returns HTTP 200 with degenerate text** (e.g. `"Hey ofbodyre\n\nEste["`
+for a simple `[{role:"user",content:"hi"}]` request). The model + math
+are correct (completions proves it); what's broken is the chat-template
+layer between the user's `messages: [...]` payload and the prompt
+string the model actually sees.
+
+`vllm chat` CLI separately needs `--url http://localhost:18081/v1`
+because the smoke launcher binds port 18081, not vllm's default 8000.
+A Connection-refused stacktrace from `vllm chat` means either the URL
+flag is missing, or the serve isn't fully up yet (load + compile take
+~5–10 min from `./run.sh serve`).
+
+**Next-agent task:** investigate the V4-Flash tokenizer's
+`chat_template`, fix or supply one. Probable diagnosis script:
+
+```bash
+work/vllm_env/bin/python -c "
+from transformers import AutoTokenizer
+t = AutoTokenizer.from_pretrained(
+    'deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
+print('chat_template:', repr(t.chat_template))
+print('---')
+print(t.apply_chat_template(
+    [{'role':'user','content':'hi'}],
+    tokenize=False, add_generation_prompt=True))
+"
+```
+
+If `chat_template is None`, vllm falls back to a generic format the
+model wasn't trained on → garbage. Fix is to pass `--chat-template
+<path-to-jinja>` to `vllm serve` (DeepSeek typically ships a template
+file in their HF repo) or to inline a template via vllm's
+`additional_config`. Math-side fix: nothing — the model is correct.
+
+Workaround that works right now: use `/v1/completions` with manually-
+formatted prompts (`User: hi\nAssistant: `). Smoke check uses this
+path successfully.
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
