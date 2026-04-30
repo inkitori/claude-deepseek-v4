@@ -1323,37 +1323,56 @@ config CPU pytest; `/tmp/test_v4_iter5c_compile.py` under
 32-virtual-CPU mesh confirms prefill `h` diff vs path-A =
 0.000002 (≪ 5e-3 budget).
 
-**Iter 5i lane (Bug B remediation, ordered by leverage):**
+**Iter 5i status (2026-04-30, log full-slice-v4-smoke-20260430T191721Z.log):
+option 1 RULED OUT — `lax.optimization_barrier(packed_buffers)` is
+optimized away by XLA. Bug B persists.**
 
-  1. **Add a second `lax.optimization_barrier` on
-     `packed_buffers`** after `_v4_constrain_packed_replicated`,
-     before return. Cheap to try. Hypothesis: forces
-     packed_buffers to fully materialize before the JIT
-     boundary's donated-buffer commit, preventing partial
-     overwrite of the donated buffer that lets prior bytes
-     leak through. Costs nothing if XLA already evaluates
-     them in full.
+iter-5i tested option 1 from the iter-5h lane: add
+`packed_buffers = list(lax.optimization_barrier(tuple(packed_buffers)))`
+after `_v4_constrain_packed_replicated`, just before return.
+Hypothesis: force packed_buffers to fully materialize before
+the JIT boundary's donated-buffer commit. Implementation: 1
+line of code, tiny-config tests pass (124s wall on
+`TestPackedDecodeStateBuffer`, virtual-mesh probe still
+0.000002 vs path-A).
 
-  2. **Audit `_layer_packed_size` vs `_pack_layer_state`'s
+Real V4-Flash smoke (V4_DECODE_STATE=1, no DIAG):
+  * `Initial HLO module: jit_run_model instructions: 81,693`
+    (vs iter-5h's 81,648 — barrier added 45 instructions to
+    pre-optimization HLO).
+  * `(HLO module jit_run_model): Executable fingerprint:
+    ecd7cb3b67d38659edfe6eeeaa9e482c970672ced02a101b16fc78727378aacb`
+    — IDENTICAL to iter-5h's executable fingerprint. XLA's
+    optimization pipeline absorbs the barrier; the final
+    binary is the same.
+  * R1: ` Paris, France\n\n# Paris, France`
+  * R2: ` Paris, Paris, 2020`
+  * smoke_check FAIL on byte-equality.
+
+Conclusion: optimization_barrier on a value that's only used
+as a return value (not consumed by another compute) is a
+no-op for XLA — there's nothing for the barrier to "prevent
+fusion across" because nothing consumes the buffer
+downstream within the JIT. The text variance between iter-5h
+and iter-5i smokes is environmental (kv_caches contents at
+R1-entry vary across boots, e.g. due to vLLM's `capture_model`
+pre-compile pass writing into the buffers before the first
+real request).
+
+iter-5i's code change reverted at the source. Documented as
+ruled-out below; iter-5j skips this option.
+
+**Iter 5j lane (Bug B remediation, ordered by leverage):**
+
+  1. **Audit `_layer_packed_size` vs `_pack_layer_state`'s
      actual output size on real V4-Flash layer 0.** A size
      mismatch (placeholder field whose actual shape doesn't
      match the layout's predicted shape) would explain why
      the donated buffer has bytes that packed_buffers never
-     writes.
+     writes. Cheap if real-V4 layer 0 can be size-checked
+     statically; otherwise an `assert` injected at startup.
 
-  3. **For Bug B, take iter-5g lane option 4** (separate
-     prefill JIT that doesn't take kv_caches as input). With
-     no kv_caches input, donation can't apply and the compute
-     can't depend on prior contents. Touches `model_loader.py`
-     `run_model` JIT signature — minimum-delta now violated
-     because Bug B confirms the donation-reuse mechanism.
-     Pre-spec the change as: branch on `is_decode_step` AT
-     THE PYTHON LEVEL in `__call__`, dispatch to two separate
-     jit'd functions (`run_prefill_no_kv` and `run_decode_with_kv`).
-     Prefill returns kv_caches as a fresh allocation; decode
-     accepts donated kv_caches as before.
-
-  4. **Diagnostic option.** Run another smoke with
+  2. **Diagnostic option.** Run another smoke with
      `V4_DECODE_STATE_DIAG=1` to capture R1 and R2 prefill
      entry/exit sums under iter-5h's barrier+constraint. With
      Bug A fixed and the FATAL gone, the prints can land
@@ -1362,10 +1381,25 @@ config CPU pytest; `/tmp/test_v4_iter5c_compile.py` under
      the buffer-bleed channel is in the JIT-boundary write,
      not in the orchestrator's compute (favoring fix 3).
 
-iter-5h's progress: Bug A is dead. The decode-state path now
-produces the right first token on real V4-Flash, the engine
-is stable, and the 4th-token divergence is a smaller surface
-for iter-5i to attack than iter-5g's full divergence.
+  3. **Separate prefill JIT that doesn't take kv_caches as
+     input** (iter-5g lane option 4 — preserved here as the
+     escape hatch). With no kv_caches input, donation can't
+     apply and the compute can't depend on prior contents.
+     Touches `model_loader.py` `run_model` JIT signature —
+     violates minimum-delta but Bug B confirms the donation-
+     reuse mechanism is the root cause. Pre-spec: branch on
+     `is_decode_step` at the Python level in `__call__`,
+     dispatch to two jit'd functions (`run_prefill_no_kv`
+     and `run_decode_with_kv`). Prefill returns kv_caches as
+     a fresh allocation; decode accepts donated kv_caches as
+     before. Reach for this if (1) and (2) don't close the
+     gap.
+
+iter-5i's progress: ruled out a cheap "barrier on output"
+approach. iter-5j should start with the layout-size audit
+(option 1) and the diagnostic (option 2), and reach for the
+separate-prefill-JIT (option 3) only if (1) and (2) don't
+close the gap. Bug A stays fixed (iter-5h's barrier on `h`).
 
 S1 still unlocks A1 (lift `max-model-len`), B1 (sparse_attn
 Pallas becomes worthwhile), and S5 (MTP speculative decoding
