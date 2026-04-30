@@ -70,6 +70,16 @@
 #       this likely sequentializes, but the choices array must still have
 #       length n. Same prefill bucket. Exit 12 on missing/short choices /
 #       empty text / curl failure.
+#   LONG_GEN_REQUIRED=1 — fires a /v1/completions probe with max_tokens=64
+#       on a long-answer-eliciting prompt and asserts the response is
+#       sustained-coherent: (a) completion_tokens >= 30, (b) no word repeats
+#       5+ times in a row (token-loop detector), (c) the last 5 characters
+#       of the stripped text contain >= 2 alphanumerics (rejects `....`
+#       endings + trailing whitespace). Pins S8: the basic Paris gate only
+#       validates ~2-3 tokens; this is the minimum sustained-generation
+#       check. Logs observed tok/s (completion_tokens / wall_clock).
+#       Exit 13 on short / repetition-loop / degenerate-ending / curl
+#       failure. Override: LONG_GEN_MAX_TOKENS (default 64).
 #
 # Usage:
 #   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
@@ -83,6 +93,7 @@
 #   TOPK_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken top-k path
 #   PRESENCE_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken presence-penalty path
 #   N_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh            # fail on broken n>1 (multi-choice) path
+#   LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail if generation degenerates past ~30 tokens
 
 set -euo pipefail
 
@@ -110,6 +121,7 @@ LOGPROBS_REQUIRED="${LOGPROBS_REQUIRED:-0}"
 TOPK_REQUIRED="${TOPK_REQUIRED:-0}"
 PRESENCE_REQUIRED="${PRESENCE_REQUIRED:-0}"
 N_REQUIRED="${N_REQUIRED:-0}"
+LONG_GEN_REQUIRED="${LONG_GEN_REQUIRED:-0}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -253,6 +265,18 @@ fire_completion_n() {
               "$MODEL" "$PROMPT" "$MAX_TOK")"
 }
 
+# Long-generation probe: longer max_tokens with a long-answer-eliciting prompt.
+# Same prefill bucket as the basic completion (prompt + max_tokens fits in 256
+# at smoke-launcher MAX_LEN default) so no extra compile.
+fire_completion_long_gen() {
+    local max_tokens="${LONG_GEN_MAX_TOKENS:-64}"
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0,"seed":%d}' \
+              "$MODEL" "Tell me a short story about a robot exploring Mars:" \
+              "$max_tokens" "$SEED")"
+}
+
 extract_text() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['text'])"
 }
@@ -355,6 +379,37 @@ n = len(ch)
 ne = sum(1 for c in ch if (c.get('text') or '').strip())
 print(n)
 print(ne)
+"
+}
+
+# Print three lines: completion_tokens (from usage), max-word-run (longest
+# streak of identical adjacent space-split words; 1 = no repetition), and
+# ends_clean (1 if the last 5 chars of the stripped text contain >= 2
+# alphanumerics, 0 otherwise — rejects `....` / pure-whitespace endings).
+extract_long_gen_metrics() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = (d.get('choices') or [{}])[0]
+text = c.get('text') or ''
+usage = d.get('usage') or {}
+ct = int(usage.get('completion_tokens') or 0)
+stripped = text.strip()
+words = stripped.split()
+max_run = 1 if words else 0
+cur = 1
+for i in range(1, len(words)):
+    if words[i] == words[i-1]:
+        cur += 1
+        if cur > max_run:
+            max_run = cur
+    else:
+        cur = 1
+tail = stripped[-5:] if len(stripped) >= 5 else stripped
+alnum = sum(1 for ch in tail if ch.isalnum())
+print(ct)
+print(max_run)
+print(1 if alnum >= 2 else 0)
 "
 }
 
@@ -605,6 +660,37 @@ main() {
         else
             echo "[smoke-check] FAIL: n=2 probe failed (curl non-zero, N_REQUIRED=1)" >&2
             exit 12
+        fi
+    fi
+
+    if [ "$LONG_GEN_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions long-generation probe (LONG_GEN_REQUIRED=1)"
+        LG_T0=$(date +%s%N)
+        if RLG="$(fire_completion_long_gen 2>/dev/null)"; then
+            LG_T1=$(date +%s%N)
+            LG_ELAPSED_MS=$(( (LG_T1 - LG_T0) / 1000000 ))
+            mapfile -t LGM < <(printf '%s' "$RLG" | extract_long_gen_metrics 2>/dev/null || printf '0\n0\n0\n')
+            LG_TOK="${LGM[0]:-0}"
+            LG_RUN="${LGM[1]:-0}"
+            LG_CLEAN="${LGM[2]:-0}"
+            LG_TPS=$(awk "BEGIN { printf \"%.2f\", ${LG_TOK:-0} * 1000 / (${LG_ELAPSED_MS:-1} > 0 ? ${LG_ELAPSED_MS:-1} : 1) }")
+            echo "[smoke-check] long-gen completion_tokens=$LG_TOK wall_ms=$LG_ELAPSED_MS observed_tps=$LG_TPS max_word_run=$LG_RUN ends_clean=$LG_CLEAN"
+            if [ "${LG_TOK:-0}" -lt 30 ]; then
+                echo "[smoke-check] FAIL: long-gen probe produced only $LG_TOK tokens, expected >=30 (LONG_GEN_REQUIRED=1)" >&2
+                echo "[smoke-check]       sustained generation under-produced — possible premature stop / flat-logits regime." >&2
+                exit 13
+            fi
+            if [ "${LG_RUN:-0}" -ge 5 ]; then
+                echo "[smoke-check] FAIL: long-gen probe shows token-repetition loop (max_word_run=$LG_RUN >= 5) (LONG_GEN_REQUIRED=1)" >&2
+                exit 13
+            fi
+            if [ "${LG_CLEAN:-0}" = "0" ]; then
+                echo "[smoke-check] FAIL: long-gen probe ended on pure punctuation/whitespace (LONG_GEN_REQUIRED=1)" >&2
+                exit 13
+            fi
+        else
+            echo "[smoke-check] FAIL: long-gen probe failed (curl non-zero, LONG_GEN_REQUIRED=1)" >&2
+            exit 13
         fi
     fi
 

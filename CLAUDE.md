@@ -196,6 +196,7 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `TOPK_REQUIRED` | `0` | `temperature=0.7, top_k=10`; exit 10 on empty/invalid. Pins S6. |
 | `PRESENCE_REQUIRED` | `0` | `temperature=0.7, presence_penalty=0.5`; exit 11 on empty/invalid. Pins S6. |
 | `N_REQUIRED` | `0` | `n=2`; exit 12 if fewer than 2 non-empty choices. Pins S6. Under `--max-num-seqs=1` likely sequentializes but cardinality must equal n. |
+| `LONG_GEN_REQUIRED` | `0` | `max_tokens=64` long-answer probe; exit 13 if `completion_tokens<30`, any word repeats 5+ times in a row, or trailing 5 chars contain <2 alphanumerics. Pins S8. Logs observed tok/s. Override via `LONG_GEN_MAX_TOKENS`. |
 
 ## Production-readiness backlog
 
@@ -327,6 +328,41 @@ Still TODO: latency-budget probe (TTFT / ITL thresholds, gated
 behind `STREAMING_LATENCY_REQUIRED=1`). OpenRouter-style
 clients default to streaming, so latency-on-streaming is the
 production metric users feel.
+
+#### S8. Sustained-generation probe — minimum check past the Paris gate
+
+The basic smoke validates "deterministic ` Paris`" — 2-3 generated
+tokens. The longest verified output across all probes is the
+reasoning probe at len=2 ("We"). A degenerate-output bug (token-
+repetition loop, premature stop, flat-logits regime kicking in
+after token N, MoE expert collapse mid-generation) silently passes
+today's gate. Tier S because "outputs garbage on token 6" is a
+silent correctness bomb in exactly the shape S3's thinking-mode
+bug was.
+
+C1 (lm-eval-harness) and C2 (long-context functional) are the
+honest "we serve V4-Flash" gates but defer to Tier C until S2
+unblocks tractable wall-clock. **S8 is the *minimum* sustained-
+generation check that should run on every smoke.**
+
+Probe (gated `LONG_GEN_REQUIRED=1`, exit 13):
+* `/v1/completions`, prompt `"Tell me a short story about a robot
+  exploring Mars:"`, `max_tokens=64`, `temperature=0`, `seed=0`.
+  Same prefill bucket as the basic completions probe (no extra
+  compile).
+* Wall-clock from request to response; log
+  `observed_tps = completion_tokens / wall_clock_s`.
+* Assert: `completion_tokens >= 30`, no word repeated 5+ times in
+  a row (token-loop detector), trailing 5 chars of stripped text
+  contain ≥2 alphanumerics (rejects `....` endings + trailing
+  whitespace).
+
+Future S8 extensions (file under same item):
+* `MULTI_TURN_REQUIRED=1`: 2-turn chat, assert turn 2 is coherent
+  given turn 1's response, no engine state leak between turns.
+* `LONG_PROMPT_REQUIRED=1`: 2k-prompt completion (separate from
+  C2's 4k-1M sweep). Smaller, faster gate that catches the
+  prompt-bucket-2 path.
 
 ### Tier A — production-deployment infra (model is correct but infra isn't)
 
