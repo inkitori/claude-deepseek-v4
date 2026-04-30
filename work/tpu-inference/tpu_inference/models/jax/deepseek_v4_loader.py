@@ -428,34 +428,20 @@ def apply_weights_to_param_tree(
     return params
 
 
-# ------------------------------------------------------------
 # Streaming + sharded loader (production path for v6e-32 / TP=32).
-#
-# `load_v4_safetensors_to_dict` above buffers every dequantized weight in CPU
-# RAM and then materializes the full tree on TPU device — that approach
-# transient-doubles HBM and OOMs at the v6e-32 chip budget. The streaming
-# path below yields one dequantized torch tensor at a time so the caller can
-# place it directly onto a sharded global jax.Array and free the CPU buffer
-# before reading the next safetensors entry.
-# ------------------------------------------------------------
+# Yields one dequantized tensor at a time so the caller can place it directly
+# onto a sharded global jax.Array and free the CPU buffer before reading the
+# next safetensors entry. Avoids the transient-double-HBM OOM of the
+# buffer-everything path above.
 
 
 def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
-    """Convert a CPU torch tensor to a numpy array of the same dtype + shape.
+    """Convert a CPU torch tensor to a numpy array preserving dtype + shape.
 
-    For torch dtypes that numpy doesn't natively support (bfloat16,
-    float8_e4m3fn, float8_e8m0fnu) we go through an integer raw-view bridge
-    and immediately re-view the resulting buffer to the matching `ml_dtypes`
-    dtype. The end result is a numpy array semantically equal to the torch
-    tensor — shape preserved, dtype preserved (or its ml_dtypes equivalent).
-
-    The previous implementation returned an integer-typed numpy buffer and
-    relied on the caller doing a `.view(target_dtype)` later; that was
-    correct only when the caller's target dtype had the same itemsize as
-    the source. For bf16 -> fp32 (e.g. a norm stored bf16 on disk but with
-    an fp32 abstract leaf), the byte-view halved the array's logical
-    length. Doing the conversion semantically here makes the caller's
-    `.astype(target)` always shape-preserving.
+    Routes bf16 / fp8_e4m3fn through `ml_dtypes` (numpy doesn't support them
+    natively). Caller's `.astype(target)` is always shape-preserving — this
+    is why we re-view to the ml_dtypes equivalent here rather than yielding
+    a raw uint buffer.
     """
     if not t.is_contiguous():
         t = t.contiguous()
@@ -473,13 +459,9 @@ def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
     return t.numpy()
 
 
-# Tensors below this many elements get replicated rather than sharded. The
-# per-chip HBM saving from sharding 8 KB across 32 chips (256 B saved/chip) is
-# dwarfed by the per-step reshard cost when the consumer wants a different
-# layout — `compressor.ape` ((128,16) f32) was the canonical case, eating 126
-# `Involuntary full rematerialization` warnings during `jit_run_model`
-# compile. Everything larger (norm weights up at hidden_size=4096 or so are
-# the borderline; layer weights are MB-scale) keeps the sharded path.
+# Replicate tensors below this size — per-step reshard cost when the consumer
+# wants a different layout dwarfs the per-chip HBM saving from sharding small
+# leaves (norm weights, hc mix tables).
 _MIN_SHARD_ELEMENTS = 8 * 1024
 
 
@@ -739,26 +721,16 @@ def iter_v4_safetensors_dequant_torch(
                         yield fut.result()
 
 
-# ============================================================
-# Slice-aware loader (each host reads only the rows it owns)
-# ============================================================
-#
-# Motivation: in the v6e-32 deploy, every host independently dequantizes the
-# full 543 GB V4-Flash bf16 expansion even though each host only places 1/8
-# of the rows into its local devices' HBM. That's 8× redundant CPU dequant
-# AND 8× redundant PCIe pressure. The slice-aware path computes each host's
-# row range up front, reads only those bytes from the safetensors mmap, and
-# dequants only those rows. The output is byte-identical to the full path
-# (per-row dequant for fp4/fp8/bf16).
+# Slice-aware loader: each host reads + dequants only the rows its local
+# devices own (vs the full-tree path above where every host did all 8×).
+# Output is byte-identical to the full path.
 #
 # Constraints handled:
-#   * fp8 scale shape is [out/block, in/block] (block=128 in real V4): we
-#     align the host row range to block boundaries on read and trim after.
-#   * fp4 scale shape is [out, in/fp4_block]: row sharding maps directly.
-#   * non-axis-0 sharding (rare for V4): falls back to full-tensor read.
-#   * mesh=None or fully-replicated (norms, biases): full-tensor read on
-#     every host, same as the old path (these leaves are tiny).
-# ------------------------------------------------------------
+#   * fp8 scale shape [out/block, in/block]: align host row range to block
+#     boundaries on read, trim after.
+#   * fp4 scale shape [out, in/fp4_block]: row sharding maps directly.
+#   * non-axis-0 sharding: falls back to full-tensor read.
+#   * mesh=None / fully-replicated leaves: full-tensor read (tiny).
 
 
 @dataclasses.dataclass(frozen=True)

@@ -371,6 +371,36 @@ production metric users feel.
   non-root systemd unit.
 * **A6.** Single slice — no horizontal scale. Multi-slice
   needs model-aware load balancer with sticky sessions.
+* **A7.** Prefix caching disabled. `Prefix cache hit rate:
+  0.0%` in every smoke log. vLLM's `--enable-prefix-caching`
+  hasn't been verified compatible with V4's dual-buffer KV
+  (SWA circular buffer + compressor pool) — INVARIANTS I34
+  notes V4's per-layer state lives in the params tree, not
+  vllm's `kv_caches`. 5–10× throughput win for OpenRouter-
+  style chat with shared system prompts if the integration
+  works.
+* **A8.** Cancellation propagation unverified. Client
+  TCP-disconnects mid-stream may leak compute (JAX/TPU async
+  dispatch keeps running the orphaned request). Add an
+  end-to-end probe + verify vLLM's request cancellation is
+  wired through to the JAX scheduler.
+* **A9.** No `/health` vs `/ready` distinction. K8s rolling
+  updates would route traffic to a server still in cold
+  compile. Split: `/health` = process alive (responds during
+  compile); `/ready` = warm-cache populated + first-curl
+  succeeded.
+* **A10.** No server-side request caps. `max_tokens`, prompt
+  length, payload size, tool-call depth, `n` are unvalidated
+  beyond vLLM's defaults — runaway / malicious clients can
+  starve the queue or trigger fresh-compile storms (per-
+  position decode JIT cache miss, see S1 residual).
+* **A11.** No worker-host weight-divergence detection. Cache-
+  fingerprint finding showed 8 distinct sha256s for "the
+  same" compile cache entry — that's *expected* (SPMD compiles
+  host-specific binaries). What's *not* checked: bf16 weight
+  bytes per host. Silent gcsfuse fault / partial mmap on one
+  host = silently wrong output on 1/8 of devices, no alarm.
+  Hash-and-compare at engine init.
 
 ### Tier B — known performance work
 
@@ -422,6 +452,9 @@ production metric users feel.
 * **D1.** `tests/models/jax/test_deepseek_v4.py` is 2904 LOC,
   29 test classes (~4× peer models). Per-class audit needed
   for further consolidation; cheap wins are taken.
+* **D2.** No log rotation. `logs/full-slice-v4-smoke-*.log`
+  accumulates ~1–2 MB per smoke run on the head host. Add a
+  retention policy or pipe through `logrotate`.
 
 ## Iteration discipline
 
