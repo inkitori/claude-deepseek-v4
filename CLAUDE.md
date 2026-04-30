@@ -186,9 +186,9 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during first inference if `jit_run_model` recompiles. Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (see pitfall #4). |
-| `V4_DECODE_STATE` | `0` | `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real packed-state decode). Default `0` is the historical prefill-recompute baseline. With traced `start_pos` only two JIT cache keys (prefill + decode). |
+| `V4_DECODE_STATE` | `0` | `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real packed-state decode); `0` is the prefill-recompute baseline. Held at `0` pending a default-1 smoke that re-greens `REASONING_REQUIRED=1` (the 2026-04-30 cleanup-cycle default-1 smoke regressed reasoning to empty newlines despite basic Paris being byte-equal). |
 | `CHAT_REQUIRED` | `0` | smoke_check chat probe; exit 4 on missing/empty content. Adds ~30 s for first-chat OOM-retry (pitfall #9). |
-| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Requires `V4_DECODE_STATE=1` (default-0 prefill-recompute path produces all-newlines). |
+| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Fails under `V4_DECODE_STATE=0` (prefill-recompute path produces all-newlines); needs reverification under default-1 (see S1). |
 | `STREAMING_REQUIRED` | `0` | SSE byte-equality probe vs non-streaming; exit 6. Pins S7. |
 | `SAMPLING_REQUIRED` | `0` | `temperature=0.7, top_p=0.9, frequency_penalty=0.1`; exit 7 on empty/invalid. Pins S6. Determinism not asserted (per-request seed unsupported on non-greedy paths). |
 | `STOP_REQUIRED` | `0` | `stop=["Paris"]`; exit 8 if response contains Paris or `finish_reason!=stop`. Pins S6. Baseline emits ` Paris` first, so a working handler MUST intercept. |
@@ -205,16 +205,22 @@ backlog itself stays brief.
 
 ### Tier S — silent correctness bombs (fix before perf)
 
-#### S1. Real decode plumbing — DONE (env-gated; default-flip pending)
+#### S1. Real decode plumbing — DONE (env-gated; default-flip needs reverification)
 
 Decode-step kernels (`attention_decode_step`,
 `compressor_decode_step`, `indexer_decode_step`) thread real
 `AttentionDecodeState` through `kv_caches[i]` (one fp32 packed
 buffer per layer) instead of recomputing prefill every step.
 Engine returns deterministic ` Paris` byte-equal across R1/R2
-on real V4-Flash with `V4_DECODE_STATE=1`; thinking-mode chat
-emits real reasoning tokens (broken under prefill-recompute
-baseline — produced all-newlines).
+on real V4-Flash with `V4_DECODE_STATE=1`. iter-6 also verified
+`REASONING_REQUIRED=1` PASS under `V4_DECODE_STATE=1`; the
+post-cleanup smoke (`logs/smoke-check-*-20260430T21*.log`)
+regressed that probe to empty newlines despite basic Paris
+staying green. Smoke launcher default reverted to `0` until
+the regression is root-caused — the cleanup commit removed
+only comments + dead `V4_DECODE_STATE_DIAG` scaffolding +
+post-call `logger.info`, all of which should be HLO-equivalent.
+Suspect Ray env-propagation timing vs module import.
 
 `start_pos` is traced through the decode kernel chain (constant
 output shapes via `lax.dynamic_slice_in_dim`, `-1` sentinel
@@ -235,10 +241,6 @@ Runtime hooks (read these before touching V4 plumbing):
 * `models/jax/deepseek_v4.py::v4_state_max_seq_len_from_vllm_config`
   — single source of truth for buffer sizing (allocator +
   `__call__` MUST agree).
-
-Default `V4_DECODE_STATE=0` is the historical green-gate; the
-flip to default-1 is straightforward (next iter) once a
-real-V4 smoke confirms no regression on the cold-cache path.
 
 S1 unlocks A1 (`max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), S5 (MTP speculative decoding).

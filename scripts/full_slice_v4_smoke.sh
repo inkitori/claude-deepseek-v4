@@ -116,7 +116,10 @@ export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_PERSISTENT_CACHE_MIN_ENT
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 
 # 1 routes __call__ through deepseek_v4_run_with_decode_state (real packed-
-# state decode); 0 keeps the prefill-recompute baseline.
+# state decode); 0 keeps the prefill-recompute baseline. Held at 0 until a
+# default-1 smoke can re-verify REASONING_REQUIRED=1 (under default-1 the
+# 2026-04-30 cleanup-cycle smoke regressed reasoning to empty newlines —
+# basic completion gate stays green either way).
 export V4_DECODE_STATE="${V4_DECODE_STATE:-0}"
 
 # Forward these to Ray workers (vLLM only carries over a curated env-var
