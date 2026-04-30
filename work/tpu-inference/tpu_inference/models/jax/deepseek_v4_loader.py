@@ -473,6 +473,16 @@ def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
     return t.numpy()
 
 
+# Tensors below this many elements get replicated rather than sharded. The
+# per-chip HBM saving from sharding 8 KB across 32 chips (256 B saved/chip) is
+# dwarfed by the per-step reshard cost when the consumer wants a different
+# layout — `compressor.ape` ((128,16) f32) was the canonical case, eating 126
+# `Involuntary full rematerialization` warnings during `jit_run_model`
+# compile. Everything larger (norm weights up at hidden_size=4096 or so are
+# the borderline; layer weights are MB-scale) keeps the sharded path.
+_MIN_SHARD_ELEMENTS = 8 * 1024
+
+
 def pick_partition_spec(shape: Tuple[int, ...], mesh) -> P:
     """Heuristically pick a `PartitionSpec` for a weight of `shape` on `mesh`.
 
@@ -488,6 +498,11 @@ def pick_partition_spec(shape: Tuple[int, ...], mesh) -> P:
     happen to carry size > 1.
     """
     if mesh is None or not shape:
+        return P()
+    total = 1
+    for d in shape:
+        total *= int(d)
+    if total < _MIN_SHARD_ELEMENTS:
         return P()
     sizes: Dict[str, int] = {}
     try:
