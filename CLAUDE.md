@@ -212,6 +212,7 @@ launcher echoes the active values at startup so you can confirm.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s skips small inits (`jit_sample`, etc.). |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
+| `V4_DECODE_STATE` | `0` | S1 iter-5d gate. `1` flips the model's `__call__` from the green-gate baseline (`transformer_body_forward`, every step recomputes prefill on the full prompt+generated context) to the iter-5c orchestrator (`deepseek_v4_run_with_decode_state`, threaded through `kv_caches` for real O(1)/step decode). Default `0` preserves the green gate. The flip path was end-to-end tested on real V4-Flash 2026-04-30 14:40Z and made the FIRST `/v1/completions` curl return 200 OK, but a SECOND request triggered a TPU `[USER]` FATAL ~13 s after request 1 completed (engine idle in between) — see CLAUDE.md S1 for repro + hypotheses. The env-gated checkpoint lets future iters test fixes by toggling this flag without re-doing the architecture work. When `1`, every JIT trace-time entry to `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)` so the smoke log correlates compile fingerprints to argument shapes. Forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. |
 | `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
 | `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
 | `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
@@ -804,6 +805,80 @@ crashes the engine on the second request (real V4 `vllm serve`,
        FIRST in the orchestrator, materializing `h`, then
        computing the state init in a SEPARATE JIT call.
        (Probably overkill but bounds the search.)
+
+**Iter 5d status (2026-04-30): hypothesis 2 RULED OUT;
+flip is now env-gated behind `V4_DECODE_STATE`; default smoke
+stays green; future iters can test fixes by toggling the
+env var.**
+
+What landed in iter-5d:
+  * **Hypothesis 2 ruled out by code reading**:
+    `tpu_runner.py:1634` constructs a fresh `AttentionMetadata`
+    on every scheduler step (every call to `build_attn`). The
+    dataclass field `decode_start_pos: int = 0` defaults to 0
+    on each new instance. The runner's
+    `_maybe_set_v4_decode_start_pos` helper only mutates the
+    field on the decode-shape branch (q0==1 && s0>1); request
+    2's prefill (q0=N, fresh AttentionMetadata) inherits the
+    default 0, NOT request 1's last-decode value. So
+    hypothesis 2 ("stale decode_start_pos carries over from
+    request 1") is dead — the field is reset to 0 by virtue
+    of fresh allocation, no helper change needed.
+
+  * **`__call__` flip is env-gated behind `V4_DECODE_STATE=1`**.
+    Module-level constant
+    `V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE",
+    "0") == "1"` (read at module import). When `1`, __call__
+    routes through `deepseek_v4_run_with_decode_state` (the
+    iter-5c orchestrator) and threads packed
+    `AttentionDecodeState` through `kv_caches`. When `0`, the
+    legacy green-gate path (`transformer_body_forward`, kv_caches
+    passes through unchanged) is unchanged. The env var is
+    forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`
+    and echoed at smoke startup.
+
+  * **Diagnostic logging** at __call__ entry when flip is
+    active: a Python `logger.info` line per JIT trace records
+    `(call_idx, T, start_pos, is_decode, state_max_seq_len,
+    kv_caches_count)`. Since `__call__` runs at JIT trace time
+    only (the function is wrapped by `@jax.jit run_model` in
+    `models/common/model_loader.py:344`), the log fires per
+    fresh JIT cache key — i.e. once per unique
+    (start_pos, is_decode) combination. A request 2 prefill
+    that hits the cached request-1-prefill kernel won't log,
+    which itself is signal: if the FATAL still fires on a cache
+    hit, the bug is in the COMPILED ARTIFACT (likely
+    hypothesis 1 or 3), not in trace-time argument shapes.
+
+  * Pinned by the existing 37-test iter-5 suite
+    (`TestPackedDecodeStateBuffer` + `TestPrefillToDecodeStateParity`
+    + `TestTransformerBodyDecodeRoundTrip`): all pass on tiny
+    config CPU pytest unchanged from iter-5c (172 s wall).
+    Default `V4_DECODE_STATE=0` exercises only the legacy
+    `transformer_body_forward` path, identical bytewise to
+    pre-iter-5d behaviour.
+
+What is NOT yet done in iter-5d:
+  * Real-V4 smoke with `V4_DECODE_STATE=1` was **not** run
+    this iter — the iter ran out of budget after the env-gate
+    + diagnostic landed. The next iter (5e) should:
+      1. Set `V4_DECODE_STATE=1` in the smoke launcher (one
+         env edit, no code change), run the smoke, capture the
+         log.
+      2. Read the `[V4_DECODE_STATE] __call__ #N: …` log lines
+         at trace boundaries — this gives a list of unique
+         (start_pos, is_decode) seen.
+      3. Cross-reference against the compile fingerprints in
+         the smoke log. If the FATAL fingerprint matches a
+         compile from request 1 (cache hit on request 2), the
+         bug is in the compiled artifact's runtime behavior on
+         a re-execution — pursue hypothesis 1 (donation reuse)
+         or 3 (buffer aliasing). If the FATAL fires during a
+         FRESH trace from request 2's prefill, that's a new
+         JIT cache miss path that didn't exist in iter-5c's
+         smoke — pursue from there.
+  * Either way, the iter-5d checkpoint makes the next test
+    cheap: one env-var flip away from running on real V4.
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1519,6 +1594,31 @@ when the timeout SIGTERMs the iter.
   ✓ orchestrator decoupling math + first-request prefill,
   ✗ second-request stability (iter-5d to investigate before
   re-flipping `__call__`).
+* **`__call__` flip env-gated + diagnostic logging (S1
+  iter-5d)**: `models/jax/deepseek_v4.py` now reads
+  `V4_DECODE_STATE` once at module import into
+  `V4_DECODE_STATE_ENABLED`. Default `0` keeps the legacy
+  green-gate path (`transformer_body_forward`, kv_caches
+  passes through unchanged). `1` routes through the iter-5c
+  orchestrator (`deepseek_v4_run_with_decode_state`). When
+  enabled, every JIT-trace entry to __call__ logs `(call_idx,
+  T, start_pos, is_decode, state_max_seq_len, kv_caches_count)`
+  — a Python `logger.info` line that fires per fresh JIT
+  cache key (so a request-2 prefill that hits the cached
+  request-1 prefill kernel produces NO log, which is itself
+  signal). Wired through `scripts/full_slice_v4_smoke.sh` via
+  `V4_DECODE_STATE` in `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY` and
+  echoed at smoke startup. Hypothesis 2 ("stale
+  decode_start_pos meta_field across requests") was ruled out
+  by code reading: `tpu_runner.py:1634` constructs a fresh
+  `AttentionMetadata` every scheduler step, so
+  `decode_start_pos` is reset to 0 by virtue of fresh
+  allocation. Pinned by the existing 37-case iter-5 suite —
+  default `V4_DECODE_STATE=0` is bytewise identical to
+  iter-5c's behaviour. ✓ env-gating + diagnostic + tests
+  green; ✗ real-V4 smoke with `V4_DECODE_STATE=1` not yet
+  run this iter (next iter 5e flips the smoke env to test
+  hypothesis 1 / 3).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream

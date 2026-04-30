@@ -49,6 +49,18 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
 from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
     ExpertParams, GateParams, MoEParams, gate_forward, moe_forward,
 )
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
+
+# S1 iter-5d gating. When `V4_DECODE_STATE=1`, the production __call__ flips
+# from the green-gate baseline (`transformer_body_forward`, every step
+# recomputes prefill on the full prompt+generated context) to the iter-5c
+# orchestrator path (`deepseek_v4_run_with_decode_state`, threaded through
+# `kv_caches`). Default OFF so the green gate stays green; flip to 1 in
+# the smoke launcher to test fixes for the iter-5c second-request TPU
+# `[USER]` FATAL (see CLAUDE.md S1).
+V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE", "0") == "1"
 
 
 # ------------------------------------------------------------
@@ -1911,35 +1923,49 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5c (gated): the orchestrator was flipped here
-                # to thread packed `AttentionDecodeState` through
-                # `kv_caches`, and iter-5c's path-A-for-h decoupling
-                # (see `deepseek_v4_run_with_decode_state` docstring)
-                # made the FIRST `/v1/completions` curl return 200 OK
-                # on real V4-Flash (vs. iter-5b's NaN-logits). But a
-                # SECOND request immediately after triggered a TPU
-                # `[USER]` FATAL — engine death, observed
-                # 2026-04-30 14:40Z, log
-                # `logs/full-slice-v4-smoke-20260430T143050Z.log`.
-                # First-request prefill compile fingerprint
-                # `2588072356c02f4008a3c8aeec911c6d89821ccbd2b368f645edac6cfe32f938`,
-                # decode buckets compiled fresh per start_pos as
-                # designed. Second request hit TPU FATAL within ~1 s of
-                # `POST /v1/completions` arrival, no Python traceback
-                # — pure async-driver core dump.
+                # S1 iter-5d: the orchestrator flip is env-gated.
+                # `V4_DECODE_STATE=1` routes through
+                # `deepseek_v4_run_with_decode_state` (iter-5c
+                # orchestrator); default OFF preserves the green gate.
                 #
-                # Until iter-5d (or later) diagnoses + fixes the
-                # second-request crash, __call__ stays on the pre-iter-5b
-                # path: `transformer_body_forward` for prefill (the
-                # green-gate baseline) and `kv_caches` passes through
-                # unchanged. The runtime infra from iter-5b
-                # (kv_cache_manager allocator, sharding override,
-                # decode_start_pos meta_field, runner tagging) and the
-                # iter-5c orchestrator decoupling stay landed —
-                # iter-5d's job is to flip __call__ once the
-                # second-request crash is resolved.
-                h = transformer_body_forward(
-                    ids_2d, params, freqs_swa, freqs_comp, self.config)
+                # iter-5b/5c history: the flip-on path made the FIRST
+                # `/v1/completions` curl return 200 OK on real V4-Flash
+                # but a SECOND request triggered a TPU `[USER]` FATAL
+                # ~13s after request 1 completed (engine idle in
+                # between). Repro log:
+                # `logs/full-slice-v4-smoke-20260430T143050Z.log`.
+                # Hypotheses (kv_caches donation leak / buffer aliasing
+                # / runtime check failure under SPMD) are documented in
+                # CLAUDE.md S1. The diagnostic logging below surfaces
+                # call sequence + start_pos so a future smoke with
+                # V4_DECODE_STATE=1 narrows the root cause.
+                if V4_DECODE_STATE_ENABLED:
+                    start_pos = 0
+                    if attention_metadata is not None:
+                        start_pos = int(getattr(
+                            attention_metadata, "decode_start_pos", 0))
+                    T = int(ids_2d.shape[-1])
+                    is_decode = (T == 1) and (start_pos > 0)
+                    state_max_seq_len = (
+                        v4_state_max_seq_len_from_vllm_config(self.vllm_config))
+                    self._v4_call_count = (
+                        getattr(self, "_v4_call_count", 0) + 1)
+                    logger.info(
+                        "[V4_DECODE_STATE] __call__ #%d: T=%d start_pos=%d "
+                        "is_decode=%s state_max_seq_len=%d kv_caches=%d",
+                        self._v4_call_count, T, start_pos, is_decode,
+                        state_max_seq_len,
+                        len(kv_caches) if kv_caches is not None else -1)
+                    kv_caches, h = deepseek_v4_run_with_decode_state(
+                        kv_caches, ids_2d, params, freqs_swa, freqs_comp,
+                        self.config,
+                        state_max_seq_len=state_max_seq_len,
+                        is_decode_step=is_decode,
+                        start_pos=start_pos,
+                    )
+                else:
+                    h = transformer_body_forward(
+                        ids_2d, params, freqs_swa, freqs_comp, self.config)
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,
