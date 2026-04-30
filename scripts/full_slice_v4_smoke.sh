@@ -51,11 +51,11 @@ export NEW_MODEL_DESIGN=1
 # Set V4_LOADER_SLICE_AWARE=0 to fall back to full-tensor dequant per host.
 export V4_LOADER_SLICE_AWARE="${V4_LOADER_SLICE_AWARE:-1}"
 
-# Multi-threaded per-host placement. Default 4 — most per-tensor work
+# Multi-threaded per-host placement. Default 8 — most per-tensor work
 # (read_dequant_slice, make_array_from_callback, host->device transfer)
 # happens in JAX/safetensors C code that releases the GIL, so parallelism
 # is real. Set to 1 to disable for single-thread parity testing.
-export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-4}"
+export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-8}"
 
 # Optional opt-in: parallel CPU dequant inside iter_v4_safetensors_dequant_torch.
 # Default 0 = sequential. Set to 4-8 to overlap dequant with TPU placement.
@@ -80,7 +80,19 @@ fi
 # isn't a recognized XLA flag in this build. Verify any addition with
 # `python -c "import jax; jax.devices()"` under a candidate XLA_FLAGS
 # value before wiring it into the smoke launcher.
-export XLA_FLAGS="${XLA_FLAGS:-}"
+#
+# We intentionally do NOT inherit XLA_FLAGS from the parent shell — a
+# stale bad value (e.g. left over from an autorunner env) silently
+# SIGSEGVs every Ray worker. Opt in via V4_XLA_FLAGS if you really
+# need a custom flag string for one launch.
+export XLA_FLAGS="${V4_XLA_FLAGS:-}"
+case "$XLA_FLAGS" in
+    *xla_tpu_impure_hlo_parallel_compile*)
+        echo "[smoke] FATAL: XLA_FLAGS contains the known-bad flag --xla_tpu_impure_hlo_parallel_compile" >&2
+        echo "[smoke]        That flag is not recognized by this libtpu build and SIGSEGVs every worker." >&2
+        exit 2
+        ;;
+esac
 
 # Bump Ray's compiled-graph channel timeout. Default is 300 seconds, which
 # trips during the first inference if jit_run_model recompiles for the

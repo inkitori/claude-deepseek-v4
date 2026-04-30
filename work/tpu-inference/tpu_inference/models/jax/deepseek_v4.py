@@ -1012,7 +1012,7 @@ def _build_class():
             # _assign so the dataclass-tree mutation stays single-threaded.
             try:
                 place_workers = max(1, int(
-                    _os.environ.get("V4_LOADER_PLACE_WORKERS", "4")))
+                    _os.environ.get("V4_LOADER_PLACE_WORKERS", "8")))
             except ValueError:
                 place_workers = 1
 

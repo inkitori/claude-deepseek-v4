@@ -18,7 +18,13 @@ MODEL="${MODEL:-deepseek-ai/DeepSeek-V4-Flash}"
 PROMPT='The capital of France is'
 MAX_TOK=8
 SEED=0
+# Readiness poll cap (server-up wait).
 TIMEOUT_S="${TIMEOUT_S:-1800}"
+# Per-request curl cap. The FIRST inference call against a cold engine
+# triggers the jit_run_model compile (~5–10 min on V4-Flash); 900s gives
+# real headroom while still failing fast on a true hang. Subsequent calls
+# are sub-second.
+CURL_MAX_TIME="${CURL_MAX_TIME:-900}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -36,7 +42,7 @@ readiness_wait() {
 }
 
 fire_completion() {
-    curl -sf --max-time 60 "${URL}/v1/completions" \
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
         -H "Content-Type: application/json" \
         -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0,"seed":%d}' \
               "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"

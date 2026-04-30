@@ -45,6 +45,7 @@ import dataclasses
 import json
 import os
 import re
+import threading
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import jax
@@ -52,6 +53,39 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import NamedSharding, PartitionSpec as P
+
+
+# Process-global safe_open handle cache. The slice-aware path issues 35k+
+# read_dequant_slice calls per host — re-opening (mmap + safetensors header
+# re-parse) per call adds up to many minutes on real V4-Flash. Caching
+# handles for the lifetime of the process amortizes that to a one-time cost.
+# safetensors mmap reads are thread-safe, so a single handle can serve all
+# placement workers concurrently.
+_safe_open_cache: Dict[str, Any] = {}
+_safe_open_cache_lock = threading.Lock()
+
+
+def _get_safe_open(shard_path: str):
+    """Return a long-lived safetensors handle for ``shard_path``.
+
+    Handles are kept open for the process lifetime; the OS reclaims mmaps on
+    exit. Re-opening per call would cost ~10-50 ms each (header re-parse on
+    a 10GB shard with thousands of keys), and we read 35k+ tensors per host.
+    """
+    h = _safe_open_cache.get(shard_path)
+    if h is not None:
+        return h
+    with _safe_open_cache_lock:
+        h = _safe_open_cache.get(shard_path)
+        if h is None:
+            from safetensors import safe_open
+            ctx = safe_open(shard_path, framework="pt")
+            # Use the context manager's __enter__ to drive any setup side
+            # effects but never call __exit__; we deliberately leak the
+            # handle until process exit.
+            h = ctx.__enter__()
+            _safe_open_cache[shard_path] = h
+        return h
 
 # Map JAX dtypes to PyTorch raw-view dtypes so we can convert a torch tensor
 # (whose dtype numpy doesn't understand, e.g. bfloat16) to numpy via a
@@ -768,15 +802,16 @@ def iter_v4_safetensors_specs(
                         name_to_shard[nm] = p
 
     # We need each weight's on-disk dtype to determine kind. Open each shard
-    # once for that read — much cheaper than per-tensor dtype inspection.
+    # once via the process-global cache so the same handle is reused later
+    # by `read_dequant_slice` (no second mmap + header re-parse).
     name_to_dtype: Dict[str, Any] = {}
     shard_to_names: Dict[str, List[str]] = {}
     for nm, sp in name_to_shard.items():
         shard_to_names.setdefault(sp, []).append(nm)
     for sp, names in shard_to_names.items():
-        with safe_open(sp, framework="pt") as f:
-            for nm in names:
-                name_to_dtype[nm] = f.get_slice(nm).get_dtype()
+        f = _get_safe_open(sp)
+        for nm in names:
+            name_to_dtype[nm] = f.get_slice(nm).get_dtype()
 
     def _kind_of(name: str) -> str:
         meta_entry = quant_meta.get(name)
@@ -832,11 +867,12 @@ def read_dequant_slice(
     For axis-0 (out-axis) sharding this is the cheap path: the safetensors
     library mmaps each shard, so the kernel only faults in the byte range
     we actually touch. Output bf16 shape: [row_stop - row_start, in_logical].
+    Uses cached safetensors handles (`_get_safe_open`) so we don't re-mmap
+    + re-parse the header per tensor — that overhead dominated the
+    placement loop on real V4-Flash before the cache was added.
     """
-    from safetensors import safe_open
-    with safe_open(spec.shard_path, framework="pt") as f:
-        weight_slice = f.get_slice(spec.hf_name)
-        w = weight_slice[row_start:row_stop, ...]
+    f = _get_safe_open(spec.shard_path)
+    w = f.get_slice(spec.hf_name)[row_start:row_stop, ...]
 
     if spec.kind in ("bf16", "raw"):
         return dequant_weight(w, None, spec.kind)
@@ -850,15 +886,15 @@ def read_dequant_slice(
             raise ValueError(
                 f"fp8 row range [{row_start}, {row_stop}) must be aligned to "
                 f"fp8_block={bk}; weight={spec.hf_name!r}")
-        with safe_open(spec.scale_shard_path, framework="pt") as f:
-            s = f.get_slice(spec.scale_key)[row_start // bk : row_stop // bk, :]
+        sf = _get_safe_open(spec.scale_shard_path)
+        s = sf.get_slice(spec.scale_key)[row_start // bk : row_stop // bk, :]
         return dequant_weight(
             w, s, "fp8", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
 
     if spec.kind == "fp4":
         # Scale is [out, in/fp4_block] — straightforward axis-0 slice.
-        with safe_open(spec.scale_shard_path, framework="pt") as f:
-            s = f.get_slice(spec.scale_key)[row_start:row_stop, :]
+        sf = _get_safe_open(spec.scale_shard_path)
+        s = sf.get_slice(spec.scale_key)[row_start:row_stop, :]
         return dequant_weight(
             w, s, "fp4", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
 
