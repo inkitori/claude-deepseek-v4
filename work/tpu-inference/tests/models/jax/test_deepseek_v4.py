@@ -32,6 +32,7 @@ os.environ.setdefault("XLA_FLAGS",
 import sys
 import json
 import math
+import functools
 from pathlib import Path
 
 import jax
@@ -95,6 +96,7 @@ from tpu_inference.models.jax.deepseek_v4 import (
     DeepseekV4Config, BlockParams, MTPBlockParams, TransformerParams,
     block_forward, block_decode_step, block_init_state_and_forward,
     head_forward, deepseek_v4_forward_prefill, deepseek_v4_mtp_forward,
+    deepseek_v4_run_with_decode_state,
     hc_pre, hc_post, head_hc, make_freqs_cis,
     make_abstract_transformer_params, count_param_bytes,
     kv_cache_bytes_per_layer, map_hf_name_to_jax_path,
@@ -1849,6 +1851,212 @@ class TestPackedDecodeStateBuffer:
             assert d <= 5e-3, (
                 f"step {step} (pos={pos}): buffer-driven decode diverged "
                 f"from full prefill (max abs diff {d})")
+
+    def test_buffer_chain_compiles_under_jit(self):
+        """S1 iter-4 prereq: pin that the iter-3 wrappers
+        (`transformer_body_init_state_to_buffer` /
+        `transformer_body_decode_step_from_buffer`) compile end-to-end
+        through `jax.jit`. The eager parity tests already pin correctness;
+        this test pins JIT-compatibility.
+
+        Why this matters: iter-5 will donate per-layer packed buffers via
+        `kv_caches` to the JIT'd `run_model` (`donate_argnums=2` in
+        `tpu_inference/models/common/model_loader.py:327`). If pack/unpack
+        introduce a tracer leak, a non-static shape, or a missing-pytree
+        registration that only surfaces under JIT, the runtime wiring
+        would compile-fail at the worst possible moment (after weight
+        load + cluster init, costing ~5 min per attempt). Catch it here
+        on tiny config in seconds.
+
+        Treats `cfg` and `state_max_seq_len` as Python statics via
+        closure — `cfg` is `@dataclass` (not frozen) so it's not
+        hashable for `static_argnames`, and that mirrors how production
+        passes `cfg` (bound to the model, not as a jit arg).
+
+        Asserts the jit-traced output matches the eager output within
+        the ≤5e-3 budget the underlying primitives use. Pack/unpack are
+        pure JAX ops with no precision loss, so any drift must come from
+        the surrounding layers' bf16 reduction-order variance under jit
+        vs eager — same envelope as `TestTransformerBodyDecodeRoundTrip`."""
+        model, params, cfg, swa, comp = self._build_pair(seed=7)
+        T = 8
+        torch.manual_seed(T + 51)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + 1), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+        state_max_seq_len = model.args.max_seq_len
+
+        @jax.jit
+        def jitted_init(ids, p, sw, cp):
+            return transformer_body_init_state_to_buffer(
+                ids, p, sw, cp, cfg, state_max_seq_len=state_max_seq_len)
+
+        # `start_pos` is a Python int — must be threaded as a static
+        # argument because `attention_decode_step` indexes its circular
+        # buffers via `start_pos % win` / `start_pos // ratio` at trace
+        # time. Without `static_argnums` jax converts the int to a
+        # tracer and the kernel raises `IndexError: Slice entries must
+        # be static integers`. Production runtime hits this same
+        # constraint — each new decode position triggers a fresh trace
+        # but the per-position compile is cached.
+        @functools.partial(jax.jit, static_argnums=(5,))
+        def jitted_step(ids_step, p, sw, cp, prev_buffers, start_pos):
+            return transformer_body_decode_step_from_buffer(
+                ids_step, p, sw, cp, cfg, prev_buffers, start_pos=start_pos,
+                state_max_seq_len=state_max_seq_len)
+
+        # Compile without execute first — surfaces shape/sharding bugs
+        # without paying the trace cost twice.
+        jitted_init.lower(ids_full_j[:, :T], params, swa, comp).compile()
+        # We need a representative buffers pytree for the second jit's
+        # lower(); produce one eagerly and reuse its structure.
+        _, buffers_eager = transformer_body_init_state_to_buffer(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=state_max_seq_len)
+        jitted_step.lower(
+            ids_full_j[:, T:T + 1], params, swa, comp,
+            buffers_eager, T).compile()
+
+        # Execute jit'd path; compare against eager.
+        h_jit, buffers_jit = jitted_init(
+            ids_full_j[:, :T], params, swa, comp)
+        h_eager, buffers_e = transformer_body_init_state_to_buffer(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=state_max_seq_len)
+        d_h = float(jnp.max(jnp.abs(
+            h_jit.astype(jnp.float32) - h_eager.astype(jnp.float32))))
+        assert d_h <= 5e-3, (
+            f"jit'd init_state_to_buffer's `h` drifted from eager "
+            f"beyond bf16-reorder budget (max abs {d_h})")
+        assert len(buffers_jit) == len(buffers_e)
+        for i, (b_j, b_e) in enumerate(zip(buffers_jit, buffers_e)):
+            assert b_j.dtype == jnp.float32, (
+                f"layer {i}: jit'd buffer has dtype {b_j.dtype} != fp32")
+            assert b_j.shape == b_e.shape, (
+                f"layer {i}: jit'd buffer shape {b_j.shape} != eager "
+                f"{b_e.shape}")
+            # Packed buffers contain the kv_cache / score_state /
+            # indexer_kv_state — fields populated by jit'd layer math,
+            # so they inherit the same bf16 reduction-order drift as `h`.
+            # `compressor_score_state` is init'd to -inf which makes
+            # `abs(jit - eager)` produce NaN where both are -inf; mask
+            # those out before tolerance check.
+            diff = jnp.abs(b_j.astype(jnp.float32)
+                            - b_e.astype(jnp.float32))
+            valid = jnp.isfinite(diff)
+            d_b = float(jnp.max(jnp.where(valid, diff, 0.0)))
+            assert d_b <= 5e-3, (
+                f"layer {i}: jit'd packed buffer drifted beyond "
+                f"bf16-reorder budget (max abs {d_b})")
+
+        # One decode step jit'd vs eager.
+        h_step_jit, _ = jitted_step(
+            ids_full_j[:, T:T + 1], params, swa, comp, buffers_jit, T)
+        h_step_e, _ = transformer_body_decode_step_from_buffer(
+            ids_full_j[:, T:T + 1], params, swa, comp, cfg,
+            buffers_e, start_pos=T,
+            state_max_seq_len=state_max_seq_len)
+        d_step = float(jnp.max(jnp.abs(
+            h_step_jit.astype(jnp.float32)
+            - h_step_e.astype(jnp.float32))))
+        assert d_step <= 5e-3, (
+            f"jit'd decode_step_from_buffer drifted from eager beyond "
+            f"bf16-reorder budget (max abs {d_step})")
+
+    def test_run_with_decode_state_kv_caches_round_trip(self):
+        """S1 iter-4 orchestration: pin that
+        `deepseek_v4_run_with_decode_state` correctly threads packed
+        decode-state through `kv_caches` across one prefill + N decode
+        steps, under JIT.
+
+        Simulates the iter-5 runtime call pattern:
+          1. vLLM hands us `kv_caches: List[jax.Array]` (donated).
+          2. First call (prefill): we run `is_decode_step=False` →
+             returns `(updated_kv_caches, h)`.
+          3. Subsequent calls (decode): we run `is_decode_step=True`
+             with the prior `updated_kv_caches` → returns
+             `(updated_kv_caches, h_step)`.
+
+        Each step's hidden output must match the corresponding position
+        of a fresh `transformer_body_forward` over the full T+N-token
+        sequence. Same ≤5e-3 tolerance budget as the underlying
+        primitives — `run_with_decode_state` is a thin orchestration
+        layer that adds no error sources.
+
+        Uses `static_argnums` to mark `state_max_seq_len`,
+        `is_decode_step`, and `start_pos` as Python-static (required by
+        circular-buffer indexing in `attention_decode_step`)."""
+        model, params, cfg, swa, comp = self._build_pair(seed=4)
+        T = 8
+        N = 3
+        torch.manual_seed(T + N + 91)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + N), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+        state_max = model.args.max_seq_len
+
+        @functools.partial(jax.jit, static_argnums=(6, 7, 8))
+        def jitted(
+            kv_caches, ids, p, sw, cp, params_unused,
+            state_max_seq_len, is_decode_step, start_pos,
+        ):
+            # `params_unused` is included only to keep the static arg
+            # indices stable; pytree params is arg 2 here.
+            del params_unused
+            return deepseek_v4_run_with_decode_state(
+                kv_caches, ids, p, sw, cp, cfg,
+                state_max_seq_len=state_max_seq_len,
+                is_decode_step=is_decode_step,
+                start_pos=start_pos,
+            )
+
+        # Initial kv_caches: zeros at the right shape per layer. The
+        # prefill branch overwrites them entirely; iter-5's runtime
+        # allocator will produce these via `_layer_packed_size(layout)`
+        # × 4 bytes per layer. Using zeros vs uninitialized matters
+        # for nothing here — prefill never reads them.
+        layouts = transformer_body_layout(
+            params, cfg, state_max, batch_size=1)
+        kv_caches = [
+            jnp.zeros((_layer_packed_size(lo),), dtype=jnp.float32)
+            for lo in layouts
+        ]
+
+        # Reference: full prefill on T+N tokens.
+        h_full = transformer_body_forward(
+            ids_full_j, params, swa, comp, cfg)
+
+        # Step 0 — prefill on first T tokens.
+        kv_caches, h_pref = jitted(
+            kv_caches, ids_full_j[:, :T], params, swa, comp, None,
+            state_max, False, 0,
+        )
+        d_pref = float(jnp.max(jnp.abs(
+            h_pref.astype(jnp.float32)
+            - h_full[:, :T].astype(jnp.float32))))
+        assert d_pref <= 5e-3, (
+            f"prefill via run_with_decode_state diverged from full "
+            f"prefill at first T positions (max abs {d_pref})")
+        # kv_caches now holds packed buffers with the right element
+        # count per layer.
+        for i, kvc in enumerate(kv_caches):
+            assert kvc.dtype == jnp.float32
+            assert kvc.shape == (_layer_packed_size(layouts[i]),)
+
+        # Steps 1..N — decode each new token, threading kv_caches.
+        for step in range(N):
+            pos = T + step
+            kv_caches, h_step = jitted(
+                kv_caches, ids_full_j[:, pos:pos + 1], params, swa, comp,
+                None, state_max, True, pos,
+            )
+            d = float(jnp.max(jnp.abs(
+                h_step.astype(jnp.float32)
+                - h_full[:, pos:pos + 1].astype(jnp.float32))))
+            assert d <= 5e-3, (
+                f"decode step {step} (pos={pos}) via "
+                f"run_with_decode_state diverged from full prefill "
+                f"(max abs {d})")
 
 
 # =============================================================

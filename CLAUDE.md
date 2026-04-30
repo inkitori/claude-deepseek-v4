@@ -271,7 +271,7 @@ message and move down.
 These are issues where the smoke goes green but the model isn't
 doing what users will actually ask of it. Fix these *first*.
 
-#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context (transformer-body primitives landed; `__call__` integration is the next iter's job)
+#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context (math + orchestrator + JIT-correctness landed iter-4; `__call__` flip + kv_cache_manager allocator is iter-5's job)
 
 This is the headline correctness/perf bug. `__call__` in
 `work/tpu-inference/tpu_inference/models/jax/deepseek_v4.py:1363`
@@ -435,9 +435,57 @@ KB), CSA layer ≈ 50K (200 KB), HCA layer ≈ 65K (260 KB). Total
 across ~50 layers ≈ 10 MB before sharding, well below any HBM
 budget.
 
-**Iter-4 starts at:** wire packed buffers into `__call__` via
-`kv_caches`. The math + pack/unpack schema is ready; the
-remaining surgery is engine plumbing.
+**Iter 4 progress (commit pending, 2026-04-30):** the
+orchestration layer + JIT-correctness validation now landed.
+Two new pieces in `models/jax/deepseek_v4.py`:
+
+* `deepseek_v4_run_with_decode_state(kv_caches, input_ids,
+  params, freqs_swa, freqs_comp, cfg, state_max_seq_len,
+  is_decode_step, start_pos)` — branches on `is_decode_step` and
+  threads packed `AttentionDecodeState` through `kv_caches`.
+  Returns `(updated_kv_caches, h)`. The prefill branch wraps
+  `transformer_body_init_state_to_buffer` (replacing
+  kv_caches's contents wholesale, since prefill starts a fresh
+  state). The decode branch wraps
+  `transformer_body_decode_step_from_buffer` (reads each
+  `kv_caches[i]`, advances by one position, writes the new
+  buffer back).
+
+Pinned by two new tests in
+`tests/models/jax/test_deepseek_v4.py::TestPackedDecodeStateBuffer`:
+
+* `test_buffer_chain_compiles_under_jit` — wraps the iter-3
+  primitives `transformer_body_init_state_to_buffer` /
+  `transformer_body_decode_step_from_buffer` in `jax.jit` and
+  verifies (a) compile succeeds, (b) outputs match eager within
+  ≤5e-3 (bf16-reorder budget). Mid-implementation this test
+  caught a real bug: `start_pos` MUST be marked
+  `static_argnums` on the jit boundary because
+  `attention_decode_step` indexes circular buffers with Python
+  ints (`start_pos % win`). Without static_argnums the trace
+  raised `IndexError: Slice entries must be static integers`.
+  The test now hardcodes the right pattern; iter-5's runtime
+  wiring inherits it.
+* `test_run_with_decode_state_kv_caches_round_trip` —
+  end-to-end: starts with zero kv_caches, runs prefill (T
+  tokens), then 3 sequential decode steps (each reading +
+  writing kv_caches). Each step's `h` matches the
+  corresponding position in a fresh full prefill. Pins the
+  iter-5 runtime call pattern: `kv_caches → __call__(prefill) →
+  kv_caches' → __call__(decode) → kv_caches'' → ...`.
+
+Total CPU pytest time on tiny config: ~125s for all 6
+TestPackedDecodeStateBuffer tests. The pack/unpack ops
+inline cleanly into JIT (verified by the existing pure-pack
+round-trip test PLUS the new under-jit test); no surprise
+all-gathers, no NaN drift on `compressor_score_state`'s -inf
+init (the under-jit test masks NaN-from-`-inf-minus-(-inf)`
+explicitly because `jnp.abs(-inf - (-inf)) == NaN`).
+
+**Iter 5 starts at:** kv_cache_manager runtime allocation +
+flip `__call__` to invoke `deepseek_v4_run_with_decode_state`.
+The math + JIT-compatibility is now pinned; what remains is
+engine plumbing.
 
 V4's `kv_caches` is a passthrough today (INVARIANTS I34); the
 model's `nnx.Variable`s are read inside JIT but mutations are
@@ -468,42 +516,51 @@ nnx state. Two implementation options:
   the contract with non-V4 models that share the same model_fn
   signature. Defer unless A turns out infeasible.
 
-* Recommended iter-4 scope (one iter):
-  1. Extend `kv_cache_manager._create_attention_spec` for V4 so
-     each layer's `KVCacheSpec.page_size_padded` is the packed
-     state's total bytes (per-layer; CSA layers > SWA layers
-     so the spec is per-layer-class, not uniform). Override
-     `dtype=jnp.float32` on the V4 branch — score state needs
-     fp32, and the existing bf16 default would lose -inf.
-     `_layer_packed_size(layout)` (already landed) gives the
-     element count; multiply by 4 bytes/element for size.
-  2. Branch `__call__` (`models/jax/deepseek_v4.py:1507`) on
-     prefill-vs-continuation. Signal: every-token-of-seq case
-     `query_start_loc[s+1] - query_start_loc[s]` > 1 → prefill;
-     == 1 with `seq_lens[s] > 1` → decode. Use
+* Recommended iter-5 scope:
+  1. Extend `kv_cache_manager.initialize_kv_cache` to allocate
+     V4 kv_caches as `[_layer_packed_size(layout_i)]` fp32
+     arrays per layer (bypassing the standard `create_kv_caches`
+     4D layout). Per-layer size differs (CSA > SWA) so the
+     allocation is per-layer-class. `_layer_packed_size(layout)`
+     (already landed) gives element count; multiply by 4 bytes
+     for fp32. The kv_cache_sharding `P(ATTN_DATA, None,
+     ATTN_HEAD)` is 3D — for compat, reshape to
+     `[1, packed_size, 1]` so the spec maps cleanly (size-1
+     axes become replicated).
+  2. The V4 `_create_attention_spec` already returns a
+     placeholder spec. iter-5 may need to size
+     `KVCacheSpec.page_size_padded` to the per-layer packed
+     bytes if vLLM's block-budget arithmetic requires it; today
+     vLLM treats V4's spec as inert, so the value may not
+     matter end-to-end — verify under real launch.
+  3. Branch `__call__` (`models/jax/deepseek_v4.py:1759`) on
+     prefill-vs-continuation. Signal:
+     `attention_metadata.query_start_loc[s+1] - query_start_loc[s]
+     > 1 → prefill`; `== 1 with seq_lens[s] > 1 → decode`. Use
      `attention_metadata.input_positions[query_start_loc[s]]`
      as `start_pos` for the decode step.
-  3. On prefill (single-seq smoke today): call
-     `transformer_body_init_state_to_buffer(...)`, write the
-     resulting `packed_buffers[i]` into `kv_caches[i]` (slot 0
-     for max_num_seqs=1). On decode: read `kv_caches[i]`,
-     pass through `transformer_body_decode_step_from_buffer(...)`,
-     write the new packed buffer back.
-  4. Multi-seq slot indexing: defer to S2's iter. For now,
-     allocate `kv_caches[i]` as `[max_num_seqs=1, packed_size_i]`
-     and use slot 0.
-  5. Validate via `eval_shape` / `lower().compile()` on real
+  4. Replace the `transformer_body_forward` call in the
+     single-seq fall-through with
+     `deepseek_v4_run_with_decode_state(kv_caches, ids, ...,
+     is_decode_step, start_pos)`. Multi-seq path (the loop over
+     `seg_bounds`) — defer to S2's iter; today's smoke only
+     uses single-seq.
+  5. Multi-seq slot indexing: defer to S2. For now,
+     `kv_caches[i]` carries only slot 0.
+  6. Validate via `eval_shape` / `lower().compile()` on real
      V4-Flash config under virtual CPU mesh
      (`scripts/full_slice_v4_*` patterns from prior B3 work):
      no shape mismatches, no extra all-gathers from the new
      pack/unpack, fp32 per-layer state actually allocates the
      fp32 dtype (verify via `kv_caches[0].dtype`).
-  6. Real-smoke gate: deterministic " Paris" still passes AND
+  7. Real-smoke gate: deterministic " Paris" still passes AND
      a multi-token decode (e.g. max_tokens=10) returns coherent
      output. Throughput improvement is the prize; correctness
-     is the gate. (Smoke check today emits one token; need to
-     extend or add `max_tokens=10` curl to actually exercise
-     the decode path.)
+     is the gate. (Smoke check today emits 8 tokens via
+     `MAX_TOK=8`; if the new path is wired correctly, 7 of
+     those tokens go through `is_decode_step=True` — coherence
+     of the full 8-token output verifies decode threading
+     end-to-end.)
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1146,12 +1203,35 @@ when the timeout SIGTERMs the iter.
   via `init_state_to_buffer` then 3 sequential decode steps via
   `decode_step_from_buffer` reproduce a fresh T+N prefill within
   ≤ 5e-3, the same budget as the non-buffer primitives. Pinned
-  by `TestPackedDecodeStateBuffer` (4 cases: round-trip + 2
-  single-step + 1 multi-step). The pack/unpack ops are pure JAX
+  by `TestPackedDecodeStateBuffer` (6 cases: round-trip +
+  2 single-step + 1 multi-step + 1 under-jit + 1 kv_caches
+  round-trip). The pack/unpack ops are pure JAX
   (reshape+cast+concat+dynamic_slice) and inline cleanly into
   surrounding JIT — no extra error sources. ✓ math + schema, ✗
-  runtime integration (S1 iter-4 wires these into
+  runtime integration (S1 iter-5 wires these into
   `__call__` via `kv_caches`).
+* **Decode-state orchestrator + JIT-correctness validation
+  (S1 iter-4)**: `deepseek_v4_run_with_decode_state(kv_caches,
+  ids, params, …, is_decode_step, start_pos)` in
+  `models/jax/deepseek_v4.py`. Branches on `is_decode_step` and
+  threads packed `AttentionDecodeState` through `kv_caches`:
+  prefill replaces the buffer wholesale (closed-form
+  init from x); decode reads `kv_caches[i]`, advances by one
+  position via `transformer_body_decode_step_from_buffer`, and
+  writes the new buffer back. Returns `(updated_kv_caches, h)`
+  matching the iter-5 `run_model` contract.
+  Pinned by `test_run_with_decode_state_kv_caches_round_trip`
+  (one prefill on T tokens + N=3 sequential decode steps via
+  `kv_caches` threading; each step matches a fresh full prefill
+  within ≤5e-3 on tiny config). Also pinned under jit by
+  `test_buffer_chain_compiles_under_jit` which surfaced and
+  fixed a real bug: `start_pos` must be marked
+  `static_argnums` on the jit boundary because
+  `attention_decode_step` indexes circular buffers with Python
+  ints. Without that, the trace raises `IndexError: Slice
+  entries must be static integers`. iter-5's runtime wiring
+  inherits the right pattern. ✓ math + JIT-compatibility, ✗
+  runtime allocation + `__call__` flip (iter-5).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream

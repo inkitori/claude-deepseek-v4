@@ -699,6 +699,61 @@ def transformer_body_decode_step_from_buffer(
     return h, new_buffers
 
 
+def deepseek_v4_run_with_decode_state(
+    kv_caches: List[jnp.ndarray],
+    input_ids: jnp.ndarray,
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+    state_max_seq_len: int,
+    is_decode_step: bool,
+    start_pos: int,
+) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
+    """S1 iter-4: orchestrate one prefill OR one decode step with the
+    per-layer `AttentionDecodeState` packed into / unpacked from
+    `kv_caches`.
+
+    Layout contract: `kv_caches[i]` is a 1D fp32 array of length
+    `_layer_packed_size(layouts[i])` for layer i. iter-5 wires
+    `kv_cache_manager.initialize_kv_cache` to allocate these shapes;
+    today vLLM's path treats V4's kv_caches as inert placeholders so
+    this function is exercised only via the JIT-correctness tests.
+    Multi-seq slot indexing (a leading `[max_num_seqs]` axis) is S2's
+    iter; for now `kv_caches[i]` carries only slot 0.
+
+    Branch:
+      * `is_decode_step=False` (prefill): runs `transformer_body_init_state_to_buffer`
+        on `input_ids` and returns `(packed_buffers, h)`. The returned
+        `packed_buffers` REPLACES `kv_caches`'s contents — a prefill
+        starts a fresh state, so any prior buffer contents are
+        discarded. This matches `transformer_body_init_state_from_prefill`'s
+        closed-form initialization (sparse writes from x; non-touched
+        slots remain at init).
+      * `is_decode_step=True`: reads `kv_caches[i]` as layer i's prior
+        packed `AttentionDecodeState`, advances by one position, and
+        returns `(new_buffers, h)`. `start_pos` is the absolute
+        position of the new token — must be a Python static under JIT
+        (the underlying `attention_decode_step` indexes circular
+        buffers via `start_pos % win` at trace time).
+
+    Both branches return the updated `kv_caches` as the first element
+    of the tuple so the caller can pass it as a donated argument to
+    the JIT'd `run_model`."""
+    if is_decode_step:
+        h, new_buffers = transformer_body_decode_step_from_buffer(
+            input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+            kv_caches, start_pos=start_pos,
+            state_max_seq_len=state_max_seq_len,
+        )
+        return new_buffers, h
+    h, packed_buffers = transformer_body_init_state_to_buffer(
+        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+        state_max_seq_len=state_max_seq_len,
+    )
+    return packed_buffers, h
+
+
 def deepseek_v4_forward_prefill(
     input_ids: jnp.ndarray,        # [B, S] int32
     params: TransformerParams,
