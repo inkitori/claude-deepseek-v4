@@ -31,6 +31,13 @@
 #       text byte-equals the non-streaming response from the first probe.
 #       Pins S7: streaming path produces the same output as non-streaming.
 #       Exit 6 on mismatch / no chunks.
+#   SAMPLING_REQUIRED=1 — fires a /v1/completions probe with temperature>0,
+#       top_p, and frequency_penalty set, and asserts the response has
+#       non-empty text and a valid finish_reason. Pins S6: the sampling code
+#       path (temperature scaling + top-p filter + token penalties) doesn't
+#       crash or produce empty/garbage output. Cheap (same prefill bucket as
+#       the existing completions probe). Exit 7 on empty text / invalid
+#       finish_reason / curl failure.
 #
 # Usage:
 #   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
@@ -38,6 +45,7 @@
 #   CHAT_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on empty chat
 #   REASONING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on empty reasoning
 #   STREAMING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on stream/non-stream mismatch
+#   SAMPLING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken sampling path
 
 set -euo pipefail
 
@@ -58,6 +66,7 @@ CURL_MAX_TIME="${CURL_MAX_TIME:-900}"
 CHAT_REQUIRED="${CHAT_REQUIRED:-0}"
 REASONING_REQUIRED="${REASONING_REQUIRED:-0}"
 STREAMING_REQUIRED="${STREAMING_REQUIRED:-0}"
+SAMPLING_REQUIRED="${SAMPLING_REQUIRED:-0}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -117,6 +126,21 @@ fire_completion_stream() {
               "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
 }
 
+# Sampling probe: exercises the temperature>0 + top-p + frequency-penalty path
+# in one request. We don't assert on a specific token (that depends on the
+# model's distribution under sampling); we only assert the response is well-
+# formed (non-empty text, valid finish_reason). Top-k / presence_penalty / n>1 /
+# logprobs are deliberately omitted — each is a separate code path with
+# different known quirks under vLLM's TPU runner, and a minimum-delta probe
+# should cover the most-used parameters first. Same prompt/length budget as
+# the existing completions probe so it lands in the same prefill bucket.
+fire_completion_sampling() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"top_p":0.9,"frequency_penalty":0.1,"seed":%d}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
+}
+
 extract_text() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['text'])"
 }
@@ -149,6 +173,20 @@ import json, sys
 d = json.load(sys.stdin)
 r = d['choices'][0]['message'].get('reasoning') or ''
 print(len(r.strip()))
+"
+}
+
+# Print two lines: non-whitespace text length, and finish_reason.
+# A length of 0 means empty or whitespace-only output — the sampling
+# code path silently produced nothing useful. finish_reason on the
+# second line lets the caller assert it's a recognised stop signal.
+extract_completion_text_finish() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = (d.get('choices') or [{}])[0]
+print(len((c.get('text') or '').strip()))
+print(c.get('finish_reason') or '')
 "
 }
 
@@ -261,6 +299,33 @@ main() {
         else
             echo "[smoke-check] FAIL: streaming probe failed (curl non-zero, STREAMING_REQUIRED=1)" >&2
             exit 6
+        fi
+    fi
+
+    if [ "$SAMPLING_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions sampling probe (SAMPLING_REQUIRED=1)"
+        if RP="$(fire_completion_sampling 2>/dev/null)"; then
+            # extract_completion_text_finish prints two lines: text len, finish_reason.
+            # Read both with a single python invocation (cheaper than two) and split.
+            mapfile -t SAMP < <(printf '%s' "$RP" | extract_completion_text_finish 2>/dev/null || printf '0\n\n')
+            SAMP_LEN="${SAMP[0]:-0}"
+            SAMP_FIN="${SAMP[1]:-}"
+            echo "[smoke-check] sampling text len=$SAMP_LEN finish_reason=${SAMP_FIN:-<empty>}"
+            if [ "${SAMP_LEN:-0}" = "0" ]; then
+                echo "[smoke-check] FAIL: sampling probe returned empty/whitespace-only text (SAMPLING_REQUIRED=1)" >&2
+                echo "[smoke-check]       temperature>0 + top_p + frequency_penalty path produced no usable output." >&2
+                exit 7
+            fi
+            case "$SAMP_FIN" in
+                stop|length) ;;
+                *)
+                    echo "[smoke-check] FAIL: sampling probe finish_reason=${SAMP_FIN:-<empty>}, expected stop/length (SAMPLING_REQUIRED=1)" >&2
+                    exit 7
+                    ;;
+            esac
+        else
+            echo "[smoke-check] FAIL: sampling probe failed (curl non-zero, SAMPLING_REQUIRED=1)" >&2
+            exit 7
         fi
     fi
 

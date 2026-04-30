@@ -118,8 +118,8 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
   ready, fires the deterministic "capital of France" completion
   twice, asserts byte-identical responses + that the text contains
   "Paris". Has a self-test at `scripts/test_smoke_check_harness.sh`
-  (uses `scripts/_mock_openai_server.py` — 9 scenarios, no TPU
-  needed). Also fires three optional probes, each gated by an env
+  (uses `scripts/_mock_openai_server.py` — 13 scenarios, no TPU
+  needed). Also fires four optional probes, each gated by an env
   knob so the default smoke stays cheap:
   * `/v1/chat/completions` — `CHAT_REQUIRED=1` to fail on
     missing/empty content (exit 4).
@@ -131,6 +131,13 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
   * `/v1/completions` with `stream=true` — `STREAMING_REQUIRED=1`
     to fail when the reassembled SSE chunks don't byte-equal the
     non-streaming completion (exit 6). Pins S7.
+  * `/v1/completions` with `temperature=0.7, top_p=0.9,
+    frequency_penalty=0.1` — `SAMPLING_REQUIRED=1` to fail when
+    the response text is empty/whitespace-only or the
+    `finish_reason` isn't `stop`/`length` (exit 7). Pins backlog
+    item S6 — verifies the sampling code path (temperature scaling
+    + top-p filter + token penalties) doesn't crash or produce
+    garbage on TPU.
 * **`full_slice_v4_warm_cache.sh`** — runs the smoke + check, then
   cleans up. Use once on a fresh VM (or after a `/tmp` wipe) to
   populate the JAX compile cache; subsequent real launches' first
@@ -176,6 +183,7 @@ launcher echoes the active values at startup so you can confirm.
 | `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
 | `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
 | `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
+| `SAMPLING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and assert the response has non-empty text + a valid `finish_reason` (exit 7 on empty / invalid). Pins backlog item S6 — verifies the sampling code path doesn't crash or produce garbage. Cheap — same prefill bucket as the existing completions probe. Determinism under sampling is **not** asserted (vLLM/TPU runner doesn't honour per-request seed for non-greedy paths; CLAUDE.md pitfall context). |
 
 ## Current state (READ BEFORE LAUNCHING)
 
@@ -460,19 +468,42 @@ Implementation:
 
 1.5–2× decode throughput once S1 lands.
 
-#### S6. Sampling parameters are untested under load
+#### S6. Sampling parameters — single-config probe DONE; broader matrix still TODO
 
 The path is standard — V4 inherits tpu-inference's
 `sampling.py` + `rejection_sampler.py` via `compute_logits` at
-`deepseek_v4.py:1528`. But the only thing the smoke check fires
-is `temperature=0, seed=0`. Nothing exercises temperature>0,
-top_p, top_k, frequency/presence penalties, stop sequences,
-multiple completions (`n>1`), or logprobs.
+`deepseek_v4.py:1528`. The default smoke check fires
+`temperature=0, seed=0` only.
 
-Add a sampling matrix to `smoke_check` (or a
-`tests/test_v4_sampling_e2e.py` against the running smoke)
-before claiming production readiness. Each combination has
-known quirks under vLLM's TPU runner.
+**Sampling probe (DONE — harness-verified)**:
+`scripts/full_slice_v4_smoke_check.sh` accepts `SAMPLING_REQUIRED=1`,
+which fires `/v1/completions` with
+`temperature=0.7, top_p=0.9, frequency_penalty=0.1` and asserts the
+response has non-empty text plus a valid `finish_reason` (`stop` or
+`length`); exit 7 on empty / invalid. Default off so the cheap
+smoke stays cheap. Mock-server self-test
+`scripts/test_smoke_check_harness.sh` covers all three end states
+(`sampling_required_match` / `sampling_required_empty` /
+`sampling_required_bad_finish`). The mock differentiates sampling
+vs deterministic by inspecting `body.temperature > 0` so a single
+test scenario can simulate a working deterministic path **and** a
+broken sampling path simultaneously. Not yet end-to-end-verified
+on real `vllm serve` — pending the next real-smoke run with
+`SAMPLING_REQUIRED=1` in the launcher env.
+
+Determinism under sampling is **not** asserted: vLLM/TPU's runner
+doesn't honour per-request seed on non-greedy paths (CLAUDE.md
+notes this), so byte-equality across runs would be a false
+guarantee.
+
+**Broader matrix still TODO** — top_k, presence_penalty, n>1,
+logprobs, stop sequences. Each is a separate code path with
+different known quirks under vLLM's TPU runner. Add as further
+gated probes (`SAMPLING_NK_REQUIRED=1` for n>1, etc.) or a
+`tests/test_v4_sampling_e2e.py` driving the running smoke. The
+current single probe catches the most-common production
+parameter combination; broader coverage matters more before
+claiming "we serve production sampling."
 
 #### S7. Streaming (SSE) — equivalence probe DONE; latency budget probe still TODO
 
@@ -832,9 +863,17 @@ when the timeout SIGTERMs the iter.
   underlying behavior is a Tier-S correctness bomb (see S3 in the
   backlog for repro + hypotheses).
 * **Streaming probe verified end-to-end** (`STREAMING_REQUIRED=1`
-  smoke_check + 10-scenario harness self-test + real `vllm serve` run
+  smoke_check + 13-scenario harness self-test + real `vllm serve` run
   on 2026-04-30: reassembled SSE = non-streaming " Paris" byte-for-byte).
   ✓ See S7.
+* **Sampling probe scaffolded** (`SAMPLING_REQUIRED=1` smoke_check +
+  3 new scenarios in the 13-scenario harness self-test:
+  `sampling_required_match` / `sampling_required_empty` /
+  `sampling_required_bad_finish`). Fires
+  `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and asserts the
+  response has non-empty text plus a valid `finish_reason`. ✓ harness
+  verified; ✗ not yet end-to-end-verified on real `vllm serve` —
+  pending the next real-smoke run with `SAMPLING_REQUIRED=1`. See S6.
 * **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
   in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
   products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates

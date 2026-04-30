@@ -32,6 +32,15 @@ Args:
                           streaming completion path; falls back to --text when
                           unset. Lets a test exercise the streaming/non-streaming
                           mismatch path without breaking the Paris assertion.
+  --sampling-text TEXT    override choices[0].text on /v1/completions when the
+                          request body has temperature>0; falls back to --text
+                          when unset. Lets a test exercise the SAMPLING_REQUIRED
+                          probe's empty/garbage path while keeping the
+                          deterministic Paris assertion intact.
+  --sampling-finish REASON override choices[0].finish_reason on /v1/completions
+                          when the request body has temperature>0 (default
+                          'length'). Lets a test exercise the
+                          invalid-finish-reason failure path.
   --flaky-readiness N     return 503 from /v1/models for the first N calls, then
                           200. Useful for exercising the readiness-wait loop.
 """
@@ -50,6 +59,8 @@ class MockHandler(BaseHTTPRequestHandler):
     chat_text = None  # falls back to text.strip() if unset
     reasoning_text = ""  # populated on message.reasoning when thinking=true
     stream_text = None  # falls back to text if unset
+    sampling_text = None  # falls back to text on /v1/completions when temp>0
+    sampling_finish = "length"  # finish_reason on the temp>0 path
     flaky_remaining = 0
 
     def log_message(self, format, *args):
@@ -130,6 +141,12 @@ class MockHandler(BaseHTTPRequestHandler):
                                else MockHandler.text)
                 self._stream_completion(stream_text)
                 return
+            is_sampling = (body.get("temperature") or 0) > 0
+            text = MockHandler.text
+            finish = "length"
+            if is_sampling and MockHandler.sampling_text is not None:
+                text = MockHandler.sampling_text
+                finish = MockHandler.sampling_finish
             self._json(200, {
                 "id": "cmpl-mock-deterministic",
                 "object": "text_completion",
@@ -137,8 +154,8 @@ class MockHandler(BaseHTTPRequestHandler):
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "choices": [{
                     "index": 0,
-                    "text": MockHandler.text,
-                    "finish_reason": "length",
+                    "text": text,
+                    "finish_reason": finish,
                 }],
                 "usage": {"prompt_tokens": 6, "completion_tokens": 8,
                           "total_tokens": 14},
@@ -177,6 +194,8 @@ def main() -> int:
     ap.add_argument("--chat-text", default=None)
     ap.add_argument("--reasoning-text", default="")
     ap.add_argument("--stream-text", default=None)
+    ap.add_argument("--sampling-text", default=None)
+    ap.add_argument("--sampling-finish", default="length")
     ap.add_argument("--flaky-readiness", type=int, default=0)
     args = ap.parse_args()
 
@@ -184,6 +203,8 @@ def main() -> int:
     MockHandler.chat_text = args.chat_text
     MockHandler.reasoning_text = args.reasoning_text
     MockHandler.stream_text = args.stream_text
+    MockHandler.sampling_text = args.sampling_text
+    MockHandler.sampling_finish = args.sampling_finish
     MockHandler.flaky_remaining = args.flaky_readiness
 
     with HTTPServer(("127.0.0.1", args.port), MockHandler) as httpd:

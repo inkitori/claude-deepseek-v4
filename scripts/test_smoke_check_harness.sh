@@ -25,6 +25,13 @@
 #                                   STREAMING_REQUIRED=1              → PASS (0)
 #   9. streaming_required_mismatch — stream text differs from non-stream
 #                                   STREAMING_REQUIRED=1              → FAIL (6)
+#  10. sampling_required_match    — temp>0 returns non-empty text + valid
+#                                   finish_reason, SAMPLING_REQUIRED=1 → PASS (0)
+#  11. sampling_required_empty    — temp>0 returns empty text,
+#                                   SAMPLING_REQUIRED=1               → FAIL (7)
+#  12. sampling_required_bad_finish — temp>0 returns non-empty text but an
+#                                   invalid finish_reason (e.g. abort),
+#                                   SAMPLING_REQUIRED=1               → FAIL (7)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -55,6 +62,11 @@ run_scenario() {
         streaming_required_*) streaming_required=1 ;;
     esac
 
+    local sampling_required=0
+    case "$name" in
+        sampling_required_*) sampling_required=1 ;;
+    esac
+
     local mpid=
     if [ "$with_server" -eq 1 ]; then
         "$PY" "$MOCK" --port "$port" "$@" >"/tmp/mock-${port}.log" 2>&1 &
@@ -70,6 +82,7 @@ run_scenario() {
         CHAT_REQUIRED="$chat_required" \
         REASONING_REQUIRED="$reasoning_required" \
         STREAMING_REQUIRED="$streaming_required" \
+        SAMPLING_REQUIRED="$sampling_required" \
         "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
     local rc=$?
 
@@ -99,10 +112,13 @@ run_scenario reasoning_required_empty      18098 5 --reasoning-text ""
 run_scenario reasoning_required_whitespace 18099 5 --reasoning-text "$(printf '\n\n\n\n\n')"
 run_scenario streaming_required_match      18100 0
 run_scenario streaming_required_mismatch   18101 6 --stream-text " Berlin."
+run_scenario sampling_required_match       18102 0
+run_scenario sampling_required_empty       18103 7 --sampling-text ""
+run_scenario sampling_required_bad_finish  18104 7 --sampling-text " ok." --sampling-finish "abort"
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 10/10 harness scenarios pass"
+    echo "OK: 13/13 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"
