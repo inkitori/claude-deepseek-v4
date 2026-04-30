@@ -582,30 +582,17 @@ before each significant change to S1/B2.
 
 #### D1. Test bloat
 
-`tests/models/jax/test_deepseek_v4.py` is **2997 LOC, 30 test
-classes** (~4× the next biggest model's test file). Concrete
-fold-ins:
-* `TestRealFp8DequantSmoke` is strictly weaker than
-  `TestFp8DequantIndependentReference`. Fold the smoke into the
-  reference class as a second test method or drop it.
-* `TestRealFp4DequantSmoke` ↔ `TestFp4DequantIndependentReference`
-  — same.
-* `TestFp8Dequant` (synthetic-fixture full-loader bit-identical)
-  and `TestFp8CastByteDomain` (256-byte numpy-vs-torch parity)
-  are distinct concepts — keep both.
-* `TestFp4CodebookReference` exhaustively enumerates the 16-entry
-  codebook — distinct from the byte-equal real-data tests.
+`tests/models/jax/test_deepseek_v4.py` is **2904 LOC, 29 test
+classes** (~4× the next biggest model's test file). The
+strictly-weaker FP8/FP4 smoke classes were folded into their
+byte-equal reference siblings (their unique parametric layers
+were merged into `TestFp{8,4}DequantIndependentReference`'s
+parametrize list). Further consolidation candidates (compile-
+shape variants, decode-step parity classes) likely exist but
+need a per-class audit; the cheap wins are taken.
 
-Re-measure before claiming progress: `wc -l` and
+Re-measure before claiming further progress: `wc -l` and
 `grep -c "^class Test"`.
-
-#### D2. Stale comment cleanup
-
-The `__call__` docstring at `deepseek_v4.py:1395-1409` talks
-about "Tier 8 first pass" and "BLOCKERS.md B1 followup" —
-Tier-8 is green, B1 is archived. Update the docstring to reflect
-the *current* contract (still prefill-stateless decode, but say
-so as the contract not as a deferred item).
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 

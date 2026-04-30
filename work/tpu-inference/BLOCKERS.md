@@ -77,10 +77,8 @@ V4-Flash" honestly.**
 ### Tier D — code-hygiene
 
 D1 test bloat consolidation
-(`tests/models/jax/test_deepseek_v4.py` is 2997 LOC, 30
-classes; ~4× peer models), D2 stale comment cleanup
-(`__call__` docstring at `models/jax/deepseek_v4.py:1395-1409`
-references archived B1).
+(`tests/models/jax/test_deepseek_v4.py` is now 2904 LOC, 29
+classes after FP8/FP4 smoke fold-in; ~4× peer models still).
 
 For full rationale, file:line references, and verification
 patterns for each item, read **CLAUDE.md "Production-readiness
