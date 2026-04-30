@@ -183,10 +183,18 @@ End-to-end timing on the verifying run (cache-cold):
 optimized** (~2.7× smaller). XLA accounting was clean — no
 `CompileTimeHbmOom`, no `RuntimeBufferAllocationFailure`.
 
-`/v1/chat/completions` returns 200 OK with the byte-equivalent
-chat template applied (`scripts/v4_chat_template.jinja`). The chat
-probe in `smoke_check` is informational by default — see backlog
-S3/S4 for what's still loose on the chat path.
+`/v1/chat/completions` returns 200 OK. vLLM auto-resolves
+`tokenizer_mode='deepseek_v4'` for `DeepseekV4ForCausalLM`
+(`work/vllm/vllm/config/model.py:578`) and routes the chat path
+through `DeepseekV4Tokenizer` (`work/vllm/vllm/tokenizers/deepseek_v4.py`)
+whose `apply_chat_template` calls the upstream `encode_messages`
+encoder directly — byte-equivalent to the V4-Flash reference
+encoder shipped at `<hf-snapshot>/encoding/encoding_dsv4.py`
+across chat / thinking / tools / reasoning_effort. Pinned by
+`TestVllmChatTemplateParity` in
+`tests/models/jax/test_deepseek_v4.py`. The chat probe in
+`smoke_check` is informational by default — see backlog S3 for the
+deferred runtime assertion.
 
 The smoke is `MAX_LEN=256, MAX_SEQS=1, --enforce-eager`. That's
 the demo configuration, not the production configuration. See the
@@ -290,19 +298,18 @@ Both are wired into `scripts/full_slice_v4_smoke.sh` via
 vLLM validates these names at startup and refuses to launch if
 they're misregistered, so the smoke gate green = parsers loaded.
 
-What's left for S3 (depends on S4): a runtime assertion that a
-think-mode-triggering chat request produces a non-empty
-`reasoning` field. Today's chat template
-(`scripts/v4_chat_template.jinja`) emits `<｜Assistant｜></think>`
-unconditionally — i.e. it tells the model "thinking is done,
-answer now" — so the model never produces `<think>` blocks
-regardless of the parser being wired. Once S4 lands a
-thinking-mode-aware template that omits the `</think>` open and
-respects `chat_template_kwargs.thinking=True`, add a smoke_check
-chat probe that sets `chat_template_kwargs={"thinking": true}`
+What's left for S3: a runtime assertion that a think-mode-triggering
+chat request produces a non-empty `reasoning` field. The chat path
+already respects `chat_template_kwargs={"thinking": true}` via the
+upstream `DeepseekV4Tokenizer` (see S4 below — the encoder emits
+`<｜Assistant｜><think>` instead of `</think>` when thinking is set).
+Add a smoke_check chat probe that sends `chat_template_kwargs={"thinking": true}`
 plus a reasoning-eliciting prompt and asserts the response's
-`reasoning` field is non-empty. Same applies to a tool-using
-probe — depends on S4's `tools` scope.
+`reasoning` (or `reasoning_content`) field is non-empty. Same applies
+to a tool-using probe — assert `tool_calls` is non-empty when the
+prompt should trigger one. Probably gate behind a new env knob like
+`REASONING_REQUIRED=1` / `TOOLS_REQUIRED=1` so the default smoke
+stays cheap.
 
 Sanity check that the parsers are still wired (no TPU needed):
 
@@ -315,28 +322,46 @@ ToolParserManager.get_tool_parser('deepseek_v4')
 print('OK')"
 ```
 
-#### S4. Chat template covers chat-mode only — think and tool modes silently produce wrong tokens
+#### S4. Chat encoding — RESOLVED upstream by `DeepseekV4Tokenizer` (kept here as a regression boundary)
 
-`scripts/v4_chat_template.jinja` is byte-identical to
-`encode_messages(thinking_mode="chat")` for the user / assistant
-/ system subset only. The reference encoder is at
-`<hf-cache>/snapshots/<sha>/encoding/encoding_dsv4.py`. Each of
-the four missing scopes needs a Jinja translation + a
-byte-parity validation test against `encode_messages(...)`:
+vLLM's upstream `DeepseekV4Tokenizer`
+(`work/vllm/vllm/tokenizers/deepseek_v4.py`) auto-loads for
+`DeepseekV4ForCausalLM` (`work/vllm/vllm/config/model.py:578`
+sets `tokenizer_mode='deepseek_v4'`) and its `apply_chat_template`
+calls the upstream encoder
+`work/vllm/vllm/tokenizers/deepseek_v4_encoding.py::encode_messages`
+— byte-identical to the reference encoder shipped with the
+V4-Flash snapshot at `<hf-snapshot>/encoding/encoding_dsv4.py`.
+The custom tokenizer **ignores any `--chat-template` arg** and
+covers all four scopes the original S4 flagged:
 
-* `tools` array → tools encoded with the wrong delimiters →
-  model ignores tool definitions
-* `tool` role / `tool_calls` from prior assistant turns → don't
-  round-trip → multi-turn tool-using conversations break
-* `thinking_mode="think_high"` / `"think_max"` → must emit
-  `<think>` instead of an immediate `</think>` → reasoning is
-  currently always suppressed
-* `latest_reminder` injection → DeepSeek's quick-instruction
-  guidance is missing → quality regression on tasks that depend
-  on it
+* `tools` array — encoded by prepending a system message carrying
+  the tools list (matches reference)
+* `tool_calls` round-trip in multi-turn assistant turns — handled
+  by `merge_tool_messages` + `tool_calls_template` in the encoder
+* `thinking` kwarg (boolean; `enable_thinking` accepted as alias)
+  → emits `<｜Assistant｜><think>` for the trailing generation
+  prompt instead of `</think>`
+* `reasoning_effort="max" | "high"` — emits the
+  REASONING_EFFORT_MAX preamble at index 0
 
-Re-validation pattern is the snippet at the top of CLAUDE.md's
-"Chat template" section.
+Pinned by `TestVllmChatTemplateParity` in
+`work/tpu-inference/tests/models/jax/test_deepseek_v4.py` —
+parametrized over 10 representative cases (chat / thinking /
+multi-turn / tools / tool_calls / reasoning_effort). Run as:
+
+```bash
+PYTHONPATH=work/vllm:work/tpu-inference work/vllm_env/bin/python3 \
+    -m pytest work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestVllmChatTemplateParity \
+    -x -q
+```
+
+`latest_reminder` is a non-OpenAI-API role (DeepSeek's internal
+quick-instruction guidance) and isn't reachable via the chat
+completions endpoint — there's no client surface for it. If/when
+some downstream consumer needs it, route via a synthetic
+`{"role": "latest_reminder", ...}` message — `encode_messages`
+already handles that role.
 
 #### S5. MTP speculative decoding hook is not wired
 
@@ -537,11 +562,13 @@ greedy decoding looks fine but sampling has a subtle skew.
 #### C4. Tokenizer edge cases
 
 Non-ASCII (Chinese, Arabic, emoji), leading whitespace,
-multilingual code blocks, very-long single tokens. The V4
-tokenizer config's BOS handling
-(`v4_chat_template.jinja:11` has `add_bos_token=false` so the
-template emits BOS itself) is fragile — verify each role
-transition encodes byte-identically to `encode_messages()`.
+multilingual code blocks, very-long single tokens. V4-Flash's
+`tokenizer_config.json` has `add_bos_token=false`; the upstream
+`encode_messages` emits BOS itself. `TestVllmChatTemplateParity`
+covers role-transition byte-equality vs `encode_messages` on
+representative cases — extend it with non-ASCII / leading-
+whitespace / very-long-single-token fixtures rather than writing
+a new test.
 
 #### C5. Refusal/safety behavior preservation
 
@@ -693,49 +720,43 @@ when the timeout SIGTERMs the iter.
   integration (S1 — they aren't called by `__call__`).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
-* **Chat template (chat-mode subset)**: byte-equivalent to
-  `encode_messages(thinking_mode="chat")` on representative
-  inputs. ✓ for chat-mode only — see S4 for the missing scopes.
+* **Chat encoding (all scopes)**: vLLM's upstream
+  `DeepseekV4Tokenizer` calls `encode_messages` from
+  `vllm/tokenizers/deepseek_v4_encoding.py` directly — byte-equal
+  to the V4-Flash reference encoder
+  (`<hf-snapshot>/encoding/encoding_dsv4.py`) across chat /
+  thinking / tools / tool_calls / reasoning_effort. Pinned by
+  `TestVllmChatTemplateParity`. ✓ across all four S4 scopes;
+  `--chat-template` is unused (the tokenizer ignores it). See S4.
 * **Reasoning + tool parsers wired** (`--reasoning-parser deepseek_v4`,
   `--enable-auto-tool-choice --tool-call-parser deepseek_v4` in
   `scripts/full_slice_v4_smoke.sh`). Registry lookup verified via
   the snippet in S3. vLLM validates parser names at startup, so
   smoke-green = parsers loaded. ✓ wiring, ✗ runtime emission test
-  (S3 — depends on S4's thinking-mode template).
+  (S3 — runtime probe deferred).
 
 ## Chat template (chat-completions)
 
 V4-Flash deliberately ships **no Jinja `chat_template`** —
 `tokenizer_config.json` omits the field and the upstream HF
 README points users at the Python encoder at
-`<snapshot>/encoding/encoding_dsv4.py`. Without a template, vllm
-falls back to a generic format and `/v1/chat/completions` returns
-garbage.
+`<snapshot>/encoding/encoding_dsv4.py`. vLLM handles this
+without a Jinja template at all: `tokenizer_mode='deepseek_v4'`
+auto-resolves for `DeepseekV4ForCausalLM` and routes through
+`DeepseekV4Tokenizer.apply_chat_template`, which calls
+upstream's `encode_messages` (a direct port of the model card's
+encoder) and **ignores any `--chat-template` arg**. So the smoke
+launcher does not pass `--chat-template` — there's no Jinja
+file in the repo. Behavior is pinned by
+`TestVllmChatTemplateParity` (10 cases covering chat / thinking /
+multi-turn / tools / tool_calls / reasoning_effort).
 
-`scripts/v4_chat_template.jinja` is the byte-equivalent Jinja
-translation of `encode_messages(thinking_mode="chat")` for the
-system / user / assistant subset. The smoke launcher passes it
-via `--chat-template`; the `smoke_check` runs an informational
-chat probe. **Scope is chat-mode only** (no thinking, no tools,
-no tool results, no `latest_reminder`, no quick-instruction
-tasks) — backlog item S4 covers the missing scopes.
+To re-validate against the V4-Flash reference encoder:
 
-To re-validate the existing scope vs `encode_messages()`:
-
-```python
-import sys, os
-SNAP = "<hf-cache>/snapshots/<sha>"
-sys.path.insert(0, os.path.join(SNAP, "encoding"))
-from encoding_dsv4 import encode_messages
-from transformers import PreTrainedTokenizerFast
-tok = PreTrainedTokenizerFast(tokenizer_file=os.path.join(SNAP, "tokenizer.json"))
-tok.add_special_tokens({"bos_token":"<｜begin▁of▁sentence｜>",
-                         "eos_token":"<｜end▁of▁sentence｜>"})
-tmpl = open("scripts/v4_chat_template.jinja").read()
-msgs = [{"role":"user","content":"hi"}]
-assert encode_messages(msgs, thinking_mode="chat") == \
-    tok.apply_chat_template(msgs, chat_template=tmpl,
-                             tokenize=False, add_generation_prompt=True)
+```bash
+PYTHONPATH=work/vllm:work/tpu-inference work/vllm_env/bin/python3 \
+    -m pytest work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestVllmChatTemplateParity \
+    -x -q
 ```
 
 `vllm chat` CLI needs `--url http://localhost:18081/v1` since

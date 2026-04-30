@@ -125,21 +125,21 @@ else
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${new_extra}"
 fi
 
-# Chat template: V4-Flash ships no Jinja chat_template — the upstream
-# README points at encoding/encoding_dsv4.py instead. Without a template,
-# vllm falls back to a generic format and /v1/chat/completions returns
-# garbled text (the model + math are correct; this just fixes the
-# messages→prompt translation). scripts/v4_chat_template.jinja is the
-# byte-equivalent of encode_messages(thinking_mode="chat") for the
-# system/user/assistant subset that /v1/chat/completions hits.
-CHAT_TEMPLATE="$REPO_ROOT/scripts/v4_chat_template.jinja"
+# Chat template: NOT passed. vLLM auto-resolves tokenizer_mode='deepseek_v4'
+# for DeepseekV4ForCausalLM (vllm/config/model.py:578), which loads
+# DeepseekV4Tokenizer (vllm/tokenizers/deepseek_v4.py). That tokenizer's
+# apply_chat_template ignores any --chat-template arg and calls
+# encode_messages from vllm/tokenizers/deepseek_v4_encoding.py — the
+# byte-equivalent of the encoder shipped at
+# <hf-snapshot>/encoding/encoding_dsv4.py — across chat / thinking / tools
+# / reasoning_effort. Pinned by TestVllmChatTemplateParity so a future
+# upstream drift fires loudly. Passing --chat-template is a no-op here.
 
 echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set by tpu_inference)"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
-echo "[smoke]   chat_template=$CHAT_TEMPLATE"
 echo "[smoke]   reasoning_parser=deepseek_v4 tool_call_parser=deepseek_v4 (auto-tool-choice on)"
 # Reasoning + tool parsers: both registered upstream as "deepseek_v4"
 # (vllm/reasoning/__init__.py and vllm/tool_parsers/__init__.py).
@@ -157,7 +157,6 @@ echo "[smoke]   reasoning_parser=deepseek_v4 tool_call_parser=deepseek_v4 (auto-
     --trust-remote-code \
     --dtype bfloat16 \
     --enforce-eager \
-    --chat-template "$CHAT_TEMPLATE" \
     --reasoning-parser deepseek_v4 \
     --enable-auto-tool-choice \
     --tool-call-parser deepseek_v4 \

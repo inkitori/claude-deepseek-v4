@@ -2996,3 +2996,126 @@ class TestRealKeystoneTensorRoundTrip:
                 f"for int64 input"
             )
 
+
+class TestVllmChatTemplateParity:
+    """Regression check: vLLM's upstream ``DeepseekV4Tokenizer`` produces
+    the same prompt as the reference ``encode_messages`` shipped in
+    ``<v4-flash-snapshot>/encoding/encoding_dsv4.py`` across the chat,
+    thinking, tools, and reasoning_effort scopes that ``/v1/chat/completions``
+    actually exercises.
+
+    The chat path in vLLM goes:
+      OpenAIServingChat → DeepseekV4Renderer.render_messages_async →
+      _DeepseekV4Tokenizer.apply_chat_template → encode_messages.
+
+    The custom tokenizer ignores the ``chat_template`` kwarg, so passing
+    ``--chat-template <jinja>`` to ``vllm serve`` is a no-op for V4 — this
+    test pins the upstream behaviour so a future regression (upstream
+    encoder drifting from the model card's reference) fires loudly here
+    instead of silently corrupting chat output in production.
+    """
+
+    SNAP = (
+        "/home/enyouki/.cache/huggingface/hub/"
+        "models--deepseek-ai--DeepSeek-V4-Flash/snapshots/"
+        "fd53f944496234770ba80e15004f9b6d269a71f5"
+    )
+
+    @staticmethod
+    def _ref_encode():
+        """Lazy-import the reference encoder shipped with the V4-Flash
+        snapshot. The module lives at ``<snap>/encoding/encoding_dsv4.py``
+        and is the authoritative chat-format definition."""
+        snap = TestVllmChatTemplateParity.SNAP
+        ref_path = os.path.join(snap, "encoding")
+        if not os.path.exists(os.path.join(ref_path, "encoding_dsv4.py")):
+            pytest.skip(f"V4-Flash snapshot encoding/ not at {ref_path}")
+        if ref_path not in sys.path:
+            sys.path.insert(0, ref_path)
+        from encoding_dsv4 import encode_messages  # type: ignore
+        return encode_messages
+
+    @staticmethod
+    def _vllm_tok():
+        try:
+            from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
+        except ImportError:
+            pytest.skip("vllm.tokenizers.deepseek_v4 not importable")
+        snap = TestVllmChatTemplateParity.SNAP
+        if not os.path.exists(snap):
+            pytest.skip(f"V4-Flash snapshot not at {snap}")
+        return DeepseekV4Tokenizer.from_pretrained(snap)
+
+    _TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }]
+
+    _USER = [{"role": "user", "content": "weather in SF"}]
+    _MULTI_TOOL = [
+        {"role": "user", "content": "weather in SF"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "type": "function",
+            "function": {"name": "get_weather",
+                         "arguments": '{"city":"SF"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "sunny 72F"},
+        {"role": "assistant", "content": "It's sunny 72F in SF."},
+        {"role": "user", "content": "thanks"},
+    ]
+
+    @pytest.mark.parametrize("name,messages,kwargs", [
+        ("single_user_chat", _USER, dict(thinking=False)),
+        ("single_user_thinking", _USER, dict(thinking=True)),
+        ("system_user_chat",
+         [{"role": "system", "content": "You are helpful."}] + _USER,
+         dict(thinking=False)),
+        ("multi_turn_chat",
+         [{"role": "user", "content": "hi"},
+          {"role": "assistant", "content": "hello!"},
+          {"role": "user", "content": "what?"}],
+         dict(thinking=False)),
+        ("multi_turn_thinking",
+         [{"role": "user", "content": "hi"},
+          {"role": "assistant", "content": "hello!"},
+          {"role": "user", "content": "what?"}],
+         dict(thinking=True)),
+        ("tools_chat", _USER, dict(thinking=False, tools=_TOOLS)),
+        ("tools_thinking", _USER, dict(thinking=True, tools=_TOOLS)),
+        ("multi_turn_with_tool_calls", _MULTI_TOOL,
+         dict(thinking=False, tools=_TOOLS)),
+        ("reasoning_effort_max", _USER,
+         dict(thinking=True, reasoning_effort="max")),
+        ("reasoning_effort_high", _USER,
+         dict(thinking=True, reasoning_effort="high")),
+    ])
+    def test_upstream_tokenizer_matches_reference_encoder(
+            self, name, messages, kwargs):
+        ref_encode = self._ref_encode()
+        tok = self._vllm_tok()
+
+        # Reproduce the wrapping that `_DeepseekV4Tokenizer.apply_chat_template`
+        # does internally: when `tools` is set, it prepends a system message
+        # carrying the tools list. Build the reference call to match.
+        ref_messages = list(messages)
+        tools = kwargs.get("tools")
+        if tools:
+            ref_messages = [{"role": "system", "tools": tools}] + ref_messages
+        thinking_mode = "thinking" if kwargs.get("thinking") else "chat"
+
+        upstream = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **kwargs)
+        reference = ref_encode(
+            ref_messages, thinking_mode=thinking_mode,
+            reasoning_effort=kwargs.get("reasoning_effort"))
+
+        assert upstream == reference, (
+            f"upstream V4 tokenizer drifted from encode_messages on case "
+            f"{name!r}:\n  upstream={upstream!r}\n  reference={reference!r}")
+

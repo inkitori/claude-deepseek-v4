@@ -28,9 +28,13 @@ resolved. History lives in `git log`.
 * **S3.** `--reasoning-parser deepseek_v4` and
   `--tool-call-parser deepseek_v4` not enabled in the smoke
   launcher. The parsers exist upstream — one-line launcher fix.
-* **S4.** Chat template (`scripts/v4_chat_template.jinja`)
-  covers chat-mode only. Think-mode, tool-calling, tool-result
-  round-trip, and `latest_reminder` injection are missing.
+* **S4.** Chat encoding — RESOLVED upstream. vLLM's
+  `DeepseekV4Tokenizer` (auto-loaded via `tokenizer_mode='deepseek_v4'`)
+  calls upstream `encode_messages` directly, byte-equal to the
+  V4-Flash reference encoder across chat / thinking / tools /
+  reasoning_effort. Pinned by `TestVllmChatTemplateParity`.
+  `latest_reminder` isn't reachable via the chat-completions API
+  surface; punt unless a downstream consumer surfaces a need.
 * **S5.** MTP speculative-decoding hook not wired into
   `tpu_inference/runner/speculative_decoding_manager.py`. 1.5–2×
   decode throughput on the table.
