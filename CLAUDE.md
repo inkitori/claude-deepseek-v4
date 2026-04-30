@@ -118,8 +118,8 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
   ready, fires the deterministic "capital of France" completion
   twice, asserts byte-identical responses + that the text contains
   "Paris". Has a self-test at `scripts/test_smoke_check_harness.sh`
-  (uses `scripts/_mock_openai_server.py` — 13 scenarios, no TPU
-  needed). Also fires four optional probes, each gated by an env
+  (uses `scripts/_mock_openai_server.py` — 24 scenarios, no TPU
+  needed). Also fires nine optional probes, each gated by an env
   knob so the default smoke stays cheap:
   * `/v1/chat/completions` — `CHAT_REQUIRED=1` to fail on
     missing/empty content (exit 4).
@@ -151,6 +151,25 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
     — verifies the logprobs postprocessing path emits the per-token
     alternative distribution that production clients rely on for
     confidence scoring.
+  * `/v1/completions` with `temperature=0.7, top_k=10` —
+    `TOPK_REQUIRED=1` to fail when the response text is
+    empty/whitespace-only or `finish_reason` isn't `stop`/`length`
+    (exit 10). Pins backlog item S6 broader-matrix — verifies the
+    top-k filter (rank-bounded candidate set, distinct from top_p's
+    mass-bounded set) doesn't crash or zero-out on TPU.
+  * `/v1/completions` with `temperature=0.7, presence_penalty=0.5`
+    — `PRESENCE_REQUIRED=1` to fail when the response is
+    empty/whitespace-only or `finish_reason` is invalid (exit 11).
+    Pins backlog item S6 broader-matrix — verifies presence-penalty
+    (per-token, distinct from frequency_penalty's per-occurrence
+    semantics) is correctly applied on the TPU sampling path.
+  * `/v1/completions` with `n=2` — `N_REQUIRED=1` to fail when the
+    response has fewer than 2 choices, or any choice has empty text
+    (exit 12). Pins backlog item S6 broader-matrix — verifies vLLM's
+    multi-completion expansion (one request → n parallel sequences
+    sharing the prompt) actually emits n choices on the TPU runner.
+    Under `--max-num-seqs=1` likely sequentializes but cardinality
+    must still equal `n`.
 * **`full_slice_v4_warm_cache.sh`** — runs the smoke + check, then
   cleans up. Use once on a fresh VM (or after a `/tmp` wipe) to
   populate the JAX compile cache; subsequent real launches' first
@@ -199,6 +218,9 @@ launcher echoes the active values at startup so you can confirm.
 | `SAMPLING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and assert the response has non-empty text + a valid `finish_reason` (exit 7 on empty / invalid). Pins backlog item S6 — verifies the sampling code path doesn't crash or produce garbage. Cheap — same prefill bucket as the existing completions probe. Determinism under sampling is **not** asserted (vLLM/TPU runner doesn't honour per-request seed for non-greedy paths; CLAUDE.md pitfall context). |
 | `STOP_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stop=["Paris"]` and assert (a) the response text does NOT contain `Paris` and (b) `finish_reason="stop"` (exit 8 on either). Pins backlog item S6 broader-matrix — verifies vLLM's stop-sequence handler on the TPU runner truncates before the matched token and reports the right reason. Cheap — same prefill bucket as the existing completions probe. The deterministic baseline emits ` Paris` as its first token at temp=0/seed=0, so a working handler MUST intercept it. |
 | `LOGPROBS_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `logprobs=5` and assert every emitted position's `top_logprobs` entry has at least 5 alternatives (exit 9 on missing object / dropped alternatives). Pins backlog item S6 broader-matrix — verifies the logprobs postprocessing path on the TPU runner emits the per-token alternative distribution that production clients (confidence scoring, structured-output reranking) rely on. Cheap — same prefill bucket as the existing completions probe. |
+| `TOPK_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `temperature=0.7, top_k=10` and assert non-empty text + valid `finish_reason` (exit 10). Pins backlog item S6 broader-matrix — verifies the top-k filter (rank-bounded candidate set, distinct from top_p's mass-bounded set) doesn't crash or zero-out the candidate set on the TPU sampling path. Cheap — same prefill bucket as the existing completions probe. |
+| `PRESENCE_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `temperature=0.7, presence_penalty=0.5` and assert non-empty text + valid `finish_reason` (exit 11). Pins backlog item S6 broader-matrix — verifies presence-penalty (per-token, distinct from frequency_penalty's per-occurrence semantics) is correctly applied on the TPU sampling path. Cheap — same prefill bucket as the existing completions probe. |
+| `N_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `n=2` and assert the response has at least 2 choices, all non-empty (exit 12 on missing/short choices / empty text). Pins backlog item S6 broader-matrix — verifies vLLM's multi-completion expansion (one request → n parallel sequences sharing the prompt) actually emits n choices on the TPU runner. Under `--max-num-seqs=1` likely sequentializes but cardinality must still equal `n`. Cheap — same prefill bucket as the existing completions probe. |
 
 ## Current state (READ BEFORE LAUNCHING)
 
@@ -483,7 +505,7 @@ Implementation:
 
 1.5–2× decode throughput once S1 lands.
 
-#### S6. Sampling parameters — single-config + stop + logprobs probes DONE; top_k / n>1 / presence_penalty still TODO
+#### S6. Sampling parameters — sampling + stop + logprobs + top_k + presence_penalty + n>1 probes scaffolded; runtime verification per-probe (see entries below)
 
 The path is standard — V4 inherits tpu-inference's
 `sampling.py` + `rejection_sampler.py` via `compute_logits` at
@@ -544,15 +566,35 @@ exit 0. Production clients (confidence scoring, reranking,
 structured-output likelihood) depend on this path; vLLM's TPU
 runner has historically had quirks here.
 
-**Still TODO** — `top_k` (typically combined with `top_p` to bound
-the candidate set), `presence_penalty` (different from
-`frequency_penalty` — applied per-token rather than per-occurrence),
-`n>1` (interacts with seq dispatch — under today's
-`--max-num-seqs=1` this likely sequentializes; informative either
-way). Each is a separate gated probe (`TOPK_REQUIRED=1`, etc.)
-following the same pattern. Each new probe adds one fire_*
-function + one extractor + one mock branch + 1–2 harness
-scenarios + one CLAUDE.md entry. Total cost per probe ~50 LOC.
+**Top-k / presence-penalty / n>1 probes (DONE — verified
+end-to-end 2026-04-30)**:
+`TOPK_REQUIRED=1` (temperature=0.7+top_k=10, exit 10),
+`PRESENCE_REQUIRED=1` (temperature=0.7+presence_penalty=0.5,
+exit 11), and `N_REQUIRED=1` (n=2; assert >=2 non-empty choices,
+exit 12). Top-k gates the candidate set by rank rather than by
+top_p's cumulative-prob mass; presence_penalty is a per-token
+deduction the first time a token appears (vs frequency_penalty's
+linear-in-count); n>1 expands one request into n parallel
+sequences sharing the prompt — under `--max-num-seqs=1` this
+likely sequentializes but the choices array length must still
+equal n. All three follow the same shape as
+SAMPLING/STOP/LOGPROBS: one `fire_*` function + bash branch +
+mock branch (`--n-cap` for n; `--sampling-text ""` already
+covers topk/presence empty-text paths, since both hit the
+mock's `temperature>0` branch). Mock harness extended from
+18 → 24 scenarios (3 new pass + 3 new fail), all green locally.
+End-to-end-verified on real `vllm serve` 2026-04-30 10:36Z:
+top-k `text len=1 finish_reason=length`, presence
+`text len=3 finish_reason=length`, n=2
+`choices=2 non_empty=2 (requested n=2)`. Same launch verified
+SAMPLING/STOP/LOGPROBS still pass (3-min weight load + ~6 min
+total wall, includes the documented chat-OOM-retry stretch).
+
+**Still TODO under S6** — none of the standard sampling parameters
+remain unprobed. Future S6 work would be combinatorial coverage
+(e.g. logprobs+stop, topk+presence, n>1+sampling, n+logprobs)
+which is unlikely to surface anything that the per-knob probes
+miss; defer until a real production client report shows otherwise.
 
 #### S7. Streaming (SSE) — equivalence probe DONE; latency budget probe still TODO
 
@@ -946,6 +988,41 @@ when the timeout SIGTERMs the iter.
   `min_alternatives=5 (requested 5)`, exit 0. Production clients
   (confidence scoring, reranking, structured-output likelihood)
   depend on this path.
+* **Top-k + presence-penalty + n>1 probes verified end-to-end**
+  (`TOPK_REQUIRED=1` + `PRESENCE_REQUIRED=1` + `N_REQUIRED=1`
+  smoke_check + 24-scenario harness self-test + real `vllm serve`
+  run on 2026-04-30 10:36Z). ✓ See S6.
+
+  Top-k probe sends `temperature=0.7, top_k=10` and asserts
+  non-empty text + valid `finish_reason`. Distinct from the existing
+  sampling probe (top_p + frequency_penalty) because top-k bounds
+  the candidate set by rank rather than by cumulative probability
+  mass — different code path on the TPU sampler. Real-V4 outcome:
+  `text len=1 finish_reason=length`, exit 0.
+
+  Presence-penalty probe sends `temperature=0.7, presence_penalty=0.5`
+  and asserts the same well-formedness. Distinct from
+  `frequency_penalty` (the sampling probe's penalty) because
+  presence_penalty is a fixed per-token deduction the first time a
+  token appears, not a per-occurrence linear penalty — separate
+  reduction step in the TPU sampler. Real-V4 outcome:
+  `text len=3 finish_reason=length`, exit 0.
+
+  N=2 probe sends `temperature=0.7, n=2` and asserts the response
+  has at least 2 non-empty choices. vLLM expands `n>1` into n
+  parallel sequences sharing the prompt — under `--max-num-seqs=1`
+  these sequentialize, but the choices array must still have length
+  n. Real-V4 outcome: `choices=2 non_empty=2 (requested n=2)`,
+  exit 0. Confirms the multi-completion expansion path is live on
+  the TPU runner even with the constrained seq-dispatch budget;
+  S2 (real ragged-batch multi-seq) will improve throughput but
+  isn't required for n>1 correctness.
+
+  Same smoke run also re-verified SAMPLING/STOP/LOGPROBS still
+  pass (no regression from the broader-matrix wiring). Total wall
+  ~6 min including the documented chat-first-call OOM-retry
+  stretch (CLAUDE.md pitfall #9); cold compile of `jit_run_model`
+  on warm cache was sub-100s.
 * **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
   in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
   products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates
