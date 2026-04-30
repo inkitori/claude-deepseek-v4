@@ -1923,29 +1923,34 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5d: the orchestrator flip is env-gated.
-                # `V4_DECODE_STATE=1` routes through
-                # `deepseek_v4_run_with_decode_state` (iter-5c
-                # orchestrator); default OFF preserves the green gate.
+                # S1 iter-5e: env-gated orchestrator flip. `V4_DECODE_STATE=1`
+                # routes through `deepseek_v4_run_with_decode_state`; default
+                # OFF preserves the green-gate baseline.
                 #
-                # iter-5b/5c history: the flip-on path made the FIRST
-                # `/v1/completions` curl return 200 OK on real V4-Flash
-                # but a SECOND request triggered a TPU `[USER]` FATAL
-                # ~13s after request 1 completed (engine idle in
-                # between). Repro log:
-                # `logs/full-slice-v4-smoke-20260430T143050Z.log`.
-                # Hypotheses (kv_caches donation leak / buffer aliasing
-                # / runtime check failure under SPMD) are documented in
-                # CLAUDE.md S1. The diagnostic logging below surfaces
-                # call sequence + start_pos so a future smoke with
-                # V4_DECODE_STATE=1 narrows the root cause.
+                # Decode signal: `attention_metadata.decode_start_pos > 0`,
+                # set by the runner only on q0==1 / s0>1 calls
+                # (`tpu_runner._maybe_set_v4_decode_start_pos`). T from
+                # ids_2d.shape[-1] is NOT a reliable decode signal — the TPU
+                # runner pads decode calls to bucket size (T=64 typical), so
+                # T==1 never trips. Iter-5e diagnostic confirmed this:
+                # `__call__ #1: T=64 start_pos=5 is_decode=False` for what
+                # should have been a decode step, which produced empty
+                # completions text on real V4-Flash 2026-04-30 16:08Z.
+                #
+                # On the decode branch, only `ids_2d[:, 0:1]` is the real
+                # query token (the runner zero-pads the rest of the bucket
+                # via `tpu_runner.py:1475 input_ids_cpu[total_num_scheduled_tokens:] = 0`).
+                # The orchestrator's `transformer_body_decode_step_from_buffer`
+                # expects shape [B, 1]; we pad the returned `h` back to
+                # [B, T_padded, hc, D] with zeros so the run_model JIT's
+                # output shape stays consistent across cache keys.
                 if V4_DECODE_STATE_ENABLED:
                     start_pos = 0
                     if attention_metadata is not None:
                         start_pos = int(getattr(
                             attention_metadata, "decode_start_pos", 0))
                     T = int(ids_2d.shape[-1])
-                    is_decode = (T == 1) and (start_pos > 0)
+                    is_decode = start_pos > 0
                     state_max_seq_len = (
                         v4_state_max_seq_len_from_vllm_config(self.vllm_config))
                     self._v4_call_count = (
@@ -1956,13 +1961,27 @@ def _build_class():
                         self._v4_call_count, T, start_pos, is_decode,
                         state_max_seq_len,
                         len(kv_caches) if kv_caches is not None else -1)
+                    if is_decode:
+                        ids_for_orchestrator = ids_2d[:, 0:1]
+                    else:
+                        ids_for_orchestrator = ids_2d
                     kv_caches, h = deepseek_v4_run_with_decode_state(
-                        kv_caches, ids_2d, params, freqs_swa, freqs_comp,
+                        kv_caches, ids_for_orchestrator, params,
+                        freqs_swa, freqs_comp,
                         self.config,
                         state_max_seq_len=state_max_seq_len,
                         is_decode_step=is_decode,
                         start_pos=start_pos,
                     )
+                    if is_decode and T > 1:
+                        # h is [B, 1, hc, D]; pad to [B, T, hc, D] so the
+                        # downstream reshape keeps the runner's expected
+                        # (B*T_padded, D) hidden_TD shape. Padding values
+                        # are unused — the runner samples logits[0] for
+                        # decode and ignores the rest.
+                        pad_shape = (h.shape[0], T - 1, *h.shape[2:])
+                        pad = jnp.zeros(pad_shape, h.dtype)
+                        h = jnp.concatenate([h, pad], axis=1)
                 else:
                     h = transformer_body_forward(
                         ids_2d, params, freqs_swa, freqs_comp, self.config)

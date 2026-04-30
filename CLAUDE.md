@@ -212,7 +212,7 @@ launcher echoes the active values at startup so you can confirm.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s skips small inits (`jit_sample`, etc.). |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
-| `V4_DECODE_STATE` | `0` | S1 iter-5d gate. `1` flips the model's `__call__` from the green-gate baseline (`transformer_body_forward`, every step recomputes prefill on the full prompt+generated context) to the iter-5c orchestrator (`deepseek_v4_run_with_decode_state`, threaded through `kv_caches` for real O(1)/step decode). Default `0` preserves the green gate. The flip path was end-to-end tested on real V4-Flash 2026-04-30 14:40Z and made the FIRST `/v1/completions` curl return 200 OK, but a SECOND request triggered a TPU `[USER]` FATAL ~13 s after request 1 completed (engine idle in between) — see CLAUDE.md S1 for repro + hypotheses. The env-gated checkpoint lets future iters test fixes by toggling this flag without re-doing the architecture work. When `1`, every JIT trace-time entry to `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)` so the smoke log correlates compile fingerprints to argument shapes. Forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. |
+| `V4_DECODE_STATE` | `0` | S1 iter-5d/5e gate. `1` flips the model's `__call__` from the green-gate baseline (`transformer_body_forward`, every step recomputes prefill on the full prompt+generated context) to the iter-5e orchestrator (`deepseek_v4_run_with_decode_state` with the runner-tagged `decode_start_pos` driving `is_decode`). Default `0` preserves the green gate. iter-5e fixed the T-padding decode-detection bug (the runner pads decode to bucket sizes, so the previous `(T==1) and (start_pos>0)` check never triggered — empty-text completions resulted), and the decode kernel chain now executes on real V4 weights for the first time (verified 2026-04-30 16:28Z). FIRST `/v1/completions` curl returns 200 OK; SECOND request still triggers a TPU `[USER]` FATAL on the cached prefill kernel — iter-5d hypotheses 1 (kv_caches donation reuse) / 3 (XLA buffer aliasing) remain candidates for iter-5f. When `1`, every JIT trace-time entry to `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)` so the smoke log correlates compile fingerprints to argument shapes. Forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. |
 | `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
 | `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
 | `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
@@ -879,6 +879,113 @@ What is NOT yet done in iter-5d:
          smoke — pursue from there.
   * Either way, the iter-5d checkpoint makes the next test
     cheap: one env-var flip away from running on real V4.
+
+**Iter 5e status (2026-04-30): T-padding decode-detection bug
+DIAGNOSED + FIXED; decode kernel chain executes on real V4 for
+the first time; second-request FATAL persists.**
+
+Iter-5e ran the env-gated `V4_DECODE_STATE=1` smoke that iter-5d
+deferred and immediately surfaced a NEW root cause: the model's
+decode-detection check `is_decode = (T == 1) and (start_pos > 0)`
+NEVER triggers on real V4 because the TPU runner pads decode
+calls to bucket sizes (T=64 typical for our smoke), so T==1 is
+never seen. The diagnostic logs from iter-5d's instrumentation
+made the bug visible:
+
+```
+__call__ #1: T=256 start_pos=0 is_decode=False ...   (R1 prefill)
+__call__ #1: T=64  start_pos=5 is_decode=False ...   (should be decode!)
+```
+
+Both R1 and R2 in iter-5e's first smoke were served entirely by
+those two compiled kernels — the orchestrator's PREFILL branch
+ran for what should have been decode steps, generating logits
+on padded zero-input. Both requests returned 200 OK with EMPTY
+text — the model's argmax landed on BOS-id (token 0 → empty
+string) at the only real position. iter-5b's "text="" with
+finish_reason=length" repro is the same bug surfacing — iter-5c's
+path-A-h decoupling fixed prefill correctness but the decode
+branch was never actually entered.
+
+iter-5e fix (in `models/jax/deepseek_v4.py` `__call__`'s
+single-active-seq path under `V4_DECODE_STATE_ENABLED`):
+
+  * Use `decode_start_pos > 0` directly as the decode signal.
+    The runner's `_maybe_set_v4_decode_start_pos` already
+    encodes the q0==1/s0>1 contract; a non-zero value means
+    "this is a decode call regardless of T padding".
+  * Slice `ids_for_orchestrator = ids_2d[:, 0:1]` for the
+    decode branch — `tpu_runner.py:1475` zeroes the rest of
+    the bucket via `input_ids_cpu[total_num_scheduled_tokens:] = 0`,
+    so position 0 is always the real query token.
+  * Pad the decode-branch `h` (shape `[B, 1, hc, D]`) back to
+    `[B, T, hc, D]` with zeros before `head_hc`, so the
+    downstream `hidden_TD = h_BSD.reshape(B*T, D)` keeps the
+    runner-expected `[T_padded, D]` shape across the JIT
+    cache key. The runner samples logits[0] for decode and
+    ignores the padded positions (`head_hc` on a zero
+    `[B, T-1, hc, D]` slice produces zero output by
+    `rms_norm(0) = 0` propagation, no NaN risk).
+
+Verified on real V4-Flash 2026-04-30 16:28Z (3rd smoke,
+post-ray-restart, `logs/full-slice-v4-smoke-20260430T162251Z.log`):
+the fresh diagnostic shows the decode trace firing for the
+FIRST TIME on real weights —
+`__call__ #1: T=64 start_pos=5 is_decode=True ...` at 16:28:52,
+immediately followed by a fresh `jit_run_model` compile of
+30,764 HLO instructions (vs prefill's ~80k — consistent with
+the smaller decode kernel). The compile completed
+successfully, R1 returned `POST /v1/completions HTTP/1.1 200
+OK`, and `smoke_check` advanced to fire R2.
+
+The decode kernel chain (`block_decode_step` →
+`attention_decode_step` / `compressor_decode_step` /
+`indexer_decode_step`) ran on real V4-Flash bf16 weights
+without FATAL, NaN, or kernel-side error — pinning that the
+iter-3-iter-5a math (closed-form prefill→state init + per-
+position decode round-trip, ≤5e-3 vs torch reference on tiny
+config) holds at scale.
+
+**The second-request FATAL persists**: ≈3 s after R2 fired
+(16:29:37Z), the TPU emits the same `[USER] FATAL` we saw in
+iter-5c's repro — `tpu1:pe2:3` async_driver.cc:779. R2 is
+hitting the cached prefill kernel from R1 (no new
+`[V4_DECODE_STATE]` log line fires before FATAL = cache hit
+on the same compiled artifact that just succeeded for R1).
+This is iter-5d hypothesis 1 / 3 territory — the COMPILED
+ARTIFACT misbehaves on RE-EXECUTION when its donated
+kv_caches input contains data from a prior call. iter-5d's
+hypothesis-2 ruling-out (stale meta_field) still holds —
+`decode_start_pos=0` resets per-AttentionMetadata
+construction.
+
+iter-5e ALSO surfaced a non-deterministic FATAL on R1 in the
+2nd smoke (no ray restart between 1st and 2nd) — same
+prefill-orchestrator HLO that iter-5e first smoke and iter-5e
+3rd smoke both ran without R1 FATAL. After ray restart, R1
+was stable. Likely TPU-state leakage from a prior process —
+iter-5d's hypothesis 1 / 3 may have a shared root cause.
+
+iter-5f starting moves (in cheapness order):
+
+  1. Test hypothesis 1 by NOT donating `kv_caches` for V4.
+     `model_loader.py:340` hardcodes `donate_argnums=2`;
+     adding a V4-only branch (mirror of the existing
+     `_is_deepseek_v4` `kv_cache_sharding` override) that
+     drops the donation costs ~130 MB extra HBM (the V4
+     packed buffer is replicated, ~130 MB total per CLAUDE.md
+     iter-5b note) but should fix R2 FATAL if donation is the
+     culprit.
+  2. Test hypothesis 3 by zeroing `kv_caches` at the start
+     of the orchestrator's prefill branch
+     (`kv_caches[i] = jnp.zeros_like(kv_caches[i])` before
+     `transformer_body_init_state_to_buffer` writes). Forces
+     XLA to NOT alias the donated input. Adds one
+     zero-write per layer per prefill but should be free
+     under XLA fusion.
+  3. If both fail, instrument with `jax.debug.print` on
+     `kv_caches` pre/post values to compare R1's successful
+     execution to R2's FATAL.
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1616,9 +1723,31 @@ when the timeout SIGTERMs the iter.
   allocation. Pinned by the existing 37-case iter-5 suite —
   default `V4_DECODE_STATE=0` is bytewise identical to
   iter-5c's behaviour. ✓ env-gating + diagnostic + tests
-  green; ✗ real-V4 smoke with `V4_DECODE_STATE=1` not yet
-  run this iter (next iter 5e flips the smoke env to test
-  hypothesis 1 / 3).
+  green; ✓ real-V4 smoke with `V4_DECODE_STATE=1` ran in
+  iter-5e and the diagnostic surfaced the T-padding
+  decode-detection bug (see next entry).
+* **Decode-detection bug DIAGNOSED + FIXED (S1 iter-5e)**:
+  the iter-5d diagnostic logs at real-V4 boot showed
+  `__call__ #1: T=64 start_pos=5 is_decode=False` for what
+  should have been a decode call — the runner pads decode
+  shapes to bucket sizes (T=64 typical), so `(T==1) and
+  (start_pos>0)` never triggers. iter-5e replaces the check
+  with `is_decode = start_pos > 0` (the runner-provided
+  `decode_start_pos` already encodes the q0==1/s0>1 contract
+  from `tpu_runner._maybe_set_v4_decode_start_pos`), slices
+  `ids_2d[:, 0:1]` for the decode branch (the runner zero-
+  pads the rest of the bucket), and pads the decode-branch
+  `h` from `[B, 1, hc, D]` to `[B, T, hc, D]` with zeros so
+  the downstream `hidden_TD` reshape keeps the runner-
+  expected shape. Verified 2026-04-30 16:28Z on real V4-Flash:
+  `__call__ #1: T=64 start_pos=5 is_decode=True` fires for
+  the first time, fresh `jit_run_model` decode compile
+  (30,764 HLO instructions vs prefill's ~80k), R1 returns
+  `200 OK` — the decode kernel chain executes end-to-end on
+  real bf16 V4 weights. ✓ decode-branch routing + decode
+  kernel runs on real V4 (first time ever); ✗ second-request
+  stability still blocks (iter-5d hypotheses 1/3 remain —
+  iter-5f's lane).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
