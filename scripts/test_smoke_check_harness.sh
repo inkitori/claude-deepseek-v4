@@ -8,6 +8,7 @@
 #   2. flaky_readiness   — server 503 for first 3 /v1/models, then  → PASS (0)
 #   3. wrong_content     — server returns "Berlin"                  → FAIL (3)
 #   4. timeout_when_down — server never starts                      → FAIL (1)
+#   5. chat_garbled      — completions ok, chat returns garbage     → FAIL (4)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -59,10 +60,11 @@ run_scenario happy_path        18091 0
 run_scenario flaky_readiness   18092 0 --flaky-readiness 3
 run_scenario wrong_content     18093 3 --text " Berlin."
 run_scenario timeout_when_down 18095 1
+run_scenario chat_garbled      18096 4 --chat-text "Hey ofbodyre Este"
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 4/4 harness scenarios pass"
+    echo "OK: 5/5 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"

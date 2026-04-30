@@ -1,0 +1,30 @@
+{#-
+DeepSeek-V4 chat template (chat / Non-think mode).
+
+Mirrors `encode_messages(..., thinking_mode="chat")` from
+encoding/encoding_dsv4.py shipped with DeepSeek-V4-Flash. The model is
+trained with no Jinja chat_template; the upstream README points users at
+that Python encoder. This file is the byte-identical Jinja equivalent
+for the chat-mode subset (system / user / assistant; no tools, no
+thinking) which is what /v1/chat/completions exercises by default.
+
+Tokenizer config has add_bos_token=false, so this template emits BOS.
+-#}
+{%- if messages and messages[0]['role'] == 'system' -%}
+{{- '<｜begin▁of▁sentence｜>' + messages[0]['content'] -}}
+{%- set messages = messages[1:] -%}
+{%- else -%}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}
+{{- '<｜User｜>' + message['content'] -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- '<｜Assistant｜></think>' + (message['content'] or '') + '<｜end▁of▁sentence｜>' -}}
+{%- elif message['role'] == 'system' -%}
+{{- message['content'] -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<｜Assistant｜></think>' -}}
+{%- endif -%}

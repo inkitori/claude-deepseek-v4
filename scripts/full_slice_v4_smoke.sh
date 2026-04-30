@@ -125,11 +125,21 @@ else
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${new_extra}"
 fi
 
+# Chat template: V4-Flash ships no Jinja chat_template — the upstream
+# README points at encoding/encoding_dsv4.py instead. Without a template,
+# vllm falls back to a generic format and /v1/chat/completions returns
+# garbled text (the model + math are correct; this just fixes the
+# messages→prompt translation). scripts/v4_chat_template.jinja is the
+# byte-equivalent of encode_messages(thinking_mode="chat") for the
+# system/user/assistant subset that /v1/chat/completions hits.
+CHAT_TEMPLATE="$REPO_ROOT/scripts/v4_chat_template.jinja"
+
 echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set by tpu_inference)"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
+echo "[smoke]   chat_template=$CHAT_TEMPLATE"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
     --tensor-parallel-size 32 \
@@ -140,6 +150,7 @@ echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
     --trust-remote-code \
     --dtype bfloat16 \
     --enforce-eager \
+    --chat-template "$CHAT_TEMPLATE" \
     --additional_config '{"sharding":{"sharding_strategy":{"enable_dp_attention":true}}}' \
     > "$LOG" 2>&1 &
 

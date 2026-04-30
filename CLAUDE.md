@@ -263,47 +263,59 @@ Still loose ends worth tracking:
     is unchanged (47k optimized) — the savings were activation HBM,
     not graph size.
 
-## Known issue: chat-completions returns garbled text (chat-template missing/wrong)
+## Chat template (chat-completions)
 
-`/v1/completions` works deterministically — the smoke check exercises
-this path and it returns "Paris" reliably. **`/v1/chat/completions`
-returns HTTP 200 with degenerate text** (e.g. `"Hey ofbodyre\n\nEste["`
-for a simple `[{role:"user",content:"hi"}]` request). The model + math
-are correct (completions proves it); what's broken is the chat-template
-layer between the user's `messages: [...]` payload and the prompt
-string the model actually sees.
+V4-Flash deliberately ships **no Jinja `chat_template`** — `tokenizer_config.json`
+omits the field and the upstream HF README says so explicitly:
 
-`vllm chat` CLI separately needs `--url http://localhost:18081/v1`
-because the smoke launcher binds port 18081, not vllm's default 8000.
-A Connection-refused stacktrace from `vllm chat` means either the URL
-flag is missing, or the serve isn't fully up yet (load + compile take
-~5–10 min from `./run.sh serve`).
+> This release does not include a Jinja-format chat template. Instead, we
+> provide a dedicated `encoding` folder with Python scripts and test cases…
 
-**Next-agent task:** investigate the V4-Flash tokenizer's
-`chat_template`, fix or supply one. Probable diagnosis script:
+The Python encoder is at `<snapshot>/encoding/encoding_dsv4.py`. Without
+a template, vllm falls back to a generic format and `/v1/chat/completions`
+returns garbage (e.g. `"Hey ofbodyre\n\nEste["`).
 
-```bash
-work/vllm_env/bin/python -c "
-from transformers import AutoTokenizer
-t = AutoTokenizer.from_pretrained(
-    'deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
-print('chat_template:', repr(t.chat_template))
-print('---')
-print(t.apply_chat_template(
-    [{'role':'user','content':'hi'}],
-    tokenize=False, add_generation_prompt=True))
-"
+`scripts/v4_chat_template.jinja` is the byte-equivalent Jinja translation
+of `encode_messages(thinking_mode="chat")` for the system / user /
+assistant subset that `/v1/chat/completions` exercises. The smoke
+launcher passes it via `--chat-template`; the smoke_check runs a chat
+probe that asserts the response contains "Paris" (exit 4 if not).
+
+Format produced for `[{user: "hi"}]`:
+```
+<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>
+```
+The trailing `</think>` is *deliberate* — chat mode (Non-think) closes
+the thinking block immediately so the model emits content directly. To
+enable Think High / Think Max modes, the template would need to emit
+`<think>` instead and request-side handling of the thinking output.
+
+**Scope of the current template:** chat-mode only (no thinking, no
+tools, no tool results, no `latest_reminder`, no quick-instruction
+tasks). Tools in particular need DSML-format encoding + parsing on
+both sides — that's a future enhancement; the public chat endpoint
+works without it.
+
+**Validation:** byte-parity vs `encode_messages()` was checked across
+8 representative cases when the template was added. To re-validate:
+```python
+import sys, os
+SNAP = "<hf-cache>/snapshots/<sha>"
+sys.path.insert(0, os.path.join(SNAP, "encoding"))
+from encoding_dsv4 import encode_messages
+from transformers import PreTrainedTokenizerFast
+tok = PreTrainedTokenizerFast(tokenizer_file=os.path.join(SNAP, "tokenizer.json"))
+tok.add_special_tokens({"bos_token":"<｜begin▁of▁sentence｜>",
+                         "eos_token":"<｜end▁of▁sentence｜>"})
+tmpl = open("scripts/v4_chat_template.jinja").read()
+msgs = [{"role":"user","content":"hi"}]
+assert encode_messages(msgs, thinking_mode="chat") == \
+    tok.apply_chat_template(msgs, chat_template=tmpl,
+                             tokenize=False, add_generation_prompt=True)
 ```
 
-If `chat_template is None`, vllm falls back to a generic format the
-model wasn't trained on → garbage. Fix is to pass `--chat-template
-<path-to-jinja>` to `vllm serve` (DeepSeek typically ships a template
-file in their HF repo) or to inline a template via vllm's
-`additional_config`. Math-side fix: nothing — the model is correct.
-
-Workaround that works right now: use `/v1/completions` with manually-
-formatted prompts (`User: hi\nAssistant: `). Smoke check uses this
-path successfully.
+`vllm chat` CLI needs `--url http://localhost:18081/v1` since the smoke
+launcher binds 18081 (not vllm's default 8000).
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
