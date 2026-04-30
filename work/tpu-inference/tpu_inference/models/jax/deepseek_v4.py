@@ -788,13 +788,22 @@ def deepseek_v4_run_with_decode_state(
     iter; for now `kv_caches[i]` carries only slot 0.
 
     Branch:
-      * `is_decode_step=False` (prefill): runs `transformer_body_init_state_to_buffer`
-        on `input_ids` and returns `(packed_buffers, h)`. The returned
-        `packed_buffers` REPLACES `kv_caches`'s contents — a prefill
-        starts a fresh state, so any prior buffer contents are
-        discarded. This matches `transformer_body_init_state_from_prefill`'s
-        closed-form initialization (sparse writes from x; non-touched
-        slots remain at init).
+      * `is_decode_step=False` (prefill): runs `transformer_body_forward`
+        for `h` (the forward output that drives the head + lm_head)
+        and `transformer_body_init_state_to_buffer` SEPARATELY for the
+        per-layer packed state that seeds future decode steps. The two
+        paths share their input (`input_ids` + `params` + freqs) and
+        compute the same per-layer kv intermediates, so under JIT the
+        XLA optimizer CSEs the shared subgraphs. The decoupling
+        guarantees `h` is byte-equal to `transformer_body_forward`'s
+        output — iter-5b had `h` come from the combined state-init path
+        and that produced NaN logits on real V4 (suspected XLA
+        reduction-order drift between the forward and the closed-form
+        state allocations). Path-A `h` is the proven baseline.
+
+        The returned `packed_buffers` REPLACES `kv_caches`'s contents
+        — a prefill starts a fresh state, so any prior buffer contents
+        are discarded.
       * `is_decode_step=True`: reads `kv_caches[i]` as layer i's prior
         packed `AttentionDecodeState`, advances by one position, and
         returns `(new_buffers, h)`. `start_pos` is the absolute
@@ -812,7 +821,17 @@ def deepseek_v4_run_with_decode_state(
             state_max_seq_len=state_max_seq_len,
         )
         return new_buffers, h
-    h, packed_buffers = transformer_body_init_state_to_buffer(
+    # iter-5c: h comes from path A (transformer_body_forward) — byte-equal
+    # to the pre-iter-5b production path, so the head/lm_head sees the
+    # same activations the smoke gate verified green. The orchestrator's
+    # own `h` (from transformer_body_init_state_to_buffer) is computed
+    # alongside and discarded; only its packed_buffers feed kv_caches
+    # for future decode steps. XLA CSEs the shared kv/compressor
+    # intermediates between the two computations, so the duplicated
+    # surface is mostly free.
+    h = transformer_body_forward(
+        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
+    _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
@@ -1892,29 +1911,32 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5b is partially landed: the runtime allocator
-                # (kv_cache_manager) + sharding override + decode_start_pos
-                # meta_field + runner-side tagging are wired and verified.
-                # The __call__ flip to deepseek_v4_run_with_decode_state is
-                # disabled — on real V4-Flash that path produces NaN logits
-                # (visible via /v1/completions logprobs=1: HTTP 400 with
-                # "Out of range float values are not JSON compliant: nan").
-                # Tiny-config CPU tests pass byte-equal vs
-                # transformer_body_forward; the divergence appears only
-                # under the full 43-layer V4-Flash + bf16 + replicated
-                # SPMD path, suggesting the state-init's intermediate
-                # allocations re-order something XLA-side. Iter-5c will
-                # isolate (logit-comparison probe between
-                # transformer_body_forward and orchestrator output on a
-                # short prefill against real weights, NaN-mask check on
-                # each layer's output) before flipping __call__ over.
-                # Until then the prefill path is the pre-iter-5b
-                # transformer_body_forward and kv_caches passes through
-                # unchanged (the V4-allocated 1D fp32 buffer carries no
-                # semantic load yet — model_loader's V4 sharding override
-                # guarantees the JIT donation still type-checks).
-                h = transformer_body_forward(
-                    ids_2d, params, freqs_swa, freqs_comp, self.config)
+                # S1 iter-5c: single-active-seq path threads packed
+                # `AttentionDecodeState` through `kv_caches`. The runner
+                # tags `attention_metadata.decode_start_pos` (Python-static
+                # meta_field) to N-1 on a decode step; default 0 = prefill.
+                # iter-5b flipped this to the orchestrator and produced NaN
+                # logits on real V4. iter-5c's orchestrator computes `h`
+                # via path A (`transformer_body_forward`) for forward
+                # output and uses the closed-form state init only for
+                # `kv_caches`, decoupling the forward reduction order
+                # from the state-init's intermediate allocations. See
+                # `deepseek_v4_run_with_decode_state` docstring.
+                start_pos = 0
+                if attention_metadata is not None:
+                    start_pos = int(getattr(
+                        attention_metadata, "decode_start_pos", 0))
+                T = int(ids_2d.shape[-1])
+                is_decode = (T == 1) and (start_pos > 0)
+                state_max_seq_len = v4_state_max_seq_len_from_vllm_config(
+                    self.vllm_config)
+                kv_caches, h = deepseek_v4_run_with_decode_state(
+                    kv_caches, ids_2d, params, freqs_swa, freqs_comp,
+                    self.config,
+                    state_max_seq_len=state_max_seq_len,
+                    is_decode_step=is_decode,
+                    start_pos=start_pos,
+                )
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,
