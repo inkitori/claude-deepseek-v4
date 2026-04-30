@@ -1195,6 +1195,130 @@ random TPU-state nondeterminism.
      the runner/model_loader path, which violates the
      minimum-delta rule unless this is the only viable fix.
 
+**Iter 5g status (2026-04-30, log full-slice-v4-smoke-20260430T182359Z.log):
+hyp-3 sharding-constraint fix DODGES THE FATAL but exposes a
+deeper compute-depends-on-kv_caches correctness bug — the path
+gets text out of the engine, but the text is wrong AND
+non-deterministic.**
+
+iter-5g's hyp-3 fix landed (`commit b6b1aa52`):
+  * `_v4_constrain_packed_replicated(buffers)` helper applies
+    `lax.with_sharding_constraint(b, jax.sharding.PartitionSpec())`
+    to each packed buffer; falls through unchanged outside an
+    active mesh (try/except — lets the existing iter-5 unit
+    tests continue to pass).
+  * `deepseek_v4_run_with_decode_state` calls the helper on
+    `packed_buffers` before returning (prefill branch) and on
+    `new_buffers` (decode branch). Forces the reshard-to-
+    replicated to materialize INSIDE the function rather than
+    at the JIT boundary.
+  * Pinned by `TestPackedDecodeStateBuffer` (7 cases),
+    `TestPrefillToDecodeStateParity` (26 cases),
+    `TestTransformerBodyDecodeRoundTrip` (4 cases) on tiny
+    config — all pass unchanged from iter-5d/5e/5f.
+  * `/tmp/test_v4_iter5c_compile.py` under 32-virtual-CPU mesh
+    w/ replicated `P()` kv_caches: prefill `h` diff vs path-A
+    = 0.000002 (≪ 5e-3); 32 identical shards; all `h` finite.
+
+Real V4-Flash smoke (V4_DECODE_STATE=1, no DIAG):
+  * Application startup at 18:29Z; cluster healthy (no
+    `Halt is unexpected`, no `SLICE_FAILURE`).
+  * R1 prefill compile: 1m08s (prefill artifact fingerprint
+    `66efab3c4b2764...`, 86,100 instructions optimized).
+  * R1 decode compiles fired per `start_pos` ∈ {5,6,7,8,9,10,11}
+    — each ~50–60 s cold compile of 30–34k HLO instructions.
+    7 distinct compiled artifacts, fingerprints captured in
+    log.
+  * R1: `POST /v1/completions HTTP/1.1 200 OK` at 18:36:14Z.
+    **No FATAL.** Engine alive.
+  * R2: `POST /v1/completions HTTP/1.1 200 OK` ~immediately
+    after (R2 hit the cached prefill+decode artifacts; all 8
+    compiles cache-hit). **No FATAL on the second execution
+    of the cached artifact.**
+  * smoke_check FAILS: completions text differs between runs.
+    R1: ` the same as the number of the number`
+    R2: ` the 1st of January 1`
+    Neither is ` Paris` (the green-gate baseline).
+
+**Two new bugs surfaced (both blocking the smoke gate):**
+
+  **Bug A — wrong outputs.** R1 generates ` the same as the
+  number of the number`, NOT ` Paris`. The decode-state path
+  on real V4-Flash bf16 weights produces wrong logits even on
+  the FIRST decode step. Tiny-config tests pin closed-form
+  prefill state init + decode_step at ≤5e-3 vs torch reference,
+  but on 43-layer bf16 real V4 the accumulated drift may be
+  enough to flip argmax. Alternative: the closed-form init's
+  `_compressor_state_from_prefill` field-shape decisions don't
+  exactly match what `transformer_body_forward` would have
+  produced as kv state if we'd run it with real KV caching
+  (which we don't have a baseline for, since green-gate
+  re-prefills every step).
+
+  **Bug B — non-determinism.** R2 hits the SAME compiled
+  prefill artifact as R1, with IDENTICAL input_ids/params/freqs,
+  but produces DIFFERENT output. The only difference is
+  kv_caches input contents — R1 sees fresh-allocator zeros,
+  R2 sees R1's last-decode packed_buffers. The compiled
+  artifact's compute therefore DEPENDS on kv_caches contents,
+  which the source code says it doesn't. iter-5d hyp-1's
+  underlying claim ("donated buffer contents bleed into the
+  next call") is now confirmed in COMPUTE behavior, not just
+  in the diagnostic print artifact iter-5f captured.
+
+  iter-5g's sharding constraint DODGES the FATAL (the worst
+  symptom of buffer aliasing) but does NOT eliminate the
+  data dependence on kv_caches values. The reshard-to-
+  replicated materialization makes the artifact safe to
+  re-execute, but doesn't undo whatever buffer aliasing XLA
+  performs that lets prior contents leak into the compute.
+
+**Iter 5h lane:**
+
+  1. **Pin Bug A via a smaller-scope test.** Run R1 alone
+     (smoke_check modified to fire only the first request)
+     and confirm the wrong-text output is reproducible. If
+     R1's text is stable across multiple runs, Bug A is real
+     and INDEPENDENT of Bug B. If R1's text varies even alone,
+     Bug A and Bug B are tangled (the same kv_caches-bleed
+     mechanism is corrupting R1 too via an earlier code path
+     that reads/donates the freshly-allocated buffer).
+
+  2. **For Bug A, instrument the compiled prefill's
+     intermediate HBM** OR compare R1's logits to a fresh
+     `transformer_body_forward(prompt+next_token)` reference
+     run via direct JAX call (no vLLM). If logits at the last
+     prompt position don't match within ≤5% across all 256k
+     vocab entries, the closed-form state init is wrong.
+     Otherwise the decode step is wrong.
+
+  3. **For Bug B, take iter-5g lane option 4** (separate
+     prefill JIT that doesn't take kv_caches as input). With
+     no kv_caches input, donation can't apply and the compute
+     can't depend on prior contents. Touches `model_loader.py`
+     `run_model` JIT signature — minimum-delta now violated
+     because Bug B confirms the donation-reuse mechanism.
+     Pre-spec the change as: branch on `is_decode_step` AT
+     THE PYTHON LEVEL in `__call__`, dispatch to two separate
+     jit'd functions (`run_prefill_no_kv` and `run_decode_with_kv`).
+     Prefill returns kv_caches as a fresh allocation; decode
+     accepts donated kv_caches as before.
+
+  4. **Diagnostic option.** Run another smoke with
+     `V4_DECODE_STATE_DIAG=1` (already env-gated from iter-5f).
+     If iter-5g's sharding constraint changes R1's output sum,
+     the constraint had a real effect. If R2's output sum
+     STILL differs from R1's despite no FATAL, Bug B is
+     orthogonal to Bug A (kv_caches contents really do affect
+     compute). The fingerprints and chain are critical input
+     for iter-5h.
+
+iter-5g's progress: the engine is now stable. We can iterate on
+correctness without re-incurring the cluster-restart cost on
+every R2 attempt. Bug B is the root cause of both the FATAL
+(now-dodged) AND the non-determinism (still alive); fixing
+that should also help Bug A IF Bug A is downstream of Bug B.
+
 S1 still unlocks A1 (lift `max-model-len`), B1 (sparse_attn
 Pallas becomes worthwhile), and S5 (MTP speculative decoding
 becomes meaningful).
@@ -1997,6 +2121,34 @@ when the timeout SIGTERMs the iter.
   R2 FATAL — so the bug is deterministic, not random TPU
   state. ✓ diag mechanism + chain capture; ✗ root cause
   pinned (iter-5g's lane).
+* **iter-5g hyp-3 sharding-constraint fix (2026-04-30, S1
+  iter-5g, commit b6b1aa52)**: `_v4_constrain_packed_replicated`
+  helper applies `lax.with_sharding_constraint(b, PartitionSpec())`
+  to each packed buffer at `deepseek_v4_run_with_decode_state`'s
+  exit (both prefill and decode branches). Forces the reshard
+  to materialize INSIDE the function rather than at the JIT
+  boundary. Try/except fallback for tests outside a mesh
+  context (no-op there). On real V4-Flash + V4_DECODE_STATE=1
+  smoke (logs/full-slice-v4-smoke-20260430T182359Z.log):
+    * **R1 + R2 both return 200 OK with no `[USER]` FATAL.**
+      iter-5e/iter-5f's TPU FATAL on R2's cached prefill
+      artifact RE-EXECUTION is dodged. The artifact is now
+      safe to re-run with prior-call kv_caches contents in
+      the donated buffer.
+    * R2 hit cached prefill artifact (same fingerprint as R1).
+      No fresh trace, no new compile. ~0 s curl latency on R2.
+    * BUT R1's text is wrong (` the same as the number of
+      the number`) and R2's text differs from R1's (` the 1st
+      of January 1`), so smoke_check FAILS on the byte-
+      equality assertion. iter-5g surfaced TWO new bugs:
+      Bug A (decode-state path produces wrong logits even on
+      R1) and Bug B (R2's compute depends on kv_caches input
+      contents despite source code saying it doesn't —
+      iter-5d hyp-1 confirmed in compute behavior, not just
+      diagnostic-print artifacts). See "Iter 5g status" above
+      for the iter-5h hand-off + recommended next moves.
+  ✓ FATAL dodged + engine stable across requests; ✗ output
+  correctness + determinism (iter-5h's lane).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
