@@ -51,6 +51,12 @@ export NEW_MODEL_DESIGN=1
 # Set V4_LOADER_SLICE_AWARE=0 to fall back to full-tensor dequant per host.
 export V4_LOADER_SLICE_AWARE="${V4_LOADER_SLICE_AWARE:-1}"
 
+# Multi-threaded per-host placement. Default 4 — most per-tensor work
+# (read_dequant_slice, make_array_from_callback, host->device transfer)
+# happens in JAX/safetensors C code that releases the GIL, so parallelism
+# is real. Set to 1 to disable for single-thread parity testing.
+export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-4}"
+
 # Optional opt-in: parallel CPU dequant inside iter_v4_safetensors_dequant_torch.
 # Default 0 = sequential. Set to 4-8 to overlap dequant with TPU placement.
 # Note: empirically this didn't help on real V4 because placement (PCIe), not
@@ -90,7 +96,7 @@ export JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS="${JAX_COMPILATION_CACHE_MIN_
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
@@ -98,7 +104,7 @@ else
 fi
 
 echo "[smoke] launching vllm serve | log=$LOG"
-echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
+echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 echo "[smoke]   jax_cache=$JAX_COMPILATION_CACHE_DIR"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"

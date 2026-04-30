@@ -1003,58 +1003,82 @@ def _build_class():
             # path (useful for parity testing or if a future refactor breaks
             # slice-aware in a corner case).
             slice_aware = _os.environ.get("V4_LOADER_SLICE_AWARE", "1") == "1"
+
+            # Multi-threaded placement: each tensor's read+dequant+placement
+            # spends most of its wall time in JAX/safetensors C code that
+            # releases the GIL. Running N placement threads per host
+            # parallelizes the per-tensor framework overhead. Workers produce
+            # (jax_path, arr) pairs; the main thread drains them and does
+            # _assign so the dataclass-tree mutation stays single-threaded.
+            try:
+                place_workers = max(1, int(
+                    _os.environ.get("V4_LOADER_PLACE_WORKERS", "4")))
+            except ValueError:
+                place_workers = 1
+
             print(
                 f"[deepseek_v4] load_weights_from_dir: streaming "
                 f"{checkpoint_dir!r} (mesh={self.mesh}, "
-                f"slice_aware={slice_aware})",
+                f"slice_aware={slice_aware}, place_workers={place_workers})",
                 file=_sys.stderr, flush=True,
             )
 
+            def _do_place_spec(spec) -> Tuple[Optional[str], Any, str]:
+                """Worker-side: resolve path + run the slice-aware placement.
+                Returns (jax_path, arr, hf_name); jax_path=None means skip."""
+                jax_path = map_hf_name_to_jax_path(spec.hf_name)
+                if jax_path is None or jax_path.endswith("<scale>"):
+                    return (None, None, spec.hf_name)
+                leaf = path_to_leaf.get(jax_path)
+                if leaf is None:
+                    return (None, None, spec.hf_name)
+                target_shape = tuple(leaf.shape)
+                target_dtype = jnp.dtype(leaf.dtype)
+                arr = place_spec_as_jax_sharded(
+                    spec, target_dtype, target_shape, self.mesh,
+                )
+                return (jax_path, arr, spec.hf_name)
+
+            def _do_place_full(item) -> Tuple[Optional[str], Any, str]:
+                """Worker-side equivalent for the full-dequant fallback path."""
+                hf_name, torch_t = item
+                jax_path = map_hf_name_to_jax_path(hf_name)
+                if jax_path is None or jax_path.endswith("<scale>"):
+                    return (None, None, hf_name)
+                leaf = path_to_leaf.get(jax_path)
+                if leaf is None:
+                    return (None, None, hf_name)
+                target_shape = tuple(leaf.shape)
+                target_dtype = jnp.dtype(leaf.dtype)
+                arr = place_torch_as_jax_sharded(
+                    torch_t, target_dtype, target_shape, self.mesh,
+                )
+                return (jax_path, arr, hf_name)
+
+            def _drain_one(future, last_hf_name_box):
+                jax_path, arr, hf_name = future.result()
+                last_hf_name_box[0] = hf_name
+                if jax_path is None:
+                    skipped.append(hf_name)
+                    return False
+                _assign(jax_path, arr)
+                placed_paths.add(jax_path)
+                return True
+
             if slice_aware:
-                for spec in iter_v4_safetensors_specs(checkpoint_dir):
-                    jax_path = map_hf_name_to_jax_path(spec.hf_name)
-                    if jax_path is None or jax_path.endswith("<scale>"):
-                        skipped.append(spec.hf_name)
-                        continue
-                    leaf = path_to_leaf.get(jax_path)
-                    if leaf is None:
-                        skipped.append(spec.hf_name)
-                        continue
-                    target_shape = tuple(leaf.shape)
-                    target_dtype = jnp.dtype(leaf.dtype)
-                    arr = place_spec_as_jax_sharded(
-                        spec, target_dtype, target_shape, self.mesh,
-                    )
-                    _assign(jax_path, arr)
-                    placed_paths.add(jax_path)
-                    placed_count += 1
-                    if placed_count % 200 == 0:
-                        now = _time.time()
-                        rate = 200.0 / max(now - t_last, 1e-9)
-                        print(
-                            f"[deepseek_v4] placed {placed_count} tensors "
-                            f"({rate:.1f}/s, last={spec.hf_name})",
-                            file=_sys.stderr, flush=True,
-                        )
-                        t_last = now
+                source_iter = iter_v4_safetensors_specs(checkpoint_dir)
+                worker_fn = _do_place_spec
             else:
-                for hf_name, torch_t in iter_v4_safetensors_dequant_torch(checkpoint_dir):
-                    jax_path = map_hf_name_to_jax_path(hf_name)
-                    if jax_path is None or jax_path.endswith("<scale>"):
+                source_iter = iter_v4_safetensors_dequant_torch(checkpoint_dir)
+                worker_fn = _do_place_full
+
+            if place_workers <= 1:
+                # Single-threaded path (env override or fallback).
+                for item in source_iter:
+                    jax_path, arr, hf_name = worker_fn(item)
+                    if jax_path is None:
                         skipped.append(hf_name)
-                        del torch_t
                         continue
-                    leaf = path_to_leaf.get(jax_path)
-                    if leaf is None:
-                        skipped.append(hf_name)
-                        del torch_t
-                        continue
-                    target_shape = tuple(leaf.shape)
-                    target_dtype = jnp.dtype(leaf.dtype)
-                    arr = place_torch_as_jax_sharded(
-                        torch_t, target_dtype, target_shape, self.mesh,
-                    )
-                    del torch_t
                     _assign(jax_path, arr)
                     placed_paths.add(jax_path)
                     placed_count += 1
@@ -1067,6 +1091,46 @@ def _build_class():
                             file=_sys.stderr, flush=True,
                         )
                         t_last = now
+            else:
+                # Bounded sliding window over a thread pool. We keep a few
+                # extra futures in flight beyond `place_workers` so the pool
+                # is always saturated, but cap the queue so peak host memory
+                # stays bounded to ~that many in-flight (slice, scale)
+                # buffers.
+                from concurrent.futures import (
+                    ThreadPoolExecutor, wait, FIRST_COMPLETED)
+                in_flight_max = place_workers * 2
+                last_hf_name_box = [""]
+                with ThreadPoolExecutor(max_workers=place_workers) as ex:
+                    pending = set()
+                    exhausted = False
+                    while not exhausted or pending:
+                        # Refill the in-flight queue.
+                        while not exhausted and len(pending) < in_flight_max:
+                            try:
+                                item = next(source_iter)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            pending.add(ex.submit(worker_fn, item))
+                        if not pending:
+                            break
+                        done, pending = wait(
+                            pending, return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            ok = _drain_one(fut, last_hf_name_box)
+                            if ok:
+                                placed_count += 1
+                                if placed_count % 200 == 0:
+                                    now = _time.time()
+                                    rate = 200.0 / max(now - t_last, 1e-9)
+                                    print(
+                                        f"[deepseek_v4] placed {placed_count} "
+                                        f"tensors ({rate:.1f}/s, "
+                                        f"last={last_hf_name_box[0]})",
+                                        file=_sys.stderr, flush=True,
+                                    )
+                                    t_last = now
             elapsed = _time.time() - t0
             print(
                 f"[deepseek_v4] load_weights_from_dir done: placed="
