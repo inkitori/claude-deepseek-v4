@@ -596,22 +596,37 @@ V4's MoE. Hash-routing layers (INVARIANTS I18) need a different
 treatment — `tid2eid` lookup is per-token, but the dispatch
 pattern is the same.
 
-#### B3. SPMD `Involuntary full rematerialization` audit
+#### B3. SPMD `Involuntary full rematerialization` audit — DONE for the `compressor.ape` family (126 → 0)
 
-Each warning in the smoke log is XLA giving up on a sharding
-spec and falling back to replicate + re-partition. They lengthen
-compile and add slow runtime barriers.
+The 126 `Involuntary full rematerialization` warnings observed
+in the green-gate smoke log were all the `compressor.ape` /
+`indexer.compressor.ape` family — tiny `f32[128,16]` /
+`f32[4,32]` / `f32[4,8]` constant tables that the loader's
+sharding heuristic split along `attn_dp` because their largest
+dim happened to divide cleanly into 32. Consumers wanted them
+replicated (or differently sharded), and XLA reported the
+unavoidable reshard at every consume site. The
+`_replicate(params.ape)` `with_sharding_constraint` inside
+`compressor_prefill` / `compressor_decode_step` was a partial
+mitigation but didn't drop the warnings — XLA still has to
+reshard from the loaded sharding to the constraint.
+
+Fix: `pick_partition_spec` (`models/jax/deepseek_v4_loader.py`)
+now returns `P()` for any tensor below `_MIN_SHARD_ELEMENTS`
+(8K elements, ~32 KiB f32). Anything bigger keeps the sharded
+path; norm weights (4096 f32 elements at hidden_size=4096) and
+similar fall under the threshold and replicate too — the per-
+chip HBM cost is negligible (~16 KiB/chip extra per norm × ~80
+norms × 32 chips = ~40 MiB total), and the extra reshard noise
+is gone. Verified 2026-04-30: real-smoke green with 0 remat
+warnings (vs 126 prior) and the same sub-100s cold compile.
+
+To re-audit after future kernel work:
 
 ```
 grep "Involuntary full rematerialization" \
     logs/full-slice-v4-smoke-*.log
 ```
-
-Group by sharding pair, fix the worst offenders by adding
-`with_sharding_constraint` or `_replicate` calls. The
-`compressor.ape` family was already eliminated by a `_replicate`
-in `compressor_prefill`/`compressor_decode_step`; same pattern
-likely applies to others.
 
 #### B4. AOT compile + binary persist
 
@@ -820,6 +835,17 @@ when the timeout SIGTERMs the iter.
   smoke_check + 10-scenario harness self-test + real `vllm serve` run
   on 2026-04-30: reassembled SSE = non-streaming " Paris" byte-for-byte).
   ✓ See S7.
+* **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
+  in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
+  products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates
+  the loader-side `attn_dp`-axis sharding for `compressor.ape` /
+  `indexer.compressor.ape` / norm weights / `attn_sink` and similar
+  tiny constants whose consumers couldn't accept the heuristic
+  layout. Drops the green-gate smoke from 126 `Involuntary full
+  rematerialization` warnings to 0 with no perf regression
+  (cold compile ~75s end-to-end, prefill+decode buckets each at
+  ~47k optimized HLO instructions, deterministic " Paris" ✓).
+  Verified 2026-04-30 09:28:55Z. See B3.
 
 ## Chat template (chat-completions)
 
