@@ -181,26 +181,82 @@ just noise the next reader has to wade through.
 Numbers above are snapshots; re-measure with `wc -l` and `grep -c "^class Test"`
 when you touch.
 
-## What's been optimized + verified
+## Current state (READ BEFORE LAUNCHING)
 
-* **Streaming sharded loader** (no zero-tree OOM, places one tensor
-  at a time onto a sharded global `jax.Array`). ✓
-* **Slice-aware load**: each host reads only its row range from the
-  safetensors mmap. ✓ Parity-verified on tiny fixture.
+`./run.sh serve` will reach `Application startup complete` and the
+load is fast (~4 min). **The first `/v1/completions` call fails with
+`CompileTimeHbmOom`** during XLA's late codegen pass on real
+V4-Flash. This is the **#1 thing to fix**.
+
+What happened: the vectorized MoE (`deepseek_v4_moe.py::moe_forward`)
+collapses 256 per-expert matmuls into 3 stacked einsums per layer,
+which dropped `jit_run_model` HLO from 477k → 103k instructions
+(4.6×). Compile time fell with it. **But** the stack op
+`jnp.stack([e.w1 for e in params.experts])` produces an
+`[E, inter, dim] = [256, 2048, 4096]` tensor whose new "expert"
+dim has no mesh axis to shard on (mesh is `attn_dp=32, others=1`),
+so XLA all-gathers the full unsharded stack on every chip:
+
+```
+1. Size: 4.00G
+   Operator: op_name="jit(run_model)/nd,eid->nei/dot_general"
+   Shape: bf16[256, 2048, 4096]
+   XLA label: all-gather.9090 ...
+   Allocation type: HLO temp
+```
+
+× 3 stacks (W1/W2/W3) = 12 GiB of HLO temp on top of the model
+weights (~18 GiB / chip post-load) → blows the 31.25 GiB chip HBM
+budget by ~3.5 GiB.
+
+The original Python-unrolled per-expert loop didn't trip this
+because each expert's weights stayed independently sharded — no
+stack, no all-gather. Slow to compile (30+ min, 477k HLO
+instructions) but the memory plan fit.
+
+### Attack lanes (in rough ROI order)
+
+1. **Add `with_sharding_constraint` to the stacked weights** so
+   XLA shards the inter dim across `attn_dp` instead of all-gathering
+   the new expert dim. One line per stack, e.g.:
+   `W1 = jax.lax.with_sharding_constraint(W1, NamedSharding(mesh, P(None, 'attn_dp', None)))`.
+   Lowest-risk fix; preserves the 4.6× HLO win + the existing math.
+2. **Pre-stack the experts at load time** in
+   `deepseek_v4_loader.py` so the param tree carries `[E, inter, dim]`
+   tensors instead of `list[ExpertParams]`. Place them with an
+   explicit `(expert, attn_dp, None)` PartitionSpec. Bigger
+   change (touches the loader + the `MoEParams` dataclass) but
+   cleanest.
+3. **Process experts in chunks** (e.g. 8 at a time via
+   `jax.lax.scan` over an `[E/chunk, chunk, inter, dim]` reshape).
+   Bounds peak HBM but is more complex than (1).
+4. **Revert the vectorize.** Falls back to the working-but-slow
+   30+ min cold compile path. Trade HBM safety for compile time.
+   Use only as a last resort if (1)–(3) all fail.
+
+After any change, validate with the loop:
+```bash
+./run.sh serve
+./scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
+```
+
+## What's been optimized + verified (load path only)
+
+* **Streaming sharded loader** (no zero-tree OOM). ✓
+* **Slice-aware load**: each host reads only its row range. ✓
+  Parity-verified on tiny fixture.
 * **Multi-threaded placement** (`V4_LOADER_PLACE_WORKERS=8`). ✓
   Parity-verified on tiny fixture.
 * **safetensors handle cache** (`_safe_open_cache`): eliminates
   per-tensor mmap+header reopen — observed ~6× load speedup
   (23 t/s → 140 t/s on real V4-Flash, ~4 min total load down from
   ~25 min). ✓
-* **Vectorized MoE forward**: 256 expert kernels per layer collapsed
-  into 3 einsums via stacked `[E, ...]` weights + one_hot routing
-  weight. Mathematically identical to the per-expert loop
-  (maxabs=0 across 5 seeds on the synthetic fixture). Drops
-  `jit_run_model` HLO instruction count by orders of magnitude
-  and cold-compile time with it. ✓
-* **Persistent JAX compile cache**: wired up local-disk per host;
-  populates after first successful `jit_run_model` finishes. ✓
+* **Vectorized MoE forward**: math byte-equivalent to the per-expert
+  reference loop (maxabs=0 across 5 seeds on synthetic fixture);
+  HLO instruction count drops 4.6× (477k → 103k). ✓ correctness,
+  ✗ deploy (HBM OOM, see "Current state" above).
+* **Persistent JAX compile cache**: wired; not yet populated because
+  no successful compile has completed end-to-end on real V4-Flash. ⚠
 
 ## Pitfalls already learned (don't repeat)
 

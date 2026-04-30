@@ -64,3 +64,12 @@ Things that must remain true for the math to work. When something breaks, check 
 
 ## MoE forward
 - I43. **Vectorized dense MoE is mathematically equivalent to top-k routing.** The forward stacks per-expert weights into `[E, ...]` tensors and uses a per-(token, expert) routing weight built from `one_hot(indices) * weights`, which is non-zero only for the top_k experts the gate picked. Output is byte-identical (maxabs=0) to the per-expert reference loop on a synthetic fixture across 5 seeds (3 top-k + 2 hash-routing). FLOP cost is the same as before — true sparse dispatch (a follow-up) would be ~32× cheaper for top_k=8 / E=256.
+
+  **Caveat (current blocker, see CLAUDE.md "Current state"):** the
+  stack op materializes an unsharded `[E=256, inter, dim]` tensor
+  per layer because the new "expert" dim has no mesh axis to shard
+  on (mesh is `attn_dp=32, others=1`). XLA emits a 4 GiB all-gather
+  per stack at compile time, which OOMs the 31.25 GiB chip HBM
+  budget on real V4-Flash. The math is correct; the sharding plan
+  needs `with_sharding_constraint` on the stacks (or pre-stacking
+  at load time) before the deploy works end-to-end.

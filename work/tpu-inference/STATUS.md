@@ -9,12 +9,16 @@ Snapshot at the time this stub was written:
 
 * **Load (real V4-Flash, 35020 tensors):** ~4 min on the v6e-32 slice.
   Verified end-to-end (`load_weights_from_dir done: placed=35020 skipped=0`).
-* **MoE forward:** vectorized to 3 einsums per layer; HLO instruction
-  count for `jit_run_model` dropped from 477,014 → 103,540 (4.6×). Math
-  byte-equivalent vs the per-expert reference loop on a synthetic fixture
-  (maxabs=0 across 5 seeds).
-* **Cold first curl:** still ~10–15 min on a clean compile cache. Not yet
-  reduced to "fast"; this is the primary objective for the next agent
-  iteration (see `prompt.md` "Your job — primary objective").
+* **MoE forward:** vectorized; math byte-equivalent vs the per-expert
+  reference loop on a synthetic fixture (maxabs=0 across 5 seeds);
+  HLO instruction count for `jit_run_model` drops 477,014 → 103,540
+  (4.6×). **But:** the vectorize introduces a compile-time HBM OOM
+  on real V4-Flash via an unsharded 4 GB all-gather of the stacked
+  expert weights. **First curl currently fails.** See
+  [`../../CLAUDE.md`](../../CLAUDE.md) "Current state" for the full
+  breakdown + 4 ranked attack lanes.
+* **First curl:** broken (HBM OOM at compile time). Fixing this is the
+  next agent's #1 task; lane 1 (`with_sharding_constraint` on the
+  stacked MoE weights) should be a one-line fix.
 
-For the current state, run the iterate loop and read CLAUDE.md.
+For the current state, read CLAUDE.md.

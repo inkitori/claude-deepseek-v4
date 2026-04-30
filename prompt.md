@@ -82,61 +82,69 @@ See CLAUDE.md "What's been optimized + verified" for the latest.
 
 ## Your job — primary objective
 
-**Make the first `/v1/completions` request after `./run.sh serve`
-return as fast as possible** while keeping the math correct.
+**Fix the `CompileTimeHbmOom` so `./run.sh serve` actually returns
+a curl response.** The detailed failure breakdown lives in
+[CLAUDE.md](CLAUDE.md) "Current state (READ BEFORE LAUNCHING)" with
+4 ranked attack lanes. Start with lane 1 (`with_sharding_constraint`
+on the stacked MoE weights) — it's a one-line fix per stack and
+should preserve the 4.6× HLO instruction count win.
 
-Current floor: ~5-15 min on cold compile cache (the V4 forward graph
-is ~103k HLO instructions post-MoE-vectorize, and XLA's TPU compile
-cost is super-linear in instruction count). On a warm cache, ~30-60s
-is realistic. **Sub-10s is the stretch goal.**
+Once curl returns, the **secondary objective** is reducing first-curl
+latency. The graph is currently ~103k HLO instructions; cold compile
+takes ~10 min. Realistic targets:
 
-Concrete things to attack, in rough ROI order:
+* Cold cache: ~5-10 min (architectural floor on TPU XLA for a graph
+  of this size).
+* Warm cache: ~30-60s (cache load + first execute).
+* Sub-10s is the stretch goal but requires AOT-precompile work.
+
+Attack lanes for first-curl (after the OOM is fixed):
 
 1. **Verify cross-host JAX cache sharing is safe.** Each of the 8
    hosts currently compiles its own slice of the SPMD program;
    `/tmp/jax-compile-cache-v4` is per-host. After a successful
    compile, fingerprint the cache files (sha256 the .pb / .bin
    contents on every host) — if host 0's matches hosts 1-7, write
-   a `scripts/full_slice_v4_share_cache.sh` helper that rsyncs
-   host 0's cache to all workers after a bootstrap-time warmup.
-   This makes brand-new-slice first-launch 8x faster on cold.
-   Uncertain: SPMD might bake in per-device identifiers that
-   break byte-equality. Verify before shipping.
+   `scripts/full_slice_v4_share_cache.sh` to rsync host 0's cache
+   to all workers after a bootstrap-time warmup. Brand-new-slice
+   first-launch becomes 8× faster on cold. Uncertain: SPMD might
+   bake in per-device identifiers that break byte-equality. Verify
+   before shipping.
 
 2. **Fix `Involuntary full rematerialization` warnings.** Every one
-   of these in the smoke log is XLA giving up on a sharding spec
-   (e.g. `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`).
-   Track down which leaf or activation is generating each one and
-   either pre-shard it correctly at load-time or annotate the
-   forward with `with_sharding_constraint`. Shrinks the HLO and
-   removes runtime barriers.
+   in the smoke log is XLA giving up on a sharding spec (e.g.
+   `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`). Track
+   down which leaf or activation generates each and either pre-shard
+   it at load-time or annotate the forward with
+   `with_sharding_constraint`. Shrinks HLO and removes runtime
+   barriers.
 
-3. **Reduce HLO instruction count further.** The vectorized MoE
-   already collapsed 256 expert kernels per layer into 3 einsums.
-   Look for similar patterns in attention (sparse_attn, indexer)
-   and the head — Python-level loops over heads / layers / hash
-   shards that XLA is unrolling. Consolidate where possible.
+3. **Reduce HLO instruction count further.** Look for Python-level
+   loops over heads / layers / hash shards that XLA is unrolling.
+   Consolidate where the same memory-safety considerations as the
+   MoE vectorize are met (don't create unsharded stacks).
 
-4. **AOT precompile + persist as a binary.** Use
+4. **AOT precompile + binary persist.** Use
    `jit().lower().compile()` to produce a serializable XLA
-   executable, then load it on subsequent launches without
-   re-tracing. Real work; non-trivial XLA-versioning risk.
+   executable, load on subsequent launches without re-tracing. Real
+   work; non-trivial XLA-versioning risk.
 
-After each change, validate with the same loop:
+After each change, validate with the loop:
 
 ```bash
 ./run.sh serve
 ./scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
 ```
 
-Report observed first-curl latency in the commit message so we can
-see the trend.
+Report observed first-curl latency (or the failure mode) in the
+commit message so we can see the trend.
 
 ## Secondary: keep cleaning up
 
-If first-curl is already optimal, fall back to consolidating the
-known-bloat targets in CLAUDE.md "Known bloat / consolidation
-candidates" — particularly the 3185-LOC test file with 33 classes.
+If the OOM is fixed and first-curl is already optimal, fall back to
+consolidating the known-bloat targets in CLAUDE.md "Known bloat /
+consolidation candidates" — particularly the 3185-LOC test file
+with 33 classes.
 
 ## Commit + push hygiene
 
