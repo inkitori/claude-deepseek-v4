@@ -41,6 +41,16 @@ Args:
                           when the request body has temperature>0 (default
                           'length'). Lets a test exercise the
                           invalid-finish-reason failure path.
+  --stop-honor BOOL       when "1" (default), honor the request body's `stop`
+                          field by truncating choices[0].text before the first
+                          stop string and reporting finish_reason="stop". When
+                          "0", emit the full text and finish_reason="length"
+                          regardless — exercises the broken-stop-handler path.
+  --logprobs-alts N       number of top-logprob alternatives to emit per token
+                          when the request body has logprobs>0 (default 5).
+                          Set to 0 to emit no logprobs object — exercises the
+                          missing-logprobs failure path. Set to <5 to exercise
+                          the dropped-alternatives failure path.
   --flaky-readiness N     return 503 from /v1/models for the first N calls, then
                           200. Useful for exercising the readiness-wait loop.
 """
@@ -61,6 +71,8 @@ class MockHandler(BaseHTTPRequestHandler):
     stream_text = None  # falls back to text if unset
     sampling_text = None  # falls back to text on /v1/completions when temp>0
     sampling_finish = "length"  # finish_reason on the temp>0 path
+    stop_honor = True  # if False, ignore request `stop` and emit full text
+    logprobs_alts = 5  # alternatives per token when logprobs>0; 0 = omit object
     flaky_remaining = 0
 
     def log_message(self, format, *args):
@@ -147,16 +159,64 @@ class MockHandler(BaseHTTPRequestHandler):
             if is_sampling and MockHandler.sampling_text is not None:
                 text = MockHandler.sampling_text
                 finish = MockHandler.sampling_finish
+
+            # Stop-sequence handling. When `stop` is set in the body, a
+            # well-behaved server truncates `text` before the first stop
+            # match and reports finish_reason="stop". With `--stop-honor 0`
+            # we deliberately ignore the field — exercises the broken path.
+            stop_seqs = body.get("stop") or []
+            if isinstance(stop_seqs, str):
+                stop_seqs = [stop_seqs]
+            if stop_seqs and MockHandler.stop_honor:
+                cut = len(text)
+                for s in stop_seqs:
+                    if not isinstance(s, str) or not s:
+                        continue
+                    idx = text.find(s)
+                    if idx >= 0 and idx < cut:
+                        cut = idx
+                if cut < len(text):
+                    text = text[:cut]
+                    finish = "stop"
+
+            choice = {
+                "index": 0,
+                "text": text,
+                "finish_reason": finish,
+            }
+
+            # Logprobs handling. When `logprobs` is set in the body, emit a
+            # per-position object with `tokens`, `token_logprobs`, and
+            # `top_logprobs`. With `--logprobs-alts 0` we omit the object
+            # entirely (broken path); with a value <5 we emit fewer than
+            # the requested alternatives (dropped-alternatives path).
+            n_lp = body.get("logprobs")
+            if isinstance(n_lp, int) and n_lp > 0 and MockHandler.logprobs_alts > 0:
+                # Naively split text on whitespace as a stand-in for tokens.
+                # Real vLLM emits token-id-aligned entries; the smoke check
+                # only inspects len(top_logprobs[i]), which is what this
+                # mock cares about.
+                toks = text.split() or [text]
+                alts = MockHandler.logprobs_alts
+                top = []
+                for tok in toks:
+                    entry = {tok: -0.1}
+                    for k in range(1, alts):
+                        entry[f"alt_{k}"] = -1.0 - 0.1 * k
+                    top.append(entry)
+                choice["logprobs"] = {
+                    "tokens": list(toks),
+                    "token_logprobs": [-0.1] * len(toks),
+                    "top_logprobs": top,
+                    "text_offset": [0] * len(toks),
+                }
+
             self._json(200, {
                 "id": "cmpl-mock-deterministic",
                 "object": "text_completion",
                 "created": 0,
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
-                "choices": [{
-                    "index": 0,
-                    "text": text,
-                    "finish_reason": finish,
-                }],
+                "choices": [choice],
                 "usage": {"prompt_tokens": 6, "completion_tokens": 8,
                           "total_tokens": 14},
             })
@@ -196,6 +256,8 @@ def main() -> int:
     ap.add_argument("--stream-text", default=None)
     ap.add_argument("--sampling-text", default=None)
     ap.add_argument("--sampling-finish", default="length")
+    ap.add_argument("--stop-honor", default="1")
+    ap.add_argument("--logprobs-alts", type=int, default=5)
     ap.add_argument("--flaky-readiness", type=int, default=0)
     args = ap.parse_args()
 
@@ -205,6 +267,8 @@ def main() -> int:
     MockHandler.stream_text = args.stream_text
     MockHandler.sampling_text = args.sampling_text
     MockHandler.sampling_finish = args.sampling_finish
+    MockHandler.stop_honor = (args.stop_honor != "0")
+    MockHandler.logprobs_alts = args.logprobs_alts
     MockHandler.flaky_remaining = args.flaky_readiness
 
     with HTTPServer(("127.0.0.1", args.port), MockHandler) as httpd:

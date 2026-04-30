@@ -138,6 +138,19 @@ scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
     item S6 — verifies the sampling code path (temperature scaling
     + top-p filter + token penalties) doesn't crash or produce
     garbage on TPU.
+  * `/v1/completions` with `stop=["Paris"]` — `STOP_REQUIRED=1`
+    to fail when the response still contains `Paris` or
+    `finish_reason` isn't `stop` (exit 8). Pins backlog item S6
+    broader-matrix — verifies the stop-sequence handler actually
+    truncates before the matched token. The deterministic baseline
+    emits ` Paris` as its first token, so a working handler MUST
+    intercept it.
+  * `/v1/completions` with `logprobs=5` — `LOGPROBS_REQUIRED=1`
+    to fail when any emitted position has fewer than 5 alternatives
+    in `top_logprobs` (exit 9). Pins backlog item S6 broader-matrix
+    — verifies the logprobs postprocessing path emits the per-token
+    alternative distribution that production clients rely on for
+    confidence scoring.
 * **`full_slice_v4_warm_cache.sh`** — runs the smoke + check, then
   cleans up. Use once on a fresh VM (or after a `/tmp` wipe) to
   populate the JAX compile cache; subsequent real launches' first
@@ -184,6 +197,8 @@ launcher echoes the active values at startup so you can confirm.
 | `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
 | `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
 | `SAMPLING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and assert the response has non-empty text + a valid `finish_reason` (exit 7 on empty / invalid). Pins backlog item S6 — verifies the sampling code path doesn't crash or produce garbage. Cheap — same prefill bucket as the existing completions probe. Determinism under sampling is **not** asserted (vLLM/TPU runner doesn't honour per-request seed for non-greedy paths; CLAUDE.md pitfall context). |
+| `STOP_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stop=["Paris"]` and assert (a) the response text does NOT contain `Paris` and (b) `finish_reason="stop"` (exit 8 on either). Pins backlog item S6 broader-matrix — verifies vLLM's stop-sequence handler on the TPU runner truncates before the matched token and reports the right reason. Cheap — same prefill bucket as the existing completions probe. The deterministic baseline emits ` Paris` as its first token at temp=0/seed=0, so a working handler MUST intercept it. |
+| `LOGPROBS_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `logprobs=5` and assert every emitted position's `top_logprobs` entry has at least 5 alternatives (exit 9 on missing object / dropped alternatives). Pins backlog item S6 broader-matrix — verifies the logprobs postprocessing path on the TPU runner emits the per-token alternative distribution that production clients (confidence scoring, structured-output reranking) rely on. Cheap — same prefill bucket as the existing completions probe. |
 
 ## Current state (READ BEFORE LAUNCHING)
 
@@ -468,7 +483,7 @@ Implementation:
 
 1.5–2× decode throughput once S1 lands.
 
-#### S6. Sampling parameters — single-config probe DONE; broader matrix still TODO
+#### S6. Sampling parameters — single-config + stop + logprobs probes DONE; top_k / n>1 / presence_penalty still TODO
 
 The path is standard — V4 inherits tpu-inference's
 `sampling.py` + `rejection_sampler.py` via `compute_logits` at
@@ -500,14 +515,41 @@ completions probe still sends `seed=0` because at temperature=0
 JAX accepts it (as a no-op). That asymmetry is the same reason
 byte-equality across runs would be a false guarantee.
 
-**Broader matrix still TODO** — top_k, presence_penalty, n>1,
-logprobs, stop sequences. Each is a separate code path with
-different known quirks under vLLM's TPU runner. Add as further
-gated probes (`SAMPLING_NK_REQUIRED=1` for n>1, etc.) or a
-`tests/test_v4_sampling_e2e.py` driving the running smoke. The
-current single probe catches the most-common production
-parameter combination; broader coverage matters more before
-claiming "we serve production sampling."
+**Stop-sequence probe (DONE — harness-verified, real-V4 verification deferred)**:
+`STOP_REQUIRED=1` fires `/v1/completions` with `stop=["Paris"]` and
+asserts (a) the response text does NOT contain `Paris` and
+(b) `finish_reason="stop"`; exit 8 on either. The deterministic
+baseline (`fire_completion`, no stop) emits ` Paris` as its first
+token at temp=0/seed=0, so a working stop-sequence handler MUST
+intercept that token, truncate, and report `stop`. Mock harness
+covers `stop_required_match` (mock truncates correctly →
+exit 0) and `stop_required_leak` (mock with `--stop-honor 0`
+ignores the field → exit 8). Real-V4 verification deferred to
+the next real-smoke run.
+
+**Logprobs probe (DONE — harness-verified, real-V4 verification deferred)**:
+`LOGPROBS_REQUIRED=1` fires `/v1/completions` with `logprobs=5`
+and asserts every emitted position's `top_logprobs` entry has at
+least 5 alternatives (exit 9 on missing object / dropped
+alternatives). Mock harness covers `logprobs_required_match`
+(mock emits 5 alts → exit 0), `logprobs_required_missing`
+(mock with `--logprobs-alts 0` omits the object → exit 9), and
+`logprobs_required_dropped` (mock with `--logprobs-alts 3` emits
+fewer than requested → exit 9). Real-V4 verification deferred.
+Production clients (confidence scoring, reranking, structured-
+output likelihood) depend on this path; vLLM's TPU runner has
+historically had quirks here (per-position emission can be
+silently dropped under some sampling configs).
+
+**Still TODO** — `top_k` (typically combined with `top_p` to bound
+the candidate set), `presence_penalty` (different from
+`frequency_penalty` — applied per-token rather than per-occurrence),
+`n>1` (interacts with seq dispatch — under today's
+`--max-num-seqs=1` this likely sequentializes; informative either
+way). Each is a separate gated probe (`TOPK_REQUIRED=1`, etc.)
+following the same pattern. Each new probe adds one fire_*
+function + one extractor + one mock branch + 1–2 harness
+scenarios + one CLAUDE.md entry. Total cost per probe ~50 LOC.
 
 #### S7. Streaming (SSE) — equivalence probe DONE; latency budget probe still TODO
 
@@ -885,6 +927,16 @@ when the timeout SIGTERMs the iter.
   inspect `seed`). The pitfall is the deeper "TPU runner doesn't
   support per-request seed" CLAUDE.md note showing up *as a 400*,
   not just as silently-ignored.
+* **Stop-sequence + logprobs probes scaffolded** (`STOP_REQUIRED=1`
+  + `LOGPROBS_REQUIRED=1` smoke_check + 18-scenario harness self-test).
+  ✓ harness; ✗ real-V4 verification (deferred to next real-smoke run).
+  Stop probe sends `stop=["Paris"]` against the deterministic prompt
+  whose first token is ` Paris` — a working handler MUST truncate
+  before that token and report `finish_reason="stop"`. Logprobs probe
+  sends `logprobs=5` and asserts every position's `top_logprobs` has
+  at least 5 alternatives. Mock covers leak (stop ignored) and dropped/
+  missing (logprobs alts fewer than requested or omitted entirely).
+  See S6.
 * **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
   in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
   products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates

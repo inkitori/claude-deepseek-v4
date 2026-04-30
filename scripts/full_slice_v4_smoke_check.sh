@@ -38,6 +38,19 @@
 #       crash or produce empty/garbage output. Cheap (same prefill bucket as
 #       the existing completions probe). Exit 7 on empty text / invalid
 #       finish_reason / curl failure.
+#   STOP_REQUIRED=1 — fires a /v1/completions probe with `stop=["Paris"]`
+#       and asserts (a) the response text does NOT contain "Paris" and (b)
+#       finish_reason is "stop". Pins S6 broader-matrix: the stop-sequence
+#       handler in vLLM's TPU runner actually truncates the generation at
+#       the matched token and reports it. Same prefill bucket as the
+#       existing completions probe. Exit 8 on bad text / wrong finish_reason
+#       / curl failure.
+#   LOGPROBS_REQUIRED=1 — fires a /v1/completions probe with `logprobs=5`
+#       and asserts every emitted token's `logprobs.top_logprobs` entry has
+#       at least 5 alternatives. Pins S6 broader-matrix: the logprobs
+#       postprocessing path emits the per-token alternative distribution.
+#       Same prefill bucket. Exit 9 on missing logprobs / wrong cardinality
+#       / curl failure.
 #
 # Usage:
 #   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
@@ -46,6 +59,8 @@
 #   REASONING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on empty reasoning
 #   STREAMING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on stream/non-stream mismatch
 #   SAMPLING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken sampling path
+#   STOP_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken stop-sequence path
+#   LOGPROBS_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken logprobs path
 
 set -euo pipefail
 
@@ -67,6 +82,8 @@ CHAT_REQUIRED="${CHAT_REQUIRED:-0}"
 REASONING_REQUIRED="${REASONING_REQUIRED:-0}"
 STREAMING_REQUIRED="${STREAMING_REQUIRED:-0}"
 SAMPLING_REQUIRED="${SAMPLING_REQUIRED:-0}"
+STOP_REQUIRED="${STOP_REQUIRED:-0}"
+LOGPROBS_REQUIRED="${LOGPROBS_REQUIRED:-0}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -146,6 +163,32 @@ fire_completion_sampling() {
               "$MODEL" "$PROMPT" "$MAX_TOK")"
 }
 
+# Stop-sequence probe: same deterministic prompt as fire_completion, but with
+# stop=["Paris"]. The model's first generated token at temp=0/seed=0 is
+# " Paris" (the deterministic baseline asserts this), so a working stop-sequence
+# handler must intercept that token, truncate the response before it, and
+# report finish_reason="stop". A broken handler either lets the token through
+# (response still contains "Paris") or emits the wrong finish_reason.
+fire_completion_stop() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0,"seed":%d,"stop":["Paris"]}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
+}
+
+# Logprobs probe: same deterministic prompt as fire_completion, but with
+# logprobs=5. vLLM emits a per-position object containing `tokens`,
+# `token_logprobs`, and `top_logprobs` (a list of {alt_token: logprob} dicts);
+# we assert every position has at least 5 alternatives. Greedy decode at
+# temp=0 keeps the chosen-token logprob deterministic, but the alternatives
+# matter to clients that use logprobs for confidence/scoring.
+fire_completion_logprobs() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0,"seed":%d,"logprobs":5}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
+}
+
 extract_text() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['text'])"
 }
@@ -192,6 +235,47 @@ d = json.load(sys.stdin)
 c = (d.get('choices') or [{}])[0]
 print(len((c.get('text') or '').strip()))
 print(c.get('finish_reason') or '')
+"
+}
+
+# Print three lines: contains-needle ("1" if response text contains the
+# argument, "0" otherwise), non-whitespace text length, and finish_reason.
+# Used by the STOP_REQUIRED probe to detect both leak ("Paris" still in
+# the text) and wrong finish_reason in one call.
+extract_completion_stop_check() {
+    local needle="$1"
+    NEEDLE="$needle" python3 -c "
+import json, os, sys
+needle = os.environ.get('NEEDLE', '')
+d = json.load(sys.stdin)
+c = (d.get('choices') or [{}])[0]
+text = (c.get('text') or '')
+print('1' if needle and needle in text else '0')
+print(len(text.strip()))
+print(c.get('finish_reason') or '')
+"
+}
+
+# Print one line: minimum number of `top_logprobs` alternatives across
+# all emitted positions, or -1 if the logprobs object is missing/empty.
+# A value below the requested logprobs count = vLLM silently dropped
+# alternatives on the TPU sampling path.
+extract_completion_logprobs_min_alts() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = (d.get('choices') or [{}])[0]
+lp = c.get('logprobs')
+if not isinstance(lp, dict):
+    print(-1); sys.exit(0)
+top = lp.get('top_logprobs')
+if not top:
+    print(-1); sys.exit(0)
+alts = []
+for entry in top:
+    if isinstance(entry, dict):
+        alts.append(len(entry))
+print(min(alts) if alts else -1)
 "
 }
 
@@ -331,6 +415,45 @@ main() {
         else
             echo "[smoke-check] FAIL: sampling probe failed (curl non-zero, SAMPLING_REQUIRED=1)" >&2
             exit 7
+        fi
+    fi
+
+    if [ "$STOP_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions stop-sequence probe (STOP_REQUIRED=1)"
+        if RT="$(fire_completion_stop 2>/dev/null)"; then
+            mapfile -t STP < <(printf '%s' "$RT" | extract_completion_stop_check "Paris" 2>/dev/null || printf '0\n0\n\n')
+            STP_HIT="${STP[0]:-0}"
+            STP_LEN="${STP[1]:-0}"
+            STP_FIN="${STP[2]:-}"
+            echo "[smoke-check] stop probe contains_needle=$STP_HIT text_len=$STP_LEN finish_reason=${STP_FIN:-<empty>}"
+            if [ "$STP_HIT" = "1" ]; then
+                echo "[smoke-check] FAIL: stop probe response still contains 'Paris' (STOP_REQUIRED=1)" >&2
+                echo "[smoke-check]       stop=[\"Paris\"] should have truncated before that token." >&2
+                exit 8
+            fi
+            if [ "$STP_FIN" != "stop" ]; then
+                echo "[smoke-check] FAIL: stop probe finish_reason=${STP_FIN:-<empty>}, expected 'stop' (STOP_REQUIRED=1)" >&2
+                exit 8
+            fi
+        else
+            echo "[smoke-check] FAIL: stop probe failed (curl non-zero, STOP_REQUIRED=1)" >&2
+            exit 8
+        fi
+    fi
+
+    if [ "$LOGPROBS_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions logprobs probe (LOGPROBS_REQUIRED=1)"
+        if RL="$(fire_completion_logprobs 2>/dev/null)"; then
+            LP_MIN="$(printf '%s' "$RL" | extract_completion_logprobs_min_alts 2>/dev/null || echo -1)"
+            echo "[smoke-check] logprobs probe min_alternatives=$LP_MIN (requested 5)"
+            if [ "${LP_MIN:--1}" -lt 5 ]; then
+                echo "[smoke-check] FAIL: logprobs probe min_alternatives=$LP_MIN < 5 (LOGPROBS_REQUIRED=1)" >&2
+                echo "[smoke-check]       requested logprobs=5; vLLM TPU sampling path dropped alternatives." >&2
+                exit 9
+            fi
+        else
+            echo "[smoke-check] FAIL: logprobs probe failed (curl non-zero, LOGPROBS_REQUIRED=1)" >&2
+            exit 9
         fi
     fi
 

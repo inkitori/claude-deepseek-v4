@@ -32,6 +32,17 @@
 #  12. sampling_required_bad_finish — temp>0 returns non-empty text but an
 #                                   invalid finish_reason (e.g. abort),
 #                                   SAMPLING_REQUIRED=1               → FAIL (7)
+#  13. stop_required_match        — stop=["Paris"] truncates before token,
+#                                   finish_reason="stop",
+#                                   STOP_REQUIRED=1                   → PASS (0)
+#  14. stop_required_leak         — server ignores stop, leaves "Paris" in
+#                                   text, STOP_REQUIRED=1             → FAIL (8)
+#  15. logprobs_required_match    — logprobs=5 returns >=5 alternatives per
+#                                   token, LOGPROBS_REQUIRED=1        → PASS (0)
+#  16. logprobs_required_missing  — logprobs=5 but server omits the object,
+#                                   LOGPROBS_REQUIRED=1               → FAIL (9)
+#  17. logprobs_required_dropped  — logprobs=5 but server emits only 3 alts,
+#                                   LOGPROBS_REQUIRED=1               → FAIL (9)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -67,6 +78,16 @@ run_scenario() {
         sampling_required_*) sampling_required=1 ;;
     esac
 
+    local stop_required=0
+    case "$name" in
+        stop_required_*) stop_required=1 ;;
+    esac
+
+    local logprobs_required=0
+    case "$name" in
+        logprobs_required_*) logprobs_required=1 ;;
+    esac
+
     local mpid=
     if [ "$with_server" -eq 1 ]; then
         "$PY" "$MOCK" --port "$port" "$@" >"/tmp/mock-${port}.log" 2>&1 &
@@ -83,6 +104,8 @@ run_scenario() {
         REASONING_REQUIRED="$reasoning_required" \
         STREAMING_REQUIRED="$streaming_required" \
         SAMPLING_REQUIRED="$sampling_required" \
+        STOP_REQUIRED="$stop_required" \
+        LOGPROBS_REQUIRED="$logprobs_required" \
         "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
     local rc=$?
 
@@ -115,10 +138,15 @@ run_scenario streaming_required_mismatch   18101 6 --stream-text " Berlin."
 run_scenario sampling_required_match       18102 0
 run_scenario sampling_required_empty       18103 7 --sampling-text ""
 run_scenario sampling_required_bad_finish  18104 7 --sampling-text " ok." --sampling-finish "abort"
+run_scenario stop_required_match           18105 0
+run_scenario stop_required_leak            18106 8 --stop-honor 0
+run_scenario logprobs_required_match       18107 0
+run_scenario logprobs_required_missing     18108 9 --logprobs-alts 0
+run_scenario logprobs_required_dropped     18109 9 --logprobs-alts 3
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 13/13 harness scenarios pass"
+    echo "OK: 18/18 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"
