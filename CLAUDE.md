@@ -250,12 +250,22 @@ Still loose ends worth tracking:
     cache after one good launch would 8× brand-new-slice
     first-launch on a freshly bootstrapped slice.
   * **`Involuntary full rematerialization` warnings** still appear
-    in the compile log on `f32[128, 16]` reshards (`{devices=[1,32]}
-    → {devices=[16,1,2]} last_tile_dim_replicate`). They didn't
-    block the compile this iter, but each one wastes activation
-    budget; a future iter should pin a `with_sharding_constraint`
-    upstream so XLA doesn't have to do the inefficient
-    replicate-then-partition.
+    in the compile log — 126 of them in the GREEN smoke log
+    (2026-04-30T041423Z), all on `f32[128, 16]` tensors reshard
+    `{devices=[1,32]}` → `{devices=[16,1,2]} last_tile_dim_replicate`.
+    Diagnosed: every warning is on either `compressor.ape` (op_name
+    `state['params_v'].value[1][L][0][8][0]`) or
+    `indexer.compressor.ape` (`[1][L][0][9][2][0]`) — the absolute
+    positional embedding tensors of the HCA / CSA compressors. Total
+    HBM cost ≈ 528 KB across all layers (66 tensors × 8 KB), so the
+    cheap fix is to mark these as fully replicated either by special-
+    casing them in `pick_partition_spec` (return `P()` when the leaf
+    is a small ape: shape == (cr, coff*Dh) with cr ≥ 4) or with a
+    `with_sharding_constraint(params.ape, P())` at the top of
+    `compressor_prefill` / `compressor_decode_step` in
+    `deepseek_v4_attention.py`. They didn't block the compile this
+    iter, but each one wastes activation budget. Validate with a
+    CPU-only `lower().compile()` probe before paying for a smoke.
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
