@@ -870,12 +870,13 @@ def _build_class():
             # block above) when computing state / partition specs.
             self.params_v = nnx.Param(real_tree)
             # Freqs are fp32 lookup tables. Cap the precomputed length at
-            # max_model_len (vLLM's per-request seq cap) instead of the
-            # architectural max_position_embeddings — V4-Flash's HF config
-            # has 1 048 576 there, which produces a 1 GB freqs_compressed
-            # tensor (f32[1M, 32] split high/low) that gets pinned in HBM
-            # as XLA arguments and dominates the per-chip activation budget.
-            # Using max_model_len shrinks that to e.g. 8 KB at max_model_len=256.
+            # the actual prefill bucket ceiling vLLM will produce (see
+            # _effective_freqs_seq_len) instead of the architectural
+            # max_position_embeddings — V4-Flash's HF config has 1 048 576
+            # there, which produces a 1 GB freqs_compressed tensor that
+            # gets pinned in HBM as XLA arguments and dominates per-chip
+            # activation budget. The bucket-aware ceiling is typically
+            # 1024–8192 (max_num_batched_tokens × dp_size) — a few MB.
             swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
@@ -884,14 +885,39 @@ def _build_class():
 
         def _effective_freqs_seq_len(self) -> int:
             """Pick the smallest seq-len bound the precomputed RoPE tables
-            need to cover. Prefer vllm_config.model_config.max_model_len
-            (the active per-request cap) over max_position_embeddings (the
-            architectural cap, which can be ~1M for YaRN models)."""
+            need to cover. Must include both:
+              * `model_config.max_model_len` — the per-request seq cap.
+              * `scheduler_config.max_num_batched_tokens *
+                 sharding_config.total_dp_size` — vLLM's TPU runner pads
+                 prefill to buckets up to this product (see
+                 runner/tpu_runner.py:469 → `get_token_paddings`'s
+                 max_token_size). For tp=32 + dp_attention with default
+                 max_num_batched_tokens=256, that's 8192 — even a short
+                 18-token prompt lands in a 1024-token bucket, and a
+                 freqs table sized only at 256 produces
+                 `cannot reshape array of shape (256, 32)` when the
+                 model tries `freqs_cis[:S].reshape(1, S, 1, _)` with
+                 S=1024 (chat-completions reproducer).
+            Anything below that floor exposes a real prefill crash on
+            longer prompts. Cap above by `max_position_embeddings` so
+            YaRN models with 1M-token architectural maxes don't blow
+            up the table to 1 GB."""
             mc = getattr(self.vllm_config, "model_config", None)
+            sc = getattr(self.vllm_config, "scheduler_config", None)
+            shc = getattr(self.vllm_config, "sharding_config", None)
+
             mml = getattr(mc, "max_model_len", None) if mc is not None else None
-            if mml is None or int(mml) <= 0:
-                return int(self.config.max_position_embeddings)
-            return min(int(mml), int(self.config.max_position_embeddings))
+            mml = int(mml) if mml else 0
+
+            mnbt = getattr(sc, "max_num_batched_tokens", None) if sc is not None else None
+            dp = getattr(shc, "total_dp_size", None) if shc is not None else None
+            pad_ceiling = (int(mnbt) * int(dp)) if (mnbt and dp) else 0
+
+            mpe = int(self.config.max_position_embeddings)
+            eff = max(mml, pad_ceiling)
+            if eff <= 0:
+                return mpe
+            return min(eff, mpe)
 
         def initialize_cache(self):
             """Pre-compute RoPE freq tables. Called by the loader after
