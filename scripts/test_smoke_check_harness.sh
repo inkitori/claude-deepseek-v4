@@ -14,6 +14,13 @@
 #                                   REASONING_REQUIRED=1              → PASS (0)
 #   7. reasoning_required_empty   — thinking mode returns no reasoning,
 #                                   REASONING_REQUIRED=1              → FAIL (5)
+#   7b. reasoning_required_whitespace — thinking mode returns only newlines,
+#                                       REASONING_REQUIRED=1          → FAIL (5)
+#                                       (caught the real V4 thinking-mode
+#                                        regression where greedy decode at
+#                                        temp=0 emits N newlines after <think>;
+#                                        bash $(...) strips trailing \n so the
+#                                        check uses str.strip() len, not -z)
 #   8. streaming_required_match   — stream reassembles to non-stream,
 #                                   STREAMING_REQUIRED=1              → PASS (0)
 #   9. streaming_required_mismatch — stream text differs from non-stream
@@ -89,12 +96,13 @@ run_scenario timeout_when_down             18095 1
 run_scenario chat_required_empty           18096 4 --chat-text ""
 run_scenario reasoning_required_present    18097 0 --reasoning-text "17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391"
 run_scenario reasoning_required_empty      18098 5 --reasoning-text ""
+run_scenario reasoning_required_whitespace 18099 5 --reasoning-text "$(printf '\n\n\n\n\n')"
 run_scenario streaming_required_match      18100 0
 run_scenario streaming_required_mismatch   18101 6 --stream-text " Berlin."
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 9/9 harness scenarios pass"
+    echo "OK: 10/10 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"

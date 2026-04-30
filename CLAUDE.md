@@ -310,19 +310,71 @@ Both are wired into `scripts/full_slice_v4_smoke.sh` via
 vLLM validates these names at startup and refuses to launch if
 they're misregistered, so the smoke gate green = parsers loaded.
 
-**Reasoning runtime probe (DONE)**:
+**Reasoning runtime probe (scaffolded; currently failing on real V4)**:
 `scripts/full_slice_v4_smoke_check.sh` accepts `REASONING_REQUIRED=1`,
 which fires a thinking-mode chat
 (`chat_template_kwargs={"thinking":true}` + a multiplication prompt)
-and asserts `message.reasoning` is non-empty (exit 5 on empty).
-Default off so the cheap smoke gate stays cheap. Mock-server
-self-test `scripts/test_smoke_check_harness.sh` covers
-both the present-reasoning and empty-reasoning paths
-(`reasoning_required_present` / `reasoning_required_empty`). The
-field on `ChatMessage` is `reasoning` (vLLM-specific, defined at
+and asserts the non-whitespace length of `message.reasoning` is > 0
+(exit 5 on empty/whitespace-only). Default off so the cheap smoke
+gate stays cheap. Mock-server self-test
+`scripts/test_smoke_check_harness.sh` covers all three
+end states: present-reasoning passes; empty-reasoning fails;
+whitespace-only-reasoning fails (the third caught a real bash
+gotcha — `$(...)` strips trailing newlines, so a `-z` check passed
+on a 96-newline payload; the probe now uses `len(reasoning.strip())`
+inside Python). The field on `ChatMessage` is `reasoning`
+(vLLM-specific, defined at
 `work/vllm/vllm/entrypoints/openai/chat_completion/protocol.py:64`),
 not `reasoning_content` — the latter is an *input* field used by
 vLLM's chat_utils to round-trip prior assistant turns.
+
+**REAL V4 BUG SURFACED — thinking-mode produces degenerate output**:
+On a successful `vllm serve` (Tier-8 GREEN, completions return Paris),
+firing the thinking-mode chat probe at `temperature=0, seed=0`
+returns HTTP 200 + a `reasoning` field containing **N newlines**
+(N == max_tokens, finish_reason=length) and an empty `content`
+field — verified at `MAX_LEN=256, max_tokens=96` and
+`max_tokens=64`, with both `What is 17 multiplied by 23?` and
+`What is 17 * 23?` prompts. Switching to `temperature=0.7` (no
+seed; `JAX does not support per-request seed`) produces incoherent
+random tokens (`packagepackage`, `[201`, `﻿#include`, ...) —
+the logits distribution is approximately uniform, suggesting
+attention or MoE state is producing near-zero/garbage activations
+specifically in thinking-mode prompts. Adding
+`reasoning_effort:"high"` to `chat_template_kwargs` does NOT help
+(same N-newline output at temp=0).
+
+This is a Tier-S correctness bomb that the *original* smoke gate
+silently missed: regular chat works, completions work, but
+thinking-mode is broken. The reasoning runtime probe now catches
+it. Possible causes (none investigated yet):
+1. Chat-template encoding is correct (pinned by
+   `TestVllmChatTemplateParity` byte-equality vs reference) — so the
+   *prompt* the model sees is right.
+2. The model's behavior after the trailing `<think>` token may be
+   sensitive to KV-cache state in a way the prefill-only path
+   (S1: every step recomputes prefill) gets wrong — e.g. greedy
+   decode at every step keeps re-rolling from the prefill output
+   rather than from a continuing decode state, so a flat-logits
+   regime persists and the most-likely token is `\n` over and over.
+   If true, S1 (real decode) likely fixes thinking-mode too.
+3. MoE expert routing for the `<think>`-conditioned activations
+   may hit a flat/dead-expert region. The vectorized-MoE math is
+   pinned byte-equal vs per-expert reference on tiny fixture, but
+   the tiny fixture doesn't include thinking-mode.
+4. FP4-quantized expert weights for the thinking-mode path may
+   have lost too much precision. A bf16 unquantized run would
+   isolate this.
+
+Reproducer (smoke up; expects all-newlines reasoning):
+```bash
+curl -s --max-time 600 http://127.0.0.1:18081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash",
+       "messages":[{"role":"user","content":"What is 17 * 23?"}],
+       "max_tokens":96,"temperature":0,"seed":0,
+       "chat_template_kwargs":{"thinking":true}}'
+```
 
 **Tool-call runtime probe (still TODO)**: an analogous
 `TOOLS_REQUIRED=1` probe that sends a request with `tools=[...]`
@@ -427,7 +479,7 @@ known quirks under vLLM's TPU runner.
 vLLM's framework supports `stream: true` natively;
 tpu-inference shouldn't need V4-specific changes.
 
-**Stream-equals-non-stream probe (DONE)**:
+**Stream-equals-non-stream probe (DONE — verified 2026-04-30)**:
 `scripts/full_slice_v4_smoke_check.sh` accepts `STREAMING_REQUIRED=1`,
 which re-fires the deterministic completion with `stream=true`,
 reassembles the SSE chunks (handles `data: {...}\n\n` lines and the
@@ -438,7 +490,8 @@ match and mismatch paths
 (`streaming_required_match` / `streaming_required_mismatch` —
 the mismatch scenario uses `--stream-text " Berlin."` so the
 non-streaming Paris assertion still passes before the streaming
-probe fires).
+probe fires). End-to-end-verified on real `vllm serve`: streaming
+output reassembled to ` Paris`, byte-equal to non-streaming.
 
 **Still TODO**: a latency-budget probe — assert TTFT < N seconds
 and ITL < M ms. Needs threshold tuning against a warm-cache run
@@ -757,12 +810,16 @@ when the timeout SIGTERMs the iter.
   `scripts/full_slice_v4_smoke.sh`). Registry lookup verified via
   the snippet in S3. vLLM validates parser names at startup, so
   smoke-green = parsers loaded. ✓ wiring; ✓ runtime probe scaffolded
-  (`REASONING_REQUIRED=1` smoke_check assertion + 9-scenario harness
-  self-test); ✗ runtime probe not yet exercised against real vLLM
-  (next smoke run with `REASONING_REQUIRED=1` will land it). See S3.
-* **Streaming probe scaffolded** (`STREAMING_REQUIRED=1` smoke_check
-  assertion + harness self-test covering match + mismatch). ✓ harness;
-  ✗ not yet exercised against real vLLM. See S7.
+  (`REASONING_REQUIRED=1` smoke_check assertion + 10-scenario harness
+  self-test); ✗ runtime probe **fails on real V4-Flash** — thinking-mode
+  emits N newlines (greedy) or random tokens (sampling), independently
+  of prompt or `reasoning_effort`. The probe is doing its job; the
+  underlying behavior is a Tier-S correctness bomb (see S3 in the
+  backlog for repro + hypotheses).
+* **Streaming probe verified end-to-end** (`STREAMING_REQUIRED=1`
+  smoke_check + 10-scenario harness self-test + real `vllm serve` run
+  on 2026-04-30: reassembled SSE = non-streaming " Paris" byte-for-byte).
+  ✓ See S7.
 
 ## Chat template (chat-completions)
 

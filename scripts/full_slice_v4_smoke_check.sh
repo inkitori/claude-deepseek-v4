@@ -92,11 +92,19 @@ fire_chat() {
 # message.reasoning when --reasoning-parser deepseek_v4 is active. Multiplication
 # is the cheapest reasoning-eliciting prompt — short, deterministic, and the
 # <think> block almost always contains digits + intermediate products.
+#
+# max_tokens is set to ~third of the smoke-launcher MAX_LEN (default 256) so
+# `prompt + max_tokens <= max-model-len` and vLLM doesn't 400 the request.
+# 96 leaves ~160 tokens for the prompt + thinking template (the actual encoded
+# prompt is ~30-40 tokens; headroom covers the <think> preamble). Even if the
+# generation is truncated mid-<think>, the parser still emits whatever it
+# captured, so non-empty assertion still holds.
 fire_chat_thinking() {
+    local max_thinking_tokens="${REASONING_MAX_TOKENS:-96}"
     curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "$(printf '{"model":"%s","messages":[{"role":"user","content":"What is 17 multiplied by 23? Show your reasoning step by step."}],"max_tokens":256,"temperature":0,"seed":%d,"chat_template_kwargs":{"thinking":true}}' \
-              "$MODEL" "$SEED")"
+        -d "$(printf '{"model":"%s","messages":[{"role":"user","content":"What is 17 multiplied by 23? Show your reasoning step by step."}],"max_tokens":%d,"temperature":0,"seed":%d,"chat_template_kwargs":{"thinking":true}}' \
+              "$MODEL" "$max_thinking_tokens" "$SEED")"
 }
 
 # Streaming probe: same prompt/params as fire_completion, but stream=true.
@@ -118,7 +126,30 @@ extract_chat_message() {
 }
 
 extract_chat_reasoning() {
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['message'].get('reasoning') or '')"
+    # Print the reasoning field with `<NL>` substituted for raw newlines.
+    # Bash command substitution `$(...)` strips trailing \n, so a reasoning
+    # field that's all whitespace would otherwise look empty to the caller.
+    # The replacement keeps the visible length non-zero AND makes log lines
+    # readable; the caller does its own emptiness/whitespace-only check
+    # against the original via `extract_chat_reasoning_len`.
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+r = d['choices'][0]['message'].get('reasoning') or ''
+print(r.replace('\n', '<NL>'))
+"
+}
+
+extract_chat_reasoning_len() {
+    # Print the byte length of the reasoning field's *non-whitespace* run.
+    # 0 means the field was missing, null, empty, or whitespace-only — the
+    # smoke gate treats all four as a failed reasoning emission.
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+r = d['choices'][0]['message'].get('reasoning') or ''
+print(len(r.strip()))
+"
 }
 
 # Reassemble streaming completion deltas into a single text. Tolerates
@@ -193,16 +224,17 @@ main() {
     if [ "$REASONING_REQUIRED" = "1" ]; then
         echo "[smoke-check] firing /v1/chat/completions thinking-mode probe (REASONING_REQUIRED=1)"
         if RR="$(fire_chat_thinking 2>/dev/null)"; then
-            TR="$(printf '%s' "$RR" | extract_chat_reasoning 2>/dev/null || true)"
-            # Trim to first 80 chars for the log so a long <think> block doesn't drown it.
-            if [ "${#TR}" -gt 80 ]; then
-                echo "[smoke-check] reasoning prefix: ${TR:0:80}..."
+            TR_DISPLAY="$(printf '%s' "$RR" | extract_chat_reasoning 2>/dev/null || true)"
+            TR_LEN="$(printf '%s' "$RR" | extract_chat_reasoning_len 2>/dev/null || echo 0)"
+            # Trim display to first 80 chars so a long <think> block doesn't drown the log.
+            if [ "${#TR_DISPLAY}" -gt 80 ]; then
+                echo "[smoke-check] reasoning prefix (len=$TR_LEN): ${TR_DISPLAY:0:80}..."
             else
-                echo "[smoke-check] reasoning: ${TR:-<empty>}"
+                echo "[smoke-check] reasoning (len=$TR_LEN): ${TR_DISPLAY:-<empty>}"
             fi
-            if [ -z "$TR" ]; then
-                echo "[smoke-check] FAIL: thinking-mode chat returned empty reasoning (REASONING_REQUIRED=1)" >&2
-                echo "[smoke-check]       --reasoning-parser deepseek_v4 is registered but produced no <think> output." >&2
+            if [ "${TR_LEN:-0}" = "0" ]; then
+                echo "[smoke-check] FAIL: thinking-mode chat returned empty/whitespace-only reasoning (REASONING_REQUIRED=1)" >&2
+                echo "[smoke-check]       --reasoning-parser deepseek_v4 is registered but the model emitted no <think> content." >&2
                 exit 5
             fi
         else
