@@ -331,17 +331,33 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
-    @jax.jit(
+    # S1 iter-5f hypothesis 1: drop `donate_argnums=2` for V4. V4's
+    # kv_caches carry a packed `AttentionDecodeState` (replicated `P()`,
+    # ~130 MB total per CLAUDE.md iter-5b note) that the decode-state
+    # orchestrator reads + rewrites every step. iter-5c flipped __call__
+    # to that orchestrator; on real V4-Flash the FIRST request returned
+    # 200 OK but the SECOND request triggered a TPU `[USER]` FATAL on the
+    # cached prefill kernel — the compiled artifact misbehaves on
+    # re-execution when the donated input still holds prior-call
+    # contents. Dropping donation forces XLA to copy the input to a
+    # fresh output buffer, eliminating buffer-aliasing/reuse as a
+    # suspect. Cost is doubled peak HBM during execution (~260 MB vs
+    # ~130 MB) — negligible vs 31 GB/chip. Non-V4 models keep donation
+    # for the existing memory profile.
+    _run_model_jit_kwargs = dict(
         out_shardings=(
             kv_cache_sharding,
             hidden_states_sharding,
             hidden_states_sharding,  # aux hidden states
         ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
         static_argnums=(
             7, 10, 11
         ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
     )
+    if not _is_deepseek_v4:
+        _run_model_jit_kwargs["donate_argnums"] = 2  # 0 is graphdef, 1 is state
+
+    @jax.jit(**_run_model_jit_kwargs)
     def run_model(graphdef, state, *args):
         model = nnx.merge(graphdef, state)
         return model(*args)
