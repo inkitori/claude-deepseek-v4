@@ -567,6 +567,10 @@ class KVCacheManager:
         if not kv_cache_config.kv_cache_groups:
             return
 
+        if self._is_deepseek_v4:
+            self._initialize_kv_cache_deepseek_v4(kv_cache_config)
+            return
+
         layer_name_to_spec = {}
         for group in kv_cache_config.kv_cache_groups:
             group_spec = group.kv_cache_spec
@@ -830,6 +834,78 @@ class KVCacheManager:
             f"KV cache delete complete | "
             f"hbm_after="
             f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+
+    def _initialize_kv_cache_deepseek_v4(
+            self, kv_cache_config: KVCacheConfig) -> None:
+        """V4-only kv-cache allocator (S1 iter-5b).
+
+        V4's per-layer state is the packed `AttentionDecodeState` produced by
+        `models/jax/deepseek_v4.py::_pack_layer_state` — a single 1D fp32
+        array per layer, sized by `v4_layer_packed_sizes_from_cfg(cfg,
+        state_max_seq_len=max_model_len)`. We allocate replicated `P()`
+        across the mesh because the buffer is per-sequence (not per-head /
+        per-block) and every chip computes the same update under SPMD;
+        replication keeps the math correct without paying any per-chip HBM
+        cost beyond the buffer itself (~10 MB total across 50 layers at
+        max_model_len=256, well below any budget).
+
+        Bypasses the standard `kv_cache_config.kv_cache_tensors` allocation
+        path because V4's spec is just an inert placeholder (kv_cache_manager
+        gates `use_mla=False` for V4 to make engine init succeed; the spec
+        carries no real shape information for V4).
+        """
+        from tpu_inference.models.jax.deepseek_v4 import (  # noqa: PLC0415
+            v4_layer_packed_sizes_from_cfg, DeepseekV4Config,
+            v4_state_max_seq_len_from_vllm_config)
+
+        set_kv_cache_layout(DEFAULT_KV_CACHE_LAYOUT)
+
+        hf_text = getattr(self.runner.model_config, "hf_text_config",
+                          getattr(self.runner.model_config, "hf_config", None))
+        cfg_dict = (hf_text.to_dict()
+                    if hasattr(hf_text, "to_dict") else dict(vars(hf_text)))
+        cfg = DeepseekV4Config.from_hf_dict(cfg_dict)
+        state_max_seq_len = v4_state_max_seq_len_from_vllm_config(
+            self.runner.vllm_config)
+        packed_sizes = v4_layer_packed_sizes_from_cfg(
+            cfg, state_max_seq_len=state_max_seq_len, batch_size=1)
+
+        sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+        kv_caches = self.runner.kv_caches
+
+        # The runner's `layer_name_to_kvcache_index` mapping is keyed by the
+        # layer names declared in `kv_cache_config.kv_cache_groups`. V4's
+        # __call__ doesn't actually consult that mapping (kv_caches is
+        # indexed positionally by layer order), but the runner's input
+        # batching path expects every spec'd layer to have an entry.
+        layer_names = []
+        for group in kv_cache_config.kv_cache_groups:
+            layer_names.extend(group.layer_names)
+        if len(layer_names) != len(packed_sizes):
+            logger.warning(
+                "DeepSeek V4 kv-cache: spec layer count %d != cfg layer "
+                "count %d — using min(...) for safety. Mismatch usually "
+                "means a layer was renamed in the spec; investigate.",
+                len(layer_names), len(packed_sizes))
+        n_layers = min(len(layer_names), len(packed_sizes))
+
+        for i in range(n_layers):
+            packed_size = int(packed_sizes[i])
+
+            def _alloc_fn(s=packed_size):
+                return jnp.zeros((s,), dtype=jnp.float32)
+
+            allocator = jax.jit(_alloc_fn, out_shardings=sharding)
+            kv_caches.append(allocator())
+            self.runner.layer_name_to_kvcache_index[layer_names[i]] = i
+
+        total_bytes = sum(int(s) * 4 for s in packed_sizes[:n_layers])
+        logger.info(
+            "Init kv-cache (DeepSeek V4) | num_layers=%d | "
+            "state_max_seq_len=%d | total_packed_bytes=%d (~%.1f MB) | "
+            "sharding=replicated | hbm=%sGb", n_layers, state_max_seq_len,
+            total_bytes, total_bytes / (1024 * 1024),
+            utils.hbm_usage_gb(self.runner.mesh.devices.flatten()))
 
     def reinitialize_kv_cache(self) -> None:
         """Reinitialize KV cache from the stored configuration.

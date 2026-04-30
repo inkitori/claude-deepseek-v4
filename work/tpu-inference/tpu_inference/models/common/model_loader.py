@@ -305,10 +305,23 @@ def get_flax_model(
             vllm_config.model_config.hf_config)
     jit_model = _get_nnx_model(model_class, vllm_config, rng, mesh)
     vllm_config.model_config.dtype = original_dtype
-    kv_cache_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD))
+    # DeepSeek V4 stores its packed AttentionDecodeState as a 1D fp32 array
+    # per layer (S1 iter-5b). The standard 3D sharding doesn't apply — every
+    # chip holds the same packed state under SPMD because the buffer is
+    # per-sequence, not per-head/per-block. Use replicated `P()` so JAX's
+    # divisibility check passes for arbitrary 1D shapes.
+    _hf_text = getattr(vllm_config.model_config, "hf_text_config",
+                       getattr(vllm_config.model_config, "hf_config", None))
+    _is_deepseek_v4 = (
+        _hf_text is not None
+        and getattr(_hf_text, "model_type", None) == "deepseek_v4")
+    if _is_deepseek_v4:
+        kv_cache_sharding = NamedSharding(mesh, PartitionSpec())
+    else:
+        kv_cache_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                          ShardingAxisName.ATTN_HEAD))
     hidden_states_sharding = NamedSharding(mesh,
                                            PartitionSpec(
                                                ShardingAxisName.ATTN_DATA,

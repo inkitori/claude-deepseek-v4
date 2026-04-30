@@ -28,7 +28,7 @@ import jax
         "query_start_loc",
         "request_distribution",
     ],
-    meta_fields=[],
+    meta_fields=["decode_start_pos"],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
 @dataclass
@@ -44,6 +44,14 @@ class AttentionMetadata(object):
     query_start_loc: jax.Array = None
     # (3,)
     request_distribution: jax.Array = None
+    # DeepSeek V4 only (S1 iter-5b). Python-static so the kernel's circular-
+    # buffer indexing (`start_pos % win`) traces to a concrete int. 0 means
+    # "prefill at position 0" (the legacy non-V4 default; non-V4 models
+    # ignore this field). The runner sets it to `seq_lens_cpu[0] - 1` on a
+    # decode step (query_len==1 with prior prefilled tokens). Hashed into
+    # the JIT cache key — under V4, each new decode position triggers a
+    # fresh trace; the persistent compile cache amortizes after first run.
+    decode_start_pos: int = 0
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)

@@ -641,6 +641,42 @@ def transformer_body_layout(
     ]
 
 
+def v4_state_max_seq_len_from_vllm_config(vllm_config) -> int:
+    """Single source of truth for the per-layer packed-state buffer size
+    on V4 (S1 iter-5b). Both the engine's `kv_cache_manager` allocator and
+    the model's `__call__` MUST agree on this value or the JIT donation
+    of `kv_caches` will mismatch shape and fail at the worst possible
+    moment.
+
+    Mirrors `DeepseekV4ForCausalLM._effective_freqs_seq_len`'s decision
+    tree exactly: the buffer must cover whichever bucket a real prefill
+    can land in (`max(max_model_len, max_num_batched_tokens × dp_size)`),
+    capped above by the architectural `max_position_embeddings`. For
+    smoke (`MAX_LEN=256`, default `max_num_batched_tokens=2048`,
+    `dp=1`), this returns 2048; for production with larger
+    `max_num_batched_tokens` (or DP fan-out) it scales up.
+    """
+    mc = getattr(vllm_config, "model_config", None)
+    sc = getattr(vllm_config, "scheduler_config", None)
+    shc = getattr(vllm_config, "sharding_config", None)
+
+    mml = getattr(mc, "max_model_len", None) if mc is not None else None
+    mml = int(mml) if mml else 0
+
+    mnbt = getattr(sc, "max_num_batched_tokens", None) if sc is not None else None
+    dp = getattr(shc, "total_dp_size", None) if shc is not None else None
+    pad_ceiling = (int(mnbt) * int(dp)) if (mnbt and dp) else 0
+
+    hf = getattr(mc, "hf_text_config",
+                 getattr(mc, "hf_config", None)) if mc is not None else None
+    mpe = int(getattr(hf, "max_position_embeddings", 0)) if hf is not None else 0
+
+    eff = max(mml, pad_ceiling)
+    if eff <= 0:
+        return mpe
+    return min(eff, mpe) if mpe > 0 else eff
+
+
 def v4_layer_packed_sizes_from_cfg(
     cfg: DeepseekV4Config,
     state_max_seq_len: int,
@@ -1856,8 +1892,25 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                h = transformer_body_forward(
-                    ids_2d, params, freqs_swa, freqs_comp, self.config)
+                # S1 iter-5b: single-active-seq path threads packed
+                # `AttentionDecodeState` through `kv_caches`. The runner
+                # tags `attention_metadata.decode_start_pos` (Python-static
+                # meta_field) to N-1 on a decode step; default 0 = prefill.
+                start_pos = 0
+                if attention_metadata is not None:
+                    start_pos = int(getattr(
+                        attention_metadata, "decode_start_pos", 0))
+                T = int(ids_2d.shape[-1])
+                is_decode = (T == 1) and (start_pos > 0)
+                state_max_seq_len = v4_state_max_seq_len_from_vllm_config(
+                    self.vllm_config)
+                kv_caches, h = deepseek_v4_run_with_decode_state(
+                    kv_caches, ids_2d, params, freqs_swa, freqs_comp,
+                    self.config,
+                    state_max_seq_len=state_max_seq_len,
+                    is_decode_step=is_decode,
+                    start_pos=start_pos,
+                )
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,

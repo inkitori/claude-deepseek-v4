@@ -293,6 +293,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cache_dtype = self.dtype
         self.kv_cache_dtype = to_torch_dtype(cache_dtype)
 
+        # S1 iter-5b: DeepSeek V4 routes the per-step state through
+        # `attention_metadata.decode_start_pos` (a Python-static meta_field).
+        # Cache the detection at __init__ so _prepare_inputs paths don't
+        # repeat the hf_text_config / model_type lookup per request.
+        _hf_text = getattr(self.model_config, "hf_text_config",
+                           getattr(self.model_config, "hf_config", None))
+        self._is_deepseek_v4 = (
+            _hf_text is not None
+            and getattr(_hf_text, "model_type", None) == "deepseek_v4")
+
         self._pre_async_results: AsyncPreResults | None = None
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
@@ -1315,6 +1325,39 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             return self._prepare_inputs_non_dp(scheduler_output)
 
+    def _maybe_set_v4_decode_start_pos(
+            self, attention_metadata, query_start_loc_view, seq_lens_view):
+        """S1 iter-5b: tag V4's `attention_metadata.decode_start_pos` so the
+        model's __call__ branches between prefill and decode.
+
+        Hits only the V4 single-active-seq decode shape (query_len[0]==1
+        with prior prefilled tokens). Non-V4 models leave the field at 0
+        — the field has no semantic meaning for them and the JIT cache
+        key includes 0 unconditionally, so no extra compiles.
+
+        Today's smoke is `MAX_SEQS=1`. If we ever lift S2 (multi-seq), the
+        first-active-seq's start_pos is what V4's `attention_decode_step`
+        consumes; multi-seq decode is per-slot and lands on the iter-5c
+        kernel-refactor path.
+        """
+        if not self._is_deepseek_v4:
+            return
+        # query_start_loc_view[0] == 0 always; query_start_loc_view[1] is
+        # the cumulative end of req 0 == its query length.
+        try:
+            q0 = int(query_start_loc_view[1])
+            s0 = int(seq_lens_view[0])
+        except Exception:  # noqa: BLE001
+            return
+        if q0 != 1 or s0 <= 1:
+            return
+        start_pos = s0 - 1
+        if isinstance(attention_metadata, dict):
+            for am in attention_metadata.values():
+                am.decode_start_pos = start_pos
+        else:
+            attention_metadata.decode_start_pos = start_pos
+
     def _prepare_inputs_dp(self, scheduler_output: "VllmSchedulerOutput"):
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
@@ -1615,6 +1658,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
             }
+        self._maybe_set_v4_decode_start_pos(attention_metadata,
+                                            query_start_loc_view,
+                                            seq_lens_view)
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
@@ -1884,6 +1930,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
             }
+        self._maybe_set_v4_decode_start_pos(attention_metadata,
+                                            query_start_loc_view,
+                                            seq_lens_view)
 
         if self.scheduler_config.async_scheduling and len(
                 token_in_tpu_cur_input_indices) > 0:
