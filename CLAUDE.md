@@ -48,9 +48,9 @@ If you ever hit `ABORTED: TPU is already in use by process with pid X` even afte
 
 | env var | default | what it does |
 |---|---|---|
-| `V4_LOADER_SLICE_AWARE` | `1` | Each host reads only the rows its local devices own (vs full-tensor read on every host). ~26% load speedup on its own. |
-| `V4_LOADER_PLACE_WORKERS` | `4` | Threads driving `place_spec_as_jax_sharded` per host. Most per-tensor work releases the GIL; expect ~2-4× on top of slice-aware. Set to `1` for parity testing. |
-| `V4_LOADER_PREFETCH_WORKERS` | `0` | Thread-pool prefetch in the iterator. Empirically didn't help on real V4 because dequant isn't the bottleneck — left as a knob for future work. |
+| `V4_LOADER_SLICE_AWARE` | `1` | Each host reads only the rows its local devices own (vs full-tensor read on every host). |
+| `V4_LOADER_PLACE_WORKERS` | `8` | Threads driving `place_spec_as_jax_sharded` per host. Most per-tensor work releases the GIL (safetensors mmap reads + JAX C calls), so parallelism is real. Set to `1` for single-thread parity testing. |
+| `V4_LOADER_PREFETCH_WORKERS` | `0` | Thread-pool prefetch inside the non-slice-aware iterator. Empirically didn't help — left as a knob for future work. |
 | `JAX_COMPILATION_CACHE_DIR` | `/tmp/jax-compile-cache-v4` | Local-disk persistent compile cache. Each host has its own; survives restarts. **Not GCS** — the bucket the venv mounts is shared, do not write cache there without explicit user authorization. |
 | `JAX_COMPILATION_CACHE_MIN_*` | `0` | Cache even small / fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips the first time `jit_run_model` compiles for an unseen shape. Don't lower. |
@@ -110,7 +110,8 @@ Pass criterion: `scripts/full_slice_v4_smoke_check.sh` exits 0 with `PASS: deter
 
 - Streaming sharded loader (no zero-tree OOM): ✓ committed.
 - Slice-aware load (per-host row-range read): ✓ committed + parity-verified on tiny fixture + 4-device CPU mesh.
-- Multi-threaded placement (V4_LOADER_PLACE_WORKERS): ✓ committed + parity-verified.
+- Multi-threaded placement (V4_LOADER_PLACE_WORKERS=8): ✓ committed + parity-verified.
+- safetensors handle cache (`_safe_open_cache`): ✓ committed. Eliminates per-tensor mmap+header reopen — observed ~6× load speedup (23 t/s → 140+ t/s on real V4-Flash, ~4 min total load down from ~25 min).
 - Persistent local JAX compile cache: ✓ wired up; populates after the first jit_run_model finishes.
 - Smoke-check harness self-test: ✓ 4/4 scenarios pass.
 - End-to-end `Application startup complete` + first request: ⚠️ in flight — the load and compile have been verified working; the first request response is still being shaken out under the new optimizations.
