@@ -142,6 +142,15 @@ class MoEParams:
     shared_expert: ExpertParams
     n_routed_experts: int
     dim: int
+    # Optional pre-stacked weights. When present, `moe_forward` reads these
+    # directly and skips the per-call `jnp.stack(experts[*].wN)` step that
+    # otherwise triggers a full all-to-all to honor the E-sharding constraint
+    # — the all-to-all storm was burning ~16 GB / chip of HLO temp on real
+    # V4-Flash. Built once at load time (see `_consolidate_moe_after_load`).
+    w1_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
+    w2_stacked: Optional[jnp.ndarray] = None  # [E, dim, inter]
+    w3_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
+    swiglu_limit: Optional[float] = None      # uniform across experts
 
 
 def moe_forward(
@@ -180,25 +189,38 @@ def moe_forward(
     fp32 = jnp.float32
     dtype = x.dtype
 
-    # Stack the 256 ExpertParams entries into [E, ...] tensors. The new
-    # leading "expert" dim has no natural sharding from the per-leaf source
-    # (each w_e is sharded on `dim`), so without a constraint XLA satisfies
-    # the einsum by all-gathering each stacked operand to its full
-    # bf16[256, 2048, 4096] = 4 GiB shape on every chip — that's 12 GiB of
-    # HLO temp (W1+W2+W3) on top of the ~17 GiB resident weights, which
-    # OOMs the 31.25 GiB chip HBM budget at compile time on v6e-32.
+    # Stack the 256 ExpertParams entries into [E, ...] tensors. There are
+    # two paths:
     #
-    # Constrain to E-sharded: each chip ends up holding 8 of the 256 experts
-    # (256 / attn_dp=32 = 8). All downstream tensors that carry the E axis
-    # then stay E-sharded, and the only cross-chip comm is a single
-    # all-reduce over `attn_dp` on the final `[N, dim]` accumulator (E is
-    # the contracting axis when we sum over experts). The reshard at each
-    # stack is an all-to-all from "dim-sharded across stacked leaves" to
-    # "E-sharded", with the same per-chip footprint (~128 MiB bf16).
-    W1 = _shard_e_first(jnp.stack([e.w1 for e in params.experts]))  # [E,i,d]
-    W2 = _shard_e_first(jnp.stack([e.w2 for e in params.experts]))  # [E,d,i]
-    W3 = _shard_e_first(jnp.stack([e.w3 for e in params.experts]))  # [E,i,d]
-    swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
+    # 1. Pre-stacked path (production / `load_weights_from_dir` consolidates
+    #    after load): the param tree carries `w1/w2/w3_stacked` directly,
+    #    sharded `P('attn_dp', None, None)` from the start. No per-call
+    #    stack op, no all-to-all.
+    #
+    # 2. Per-expert path (synthetic-fixture tests / back-compat): stack the
+    #    per-expert leaves inside the JIT and constrain to E-sharded.
+    #    Without the constraint XLA satisfies the einsum by all-gathering
+    #    each stacked operand to its full bf16[256, 2048, 4096] = 4 GiB
+    #    shape on every chip — that's 12 GiB of HLO temp (W1+W2+W3) on top
+    #    of the ~17 GiB resident weights, which OOMs the 31.25 GiB chip
+    #    HBM budget at compile time on v6e-32. With the constraint each
+    #    chip ends up holding 8 of the 256 experts (256 / attn_dp=32 = 8)
+    #    but XLA still has to materialize a per-stack all-to-all buffer
+    #    (~128 MiB / chip) on the way in — multiply by 3 stacks × 43 layers
+    #    and the buffers alone are 16+ GiB / chip, which is why the
+    #    pre-stacked path exists.
+    if params.w1_stacked is not None:
+        W1 = params.w1_stacked
+        W2 = params.w2_stacked
+        W3 = params.w3_stacked
+        swiglu_limit = (params.swiglu_limit
+                        if params.swiglu_limit is not None
+                        else params.experts[0].swiglu_limit)
+    else:
+        W1 = _shard_e_first(jnp.stack([e.w1 for e in params.experts]))  # [E,i,d]
+        W2 = _shard_e_first(jnp.stack([e.w2 for e in params.experts]))  # [E,d,i]
+        W3 = _shard_e_first(jnp.stack([e.w3 for e in params.experts]))  # [E,i,d]
+        swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
 
     # Per-(token, expert) routing weight: nonzero only for the top_k experts
     # the gate picked for each token. Built via one_hot + einsum so it

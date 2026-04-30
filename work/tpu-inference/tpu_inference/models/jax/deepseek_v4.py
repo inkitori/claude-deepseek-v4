@@ -651,7 +651,8 @@ _register_pytree(GateParams,
 _register_pytree(ExpertParams,
                  ("w1", "w2", "w3"))
 _register_pytree(MoEParams,
-                 ("gate", "experts", "shared_expert"))
+                 ("gate", "experts", "shared_expert",
+                  "w1_stacked", "w2_stacked", "w3_stacked"))
 _register_pytree(BlockParams,
                  ("attn", "moe", "attn_norm_w", "ffn_norm_w",
                   "hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base",
@@ -868,19 +869,34 @@ def _build_class():
             # registered TransformerParams pytree (see _register_pytree
             # block above) when computing state / partition specs.
             self.params_v = nnx.Param(real_tree)
-            # Freqs are fp32 lookup tables; build them up-front so the
-            # attribute slot is registered as data (an nnx.Variable) and
-            # later mutations don't trip nnx's static/data sentinel.
-            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            # Freqs are fp32 lookup tables. Cap the precomputed length at
+            # max_model_len (vLLM's per-request seq cap) instead of the
+            # architectural max_position_embeddings — V4-Flash's HF config
+            # has 1 048 576 there, which produces a 1 GB freqs_compressed
+            # tensor (f32[1M, 32] split high/low) that gets pinned in HBM
+            # as XLA arguments and dominates the per-chip activation budget.
+            # Using max_model_len shrinks that to e.g. 8 KB at max_model_len=256.
+            swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
 
         # -- nnx housekeeping ----------------------------------------------
 
+        def _effective_freqs_seq_len(self) -> int:
+            """Pick the smallest seq-len bound the precomputed RoPE tables
+            need to cover. Prefer vllm_config.model_config.max_model_len
+            (the active per-request cap) over max_position_embeddings (the
+            architectural cap, which can be ~1M for YaRN models)."""
+            mc = getattr(self.vllm_config, "model_config", None)
+            mml = getattr(mc, "max_model_len", None) if mc is not None else None
+            if mml is None or int(mml) <= 0:
+                return int(self.config.max_position_embeddings)
+            return min(int(mml), int(self.config.max_position_embeddings))
+
         def initialize_cache(self):
             """Pre-compute RoPE freq tables. Called by the loader after
             weights are populated. Idempotent."""
-            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
 
@@ -1161,8 +1177,77 @@ def _build_class():
                     file=_sys.stderr, flush=True,
                 )
 
+            # 5. Consolidate per-expert MoE weights into stacked tensors
+            #    sharded on the leading expert axis. This eliminates the
+            #    per-forward `jnp.stack(experts[*].wN)` + the all-to-all
+            #    that follows it (XLA was burning ~16 GB / chip of HLO
+            #    temp staging the stacked tensor on every layer × every
+            #    forward call). After this pass each MoEParams carries
+            #    `w1_stacked / w2_stacked / w3_stacked` of shape
+            #    [E, inter, dim] with PartitionSpec ('attn_dp', None, None),
+            #    and the per-expert `experts` list is cleared. The
+            #    consolidate-and-clear is a one-time cost paid here.
+            if self.mesh is not None:
+                current = self._consolidate_moe_after_load(current)
+
             self.params_v = nnx.Param(current)
             self.initialize_cache()
+
+        def _consolidate_moe_after_load(self, tree):
+            """Merge per-expert MoE weights into a single E-sharded stacked
+            tensor per layer. Returns the rewritten param tree.
+
+            Memory contract: the per-expert leaves and the stacked tensor
+            have the same per-chip resident bytes (~128 MiB / 3 stacks /
+            layer). During the `jnp.stack` we briefly hold both, then drop
+            the per-leaf references by setting `experts=[]`. Worst-case
+            transient peak per chip is 2× that single-layer cost (~256 MiB),
+            negligible relative to the 17 GiB resident weight budget.
+            """
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams
+            mesh = self.mesh
+            E_spec = NamedSharding(mesh, P('attn_dp', None, None))
+
+            def consolidate(moe):
+                if not moe.experts or moe.w1_stacked is not None:
+                    return moe
+                w1 = jax.device_put(
+                    jnp.stack([e.w1 for e in moe.experts]), E_spec)
+                w2 = jax.device_put(
+                    jnp.stack([e.w2 for e in moe.experts]), E_spec)
+                w3 = jax.device_put(
+                    jnp.stack([e.w3 for e in moe.experts]), E_spec)
+                # Block on placement so the per-leaf source arrays have no
+                # outstanding readers and can be GC'd when we drop the list.
+                w1.block_until_ready()
+                w2.block_until_ready()
+                w3.block_until_ready()
+                swiglu_limit = float(moe.experts[0].swiglu_limit)
+                return MoEParams(
+                    gate=moe.gate,
+                    experts=[],  # released
+                    shared_expert=moe.shared_expert,
+                    n_routed_experts=moe.n_routed_experts,
+                    dim=moe.dim,
+                    w1_stacked=w1,
+                    w2_stacked=w2,
+                    w3_stacked=w3,
+                    swiglu_limit=swiglu_limit,
+                )
+
+            new_layers = []
+            for layer in tree.layers:
+                new_moe = consolidate(layer.moe)
+                new_layers.append(dataclasses.replace(layer, moe=new_moe))
+
+            new_mtp = []
+            for mtp_block in tree.mtp:
+                new_block_moe = consolidate(mtp_block.block.moe)
+                new_inner = dataclasses.replace(mtp_block.block, moe=new_block_moe)
+                new_mtp.append(dataclasses.replace(mtp_block, block=new_inner))
+
+            return dataclasses.replace(tree, layers=new_layers, mtp=new_mtp)
 
         def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:
             """Functional prefill helper — returns logits [B, S, vocab]."""
@@ -1411,7 +1496,7 @@ def _build_class():
             self.params_v = nnx.Param(new_params)
 
             # Recompute freq tables (pure function of static config).
-            swa, comp = make_freqs_cis(self.config, self.config.max_position_embeddings)
+            swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
             return set()
