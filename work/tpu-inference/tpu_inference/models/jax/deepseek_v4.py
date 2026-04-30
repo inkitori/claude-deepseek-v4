@@ -501,25 +501,12 @@ def transformer_body_decode_step(
     return h, new_states
 
 
-# ------------------------------------------------------------
-# Packed decode-state buffers (S1 — engine plumbing)
-# ------------------------------------------------------------
-#
-# To thread `AttentionDecodeState` through vLLM's `kv_caches: List[jax.Array]`
-# (the only carrier that survives the JIT'd `run_model` donation), each
-# layer's 6-field dataclass has to flatten into a single jax.Array. Pack
-# everything as fp32 — the score buffers genuinely need fp32 precision
-# (compressor's softmax-state accumulator), and the bf16 fields (`kv_cache`,
-# `indexer_kv_cache`) round-trip exactly through fp32 → bf16 cast. fp32 is
-# a 2× HBM cost on the bf16 fields but at MAX_LEN=256 / max_num_seqs=1 the
-# total per-layer state is ~50 KB even after the doubling, well below any
-# meaningful HBM budget. Per-slot indexing (max_num_seqs > 1) is added on
-# top of this packed-flat layout in iter-4 by stacking slots on a leading
-# axis.
+# Pack each layer's AttentionDecodeState (6 fields) into a single fp32 jax.Array
+# so it can ride through vLLM's `kv_caches: List[jax.Array]` carrier. fp32
+# is needed for compressor's softmax-state accumulator; bf16 fields round-trip
+# exactly through fp32→bf16 cast.
 
-# Per-field metadata: (name, shape, dtype). Shape's leading axis is the
-# decode-state's batch dim B. Tuple-of-tuples so the layout is hashable
-# (Python static under jit).
+# Per-field layout: (name, shape, dtype). Shape leading axis = batch dim B.
 _DECODE_STATE_FIELD_NAMES = (
     "kv_cache",
     "compressor_kv_state",
@@ -914,9 +901,7 @@ def make_freqs_cis(cfg: DeepseekV4Config, max_seq_len: int) -> Tuple[jnp.ndarray
     return swa, compressed
 
 
-# ------------------------------------------------------------
-# Abstract param-tree construction (for Tier 3 compile-only tests)
-# ------------------------------------------------------------
+# Abstract param-tree construction for compile-only tests.
 
 def _shape_struct(shape, dtype) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(tuple(int(s) for s in shape), dtype)
@@ -1080,9 +1065,7 @@ def make_abstract_transformer_params(cfg: DeepseekV4Config) -> TransformerParams
     )
 
 
-# ------------------------------------------------------------
-# Reporting helpers
-# ------------------------------------------------------------
+# Reporting helpers.
 
 def count_param_bytes(params_struct: TransformerParams) -> int:
     """Total bytes of all parameters when using the dtypes stored in the
@@ -1163,19 +1146,8 @@ _register_pytree(TransformerParams,
                   "hc_head_fn", "hc_head_base", "hc_head_scale", "mtp"))
 
 
-# ------------------------------------------------------------
-# HF safetensors name → JAX param-tree path mapping (Tier 4)
-# ------------------------------------------------------------
-
-# Mapping schema:
-#   key   : a (regex, jax-path-template) pair
-#   regex : Python regex matching the HF parameter name (groups: layer, expert)
-#   path  : a list of (segment-template, kind) where kind is 'attr', 'index'
-#           and segment-template may use {layer}, {expert} placeholders.
-#
-# We build this mapping once and use it both to validate that every name in
-# the HF index has a destination in our param tree and as the basis for the
-# real-weight loader in `deepseek_v4_loader.py`.
+# HF safetensors name → JAX param-tree path mapping. Used by the loader
+# (deepseek_v4_loader.py) and by load-time validation.
 
 import re
 
@@ -1273,16 +1245,9 @@ _HF_TO_JAX_RULES = [
 _QUANT_SUFFIXES = {".scale"}
 
 
-# ------------------------------------------------------------
-# vLLM model registry wrapper
-# ------------------------------------------------------------
-#
-# This class makes `DeepseekV4ForCausalLM` discoverable via the
-# tpu_inference model registry. It is intentionally a thin shim — the
-# math is in the functional core above (block_forward / attention_prefill /
-# moe_forward). The class exists primarily so that vLLM dispatch on the
-# `DeepseekV4ForCausalLM` architecture string finds *something* registered
-# and does NOT fall back to the vLLM-native PyTorch path.
+# vLLM model registry wrapper. Math is in the functional core above; this
+# class exists so vLLM dispatch on `DeepseekV4ForCausalLM` finds something
+# registered.
 
 def _materialize_param_tree(abstract_tree):
     """Replace every ShapeDtypeStruct leaf with jnp.zeros(shape, dtype)."""
@@ -1365,39 +1330,18 @@ def _build_class():
             # registered TransformerParams pytree (see _register_pytree
             # block above) when computing state / partition specs.
             self.params_v = nnx.Param(real_tree)
-            # Freqs are fp32 lookup tables. Cap the precomputed length at
-            # the actual prefill bucket ceiling vLLM will produce (see
-            # _effective_freqs_seq_len) instead of the architectural
-            # max_position_embeddings — V4-Flash's HF config has 1 048 576
-            # there, which produces a 1 GB freqs_compressed tensor that
-            # gets pinned in HBM as XLA arguments and dominates per-chip
-            # activation budget. The bucket-aware ceiling is typically
-            # 1024–8192 (max_num_batched_tokens × dp_size) — a few MB.
+            # Cap freqs precompute at the actual prefill bucket ceiling
+            # rather than max_position_embeddings (V4-Flash's HF config has
+            # 1 048 576, which would produce a 1 GB freqs table pinned in HBM).
             swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
 
-        # -- nnx housekeeping ----------------------------------------------
-
         def _effective_freqs_seq_len(self) -> int:
-            """Pick the smallest seq-len bound the precomputed RoPE tables
-            need to cover. Must include both:
-              * `model_config.max_model_len` — the per-request seq cap.
-              * `scheduler_config.max_num_batched_tokens *
-                 sharding_config.total_dp_size` — vLLM's TPU runner pads
-                 prefill to buckets up to this product (see
-                 runner/tpu_runner.py:469 → `get_token_paddings`'s
-                 max_token_size). For tp=32 + dp_attention with default
-                 max_num_batched_tokens=256, that's 8192 — even a short
-                 18-token prompt lands in a 1024-token bucket, and a
-                 freqs table sized only at 256 produces
-                 `cannot reshape array of shape (256, 32)` when the
-                 model tries `freqs_cis[:S].reshape(1, S, 1, _)` with
-                 S=1024 (chat-completions reproducer).
-            Anything below that floor exposes a real prefill crash on
-            longer prompts. Cap above by `max_position_embeddings` so
-            YaRN models with 1M-token architectural maxes don't blow
-            up the table to 1 GB."""
+            """Smallest freqs precompute size covering both `max_model_len` and
+            vLLM's prefill-bucket ceiling (`max_num_batched_tokens × total_dp_size`),
+            capped at `max_position_embeddings`. Without the bucket term, a
+            short prompt that lands in a 1024-token bucket fails to reshape."""
             mc = getattr(self.vllm_config, "model_config", None)
             sc = getattr(self.vllm_config, "scheduler_config", None)
             shc = getattr(self.vllm_config, "sharding_config", None)
@@ -1416,18 +1360,13 @@ def _build_class():
             return min(eff, mpe)
 
         def initialize_cache(self):
-            """Pre-compute RoPE freq tables. Called by the loader after
-            weights are populated. Idempotent."""
+            """Pre-compute RoPE freq tables. Idempotent."""
             swa, comp = make_freqs_cis(self.config, self._effective_freqs_seq_len())
             self._freqs_swa_v = nnx.Variable(swa)
             self._freqs_compressed_v = nnx.Variable(comp)
 
-        # -- public helpers (back-compat with v2 forward_prefill API) ------
-
         @property
         def params(self):
-            """Convenience accessor — returns the underlying TransformerParams
-            tree. Useful for tests that expect the v2 API."""
             return self.params_v.get_value()
 
         @params.setter
@@ -1439,30 +1378,10 @@ def _build_class():
             return map_hf_name_to_jax_path(hf_name)
 
         def load_weights_from_dir(self, checkpoint_dir: str):
-            """Load real V4 weights from a checkpoint directory.
-
-            Memory contract: this path is the v6e-32 deploy gate, where the
-            bf16-expanded V4-Flash weights are ~543 GB. We must NOT allocate
-            a transient zero copy of the full param tree (that alone hits
-            ~17 GB / chip and the load OOMs before any real weight lands),
-            and we must NOT buffer every dequantized weight on host RAM.
-
-            Strategy:
-              * Walk the abstract `ShapeDtypeStruct` tree once to capture
-                each leaf's target shape + dtype, indexed by JAX path.
-              * Stream-iterate the safetensors via
-                `iter_v4_safetensors_dequant_torch`: each step dequantizes a
-                single CPU torch tensor.
-              * Place that tensor as a sharded global `jax.Array` via
-                `place_torch_as_jax_sharded` (uses `attn_dp` as the primary
-                sharding axis when running with `enable_dp_attention=True`).
-              * Substitute the placed array into the dataclass tree at the
-                resolved path. Drop CPU buffer immediately, advance.
-              * Any leaves that the checkpoint doesn't cover (e.g. MTP
-                blocks absent on V4-Flash) are zero-filled at the end as
-                small replicated arrays — those are tiny relative to the
-                main param budget, so transient cost is negligible.
-            """
+            """Load V4 weights from a checkpoint directory. Streams one
+            dequantized tensor at a time onto a sharded jax.Array — neither
+            the full param tree nor a host-RAM buffer of all dequantized
+            weights fits at v6e-32 chip budget."""
             from tpu_inference.models.jax.deepseek_v4_loader import (
                 iter_v4_safetensors_dequant_torch, place_torch_as_jax_sharded,
                 iter_v4_safetensors_specs, place_spec_as_jax_sharded,
@@ -1871,38 +1790,13 @@ def _build_class():
             *args,
             **kwargs,
         ):
-            """vLLM-runtime forward.
+            """vLLM-runtime forward. Returns `(kv_caches, hidden_TM, [])`
+            with `hidden_TM` of shape `[T, hc*D]`.
 
-            Returns `(kv_caches, hidden_TM, [])` with `hidden_TM` of shape
-            `[T, hc*D]` (T = total tokens; hc*D collapsed by `head_hc`).
-
-            Contract: this body is **prefill-stateless**. Every call
-            recomputes attention over all `input_ids` positions from
-            scratch. Real decode (per-step state, O(1) attention compute
-            per generated token) is backlog item S1; the kernels exist
-            (`attention_decode_step`) but are not threaded through here
-            yet. Today this is correct because vllm runs in
-            `--enforce-eager` paged-KV-disabled mode and passes the full
-            prompt+generated context on every step — the cost is
-            O(L²)/step.
-
-            Multi-sequence dispatch:
-              When `attention_metadata` carries a `query_start_loc` with
-              more than one strictly-increasing segment, this dispatches
-              each sequence through `transformer_body_forward`
-              independently — so token i in sequence k attends only to
-              other tokens of seq k (positions [0, len_k)). The per-seq
-              hidden states are concatenated back in their original
-              `input_ids` order before the HC head mix.
-
-              This is a Python loop over sequences (eager only). Backlog
-              item S2 is jit'ing the dispatch — under jit the active-seq
-              count would have to be padded to a static bound with
-              `lax.dynamic_slice` per slot.
-
-            Single-sequence (no metadata, or metadata with one segment)
-            falls through to a single body call — exact-equal output to
-            the multi-seq path with `num_seqs=1`.
+            Multi-sequence (query_start_loc with >1 segment): Python loop
+            over sequences, each through `transformer_body_forward`. Hidden
+            states are concatenated back in input order before the HC head
+            mix. Single-sequence falls through to a single body call.
             """
             ids = jnp.asarray(input_ids)
             if ids.ndim == 0:

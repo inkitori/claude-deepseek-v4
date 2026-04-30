@@ -55,6 +55,15 @@ Args:
                           at N (default 0 = no cap; honor request body's `n`
                           field). Set to 1 to exercise the broken-n-expansion
                           failure path (server ignores n>1).
+  --long-gen-text TEXT    override choices[0].text on /v1/completions when the
+                          request body has max_tokens>=30 (long-gen probe path).
+                          Default is a coherent 30+ word passage. Set to a
+                          repeated-word string to exercise the
+                          token-repetition-loop failure path; set to a string
+                          ending in "...." to exercise the dirty-ending path.
+  --long-gen-tokens N     `usage.completion_tokens` to report on /v1/completions
+                          when max_tokens>=30 (default 35). Set below 30 to
+                          exercise the under-produced failure path.
   --flaky-readiness N     return 503 from /v1/models for the first N calls, then
                           200. Useful for exercising the readiness-wait loop.
 """
@@ -78,6 +87,12 @@ class MockHandler(BaseHTTPRequestHandler):
     stop_honor = True  # if False, ignore request `stop` and emit full text
     logprobs_alts = 5  # alternatives per token when logprobs>0; 0 = omit object
     n_cap = 0  # if >0, cap number of emitted choices at this value
+    long_gen_text = (
+        "On the rust-red plains of Mars, the small robot named Argo "
+        "rolled forward, its solar panels gleaming under a pale sun. "
+        "It paused to scan a curious rock formation and recorded "
+        "every reading.")
+    long_gen_tokens = 35
     flaky_remaining = 0
 
     def log_message(self, format, *args):
@@ -159,11 +174,15 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._stream_completion(stream_text)
                 return
             is_sampling = (body.get("temperature") or 0) > 0
+            is_long_gen = (body.get("max_tokens") or 0) >= 30
             text = MockHandler.text
             finish = "length"
             if is_sampling and MockHandler.sampling_text is not None:
                 text = MockHandler.sampling_text
                 finish = MockHandler.sampling_finish
+            elif is_long_gen:
+                text = MockHandler.long_gen_text
+                finish = "length"
 
             # Stop-sequence handling. When `stop` is set in the body, a
             # well-behaved server truncates `text` before the first stop
@@ -228,14 +247,17 @@ class MockHandler(BaseHTTPRequestHandler):
                     c["logprobs"] = logprobs_obj
                 choices.append(c)
 
+            completion_tokens = (MockHandler.long_gen_tokens
+                                 if is_long_gen else 8)
             self._json(200, {
                 "id": "cmpl-mock-deterministic",
                 "object": "text_completion",
                 "created": 0,
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "choices": choices,
-                "usage": {"prompt_tokens": 6, "completion_tokens": 8,
-                          "total_tokens": 14},
+                "usage": {"prompt_tokens": 6,
+                          "completion_tokens": completion_tokens,
+                          "total_tokens": 6 + completion_tokens},
             })
             return
         if self.path == "/v1/chat/completions":
@@ -276,6 +298,8 @@ def main() -> int:
     ap.add_argument("--stop-honor", default="1")
     ap.add_argument("--logprobs-alts", type=int, default=5)
     ap.add_argument("--n-cap", type=int, default=0)
+    ap.add_argument("--long-gen-text", default=None)
+    ap.add_argument("--long-gen-tokens", type=int, default=35)
     ap.add_argument("--flaky-readiness", type=int, default=0)
     args = ap.parse_args()
 
@@ -288,6 +312,9 @@ def main() -> int:
     MockHandler.stop_honor = (args.stop_honor != "0")
     MockHandler.logprobs_alts = args.logprobs_alts
     MockHandler.n_cap = args.n_cap
+    if args.long_gen_text is not None:
+        MockHandler.long_gen_text = args.long_gen_text
+    MockHandler.long_gen_tokens = args.long_gen_tokens
     MockHandler.flaky_remaining = args.flaky_readiness
 
     with HTTPServer(("127.0.0.1", args.port), MockHandler) as httpd:

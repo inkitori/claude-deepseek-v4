@@ -59,38 +59,24 @@ backlog reordering. If something was true for one iter and
 isn't anymore, remove it. The file targets ~500 lines; if it's
 ballooning, prune before adding.
 
-### 3. Code style matches upstream — this work targets eventual upstream PR
+### 3. Code style matches upstream — this work targets upstream PR
 
-V4 source files should be **indistinguishable in style** from
-their peer models in this repo (`qwen3.py`, `deepseek_v3.py`,
-`llama3.py`, `llama4.py`, `gemma4.py`). The minimum-delta rule
-covers *quantity*; this rule covers *style*. A reviewer at
-`vllm-project/tpu-inference` should not be able to tell which
-lines came from an autonomous agent.
+V4 source must be **indistinguishable in style** from peer models
+(`qwen3.py`, `deepseek_v3.py`, `llama3.py`). Minimum-delta covers
+quantity; this covers style.
 
-* **Docstrings**: brief Args/Returns blocks. No multi-paragraph
-  hypothesis-rationale, no "previous implementation was X"
-  history (that's a commit-message thing).
-* **Comments**: only when the WHY is non-obvious. No
-  iter-narrative references ("iter-5h fix", "Tier-8 keystone",
-  "Bug A was…"). No section banners (`# ===== gate =====`,
-  `# ----- expert -----`). Well-named identifiers do the WHAT
-  job already.
-* **Defensive programming**: trust internal call paths. Validate
-  only at the vLLM API boundary (e.g. `__call__` argument
-  shapes), not at every internal helper. Peer models don't add
-  belt-and-suspenders asserts; neither should V4.
-* **Backwards-compat shims**: none. V4 is new code; if a branch
-  is dead, delete it. No `# removed for X` placeholders, no
-  re-exports of types nothing imports, no `_unused_var` renames.
-* **Naming**: snake_case modules + functions, PascalCase
-  classes, verbatim from upstream where applicable
-  (`AttentionMetadata`, `compute_q_projection`, etc.).
+* **Docstrings**: brief Args/Returns. No multi-paragraph rationale,
+  no "previous implementation was X" history.
+* **Comments**: only when WHY is non-obvious. No iter-narrative
+  ("iter-5h fix", "Bug A was…"), no section banners
+  (`# ===== gate =====`).
+* **Defensive programming**: validate only at the vLLM API
+  boundary, not at every helper. Peer models don't.
+* **No backwards-compat shims**: V4 is new code; delete dead
+  branches.
 
-Before considering a piece of V4 work "done", do a 30-second
-diff-side-by-side with `qwen3.py` or `deepseek_v3.py`. If your
-file looks chattier, prune. If your function has a 30-line
-docstring and qwen3's equivalent has 4 lines, prune.
+Before declaring a piece "done", 30-second diff against
+`qwen3.py` / `deepseek_v3.py`. If chattier, prune.
 
 ## Cluster topology
 
@@ -124,41 +110,28 @@ scripts/full_slice_v4_smoke.sh        # launch vllm serve; writes pid + log
 scripts/full_slice_v4_smoke_check.sh  # validate /v1/completions when ready
 ```
 
-* **`full_slice_v4_reset.sh`** — handles the four orphan-state
-  surfaces (api-server pid, `VLLM::EngineCore` Ray actor
-  children, `/tmp/libtpu_lockfile`, leaked Ray placement
-  groups). Does **not** restart Ray itself. Cheap; run before
-  every smoke launch.
-* **`full_slice_v4_ray_restart.sh`** — heavier nuke
-  (`ray stop --force` + fresh `ray start` on all 8 hosts).
-  Reach for it only when reset isn't enough (e.g. `ABORTED:
-  TPU is already in use by process X` even after reset).
-* **`full_slice_v4_sync.sh`** — **mandatory after any code
-  edit**. rsyncs `work/tpu-inference/tpu_inference/` and
-  `scripts/` to all 7 worker hosts. (The repo-root markdown
-  files and other dirs are NOT synced.)
-* **`full_slice_v4_smoke.sh`** — launches `vllm serve` with V4
-  optimization knobs forwarded to Ray workers. Writes pid to
-  `logs/full-slice-v4-smoke.pid` and a timestamped log to
-  `logs/full-slice-v4-smoke-<TS>.log`.
-* **`full_slice_v4_smoke_check.sh`** — polls `/v1/models` until
-  ready, fires the deterministic "capital of France"
-  completion twice, asserts byte-identical responses + that
-  the text contains "Paris". Self-test at
-  `scripts/test_smoke_check_harness.sh` (24 mock scenarios, no
-  TPU). Also fires nine optional probes, each gated by an env
-  knob (default off so the smoke stays cheap):
-  `CHAT_REQUIRED`, `REASONING_REQUIRED`, `STREAMING_REQUIRED`,
-  `SAMPLING_REQUIRED`, `STOP_REQUIRED`, `LOGPROBS_REQUIRED`,
-  `TOPK_REQUIRED`, `PRESENCE_REQUIRED`, `N_REQUIRED` — see the
-  knobs table for one-line semantics and exit codes 4–12.
-* **`full_slice_v4_warm_cache.sh`** — runs the smoke + check,
-  then cleans up. Use once on a fresh VM (or after `/tmp`
-  wipe) to populate the JAX compile cache; subsequent first-
-  curls are sub-minute on cache hit.
+* `reset.sh` — clears 4 orphan-state surfaces (api-server pid,
+  `VLLM::EngineCore` Ray actors, `/tmp/libtpu_lockfile`, leaked
+  Ray placement groups). Doesn't restart Ray. Run before every
+  smoke launch.
+* `ray_restart.sh` — heavier nuke (`ray stop --force` + fresh
+  `ray start` on all 8 hosts). Use only when reset isn't enough.
+* `sync.sh` — **mandatory after any code edit**. Rsyncs only
+  `work/tpu-inference/tpu_inference/` and `scripts/` to workers;
+  the repo-root markdown files are head-only.
+* `smoke.sh` — launches `vllm serve` (background); writes pid +
+  timestamped log under `logs/`.
+* `smoke_check.sh` — polls `/v1/models` until ready, fires
+  deterministic Paris completion ×2, asserts byte-identical +
+  contains "Paris". Optional probes gated by `*_REQUIRED=1`
+  env knobs (see knob table for exit codes 4–13). Self-test at
+  `scripts/test_smoke_check_harness.sh` (28 mock scenarios).
+* `warm_cache.sh` — smoke + check + cleanup, used once on a
+  fresh VM to populate the JAX compile cache.
 
-Pass criterion: `full_slice_v4_smoke_check.sh` exits 0 with
-`PASS: deterministic completion contains 'Paris'`.
+Pass criterion: `smoke_check.sh` exits 0 with
+`PASS: deterministic completion contains 'Paris'` AND any
+`_REQUIRED=1` probes pass.
 
 ## Killing vLLM cleanly
 
@@ -186,9 +159,9 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during first inference if `jit_run_model` recompiles. Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (see pitfall #4). |
-| `V4_DECODE_STATE` | `1` | `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real packed-state decode); `0` falls back to the prefill-recompute baseline. Default `1` is the production path; set `0` to A/B against the baseline. |
+| `V4_DECODE_STATE` | `0` | `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real packed-state decode); `0` is the prefill-recompute baseline. **Default `0` because `1` produces empty/garbage output past position ~2 on real V4 — see S1.** Set `1` to reproduce / debug the broken path. |
 | `CHAT_REQUIRED` | `0` | smoke_check chat probe; exit 4 on missing/empty content. Adds ~30 s for first-chat OOM-retry (pitfall #9). |
-| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Green under default `V4_DECODE_STATE=1`; produces all-newlines under `V4_DECODE_STATE=0` (prefill-recompute path). |
+| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Currently fails under both `V4_DECODE_STATE=0` (prefill-recompute, all-newlines) and `=1` (decode plumbing, empty/garbage past token ~2 — see S1). |
 | `STREAMING_REQUIRED` | `0` | SSE byte-equality probe vs non-streaming; exit 6. Pins S7. |
 | `SAMPLING_REQUIRED` | `0` | `temperature=0.7, top_p=0.9, frequency_penalty=0.1`; exit 7 on empty/invalid. Pins S6. Determinism not asserted (per-request seed unsupported on non-greedy paths). |
 | `STOP_REQUIRED` | `0` | `stop=["Paris"]`; exit 8 if response contains Paris or `finish_reason!=stop`. Pins S6. Baseline emits ` Paris` first, so a working handler MUST intercept. |
@@ -196,7 +169,7 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `TOPK_REQUIRED` | `0` | `temperature=0.7, top_k=10`; exit 10 on empty/invalid. Pins S6. |
 | `PRESENCE_REQUIRED` | `0` | `temperature=0.7, presence_penalty=0.5`; exit 11 on empty/invalid. Pins S6. |
 | `N_REQUIRED` | `0` | `n=2`; exit 12 if fewer than 2 non-empty choices. Pins S6. Under `--max-num-seqs=1` likely sequentializes but cardinality must equal n. |
-| `LONG_GEN_REQUIRED` | `0` | `max_tokens=64` long-answer probe; exit 13 if `completion_tokens<30`, any word repeats 5+ times in a row, or trailing 5 chars contain <2 alphanumerics. Pins S8. Logs observed tok/s. Override via `LONG_GEN_MAX_TOKENS`. |
+| `LONG_GEN_REQUIRED` | `1` | `max_tokens=64` long-answer probe; exit 13 if `completion_tokens<30`, any word repeats 5+ times in a row, or trailing 5 chars contain <2 alphanumerics. Pins S8. Logs observed tok/s. Default `1` because the basic Paris probe is too thin a gate. Override via `LONG_GEN_MAX_TOKENS`. |
 
 ## Production-readiness backlog
 
@@ -206,41 +179,85 @@ backlog itself stays brief.
 
 ### Tier S — silent correctness bombs (fix before perf)
 
-#### S1. Real decode plumbing — DONE
+#### S1. Real decode plumbing — RUNTIME HOOKS SHIPPED, GENERATION IS BROKEN
 
-Decode-step kernels (`attention_decode_step`,
-`compressor_decode_step`, `indexer_decode_step`) thread real
-`AttentionDecodeState` through `kv_caches[i]` (one fp32 packed
-buffer per layer) instead of recomputing prefill every step.
-Smoke launcher defaults `V4_DECODE_STATE=1`. Engine returns
-deterministic ` Paris` byte-equal across R1/R2 and non-empty
-`message.reasoning` under thinking-mode (`REASONING_REQUIRED=1`)
-on real V4-Flash. Module-import emits
-`[V4_DECODE_STATE] module import: enabled=True` per worker so
-env-propagation regressions are visible in the smoke log.
+The runtime plumbing is complete and the JIT-cache structure is
+right (one trace fits all decode positions). **But the actual
+generation output is empty/garbage past position ~2.** Smoke
+launcher reverted to `V4_DECODE_STATE=0` (prefill-recompute
+baseline) — that path returns ` Paris` correctly but is also
+unvalidated past 2 tokens.
 
-`start_pos` is traced through the decode kernel chain (constant
-output shapes via `lax.dynamic_slice_in_dim`, `-1` sentinel
-topk slots, constant `K=index_topk`), so one JIT trace fits
-every decode position. Pinned by 37-test iter-5 suite
-(`TestPackedDecodeStateBuffer`, `TestTransformerBodyDecodeRoundTrip`,
-`TestPrefillToDecodeStateParity`) +
-`test_buffer_decode_jit_cache_hits_across_positions` (asserts
-`_cache_size()` delta == 1 over 4 positions).
+**What we know (probed 2026-04-30 ~22:50Z, real V4 + traced
+`start_pos`):**
 
-Runtime hooks (read these before touching V4 plumbing):
-* `models/common/model_loader.py` — V4-only `kv_cache_sharding=P()`
-  replicated override.
+```
+prompt: "Tell me a short story about a robot exploring Mars:"
+max_tokens=64, temperature=0, seed=0
+→ completion_tokens=64, finish_reason=length
+→ visible text: '#'   (1 character)
+```
+
+Equivalent reproducers across 4 unrelated prompts at
+`max_tokens=8` → text=`''` (empty) for all of them. The same
+engine PID returned the canonical ` Paris` text on the basic
+probe early in its lifetime, then degraded to `'# '` for the
+same Paris probe ~15 minutes later. So generation is broken AND
+the engine state corrupts over the lifetime of a vllm serve
+process.
+
+**Plumbing that's actually shipped (runtime hooks, math
+kernels, JIT cache structure):**
+* Decode-step kernels (`attention_decode_step`,
+  `compressor_decode_step`, `indexer_decode_step`) thread
+  packed `AttentionDecodeState` through `kv_caches[i]` (one
+  fp32 packed buffer per layer).
+* `start_pos` is traced (constant output shapes via
+  `lax.dynamic_slice_in_dim`, `-1` sentinel topk slots,
+  constant `K=index_topk`); one JIT trace per shape bucket.
+* Tiny-config tests pass (`TestPackedDecodeStateBuffer`,
+  `TestTransformerBodyDecodeRoundTrip`,
+  `TestPrefillToDecodeStateParity`,
+  `test_buffer_decode_jit_cache_hits_across_positions` —
+  cache-size delta == 1 over 4 positions).
+* `LONG_GEN_REQUIRED=1` gate in smoke_check (default-on)
+  catches the empty-output failure mode end-to-end.
+
+**Runtime hook locations (read before touching V4 plumbing):**
+* `models/common/model_loader.py` — V4-only
+  `kv_cache_sharding=P()` replicated override.
 * `runner/kv_cache_manager.py::_initialize_kv_cache_deepseek_v4`
   — V4 packed-buffer allocator.
 * `runner/tpu_runner.py::_maybe_set_v4_decode_start_pos` —
   sets `decode_start_pos` meta-gate on `AttentionMetadata`.
 * `models/jax/deepseek_v4.py::v4_state_max_seq_len_from_vllm_config`
-  — single source of truth for buffer sizing (allocator +
-  `__call__` MUST agree).
+  — single source of truth for buffer sizing.
 
-S1 unlocks A1 (`max-model-len`), B1 (sparse_attn Pallas
-becomes worthwhile), S5 (MTP speculative decoding).
+**Hypotheses for the empty-output bug** (untested as of writing,
+investigate in priority order):
+1. Request-state pollution: prior decode state isn't reset
+   between requests, leaking into subsequent prefills (same
+   shape as the iter-5g..5j Bug B saga; `_v4_force_kv_caches_read`
+   was supposed to fix but may not survive traced `start_pos`
+   refactor or `--enable-prefix-caching`).
+2. Compressor compress-event branching via `lax.cond` doesn't
+   produce identical state to the Python-static version on real
+   weights (works on tiny config CPU, fails on real V4 / TPU SPMD).
+3. SWA wraparound write under traced `start_pos` corrupts
+   kv_cache for positions ≥3 (`lax.dynamic_update_slice` index
+   computation off-by-one or sharding-dependent).
+4. Indexer top-k mask under traced `start_pos` picks wrong
+   positions; downstream attention reads corrupted slots.
+
+**Validation discipline going forward:** any "S1 fixed" claim
+must produce a `LONG_GEN_REQUIRED=1` PASS on a fresh vllm serve
+PLUS the same probe re-fired after 5 unrelated requests (to
+catch state-pollution bugs the single-request gate misses).
+Don't trust `completion_tokens` from `usage` — the model
+reports 64 even when visible text is 1 character.
+
+S1 closure unlocks A1, B1, S5 — but those are blocked on real
+generation working, not on more runtime plumbing.
 
 #### S2. Multi-sequence dispatch is a Python loop in eager mode
 
@@ -253,22 +270,20 @@ with `lax.dynamic_slice` per active seq. Until S2 lands,
 `--max-num-seqs=1` is forced. Independent of S1 but they
 multiply.
 
-#### S3. Tool-call runtime probe — TODO (reasoning parser fixed by S1)
+#### S3. Reasoning + tool parsers — wired, but reasoning output broken with S1
 
 Smoke launcher passes `--reasoning-parser deepseek_v4`,
 `--enable-auto-tool-choice`, `--tool-call-parser deepseek_v4`;
-both register at startup (smoke-green = parsers loaded). Reasoning
-parser is an upstream alias for `DeepSeekV3ReasoningParser`
-(standard `<think>...</think>`). `REASONING_REQUIRED=1` runtime
-probe is green under default `V4_DECODE_STATE=1`.
+both register at startup. `REASONING_REQUIRED=1` currently fails:
+both `V4_DECODE_STATE=0` (all-newlines) and `=1` (empty/garbage
+past token ~2) produce un-usable reasoning. Hypothesized to fix
+itself once S1 generation is actually working.
 
-Remaining S3 work: tool-call runtime probe (`TOOLS_REQUIRED=1`)
-— assert a request with `tools=[...]` populates `tool_calls`
-rather than emitting raw DSML tokens in `content`. Parser is
-registered (`deepseekv4_tool_parser.py` in vLLM upstream) but
-not exercised end-to-end yet.
+Tool-call runtime probe (`TOOLS_REQUIRED=1`) still TODO — assert
+a request with `tools=[...]` populates `tool_calls` rather than
+emitting raw DSML tokens in `content`.
 
-Sanity check that parsers are still wired (no TPU needed):
+Sanity check parsers are wired (no TPU needed):
 
 ```bash
 PYTHONPATH=work/vllm:work/tpu-inference work/vllm_env/bin/python3 -c "
@@ -301,29 +316,23 @@ weights load). Need a `DeepseekV4MTPProposer` in
 `--speculative-config '{"method":"deepseek_v4_mtp","num_speculative_tokens":1}'`.
 1.5–2× decode throughput once S1 lands.
 
-#### S6. Sampling parameters — all probes scaffolded + verified end-to-end
+#### S6. Sampling parameters — probes scaffolded; only validate first ~3 tokens
 
 Per-knob probes (sampling, stop, logprobs, top-k, presence,
-n>1) all pass on real `vllm serve` 2026-04-30. See knob table
-above. **Determinism under sampling is not asserted** — vLLM/
-TPU's runner rejects per-request `seed` on non-greedy paths
-with HTTP 400 ("JAX does not support per-request seed."), so
-the sampling probe omits `seed`.
+n>1) pass on real `vllm serve` but only on the same Paris-shaped
+prompt that produces 1-3 tokens before stopping. They don't
+exercise sustained generation, so any "S6 done" claim is
+meaningless until S1's empty-output bug is fixed. Determinism
+under sampling not asserted (vLLM/TPU rejects per-request `seed`
+on non-greedy paths with HTTP 400).
 
-Future S6 work would be combinatorial coverage (logprobs+stop,
-topk+presence, etc.) — defer until a production client report
-shows a gap.
-
-#### S7. Streaming — equivalence probe verified; latency budget probe TODO
+#### S7. Streaming — equivalence probe scaffolded, same caveat as S6
 
 `STREAMING_REQUIRED=1` re-fires the deterministic completion
-with `stream=true`, reassembles SSE chunks, asserts
-byte-equality vs non-streaming. Verified on real V4 2026-04-30.
-
-Still TODO: latency-budget probe (TTFT / ITL thresholds, gated
-behind `STREAMING_LATENCY_REQUIRED=1`). OpenRouter-style
-clients default to streaming, so latency-on-streaming is the
-production metric users feel.
+with `stream=true`, reassembles SSE chunks, asserts byte-equality
+vs non-streaming. Passes today on the Paris probe but doesn't
+validate sustained streaming. Latency-budget probe (TTFT/ITL,
+behind `STREAMING_LATENCY_REQUIRED=1`) still TODO.
 
 #### S8. Sustained-generation probe — minimum check past the Paris gate
 
@@ -469,83 +478,77 @@ Future S8 extensions (file under same item):
 
 ## Iteration discipline
 
-**Do NOT use `./run.sh serve` as your inner test loop.** Each
-attempt is 25–45 min (4 min load + 10–30 min cold compile +
-curl wait). That budget is fixed by XLA. Prior sessions burned
-real time treating it as if it should be fast. Use the fastest
-validation that catches the bug class you're working on:
+**Don't use `./run.sh serve` as your inner test loop** — each
+attempt is 25–45 min. Use the fastest validation that catches
+the bug class:
 
-1. **Standalone math scripts** under `/tmp/` (~10–30s).
-2. **Tiny-fixture pytest classes** in
-   `tests/models/jax/test_deepseek_v4.py` (~30s–2min on CPU).
-3. **`eval_shape` / `lower().compile()` on the real config**
-   (~1–3min). Catches sharding bugs + HLO-emit failures
-   without paying runtime compile cost. Pattern:
+1. Standalone math scripts under `/tmp/` (~10–30s).
+2. Tiny-fixture pytest classes in
+   `tests/models/jax/test_deepseek_v4.py` (~30s–2min CPU).
+3. `eval_shape` / `lower().compile()` on real config under
+   virtual mesh (~1–3min). Pattern:
    `XLA_FLAGS=--xla_force_host_platform_device_count=32
    JAX_PLATFORMS=cpu`.
-4. **Real `./run.sh serve`** only when 1–3 are green. Budget at
-   most 1–2 of these per session.
+4. Real `./run.sh serve` — at most 1–2 per session.
 
-### Real-smoke phase budgets (don't bail too early)
+### Real-smoke phase budgets
 
-| Phase | Expected duration | Bail signal |
+| Phase | Expected | Bail signal |
 |---|---|---|
-| **vLLM startup + Ray cluster init** | ~30s | No log activity for >2 min, OR `Worker exit type: SYSTEM_ERROR`. |
-| **Weight load** | ~4 min | No `[deepseek_v4] placed N tensors` heartbeat for >2 min, OR placed count stops growing. |
-| **`capture_model` precompile** | ~30s | Any `RESOURCE_EXHAUSTED` / `CompileTimeHbmOom`. |
-| **`Application startup complete`** | fires immediately after capture_model | If absent >2 min after capture_model finishes. |
-| **`jit_run_model` cold compile** | **10–30 min** cold, **~97s** warm | Three or more `slow_operation_alarm.cc` warnings (one alarm = one slow pass; that alone is *not* enough to bail). Any `RESOURCE_EXHAUSTED` / `Worker exit`. |
-| **First curl returning** | sub-second after compile | Curl 900s timeout, OR engine crashes mid-execute. |
+| Startup + Ray init | ~30s | No log activity >2 min |
+| Weight load | ~4 min | No `[deepseek_v4] placed N tensors` heartbeat >2 min |
+| `capture_model` precompile | ~30s | `RESOURCE_EXHAUSTED` / OOM |
+| `jit_run_model` cold compile | **10–30 min cold, ~97s warm** | 3+ `slow_operation_alarm.cc` warnings, OR `RESOURCE_EXHAUSTED` |
+| First curl | sub-second after compile | Curl timeout, engine crash |
 
 Silence in `jit_run_model` ≤25 min is *expected*, not stuck.
-**Don't bail before 25 min** unless `ITER_TIMEOUT_SEC` (5400 /
-90 min) is closing in. Spend compile time productively —
-sketch the next-lane fix in `/tmp/`, audit warning families,
-consolidate test bloat (test edits don't conflict with the
-running smoke).
 
 ### Iter-timeout management
 
-* **At T-15 min:** stop launching new long-running steps.
-  Commit whatever code change you've made (with "WIP:" prefix
-  describing what was tried + what's still unverified) so iter
-  N+1 picks up from on-disk state.
-* **At T-5 min:** reset the cluster + push the WIP commit.
-  Don't risk the iter being killed mid-`./run.sh serve`.
+`ITER_TIMEOUT_SEC=5400` (90 min). At T-15 min stop launching
+new long steps + commit a "WIP:" checkpoint. At T-5 min reset
+the cluster + push.
 
 ## What's verified
 
-* Streaming sharded loader (no zero-tree OOM).
-* Slice-aware load + multi-threaded placement
-  (`V4_LOADER_PLACE_WORKERS=8`); safetensors handle cache
-  (~6× load speedup, ~4 min total).
-* Vectorized MoE forward (math byte-equal to per-expert
-  reference; HLO 4.6× smaller). ✓ correctness, ✗ optimal flops
-  (B2).
-* Inline MoE consolidation at load (256 per-expert weights of
-  each `(layer, wname)` group stacked into single E-sharded
-  jax.Array). `jit_run_model` HLO 47k optimized vs 103k prior.
-* Freqs cap by `max_model_len` — `_effective_freqs_seq_len`
-  uses `vllm_config.model_config.max_model_len` (1 GB/chip →
-  KB).
+**On real V4-Flash via `vllm serve`:**
+* Basic ` Paris` smoke gate (R1==R2 byte-equal) on a *fresh*
+  engine — degrades to garbage after enough requests.
+* Sampling / stop / logprobs / top-k / presence / n>1 probes —
+  but all only validate the FIRST 1-3 tokens.
+* Streaming SSE byte-equal to non-streaming.
+
+**On tiny-config CPU (math correctness only — does NOT translate
+to real V4 generation working):**
+* Decode kernels match torch reference at 1e-4
+  (`TestPackedDecodeStateBuffer`,
+  `TestTransformerBodyDecodeRoundTrip`,
+  `TestPrefillToDecodeStateParity`,
+  `test_buffer_decode_jit_cache_hits_across_positions`).
+* MTP forward math validated (S5 runtime not wired).
+* Chat encoding byte-equal to V4-Flash reference encoder
+  (`TestVllmChatTemplateParity`).
+
+**Infra (no per-token correctness claim):**
+* Streaming sharded loader (~4 min, no OOM).
+* Slice-aware load + multi-threaded placement.
+* Inline MoE consolidation at load (HLO 47k vs 103k prior).
+* Freqs cap by effective seq-len (1 GB → KB).
 * Persistent JAX compile cache populated under
   `~/.cache/vllm/xla_cache` per host.
-* Decode kernels (`attention_decode_step`,
-  `compressor_decode_step`, `indexer_decode_step`) match torch
-  reference at 1e-4 + run under real V4 under default
-  `V4_DECODE_STATE=1` (deterministic ` Paris` R1/R2 + non-empty
-  thinking-mode reasoning). Pinned by 37-test iter-5 suite +
-  `test_buffer_decode_jit_cache_hits_across_positions`.
-* MTP forward math validated. ✓ math, ✗ runtime (S5).
-* Chat encoding byte-equal to V4-Flash reference encoder
-  across all S4 scopes (`TestVllmChatTemplateParity`).
-* Reasoning + tool parser wiring (registry lookup ✓; runtime
-  reasoning probe ✓; tool-call runtime probe TODO, see S3).
-* Streaming probe (SSE = non-streaming byte-for-byte).
-* Sampling / stop / logprobs / top-k / presence / n>1 probes
-  all pass on real V4.
+* Reasoning + tool parser registry lookup.
 * Tiny-tensor replication at load (B3 fix): 126 → 0
   `Involuntary full rematerialization` warnings.
+
+**NOT verified — explicitly broken or untested past 1-3 tokens:**
+* Sustained generation (S1 / S8 — output is empty/`#` past
+  position ~2 on real V4 with `V4_DECODE_STATE=1`).
+* Multi-turn conversations (no probe yet).
+* Long context (4k, 16k, 64k+ — C2).
+* Real tok/s under sustained generation (last measurement was
+  0.53 tok/s but the generation was empty).
+* Refusal preservation (C5).
+* Math / code reasoning quality vs reference (C1).
 
 ## Pitfalls already learned (don't repeat)
 
@@ -607,66 +610,45 @@ running smoke).
 
 ## Layout
 
-* `work/tpu-inference/` — JAX V4 implementation (subtree of
-  upstream `tpu-inference`). V4 model:
-  `tpu_inference/models/jax/deepseek_v4*.py`. MoE:
-  `layers/jax/moe/deepseek_v4_moe.py`. Attention:
-  `layers/jax/attention/deepseek_v4_attention.py`.
-* `work/vllm/` — vLLM source. Don't edit upstream files
-  unless you've read `work/vllm/AGENTS.md`. Reasoning + tool
-  parsers for `deepseek_v4` already exist upstream.
-* `scripts/` — operational helpers; per-host entry points all
-  start with `full_slice_v4_`.
-* `logs/` — `.gitignore`d; smoke + iter logs accumulate here.
-* `README.md` — fresh-VM bringup (one-shot via `./run.sh`).
-* `.env.example` — every env var documented.
-* `prompt.md` — the prompt the autonomous loop hands to
-  `claude -p`. Read CLAUDE.md (this file) first.
+* `work/tpu-inference/tpu_inference/models/jax/deepseek_v4*.py`,
+  `layers/jax/{attention,moe}/deepseek_v4_*.py` — V4 source.
+* `work/vllm/` — vLLM upstream. Don't edit unless you've read
+  `work/vllm/AGENTS.md`.
+* `scripts/full_slice_v4_*.sh` — per-host operational helpers.
+* `logs/` — `.gitignore`d.
+* `prompt.md` — autonomous loop's prompt; read CLAUDE.md first.
 
-Durable docs in `work/tpu-inference/`:
-* `INVARIANTS.md` — math invariants. Each broken invariant is
-  a shipping bug.
-* `DECISIONS.md` — durable architectural decisions.
-* `BLOCKERS.md` — short pointer at the backlog above.
-* `TINY_CONFIG.md`, `TOLERANCE_LOG.md`, `V3_TO_V4_DIFF.md` —
-  math reference; don't decay.
+Durable docs in `work/tpu-inference/`: `INVARIANTS.md` (math
+invariants), `DECISIONS.md`, `BLOCKERS.md` (pointer to backlog),
+`TINY_CONFIG.md`, `TOLERANCE_LOG.md`, `V3_TO_V4_DIFF.md`.
 
 ## Chat template note
 
-V4-Flash deliberately ships **no Jinja `chat_template`** —
-`tokenizer_config.json` omits the field. vLLM's
-`DeepseekV4Tokenizer` auto-resolves and routes through
-upstream `encode_messages`, ignoring any `--chat-template`
-arg. The smoke launcher does not pass one; there's no Jinja
-file in the repo. Behavior pinned by
+V4-Flash ships **no Jinja `chat_template`**. vLLM's
+`DeepseekV4Tokenizer` auto-resolves via upstream `encode_messages`,
+ignoring any `--chat-template` arg. Pinned by
 `TestVllmChatTemplateParity`. `vllm chat` CLI needs
-`--url http://localhost:18081/v1` (smoke launcher binds 18081).
+`--url http://localhost:18081/v1`.
 
 ## Sanity check on a fresh VM
 
-After `cp .env.example .env` + filling in tokens + `./run.sh`:
-
 ```bash
-# 1. CPU-only math test (no TPU; ~10s)
+# CPU math (no TPU; ~10s)
 work/vllm_env/bin/python3 -m pytest \
     work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestFp8DequantIndependentReference \
     work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestFp4DequantIndependentReference \
     -x -q
 
-# 2. Smoke harness self-test (no TPU; mocks vllm)
+# Smoke harness self-test (no TPU)
 scripts/test_smoke_check_harness.sh
 
-# 3. Cluster: should be all green
-scripts/full_slice_v4_reset.sh
-ray status   # expect 8 nodes, 0.0/32.0 TPU
+# Cluster (expect 8 nodes, 0.0/32.0 TPU)
+scripts/full_slice_v4_reset.sh && ray status
 
-# 4. Real smoke
+# Real smoke
 scripts/full_slice_v4_sync.sh
 scripts/full_slice_v4_smoke.sh
-tail -f logs/full-slice-v4-smoke-*.log
-
-# 5. Validate when ready
-scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
+scripts/full_slice_v4_smoke_check.sh
 ```
 
 Update this file as you learn — but updates are for *durable*

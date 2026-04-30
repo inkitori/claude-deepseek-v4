@@ -110,69 +110,27 @@ If you skip the sync step after editing code, 7 of 8 worker
 hosts will silently run stale code and you'll lose 30+ minutes
 per attempt. This is the most common foot-gun in this repo.
 
-## Your job — pick the highest-leverage backlog item you can finish in one iter
+## Your job — pick the highest-leverage backlog item
 
-The full backlog is in CLAUDE.md "Production-readiness
-backlog" — **read it before picking work.** Brief recap of the
-priority order:
+The authoritative backlog is in CLAUDE.md "Production-readiness
+backlog" (S1–S8, A1–A11, B1–B4, C1–C5, D1–D2). Read it before
+picking work. Tier order: S (silent correctness bombs) > A
+(production infra) > B (perf) > C (quality gates) > D
+(janitorial).
 
-* **Tier S — silent correctness bombs.** Fix first. The smoke
-  may go green but real users will see broken output:
-  * **S1** — decode is not real decode (every step recomputes
-    full prefill on prompt+generated). Headline correctness/
-    perf bug. Unblocks A1, B1, S5.
-  * **S2** — multi-seq dispatch is a Python loop, doesn't jit.
-  * **S3** — `--reasoning-parser` and `--tool-call-parser`
-    flags not enabled in smoke launcher. **One-line fix; do
-    this first unless someone else already did.**
-  * **S4** — chat template covers chat-mode only (no thinking,
-    no tools, no `latest_reminder`).
-  * **S5** — MTP speculative decoding hook not wired.
-  * **S6** — sampling parameters untested under load.
-  * **S7** — streaming (SSE) unverified.
+**S1 is the only acceptable next-iter work right now.** Runtime
+hooks shipped (decode kernels, traced start_pos, packed-state
+buffer plumbing) but the actual generation output is broken:
+prompts other than `"The capital of France is"` produce empty/
+garbage text past position ~2 on real V4. `LONG_GEN_REQUIRED=1`
+in the smoke gate exposes this. CLAUDE.md S1 has the four root-
+cause hypotheses + reproducer + the validation discipline
+("`LONG_GEN_REQUIRED=1` PASS on a fresh engine PLUS the same
+probe re-fired after 5 unrelated requests").
 
-* **Tier A — production deployment infra.** A1 (lift
-  `MAX_LEN`/`MAX_SEQS`) depends on S1; A2–A6 (cache durability,
-  crash recovery, metrics, TLS, multi-slice) are independent.
-
-* **Tier B — known performance work.** B1 (sparse-attn Pallas),
-  B2 (megablox MoE dispatch), B3 (remat-warning audit), B4
-  (AOT binary persist).
-
-* **Tier C — quality gates.** C1 (lm-eval-harness), C2 (long
-  context), C3 (math regression), C4 (tokenizer edges), C5
-  (refusal preservation). Required before claiming "we serve V4".
-
-* **Tier D — janitorial.** D1 (test bloat consolidation), D2
-  (stale comment cleanup).
-
-**Picking rule:** any unresolved Tier-S item beats every A/B/C/D
-item. Within Tier S, pick by current state — S1 correctness
-landed in iter-5j (real V4 smoke green with `V4_DECODE_STATE=1`),
-but S3 (thinking-mode broken on real V4) was hypothesized to
-root in S1 and needs verification. S2 is unblocked but separate.
-
-**Current high-leverage candidates (read CLAUDE.md backlog for
-full rationale):**
-
-* **S3 verification.** Run `REASONING_REQUIRED=1` +
-  `V4_DECODE_STATE=1` smoke. If thinking-mode still broken,
-  Tier-S correctness item is open and beats every perf item.
-* **Traced-`start_pos` refactor (S1 follow-on).** S1 shipped
-  with `decode_start_pos` as a Python int hashed into the JIT
-  cache key — fresh start_pos = ~50s compile. Refactor to
-  `jnp.int32` via `lax.dynamic_slice` / `lax.cond` for
-  one-compile-fits-all-positions. This is the actual throughput
-  unlock; S1 alone is correctness. Mentioned in iter-5b
-  planning notes as "Tactical pick (a)". Other models in this
-  repo (qwen3, deepseek_v3, llama3) all use traced positions
-  via `attn_metadata.input_positions`; V4 is the outlier
-  because of compressor compress-event / SWA wraparound /
-  indexer top-k branches.
-* **S2 (jit'd multi-seq dispatch).** Independent of decode
-  perf; blocks `--max-num-seqs > 1`.
-* **A1 (lift MAX_LEN/MAX_SEQS).** Now meaningful that S1
-  correctness landed.
+Don't pivot to S2/A1/B1/C/D until S1 generation is actually
+working. The whole "we serve V4" story collapses if generation
+produces empty output past 2 tokens.
 
 If you can't make progress on the highest-leverage item *within
 this iter* (e.g. the surgery splits across iters), commit a

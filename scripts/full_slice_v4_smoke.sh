@@ -115,11 +115,12 @@ export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-3600}"
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 
-# 1 routes __call__ through deepseek_v4_run_with_decode_state (real packed-
-# state decode); 0 keeps the prefill-recompute baseline. Default 1 is the
-# production path; override with `V4_DECODE_STATE=0 scripts/...` to A/B
-# against the prefill-only baseline.
-export V4_DECODE_STATE="${V4_DECODE_STATE:-1}"
+# 1 routes __call__ through deepseek_v4_run_with_decode_state. Default 0:
+# the path is shipped but produces empty/garbage tokens past position ~2 on
+# real V4 (S1 in the backlog). 0 keeps the prefill-recompute baseline that
+# at least returns ` Paris` correctly for the smoke gate. Set =1 only to
+# reproduce / debug the broken path.
+export V4_DECODE_STATE="${V4_DECODE_STATE:-0}"
 
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).

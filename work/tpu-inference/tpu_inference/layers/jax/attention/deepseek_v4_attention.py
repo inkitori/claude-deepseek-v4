@@ -33,22 +33,16 @@ from jax import lax
 from jax.sharding import PartitionSpec as P
 
 
-# --------------------- general helpers ---------------------
-
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:
-    """Force `x` fully replicated. Used on tiny constant tables (ape)
-    that the loader heuristically sharded along `attn_dp`; without this
-    constraint XLA emits a 32-way reshard at every broadcast site, which
-    `Involuntary full rematerialization`-warns and wastes activation HBM.
-    No-op outside a mesh context (CPU unit tests run without `jax.set_mesh`).
-    """
+    """Replicate small constant tables to avoid 32-way reshard at every
+    broadcast site (loader heuristically shards along attn_dp). No-op
+    outside a mesh context."""
     if jax.sharding.get_abstract_mesh().empty:
         return x
     return jax.lax.with_sharding_constraint(x, P())
 
 def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
-    """RMSNorm: out = weight * x / sqrt(mean(x*x) + eps). Computation in fp32,
-    cast back to x.dtype. Matches PyTorch reference RMSNorm exactly."""
+    """RMSNorm with fp32 accumulation, cast back to x.dtype."""
     dtype = x.dtype
     xf = x.astype(jnp.float32)
     var = jnp.mean(xf * xf, axis=-1, keepdims=True)
@@ -126,7 +120,7 @@ def splice_rope(x: jnp.ndarray, rope_dim: int, freqs_cis: jnp.ndarray, inverse: 
     return jnp.concatenate([nope, rope_rotated], axis=-1)
 
 
-# --------------------- sparse attention ---------------------
+# Sparse attention.
 
 def sparse_attn(
     q: jnp.ndarray,        # [B, M, H, D]
@@ -171,7 +165,7 @@ def sparse_attn(
     return out.astype(q.dtype)
 
 
-# --------------------- mHC sinkhorn ---------------------
+# mHC sinkhorn.
 
 def hc_split_sinkhorn(
     mixes: jnp.ndarray,     # [N, mix_hc] fp32
@@ -202,11 +196,7 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
-# --------------------- compressor / indexer (PREFILL ONLY) ---------------------
-#
-# The PyTorch reference Compressor maintains decode-time state buffers in
-# `kv_state` / `score_state`. For Tier 1/2 numerical equivalence we use only
-# prefill (start_pos=0); decode-state plumbing lives in the model module.
+# Compressor / indexer — prefill path. Decode-state variants follow below.
 
 @dataclass
 class CompressorParams:
@@ -298,7 +288,7 @@ def compressor_prefill(
     return kv_norm
 
 
-# --------------------- topk index helpers ---------------------
+# Top-k index helpers.
 
 def get_window_topk_idxs_prefill(window_size: int, bsz: int, seqlen: int) -> jnp.ndarray:
     """Window-attention topk indices for prefill (start_pos=0).
@@ -323,7 +313,7 @@ def get_compress_topk_idxs_prefill(ratio: int, bsz: int, seqlen: int, offset: in
     return jnp.broadcast_to(matrix[None, :, :], (bsz, seqlen, matrix.shape[-1])).astype(jnp.int32)
 
 
-# --------------------- indexer (PREFILL ONLY) ---------------------
+# Indexer — prefill.
 
 @dataclass
 class IndexerParams:
@@ -399,7 +389,7 @@ def indexer_prefill(
     return topk_idxs.astype(jnp.int32), kv
 
 
-# --------------------- attention (PREFILL ONLY) ---------------------
+# Attention — prefill.
 
 @dataclass
 class AttentionParams:
@@ -430,36 +420,14 @@ class AttentionParams:
 
 
 def _linear(x, w):
-    """Convenience: x @ w.T using w's dtype-aware path. We always upcast to fp32
-    for accumulation here, then cast back. Matches the PyTorch reference's
-    behavior (F.linear in bf16 typically uses fp32 accumulation under the hood
-    but the input/output are bf16)."""
+    """x @ w.T with fp32 accumulation, cast back to x.dtype."""
     return (x.astype(jnp.float32) @ w.astype(jnp.float32).T).astype(x.dtype)
 
 
-# --------------------- compressor / indexer (DECODE) ---------------------
-#
-# Decode-time variants. The reference Compressor maintains two state buffers
-# (`kv_state`, `score_state`) and a `kv_cache` of compressed positions. The
-# functional JAX equivalents thread these as input/output arrays:
-#
-#   compressor_decode_step:   manages (kv_state, score_state) and emits a new
-#                             compressed kv when (start_pos+1) % ratio == 0.
-#                             It does NOT manage a kv_cache buffer — the caller
-#                             owns that and decides where to write.
-#   indexer_decode_step:      runs its own compressor_decode_step on its
-#                             internal compressor params, writes the new
-#                             compressed kv into a private kv_cache buffer at
-#                             slot start_pos//ratio, then computes top-k.
-#   attention_decode_step:    runs its own compressor_decode_step, writes the
-#                             new compressed kv into kv_cache[:, win + ...],
-#                             plus runs the indexer (if ratio==4) to get
-#                             top-K compressed positions, then sparse_attn.
-#
-# State shapes (per batch, single layer):
-#   compressor.kv_state:    [B, coff*ratio, coff*head_dim]  fp32
-#   compressor.score_state: [B, coff*ratio, coff*head_dim]  fp32, init -inf
-# where coff = 2 if ratio == 4 else 1.
+# Compressor / indexer — decode path. State is threaded as input/output arrays:
+# `compressor_decode_step` updates (kv_state, score_state) and emits a new
+# compressed kv on compress events. `indexer_decode_step` and
+# `attention_decode_step` wrap that and own their own kv_cache buffers.
 
 
 def compressor_init_state(
@@ -603,7 +571,7 @@ def indexer_decode_step(
     return inner_kv_state, inner_score_state, inner_kv_cache, topk_idxs.astype(jnp.int32)
 
 
-# --------------------- attention decode helpers ---------------------
+# Attention decode helpers.
 
 def get_window_topk_idxs_decode(window_size: int, bsz: int, start_pos) -> jnp.ndarray:
     """Decode-time window topk indices. Shape [B, 1, window_size].
@@ -875,7 +843,7 @@ def attention_prefill(
     return _linear(o_flat, params.wo_b)
 
 
-# --------------------- prefill→decode state init ---------------------
+# Prefill→decode state init.
 #
 # Closed-form derivation of `AttentionDecodeState` from a prefill input.
 # Equivalent to running `attention_decode_step` T times from zero state but

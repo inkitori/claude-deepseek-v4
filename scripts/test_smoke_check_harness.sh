@@ -55,6 +55,15 @@
 #                                   N_REQUIRED=1                      → PASS (0)
 #  23. n_required_short           — server caps choices at 1 despite
 #                                   n=2, N_REQUIRED=1                 → FAIL (12)
+#  24. long_gen_required_match    — max_tokens=64 returns 30+ tokens of
+#                                   well-formed text, LONG_GEN_REQUIRED=1
+#                                                                     → PASS (0)
+#  25. long_gen_required_short    — usage.completion_tokens=10 (under 30),
+#                                   LONG_GEN_REQUIRED=1               → FAIL (13)
+#  26. long_gen_required_loop     — text shows the same word 5+ times in a
+#                                   row, LONG_GEN_REQUIRED=1          → FAIL (13)
+#  27. long_gen_required_dirty_end — text ends in "...." (non-alphanumeric
+#                                   tail), LONG_GEN_REQUIRED=1        → FAIL (13)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -115,6 +124,11 @@ run_scenario() {
         n_required_*) n_required=1 ;;
     esac
 
+    local long_gen_required=0
+    case "$name" in
+        long_gen_required_*) long_gen_required=1 ;;
+    esac
+
     local mpid=
     if [ "$with_server" -eq 1 ]; then
         "$PY" "$MOCK" --port "$port" "$@" >"/tmp/mock-${port}.log" 2>&1 &
@@ -136,6 +150,7 @@ run_scenario() {
         TOPK_REQUIRED="$topk_required" \
         PRESENCE_REQUIRED="$presence_required" \
         N_REQUIRED="$n_required" \
+        LONG_GEN_REQUIRED="$long_gen_required" \
         "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
     local rc=$?
 
@@ -179,10 +194,16 @@ run_scenario presence_required_match       18112 0
 run_scenario presence_required_empty       18113 11 --sampling-text ""
 run_scenario n_required_match              18114 0
 run_scenario n_required_short              18115 12 --n-cap 1
+run_scenario long_gen_required_match       18116 0
+run_scenario long_gen_required_short       18117 13 --long-gen-tokens 10
+run_scenario long_gen_required_loop        18118 13 \
+    --long-gen-text "robot robot robot robot robot robot wandered the plain steadily"
+run_scenario long_gen_required_dirty_end   18119 13 \
+    --long-gen-text "The robot rolled across the rust-red plain ...."
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 24/24 harness scenarios pass"
+    echo "OK: 28/28 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"

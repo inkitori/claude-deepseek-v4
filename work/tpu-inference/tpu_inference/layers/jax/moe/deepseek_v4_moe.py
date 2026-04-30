@@ -57,7 +57,7 @@ def _shard_e_mid(x: jnp.ndarray) -> jnp.ndarray:
     return jax.lax.with_sharding_constraint(x, P(None, 'attn_dp', None))
 
 
-# --------------------- gate ---------------------
+# Gate.
 
 @dataclass
 class GateParams:
@@ -105,7 +105,7 @@ def gate_forward(
     return weights, indices
 
 
-# --------------------- expert (SwiGLU FFN) ---------------------
+# Expert (SwiGLU FFN).
 
 @dataclass
 class ExpertParams:
@@ -133,7 +133,7 @@ def expert_forward(
     return (h.astype(dtype) @ params.w2.astype(dtype).T).astype(dtype)
 
 
-# --------------------- moe ---------------------
+# MoE forward.
 
 @dataclass
 class MoEParams:
@@ -142,11 +142,8 @@ class MoEParams:
     shared_expert: ExpertParams
     n_routed_experts: int
     dim: int
-    # Optional pre-stacked weights. When present, `moe_forward` reads these
-    # directly and skips the per-call `jnp.stack(experts[*].wN)` step that
-    # otherwise triggers a full all-to-all to honor the E-sharding constraint
-    # — the all-to-all storm was burning ~16 GB / chip of HLO temp on real
-    # V4-Flash. Built once at load time (see `_consolidate_moe_after_load`).
+    # Pre-stacked weights (built at load time); skips the per-call
+    # `jnp.stack(experts[*].wN)` whose all-to-all storm OOMs HLO temp.
     w1_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
     w2_stacked: Optional[jnp.ndarray] = None  # [E, dim, inter]
     w3_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
@@ -159,24 +156,10 @@ def moe_forward(
     params: MoEParams,
 ) -> jnp.ndarray:
     """MoE forward = sum_i (route_weight_i * expert_i(x)) + shared_expert(x).
-
-    Routing is mathematically the same top-k pattern as the PyTorch reference:
-    for each token n, we compute a sum over experts of
-    ``route_weight[n, e] * expert_e(x[n])`` where ``route_weight[n, e]`` is
-    nonzero only for the top_k experts the gate selected for n. The compute
-    here is "vectorized dense": rather than launching one Python-unrolled
-    expert kernel per expert (which made jit_run_model emit
-    ``n_routed_experts * 3`` separate matmul HLOs and blew up XLA compile
-    to 30+ minutes for V4-Flash), we stack the per-expert weights into a
-    single ``[E, ...]`` tensor and compute gate / up / down as three big
-    einsums. The masking is folded into a per-(token, expert) routing
-    weight that is zero for non-top_k experts, so the algebra is identical
-    to the per-expert loop modulo XLA reduction ordering.
-
-    This is still O(n_routed_experts * N) in flops — true sparse dispatch
-    (grouped matmul over only the experts each token actually picks) would
-    be ~32x cheaper for top_k=8 / E=256. That's a follow-up; this change
-    fixes the compile-time blowup without touching the param tree.
+    Vectorized dense: per-expert weights stacked into `[E, ...]` and
+    computed as three einsums; per-(token, expert) routing weight masks
+    non-top_k experts. O(E * N) flops vs O(top_k * N) for true sparse
+    dispatch (megablox); follow-up B2 in the backlog.
     """
     orig_shape = x.shape
     flat_x = x.reshape(-1, params.dim)             # [N, dim]
@@ -189,26 +172,10 @@ def moe_forward(
     fp32 = jnp.float32
     dtype = x.dtype
 
-    # Stack the 256 ExpertParams entries into [E, ...] tensors. There are
-    # two paths:
-    #
-    # 1. Pre-stacked path (production / `load_weights_from_dir` consolidates
-    #    after load): the param tree carries `w1/w2/w3_stacked` directly,
-    #    sharded `P('attn_dp', None, None)` from the start. No per-call
-    #    stack op, no all-to-all.
-    #
-    # 2. Per-expert path (synthetic-fixture tests / back-compat): stack the
-    #    per-expert leaves inside the JIT and constrain to E-sharded.
-    #    Without the constraint XLA satisfies the einsum by all-gathering
-    #    each stacked operand to its full bf16[256, 2048, 4096] = 4 GiB
-    #    shape on every chip — that's 12 GiB of HLO temp (W1+W2+W3) on top
-    #    of the ~17 GiB resident weights, which OOMs the 31.25 GiB chip
-    #    HBM budget at compile time on v6e-32. With the constraint each
-    #    chip ends up holding 8 of the 256 experts (256 / attn_dp=32 = 8)
-    #    but XLA still has to materialize a per-stack all-to-all buffer
-    #    (~128 MiB / chip) on the way in — multiply by 3 stacks × 43 layers
-    #    and the buffers alone are 16+ GiB / chip, which is why the
-    #    pre-stacked path exists.
+    # Two paths: pre-stacked (production; param tree carries E-sharded
+    # `wN_stacked` from load) or per-expert stack inside JIT (tests).
+    # The per-expert path needs `_shard_e_first` to avoid all-gathering
+    # each stacked operand to its full [E, inter, dim] shape per-chip.
     if params.w1_stacked is not None:
         W1 = params.w1_stacked
         W2 = params.w2_stacked
@@ -222,33 +189,24 @@ def moe_forward(
         W3 = _shard_e_first(jnp.stack([e.w3 for e in params.experts]))  # [E,i,d]
         swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
 
-    # Per-(token, expert) routing weight: nonzero only for the top_k experts
-    # the gate picked for each token. Built via one_hot + einsum so it
-    # reduces to a single fp32 [N, E] matrix. We round-trip through `dtype`
-    # to preserve the bf16-cast precision behavior of the original loop's
-    # `per_token_weight.astype(flat_x.dtype)` step.
+    # Per-(token, expert) routing weight: zero for non-top_k experts.
+    # Round-tripped through `dtype` to match expert_forward's bf16 cast.
     one_hot = jax.nn.one_hot(indices, E, dtype=fp32)        # [N, top_k, E]
     per_expert_weight = jnp.einsum('nke,nk->ne', one_hot, weights)  # [N, E]
     per_expert_weight = per_expert_weight.astype(dtype).astype(fp32)
-    per_expert_weight = _shard_e_last(per_expert_weight)    # E-sharded
+    per_expert_weight = _shard_e_last(per_expert_weight)
 
-    # Gate / up projections in fp32 (matches expert_forward's fp32 path).
     x_fp32 = flat_x.astype(fp32)
     W1_fp32 = W1.astype(fp32)
     W3_fp32 = W3.astype(fp32)
-    gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))  # [N,E,i]
-    up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))    # [N,E,i]
+    gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))
+    up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))
     if swiglu_limit > 0:
         up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
         gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
-    h_NEi = jax.nn.silu(gate_NEi) * up_NEi                  # [N, E, inter]
+    h_NEi = jax.nn.silu(gate_NEi) * up_NEi
+    h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
 
-    # Apply per-(token, expert) routing weight (mid-apply, matches
-    # expert_forward's `h = h * weights` between SwiGLU and w2).
-    h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])  # [N,E,i] E-sharded
-
-    # Down projection in the activation dtype (bf16), matching
-    # `(h.astype(dtype) @ w2.astype(dtype).T)`.
     out_NEd = _shard_e_mid(jnp.einsum(
         'nei,edi->ned',
         h_NEi.astype(dtype),
