@@ -104,6 +104,7 @@ from tpu_inference.models.jax.deepseek_v4 import (
     transformer_body_init_state_from_prefill,
     transformer_body_layout, transformer_body_init_state_to_buffer,
     transformer_body_decode_step_from_buffer,
+    v4_layer_packed_sizes_from_cfg,
     _pack_layer_state, _unpack_layer_state, _layer_packed_size,
     _layer_decode_state_layout,
 )
@@ -1727,6 +1728,39 @@ class TestPackedDecodeStateBuffer:
         if comp_layer is not None:
             comp = t2j(comp_layer.attn.freqs_cis).astype(jnp.complex64)
         return model, params, cfg, swa, comp
+
+    def test_v4_layer_packed_sizes_from_cfg_matches_layout(self):
+        """S1 iter-5 prereq: pin that the cfg-derived per-layer packed
+        sizes match what `transformer_body_layout` + `_layer_packed_size`
+        produce on real `params`. iter-5b's runtime allocator
+        (kv_cache_manager) needs to size kv_caches BEFORE weights are
+        loaded — it has cfg, not yet `params`. The cfg-only helper must
+        agree exactly with the params-derived path.
+
+        Why this matters: any drift between the two would cause the
+        runtime-allocated buffer to be a different size than what
+        `_pack_layer_state(state, layout)` produces inside `__call__`,
+        and the JIT'd buffer write would fail with a shape mismatch.
+        Catch the parity bug here on tiny config in seconds, not after
+        4 minutes of weight load on the real cluster."""
+        model, params, cfg, _swa, _comp = self._build_pair(seed=33)
+        for state_max in [model.args.max_seq_len, 32, 16]:
+            sizes_from_cfg = v4_layer_packed_sizes_from_cfg(
+                cfg, state_max_seq_len=state_max, batch_size=1)
+            layouts = transformer_body_layout(
+                params, cfg, state_max_seq_len=state_max, batch_size=1)
+            sizes_from_params = [_layer_packed_size(lo) for lo in layouts]
+            assert sizes_from_cfg == sizes_from_params, (
+                f"state_max={state_max}: cfg-derived sizes "
+                f"{sizes_from_cfg} != params-derived "
+                f"{sizes_from_params}")
+            # The tiny config has at least one of each layer kind; ensure
+            # ratio>0 layers come out larger than ratio=0 (sanity check
+            # that we're actually testing a non-trivial mix).
+            ratios = [layer.attn.compress_ratio for layer in params.layers]
+            assert 0 in ratios and any(r > 0 for r in ratios), (
+                "tiny config should have both SWA (ratio=0) and a "
+                "non-SWA layer; mix observed: %s" % (ratios,))
 
     def test_pack_unpack_round_trip_preserves_state(self):
         """Pack then unpack each layer's state. Each field must compare

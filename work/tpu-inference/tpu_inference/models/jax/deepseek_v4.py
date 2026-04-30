@@ -641,6 +641,35 @@ def transformer_body_layout(
     ]
 
 
+def v4_layer_packed_sizes_from_cfg(
+    cfg: DeepseekV4Config,
+    state_max_seq_len: int,
+    batch_size: int = 1,
+) -> List[int]:
+    """Per-layer packed `AttentionDecodeState` size (fp32 elements) derived
+    from `cfg` alone. Mirrors `_layer_decode_state_layout`'s shape decisions
+    exactly so the kv_cache_manager allocator (which has cfg but not yet
+    loaded params) can size buffers identically to what
+    `transformer_body_layout(params, cfg, ...)` would produce on the same
+    cfg + state_max_seq_len.
+    """
+    sizes: List[int] = []
+    Dh = cfg.head_dim
+    win = cfg.sliding_window
+    for layer_id in range(cfg.num_hidden_layers):
+        ratio = cfg.compress_ratios[layer_id]
+        extra = (state_max_seq_len // ratio) if ratio else 0
+        coff = 2 if ratio == 4 else 1
+        n = batch_size * (win + extra) * Dh
+        if ratio > 0:
+            n += 2 * batch_size * (coff * ratio) * (coff * Dh)
+        if ratio == 4 and cfg.index_head_dim > 0:
+            n += 2 * batch_size * (coff * ratio) * (coff * cfg.index_head_dim)
+            n += batch_size * (state_max_seq_len // ratio) * cfg.index_head_dim
+        sizes.append(int(n))
+    return sizes
+
+
 def transformer_body_init_state_to_buffer(
     input_ids: jnp.ndarray,            # [B, T] int32
     params: TransformerParams,

@@ -482,85 +482,160 @@ all-gathers, no NaN drift on `compressor_score_state`'s -inf
 init (the under-jit test masks NaN-from-`-inf-minus-(-inf)`
 explicitly because `jnp.abs(-inf - (-inf)) == NaN`).
 
-**Iter 5 starts at:** kv_cache_manager runtime allocation +
-flip `__call__` to invoke `deepseek_v4_run_with_decode_state`.
-The math + JIT-compatibility is now pinned; what remains is
-engine plumbing.
+**Iter 5a (commit pending, 2026-04-30):** the cfg-based
+per-layer packed-size helper + parity test landed.
+`v4_layer_packed_sizes_from_cfg(cfg, state_max_seq_len,
+batch_size=1) → List[int]` in `models/jax/deepseek_v4.py`
+returns the fp32-element count of each main-body layer's
+packed `AttentionDecodeState`, derived from `cfg` alone (no
+need for loaded `params`). Mirrors `_layer_decode_state_layout`
+shape decisions exactly. Pinned by
+`test_v4_layer_packed_sizes_from_cfg_matches_layout` in
+`TestPackedDecodeStateBuffer` (3 cases × all main-body layers
+= asserts cfg-derived == params-derived for state_max_seq_len
+∈ {64, 32, 16}).
+
+This unblocks iter-5b's runtime allocator: kv_cache_manager
+needs to size the fp32 packed buffers BEFORE the V4 model's
+weights are loaded — it has `runner.model.config` available
+but `runner.model.params_v` may still be abstract at that
+point. The cfg-only helper avoids that race.
+
+**Iter 5a — verified-WRONG hint from iter-4 plan:** the iter-4
+recommendation to use shape `[1, packed_size, 1]` with the
+existing `kv_cache_sharding=P(ATTN_DATA, None, ATTN_HEAD)`
+"because size-1 axes become replicated" does NOT compile on
+the v6e-32 mesh. Verified on a virtual `8 × 4` CPU mesh:
+
+```
+jax._src.sharding.IndivisibleError: Sharding NamedSharding(...
+P('attn_dp', None, 'attn_head'), ...) implies that array axis
+0 is partitioned 8 times, but the dimension size is 1
+```
+
+JAX requires each sharded axis to be evenly divisible by the
+mesh axis it's sharded along — there's no implicit "size-1 ⇒
+replicate" fallback. iter-5b must use a different approach.
+
+**Iter 5b — corrected scope (S1 still NOT runtime-integrated):**
 
 V4's `kv_caches` is a passthrough today (INVARIANTS I34); the
 model's `nnx.Variable`s are read inside JIT but mutations are
 lost because `tpu_inference/models/common/model_loader.py:332`
 returns `(kv_cache, hidden, aux)` without capturing the mutated
-nnx state. Two implementation options:
+nnx state. Use `kv_caches` as the carrier (the standard pattern
+in `llama3.py:338-344`).
 
-  **Option A — use `kv_caches` as the carrier (preferred).**
-  vLLM allocates `kv_caches: List[jax.Array]` per layer and
-  donates them on the JIT'd `run_model` call (`donate_argnums=2`
-  in `model_loader.py:327`). The standard pattern in the other
-  tpu-inference models (e.g. `llama3.py:338-344`) is exactly
-  this: read `kv_cache = kv_caches[i]`, run the layer with it,
-  write `kv_caches[i] = new_kv_cache`, return the updated list.
-  vLLM's V4 kv_cache spec is "an inert placeholder" per
-  `kv_cache_manager.py:73`, so we have layout freedom; just
-  need to size + dtype the per-layer buffer to match our
-  packed state. **The dtype matters:** the packed buffer is
-  fp32 (score state is fp32 with -inf init; can't downgrade).
-  Today vLLM's spec uses `cache_dtype=bfloat16` (`DEFAULT_KV_CACHE_DTYPE`
-  at `runner/kv_cache.py:33`).
+Two real blockers to resolve in iter-5b:
 
-  **Option B — return state from `run_model` and thread via
-  the runner.** Add a 4th output tuple element holding the new
-  per-layer state, and teach `tpu_inference/runner/tpu_runner.py`
-  to feed it back next call. Cleaner abstractly but touches the
-  runner (CLAUDE.md "Touch the runtime sparingly") and breaks
-  the contract with non-V4 models that share the same model_fn
-  signature. Defer unless A turns out infeasible.
+  **B1. kv_cache_sharding is hardcoded for non-V4 4D layout.**
+  `tpu_inference/models/common/model_loader.py:308-311` defines
+  `kv_cache_sharding = NamedSharding(mesh, P(ATTN_DATA, None,
+  ATTN_HEAD))`, applied as both input-donation and out_shardings
+  for `run_model`. V4's packed buffers are 1D `[packed_size]`
+  fp32 — none of the 3D-sharding-spec axes map cleanly. Two
+  resolution paths:
 
-* Recommended iter-5 scope:
-  1. Extend `kv_cache_manager.initialize_kv_cache` to allocate
-     V4 kv_caches as `[_layer_packed_size(layout_i)]` fp32
-     arrays per layer (bypassing the standard `create_kv_caches`
-     4D layout). Per-layer size differs (CSA > SWA) so the
-     allocation is per-layer-class. `_layer_packed_size(layout)`
-     (already landed) gives element count; multiply by 4 bytes
-     for fp32. The kv_cache_sharding `P(ATTN_DATA, None,
-     ATTN_HEAD)` is 3D — for compat, reshape to
-     `[1, packed_size, 1]` so the spec maps cleanly (size-1
-     axes become replicated).
-  2. The V4 `_create_attention_spec` already returns a
-     placeholder spec. iter-5 may need to size
-     `KVCacheSpec.page_size_padded` to the per-layer packed
-     bytes if vLLM's block-budget arithmetic requires it; today
-     vLLM treats V4's spec as inert, so the value may not
-     matter end-to-end — verify under real launch.
-  3. Branch `__call__` (`models/jax/deepseek_v4.py:1759`) on
-     prefill-vs-continuation. Signal:
-     `attention_metadata.query_start_loc[s+1] - query_start_loc[s]
-     > 1 → prefill`; `== 1 with seq_lens[s] > 1 → decode`. Use
-     `attention_metadata.input_positions[query_start_loc[s]]`
-     as `start_pos` for the decode step.
-  4. Replace the `transformer_body_forward` call in the
-     single-seq fall-through with
+    (a) **Detect V4 in `get_flax_model` and override
+       `kv_cache_sharding` to `NamedSharding(mesh, P())`
+       (replicated).** Smallest change: ~10 lines in
+       model_loader. Each chip stores its own copy of the
+       packed buffer (~50 KB/layer × ~50 layers × 32 chips
+       = ~80 MB total — negligible vs 31 GB/chip budget). All
+       chips compute the same buffer update under SPMD (the
+       packed state is per-sequence, not sharded), so
+       replication is correct, not wasteful in the bad sense.
+
+    (b) **Allocate `[mesh.attn_dp, packed_size,
+       mesh.attn_head]` fp32 with `P('attn_dp', None,
+       'attn_head')` and treat all shards as identical.**
+       Avoids the model_loader change but wastes 32× HBM per
+       layer and complicates `__call__` (must pick one shard's
+       view). Strictly worse than (a). Skip.
+
+  Pick (a). Verify it compiles by allocating a 1D fp32 array
+  with `P()` on a 32-virtual-CPU mesh and inspecting the shard
+  count == 32 (replicated).
+
+  **B2. `start_pos` is required as a Python int by every
+  decode kernel** (`attention_decode_step` →
+  `freqs_cis_full[start_pos:start_pos+1]` Python slice;
+  `compressor_decode_step` → `if did_compress:` Python branch
+  on `(start_pos+1) % ratio == 0`; `indexer_decode_step` → `K
+  = min(params.index_topk, end_pos_div_ratio)` Python compare;
+  `get_window_topk_idxs_decode` → Python branches +
+  `jnp.arange` with traced bounds). Inside the JIT'd
+  `run_model`, `attention_metadata.input_positions` is a
+  tracer; `np.asarray(traced_positions)` raises. Two paths:
+
+    (a) **Refactor decode kernels to accept traced
+       `start_pos`.** Replace `arr[a:a+1]` →
+       `lax.dynamic_slice_in_dim(arr, a, 1, axis=0)`,
+       `if did_compress` → `jnp.where(did, computed, original)`
+       with always-compute-then-mask, `K = min(...)` →
+       always-K via `lax.top_k` + invalid-mask. Substantial
+       (~6 sites × careful per-site refactor) but produces
+       ONE compile that handles all decode positions. Right
+       long-term answer.
+
+    (b) **Pass `start_pos` as a Python static via meta_field
+       on AttentionMetadata.** `meta_fields` are part of the
+       pytree's auxiliary data, hashed for the JIT cache key.
+       Per-position compile (~50–100 s cold per unique
+       value); persistent cache amortizes after first run.
+       For 8-token smoke fresh: 1 prefill + 8 decode compiles
+       ≈ 7–15 min added to first launch. Fast on subsequent
+       runs. Touches `tpu_inference/layers/common/attention_metadata.py`
+       (1 line: add `decode_start_pos: int = 0` meta_field) +
+       `tpu_inference/runner/tpu_runner.py` (~5 lines per
+       prepare_inputs path: read CPU mirrors, set the field
+       when V4-decode). Other models default to 0 — single
+       cache key, no perf impact.
+
+  Tactical pick: **(b) for iter-5b**, defer (a) to a
+  future kernel-perf iter (the kernel refactor's correctness
+  risk is high enough to merit its own iter, and (b) lands
+  the runtime correctness immediately).
+
+* Recommended iter-5b scope:
+  1. **model_loader.py**: detect V4 (via
+     `vllm_config.model_config.hf_config.model_type ==
+     'deepseek_v4'`), override `kv_cache_sharding` to
+     `NamedSharding(mesh, P())`. Stays gated to the V4
+     path; non-V4 unchanged.
+  2. **kv_cache_manager.py**: re-add the V4 branch (the
+     iter-5a draft is in commit history, just fix the
+     sharding to `P()` and shape to 1D `[packed_size_i]`
+     fp32).
+  3. **attention_metadata.py**: add `decode_start_pos: int =
+     0` as a meta_field. Default 0 = "prefill at position 0"
+     (matches existing pre-iter-5 behavior for non-V4
+     callers).
+  4. **tpu_runner.py**: in `_prepare_inputs_dp` /
+     `_prepare_inputs_non_dp`, after `build_attn`, when V4
+     and `query_len[0] == 1 and seq_lens[0] > 1`, set
+     `attention_metadata.decode_start_pos =
+     int(seq_lens_cpu[0] - 1)`.
+  5. **deepseek_v4.py `__call__`**: branch on
+     `input_ids.shape[-1] > 1` (multi-token prefill) vs
+     `== 1` (decode-or-1-token-prefill). For the decode
+     branch read `attention_metadata.decode_start_pos` as
+     Python static. Reshape `kv_caches[i]` from 1D buffer →
+     `_unpack_layer_state` input, run
      `deepseek_v4_run_with_decode_state(kv_caches, ids, ...,
-     is_decode_step, start_pos)`. Multi-seq path (the loop over
-     `seg_bounds`) — defer to S2's iter; today's smoke only
-     uses single-seq.
-  5. Multi-seq slot indexing: defer to S2. For now,
-     `kv_caches[i]` carries only slot 0.
-  6. Validate via `eval_shape` / `lower().compile()` on real
-     V4-Flash config under virtual CPU mesh
-     (`scripts/full_slice_v4_*` patterns from prior B3 work):
-     no shape mismatches, no extra all-gathers from the new
-     pack/unpack, fp32 per-layer state actually allocates the
-     fp32 dtype (verify via `kv_caches[0].dtype`).
-  7. Real-smoke gate: deterministic " Paris" still passes AND
-     a multi-token decode (e.g. max_tokens=10) returns coherent
-     output. Throughput improvement is the prize; correctness
-     is the gate. (Smoke check today emits 8 tokens via
-     `MAX_TOK=8`; if the new path is wired correctly, 7 of
-     those tokens go through `is_decode_step=True` — coherence
-     of the full 8-token output verifies decode threading
-     end-to-end.)
+     is_decode_step=(start_pos > 0), start_pos)`, write back
+     1D buffer.
+  6. **Validate** via `eval_shape` / `lower().compile()` on
+     real V4-Flash config under virtual CPU mesh
+     (`XLA_FLAGS=--xla_force_host_platform_device_count=32
+     JAX_PLATFORMS=cpu`): no shape mismatches, fp32 dtype
+     actually allocated, no extra all-gathers.
+  7. **Real-smoke gate**: deterministic " Paris" still
+     passes AND a multi-token decode returns coherent output.
+     With (B2.b), expect ~7–15 min added first-launch
+     compile time per unique decode position; that's the
+     known cost of per-position compile until iter-5c lifts
+     the kernel refactor.
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -1232,6 +1307,26 @@ when the timeout SIGTERMs the iter.
   entries must be static integers`. iter-5's runtime wiring
   inherits the right pattern. ✓ math + JIT-compatibility, ✗
   runtime allocation + `__call__` flip (iter-5).
+* **Cfg-derived per-layer packed sizes (S1 iter-5a)**:
+  `v4_layer_packed_sizes_from_cfg(cfg, state_max_seq_len,
+  batch_size=1) → List[int]` in `models/jax/deepseek_v4.py`
+  computes per-layer `AttentionDecodeState` packed-size from
+  `cfg` alone (no loaded `params` needed). Mirrors
+  `_layer_decode_state_layout` shape decisions exactly. Pinned
+  by `test_v4_layer_packed_sizes_from_cfg_matches_layout` —
+  asserts cfg-derived sizes ≡ params-derived sizes (via
+  `transformer_body_layout` + `_layer_packed_size`) for
+  `state_max_seq_len ∈ {64, 32, 16}` on a tiny 6-layer config
+  (3 SWA + 2 CSA + 2 HCA pattern). Unblocks iter-5b's
+  kv_cache_manager allocator: it can size the V4 fp32 packed
+  buffers from `cfg + max_model_len` BEFORE `model.params_v`
+  is concretely loaded. Same iter also empirically refuted the
+  iter-4 plan's "size-1 axes are replicated" hypothesis: a
+  shape `[1, packed_size, 1]` fp32 array sharded `P('attn_dp',
+  None, 'attn_head')` fails at allocation with
+  `IndivisibleError` on a 32-virtual-CPU mesh — JAX has no
+  size-1-axis fallback. iter-5b uses replicated `P()` instead.
+  ✓ helper + parity test, ✗ runtime allocation (iter-5b).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
