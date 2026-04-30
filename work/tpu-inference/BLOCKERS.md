@@ -6,16 +6,17 @@ rationale) lives in **[../../CLAUDE.md](../../CLAUDE.md)**
 
 ## Status
 
-Tier-8 deploy gate is GREEN — `./run.sh serve` plus
+Smoke gate is GREEN — `./run.sh serve` plus
 `scripts/full_slice_v4_smoke_check.sh` returns
 `PASS: deterministic completion contains 'Paris'` reliably,
 cold compile ~97s, warm-cache curl sub-second.
 
 ## Current blockers (priority order)
 
-* **Tier S — silent correctness bombs** (S1 decode threading
-  IN FLIGHT; S2 multi-seq dispatch; S3 thinking-mode broken
-  output; S5 MTP hook). S4/S6/S7 mostly resolved.
+* **Tier S — silent correctness bombs** (S2 multi-seq
+  dispatch; S3 tool-call runtime probe; S5 MTP hook). S1 done
+  (env-gated behind `V4_DECODE_STATE=1`, default-flip pending);
+  S4/S6/S7 resolved.
 * **Tier A — production infra** (A1 max-len lift depends on
   S1; A2–A6 cache durability, crash recovery, metrics, TLS,
   multi-slice).

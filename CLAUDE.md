@@ -6,7 +6,7 @@ You're picking up a TPU-inference effort: get
 quality. The model is a flagship MoE — 256 FP4 experts + MLA
 attention + dense FP8 — about 543 GiB bf16-expanded.
 
-The Tier-8 deploy gate is GREEN: `/v1/completions` returns
+The smoke gate is GREEN: `/v1/completions` returns
 deterministic `Paris` for "The capital of France is", cold
 compile ~97s warm-cache curl sub-second. The current work is
 converting that demo into something that handles real
@@ -186,10 +186,9 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during first inference if `jit_run_model` recompiles. Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (see pitfall #4). |
-| `V4_DECODE_STATE` | `0` | S1 gate. `1` flips `__call__` to `deepseek_v4_run_with_decode_state` (orchestrator path threading packed `AttentionDecodeState` through `kv_caches`). Default `0` preserves the green gate. When `1`, `__call__` logs `(call_idx, T, is_decode, state_max_seq_len, kv_caches_count)` per call. With iter-6 traced start_pos there are at most 2 distinct JIT cache keys (prefill + decode). |
-| `V4_DECODE_STATE_DIAG` | `0` | Adds `jax.debug.print` of kv_caches[0] sum + nonfinite-count at orchestrator entry/exit. Forwarded to workers. Use only when debugging Bug B (S1). |
+| `V4_DECODE_STATE` | `0` | `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real packed-state decode). Default `0` is the historical prefill-recompute baseline. With traced `start_pos` only two JIT cache keys (prefill + decode). |
 | `CHAT_REQUIRED` | `0` | smoke_check chat probe; exit 4 on missing/empty content. Adds ~30 s for first-chat OOM-retry (pitfall #9). |
-| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Passes under `V4_DECODE_STATE=1` (S1 iter-5j); fails under default `V4_DECODE_STATE=0` (broken-decode prefill-only path produces all-newlines). Pair with `REASONING_MAX_TOKENS=8` to bound per-position decode-compile cost when run under `V4_DECODE_STATE=1`. |
+| `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Requires `V4_DECODE_STATE=1` (default-0 prefill-recompute path produces all-newlines). |
 | `STREAMING_REQUIRED` | `0` | SSE byte-equality probe vs non-streaming; exit 6. Pins S7. |
 | `SAMPLING_REQUIRED` | `0` | `temperature=0.7, top_p=0.9, frequency_penalty=0.1`; exit 7 on empty/invalid. Pins S6. Determinism not asserted (per-request seed unsupported on non-greedy paths). |
 | `STOP_REQUIRED` | `0` | `stop=["Paris"]`; exit 8 if response contains Paris or `finish_reason!=stop`. Pins S6. Baseline emits ` Paris` first, so a working handler MUST intercept. |
@@ -206,84 +205,40 @@ backlog itself stays brief.
 
 ### Tier S — silent correctness bombs (fix before perf)
 
-#### S1. Decode is not real decode — IN FLIGHT
+#### S1. Real decode plumbing — DONE (env-gated; default-flip pending)
 
-`__call__` in `models/jax/deepseek_v4.py` defaults to
-`transformer_body_forward`, which recomputes attention over
-prompt+generated context every step. Decode-step kernels
-(`attention_decode_step`, `compressor_decode_step`,
-`indexer_decode_step`) match the torch reference at 1e-4 on
-tiny config but aren't wired in production.
+Decode-step kernels (`attention_decode_step`,
+`compressor_decode_step`, `indexer_decode_step`) thread real
+`AttentionDecodeState` through `kv_caches[i]` (one fp32 packed
+buffer per layer) instead of recomputing prefill every step.
+Engine returns deterministic ` Paris` byte-equal across R1/R2
+on real V4-Flash with `V4_DECODE_STATE=1`; thinking-mode chat
+emits real reasoning tokens (broken under prefill-recompute
+baseline — produced all-newlines).
 
-**What's landed (env-gated behind `V4_DECODE_STATE=1`):**
-* Closed-form prefill→state init
-  (`attention_init_state_from_prefill`); transformer-body
-  primitives (`block_init_state_and_forward`,
-  `block_decode_step`, `transformer_body_init_state_to_buffer`,
-  `transformer_body_decode_step_from_buffer`); pack/unpack of
-  `AttentionDecodeState` to a 1D fp32 buffer per layer.
-  Pinned by `TestPackedDecodeStateBuffer`,
-  `TestTransformerBodyDecodeRoundTrip`,
-  `TestPrefillToDecodeStateParity` (37 cases, ≤5e-3 vs torch
-  reference on tiny config).
-* Orchestrator
-  `deepseek_v4_run_with_decode_state(kv_caches, ids, params,
-  ..., is_decode_step, start_pos)` branches on
-  `is_decode_step`, threads packed state through `kv_caches`.
-  Prefill `h` is byte-equal-by-construction to
-  `transformer_body_forward` (path-A decoupling +
-  `lax.optimization_barrier(h)` to prevent XLA CSE/fusion
-  drift on bf16 reductions).
-* Runtime hooks: V4-only `kv_cache_sharding=P()` replicated
-  override in `model_loader.py`, V4 packed-buffer allocator
-  in `kv_cache_manager.py`, `decode_start_pos` meta_field on
-  `AttentionMetadata`, `_maybe_set_v4_decode_start_pos` in
-  `tpu_runner.py`, module-level
-  `v4_state_max_seq_len_from_vllm_config` (single source of
-  truth for buffer sizing).
-* Decode-detection uses `decode_start_pos > 0` directly (the
-  runner pads decode shapes to bucket sizes so a `T==1` check
-  never triggers).
-* iter-5g `with_sharding_constraint(P())` on packed buffers
-  dodges the TPU `[USER]` FATAL on R2's cached prefill
-  artifact re-execution.
-* iter-5j `_v4_force_kv_caches_read(buffers, kv_caches)`:
-  fold `pb + opaque_zero * kv` into each output buffer where
-  `opaque_zero = lax.optimization_barrier(jnp.zeros(()))`. The
-  compute output equals `pb` byte-for-byte (zero at runtime)
-  but XLA must emit a real read of `kv_caches[i]` and a real
-  elementwise add. Without this, XLA could elide the
-  donation-aliased write when output value is statically
-  derivable without reading the input — leaving prior-call
-  contents partly bleeding through.
+`start_pos` is traced through the decode kernel chain (constant
+output shapes via `lax.dynamic_slice_in_dim`, `-1` sentinel
+topk slots, constant `K=index_topk`), so one JIT trace fits
+every decode position. Pinned by 37-test iter-5 suite
+(`TestPackedDecodeStateBuffer`, `TestTransformerBodyDecodeRoundTrip`,
+`TestPrefillToDecodeStateParity`) +
+`test_buffer_decode_jit_cache_hits_across_positions` (asserts
+`_cache_size()` delta == 1 over 4 positions).
 
-**Bug B FIXED by iter-5j (2026-04-30 ~20:03Z, smoke
-`logs/full-slice-v4-smoke-20260430T195032Z.log`):** R1 and R2
-both return ` Paris` byte-equal on real V4-Flash with
-`V4_DECODE_STATE=1`. Both HTTP 200, no FATAL, no divergence.
-The CPU virtual-mesh experiment
-(`/tmp/test_v4_iter5j_kv_caches_dep.py`) confirmed the
-mechanism: BEFORE iter-5j the HLO entry signature dropped
-`kv_caches` inputs entirely (XLA proved unused); AFTER it
-keeps them with explicit `input_output_alias={ {i}: (i, ...,
-may-alias) }` markers, while compute on CPU stays byte-equal
-between zeros and random `kv_caches` inputs (opaque_zero is
-0 at runtime).
+Runtime hooks (read these before touching V4 plumbing):
+* `models/common/model_loader.py` — V4-only `kv_cache_sharding=P()`
+  replicated override.
+* `runner/kv_cache_manager.py::_initialize_kv_cache_deepseek_v4`
+  — V4 packed-buffer allocator.
+* `runner/tpu_runner.py::_maybe_set_v4_decode_start_pos` —
+  sets `decode_start_pos` meta-gate on `AttentionMetadata`.
+* `models/jax/deepseek_v4.py::v4_state_max_seq_len_from_vllm_config`
+  — single source of truth for buffer sizing (allocator +
+  `__call__` MUST agree).
 
-The decode runtime is now real-V4-correct AND throughput-
-amortized: iter-6 traced `start_pos` through the decode
-kernel chain (`get_window_topk_idxs_decode`,
-`get_compress_topk_idxs_decode`, `compressor_decode_step`,
-`indexer_decode_step`, `attention_decode_step` all use
-`lax.dynamic_slice_in_dim` / `lax.dynamic_index_in_dim` /
-`jnp.where` with constant output shapes — `-1` sentinels
-fill unused topk slots, `lax.top_k` always uses constant
-K = `index_topk`). `decode_start_pos` collapsed to a 0/1
-prefill/decode meta-gate; absolute position threads through
-`seq_lens[0] - 1` at trace time. One JIT trace fits every
-decode position. Pinned by
-`TestPackedDecodeStateBuffer.test_buffer_decode_jit_cache_hits_across_positions`
-(asserts `_cache_size()` delta == 1 over 4 positions).
+Default `V4_DECODE_STATE=0` is the historical green-gate; the
+flip to default-1 is straightforward (next iter) once a
+real-V4 smoke confirms no regression on the cold-cache path.
 
 S1 unlocks A1 (`max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), S5 (MTP speculative decoding).
@@ -299,45 +254,20 @@ with `lax.dynamic_slice` per active seq. Until S2 lands,
 `--max-num-seqs=1` is forced. Independent of S1 but they
 multiply.
 
-#### S3. Reasoning parser — FIXED by S1; tool-call runtime probe still TODO
+#### S3. Tool-call runtime probe — TODO (reasoning parser fixed by S1)
 
 Smoke launcher passes `--reasoning-parser deepseek_v4`,
-`--enable-auto-tool-choice`, `--tool-call-parser deepseek_v4`.
-vLLM validates parser names at startup (smoke-green = parsers
-loaded). V4's reasoning parser is registered upstream as an
-alias for `DeepSeekV3ReasoningParser` (standard `<think>...</think>`
-extraction).
+`--enable-auto-tool-choice`, `--tool-call-parser deepseek_v4`;
+both register at startup (smoke-green = parsers loaded). Reasoning
+parser is an upstream alias for `DeepSeekV3ReasoningParser`
+(standard `<think>...</think>`). `REASONING_REQUIRED=1` runtime
+probe is green under `V4_DECODE_STATE=1`.
 
-**Thinking-mode bug FIXED by S1 iter-5j (2026-04-30 ~20:34Z,
-smoke `logs/full-slice-v4-smoke-20260430T201602Z.log` +
-`logs/smoke-check-iter5k-20260430T202223Z.log`):** under the
-green-gate baseline (`V4_DECODE_STATE=0`, prefill-recompute
-every step) thinking-mode chat at `temperature=0, seed=0`
-returned N newlines (all-whitespace, `finish_reason=length`)
-because the prefill-only path kept re-rolling from a
-flat-logits regime. With `V4_DECODE_STATE=1` (real decode,
-packed `AttentionDecodeState` threaded through `kv_caches`)
-the model emits real reasoning tokens. Verification:
-
-```bash
-V4_DECODE_STATE=1 scripts/full_slice_v4_smoke.sh
-REASONING_REQUIRED=1 REASONING_MAX_TOKENS=8 \
-  scripts/full_slice_v4_smoke_check.sh
-# expect: "[smoke-check] reasoning (len=N>0): <real tokens>"
-#         "[smoke-check] PASS"
-```
-
-`REASONING_MAX_TOKENS=8` (vs the default 96) keeps the
-per-position decode-compile cost bounded under
-`V4_DECODE_STATE=1` until the JIT-cache-miss amortization is
-in place; len>0 still discriminates the bug since broken=
-all-whitespace.
-
-**Remaining S3 work**: tool-call runtime probe
-(`TOOLS_REQUIRED=1`) — assert a request with `tools=[...]`
-populates `tool_calls` rather than emitting raw DSML tokens
-in `content`. Parser is registered (`deepseekv4_tool_parser.py`
-in vLLM upstream) but not exercised end-to-end yet.
+Remaining S3 work: tool-call runtime probe (`TOOLS_REQUIRED=1`)
+— assert a request with `tools=[...]` populates `tool_calls`
+rather than emitting raw DSML tokens in `content`. Parser is
+registered (`deepseekv4_tool_parser.py` in vLLM upstream) but
+not exercised end-to-end yet.
 
 Sanity check that parsers are still wired (no TPU needed):
 
@@ -566,23 +496,17 @@ running smoke).
   KB).
 * Persistent JAX compile cache populated under
   `~/.cache/vllm/xla_cache` per host.
-* Decode-step kernels (`attention_decode_step`,
+* Decode kernels (`attention_decode_step`,
   `compressor_decode_step`, `indexer_decode_step`) match torch
-  reference at 1e-4. ✓ math, ✓ runtime integration on real V4
-  (S1 iter-5j; engine returns deterministic ` Paris`
-  byte-equal across R1/R2 with `V4_DECODE_STATE=1`). Default
-  `V4_DECODE_STATE=0` keeps green-gate as the smoke-pinned
-  fallback until the per-position decode JIT-cache-miss
-  amortization is in place.
-* Transformer-body decode primitives + packed
-  `AttentionDecodeState` buffers + orchestrator with JIT-
-  correctness validation. Pinned by 37-test iter-5 suite.
+  reference at 1e-4 + run under real V4 with
+  `V4_DECODE_STATE=1` (deterministic ` Paris` R1/R2,
+  reasoning-mode tokens green). Pinned by 37-test iter-5
+  suite + `test_buffer_decode_jit_cache_hits_across_positions`.
 * MTP forward math validated. ✓ math, ✗ runtime (S5).
 * Chat encoding byte-equal to V4-Flash reference encoder
   across all S4 scopes (`TestVllmChatTemplateParity`).
 * Reasoning + tool parser wiring (registry lookup ✓; runtime
-  reasoning probe ✓ under `V4_DECODE_STATE=1` — fixed by
-  S1 iter-5j; tool-call runtime probe still TODO, see S3).
+  reasoning probe ✓; tool-call runtime probe TODO, see S3).
 * Streaming probe (SSE = non-streaming byte-for-byte).
 * Sampling / stop / logprobs / top-k / presence / n>1 probes
   all pass on real V4.

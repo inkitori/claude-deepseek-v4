@@ -53,26 +53,9 @@ from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
-# S1 iter-5d gating. When `V4_DECODE_STATE=1`, the production __call__ flips
-# from the green-gate baseline (`transformer_body_forward`, every step
-# recomputes prefill on the full prompt+generated context) to the iter-5c
-# orchestrator path (`deepseek_v4_run_with_decode_state`, threaded through
-# `kv_caches`). Default OFF so the green gate stays green; flip to 1 in
-# the smoke launcher to test fixes for the iter-5c second-request TPU
-# `[USER]` FATAL (see CLAUDE.md S1).
+# `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real
+# packed-state decode); `0` keeps the prefill-recompute baseline.
 V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE", "0") == "1"
-
-# S1 iter-5f diagnostic gate. When `V4_DECODE_STATE_DIAG=1`,
-# `deepseek_v4_run_with_decode_state` emits jax.debug.print of
-# kv_caches[0]'s sum + nonfinite-count at branch entry, and of the
-# returned packed_buffers[0]'s same statistics at branch exit. Used
-# to diagnose iter-5c's second-request TPU [USER] FATAL by
-# distinguishing R1 vs R2 input/output state. Caveat: side-effecting
-# prints CHANGE THE HLO (fresh JIT cache key), so a "passes with
-# DIAG=1" result may mean "prints disturb XLA scheduling enough to
-# dodge the FATAL", not "the bug is fixed". Default OFF — only
-# enable when running a diagnostic smoke.
-V4_DECODE_STATE_DIAG = os.environ.get("V4_DECODE_STATE_DIAG", "0") == "1"
 
 
 # ------------------------------------------------------------
@@ -663,19 +646,13 @@ def transformer_body_layout(
 
 
 def v4_state_max_seq_len_from_vllm_config(vllm_config) -> int:
-    """Single source of truth for the per-layer packed-state buffer size
-    on V4 (S1 iter-5b). Both the engine's `kv_cache_manager` allocator and
-    the model's `__call__` MUST agree on this value or the JIT donation
-    of `kv_caches` will mismatch shape and fail at the worst possible
-    moment.
+    """Single source of truth for the per-layer packed-state buffer size.
+    The kv-cache allocator and `__call__` MUST agree on this value or the
+    JIT donation of `kv_caches` mismatches shape.
 
-    Mirrors `DeepseekV4ForCausalLM._effective_freqs_seq_len`'s decision
-    tree exactly: the buffer must cover whichever bucket a real prefill
-    can land in (`max(max_model_len, max_num_batched_tokens × dp_size)`),
-    capped above by the architectural `max_position_embeddings`. For
-    smoke (`MAX_LEN=256`, default `max_num_batched_tokens=2048`,
-    `dp=1`), this returns 2048; for production with larger
-    `max_num_batched_tokens` (or DP fan-out) it scales up.
+    Returns `min(max(max_model_len, max_num_batched_tokens * dp_size),
+    max_position_embeddings)` — the buffer covers whichever bucket a real
+    prefill can land in, capped by the architectural sequence limit.
     """
     mc = getattr(vllm_config, "model_config", None)
     sc = getattr(vllm_config, "scheduler_config", None)
@@ -737,12 +714,7 @@ def transformer_body_init_state_to_buffer(
 ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
     """Run a prefill of `input_ids` and return `(h, packed_buffers)` where
     `packed_buffers[i]` is the 1D fp32 packed `AttentionDecodeState` for
-    layer `i`. Wraps `transformer_body_init_state_from_prefill` with the
-    pack step. Output `h` is byte-equivalent to `transformer_body_forward`
-    on the same input (same as the underlying primitive).
-
-    Iter-4 calls this on the prefill branch of `__call__` and writes each
-    `packed_buffers[i]` into the corresponding slot of `kv_caches[i]`."""
+    layer `i`. Output `h` is byte-equivalent to `transformer_body_forward`."""
     h, states = transformer_body_init_state_from_prefill(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
@@ -786,22 +758,14 @@ def transformer_body_decode_step_from_buffer(
 def _v4_constrain_packed_replicated(
     buffers: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Apply `lax.with_sharding_constraint(b, P())` to each packed-state
-    buffer. Forces the reshard-to-replicated to materialize at this point
-    in the trace rather than at the JIT boundary, which iter-5g hyp-3
-    pins as the trigger for R2's TPU `[USER]` FATAL on the cached prefill
-    artifact.
-
-    No-op outside an active mesh context (raises an error in some JAX
-    versions) — the unit tests run without a mesh, so guard with a
-    physical-mesh check. Inside `run_model`'s JIT (which is dispatched
-    under `nnx.merge`'s mesh context), the constraint takes effect."""
+    """Force each packed-state buffer to materialize as `P()`-replicated
+    inside the trace. Without this, the JIT-boundary reshard interacts with
+    the donated `kv_caches` buffer's prior contents and triggers a TPU
+    `[USER]` FATAL on the cached prefill artifact's second execution."""
     try:
         spec = jax.sharding.PartitionSpec()
         return [lax.with_sharding_constraint(b, spec) for b in buffers]
     except Exception:
-        # Tests outside a mesh context fall through unchanged — the
-        # constraint only matters under SPMD anyway.
         return buffers
 
 
@@ -809,26 +773,13 @@ def _v4_force_kv_caches_read(
     buffers: List[jnp.ndarray],
     kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Fold an opaque-zero multiplication of `kv_caches[i]` into each
-    `buffers[i]`. The compute output equals `buffers[i]` byte-for-byte
-    (since `opaque_zero * kv = 0` then `pb + 0 = pb` at runtime) but the
-    HLO has a real read of `kv_caches[i]` and a real elementwise add —
-    so XLA cannot elide the donation-aliased write of the output buffer.
-
-    Why this exists: iter-5g/5h Bug B. The prefill orchestrator's compute
-    is independent of `kv_caches` input (`transformer_body_init_state_to_buffer`
-    derives output entirely from `input_ids`/`params`/`freqs`). Under
-    XLA TPU SPMD with `donate_argnums=2` (`model_loader.py:340`), the
-    cached prefill artifact's R2 execution produces output values that
-    differ from R1's despite identical compute. Hypothesis: XLA elides
-    writes to the donated buffer when output value is statically derivable
-    without reading the input — leaving parts of the donated buffer at R1's
-    last-decode contents on R2. Forcing a value-neutral dependence on
-    `kv_caches` makes elision impossible. The CPU virtual-mesh test
-    `/tmp/test_v4_iter5j_kv_caches_dep.py` shows this matters only on TPU
-    (CPU XLA drops the unused `kv_caches` from the entry signature
-    entirely; TPU XLA keeps them due to SPMD's more conservative DCE).
-    """
+    """Fold `b + opaque_zero * kv` into each output buffer where
+    `opaque_zero = lax.optimization_barrier(jnp.zeros(()))`. Compute output
+    equals `b` byte-for-byte at runtime, but XLA must emit a real read of
+    `kv_caches[i]` and a real elementwise add. Without this, XLA can elide
+    the donation-aliased write when output value is statically derivable
+    without reading the input — leaving prior-call contents bleeding
+    through under TPU SPMD's `donate_argnums=2`."""
     opaque_zero = lax.optimization_barrier(
         jnp.zeros((), dtype=jnp.float32))
     return [
@@ -848,161 +799,49 @@ def deepseek_v4_run_with_decode_state(
     is_decode_step: bool,
     start_pos,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
-    """S1 iter-4: orchestrate one prefill OR one decode step with the
-    per-layer `AttentionDecodeState` packed into / unpacked from
-    `kv_caches`.
+    """Orchestrate one prefill OR one decode step, threading the per-layer
+    `AttentionDecodeState` through `kv_caches` (each `kv_caches[i]` is a 1D
+    fp32 buffer sized by `v4_layer_packed_sizes_from_cfg`).
 
-    Layout contract: `kv_caches[i]` is a 1D fp32 array of length
-    `_layer_packed_size(layouts[i])` for layer i. iter-5 wires
-    `kv_cache_manager.initialize_kv_cache` to allocate these shapes;
-    today vLLM's path treats V4's kv_caches as inert placeholders so
-    this function is exercised only via the JIT-correctness tests.
-    Multi-seq slot indexing (a leading `[max_num_seqs]` axis) is S2's
-    iter; for now `kv_caches[i]` carries only slot 0.
+    Prefill (`is_decode_step=False`): runs `transformer_body_forward` for
+    `h` (drives head + lm_head) and `transformer_body_init_state_to_buffer`
+    separately for the seeded packed state. The decoupling keeps `h`
+    byte-equal to the prefill-only baseline; XLA CSEs shared kv/compressor
+    intermediates so the duplication is mostly free.
 
-    Branch:
-      * `is_decode_step=False` (prefill): runs `transformer_body_forward`
-        for `h` (the forward output that drives the head + lm_head)
-        and `transformer_body_init_state_to_buffer` SEPARATELY for the
-        per-layer packed state that seeds future decode steps. The two
-        paths share their input (`input_ids` + `params` + freqs) and
-        compute the same per-layer kv intermediates, so under JIT the
-        XLA optimizer CSEs the shared subgraphs. The decoupling
-        guarantees `h` is byte-equal to `transformer_body_forward`'s
-        output — iter-5b had `h` come from the combined state-init path
-        and that produced NaN logits on real V4 (suspected XLA
-        reduction-order drift between the forward and the closed-form
-        state allocations). Path-A `h` is the proven baseline.
+    Decode (`is_decode_step=True`): reads `kv_caches[i]` as the prior
+    packed state, advances by one position, and returns the new buffers.
+    `start_pos` is the absolute position of the new token — accepts a
+    traced `jnp.int32` scalar (one compile fits all positions).
 
-        The returned `packed_buffers` REPLACES `kv_caches`'s contents
-        — a prefill starts a fresh state, so any prior buffer contents
-        are discarded.
-      * `is_decode_step=True`: reads `kv_caches[i]` as layer i's prior
-        packed `AttentionDecodeState`, advances by one position, and
-        returns `(new_buffers, h)`. `start_pos` is the absolute
-        position of the new token — accepts a Python int or a traced
-        jnp.int32 scalar (one compile fits all positions).
+    Both branches return `(updated_kv_caches, h)` so the caller can pass
+    `kv_caches` as a donated JIT argument.
 
-    Both branches return the updated `kv_caches` as the first element
-    of the tuple so the caller can pass it as a donated argument to
-    the JIT'd `run_model`.
-
-    iter-5f diagnostic: when `V4_DECODE_STATE_DIAG=1` is set in the
-    surrounding env at module import time, the orchestrator emits a
-    `jax.debug.print` of `kv_caches[0]`'s sum + nonfinite-count at
-    branch entry AND of `packed_buffers[0]` / `new_buffers[0]`'s sum
-    at exit. Side-effecting; XLA cannot DCE. Goal: distinguish R1 vs
-    R2's input/output state to pin whether prior-call data really
-    bleeds through the donated buffer (iter-5d hypothesis 1) or
-    whether the bug is in the orchestrator's intermediate compute
-    independent of input contents. CAVEAT: instrumenting changes the
-    HLO → fresh JIT cache key → if the smoke goes green when DIAG=1,
-    that may mean "prints disturb XLA scheduling enough to dodge the
-    FATAL", not "the bug is fixed". Even so, captured prints from a
-    successful R1 + a FATAL-ing R2 (or two successful runs) are
-    informative.
-
-    iter-5g hyp-3 fix: each output packed_buffer / new_buffer is wrapped in
-    `lax.with_sharding_constraint(b, P())` before return. The kv_caches input
-    is `P()`-replicated (`model_loader.py:319`) and the JIT's `out_shardings`
-    enforce `P()` on the kv_caches output. Without an explicit constraint,
-    the natural sharding of `_pack_layer_state`'s output (a concat of
-    reshapes derived from `attn_dp`-sharded params) doesn't match the
-    boundary's required `P()`, so XLA inserts a JIT-boundary reshard. Under
-    `donate_argnums=2`, that boundary reshard must produce the donated
-    buffer's exact byte layout — and on the cached prefill artifact's
-    SECOND execution (R2), that reshard's interaction with the donated
-    buffer's prior contents triggers the TPU `[USER]` FATAL observed
-    iter-5e/iter-5f. Forcing the reshard to materialize at this known
-    code point (inside the function body) means the JIT-boundary then
-    sees an already-`P()` value and doesn't need to do its own reshard."""
+    Bug-fix scaffolding (DO NOT REMOVE without re-running the second-
+    request smoke): `lax.optimization_barrier(h)` blocks XLA from CSE-ing
+    forward with the state-init's internal forward (bf16 reduction-order
+    drift on 43-layer accumulation flipped argmax otherwise);
+    `_v4_force_kv_caches_read` + `_v4_constrain_packed_replicated` block
+    XLA from eliding donation-aliased writes (would leave prior-call
+    contents bleeding through R2 of a cached prefill artifact)."""
     if is_decode_step:
-        if V4_DECODE_STATE_DIAG:
-            # Decode branch: kv_caches IS read by decode_step_from_buffer
-            # (it's the prev_buffers). Print before consuming.
-            jax.debug.print(
-                "[V4_PREFILL] DECODE entry start_pos={sp} "
-                "kv_caches[0] sum={s} nonfinite={nf}",
-                sp=start_pos,
-                s=jnp.sum(kv_caches[0]).astype(jnp.float32),
-                nf=jnp.sum(jnp.logical_not(jnp.isfinite(kv_caches[0]))),
-            )
         h, new_buffers = transformer_body_decode_step_from_buffer(
             input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
             kv_caches, start_pos=start_pos,
             state_max_seq_len=state_max_seq_len,
         )
-        # iter-5j: fold opaque-zero kv_caches read into new_buffers so XLA
-        # cannot elide the donation-aliased writes. Decode already reads
-        # kv_caches semantically (prev_buffers), but the bug is in WRITE
-        # elision under donation, not read elision.
         new_buffers = _v4_force_kv_caches_read(new_buffers, kv_caches)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
-        if V4_DECODE_STATE_DIAG:
-            jax.debug.print(
-                "[V4_PREFILL] DECODE exit  start_pos={sp} "
-                "new_buffers[0] sum={s} nonfinite={nf}",
-                sp=start_pos,
-                s=jnp.sum(new_buffers[0]).astype(jnp.float32),
-                nf=jnp.sum(jnp.logical_not(jnp.isfinite(new_buffers[0]))),
-            )
         return new_buffers, h
-    # iter-5c: h comes from path A (transformer_body_forward) — byte-equal
-    # to the pre-iter-5b production path, so the head/lm_head sees the
-    # same activations the smoke gate verified green. The orchestrator's
-    # own `h` (from transformer_body_init_state_to_buffer) is computed
-    # alongside and discarded; only its packed_buffers feed kv_caches
-    # for future decode steps. XLA CSEs the shared kv/compressor
-    # intermediates between the two computations, so the duplicated
-    # surface is mostly free.
-    if V4_DECODE_STATE_DIAG:
-        # Prefill branch: kv_caches input is NOT consumed by the
-        # orchestrator (init_state_to_buffer derives its output from
-        # input_ids only). The print here pins what the donated buffer
-        # contains ON ENTRY — R1 sees fresh-allocator zeros, R2 should
-        # see R1's last-decode packed_buffers contents. The print's
-        # read forces XLA to materialize that input, which doubles as
-        # a hyp-1B test (read-before-write may itself dodge the FATAL).
-        jax.debug.print(
-            "[V4_PREFILL] PREFILL entry kv_caches[0] sum={s} nonfinite={nf}",
-            s=jnp.sum(kv_caches[0]).astype(jnp.float32),
-            nf=jnp.sum(jnp.logical_not(jnp.isfinite(kv_caches[0]))),
-        )
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
-    # iter-5h: barrier `h` so XLA cannot CSE/fuse `transformer_body_forward`'s
-    # per-layer attention/MoE compute with `transformer_body_init_state_to_buffer`'s
-    # internal forward (which has the same input_ids+params and produces
-    # identical intermediate y/x but with extra side-outputs into kv/score
-    # state buffers). Without the barrier, iter-5g's real-V4 smoke produced
-    # ` the same as the number...` for R1 instead of ` Paris` despite tiny-
-    # config tests saying h is byte-equal to path-A. Hypothesis: XLA's
-    # scheduler picks a different fusion plan when `attention_prefill`'s
-    # output has additional consumers via `attention_init_state_from_prefill`,
-    # changing bf16 reduction order enough on real V4-Flash 43-layer accum
-    # to flip argmax. The barrier forces forward to fully evaluate before
-    # state-init starts — same numerics XLA picks when forward is the only
-    # compute (the green-gate baseline).
     h = lax.optimization_barrier(h)
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
-    # iter-5j: fold opaque-zero kv_caches read into packed_buffers so XLA
-    # cannot elide the donation-aliased writes (Bug B). Without this, XLA
-    # has no compute-level dep on kv_caches input and may statically
-    # determine output bytes match donated input bytes (when both are zero
-    # or otherwise predictable), elide the write, and leave R1's last-
-    # decode contents bleeding into R2's prefill output. See
-    # `_v4_force_kv_caches_read` docstring for full hypothesis.
     packed_buffers = _v4_force_kv_caches_read(packed_buffers, kv_caches)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
-    if V4_DECODE_STATE_DIAG:
-        jax.debug.print(
-            "[V4_PREFILL] PREFILL exit  packed_buffers[0] sum={s} nonfinite={nf}",
-            s=jnp.sum(packed_buffers[0]).astype(jnp.float32),
-            nf=jnp.sum(jnp.logical_not(jnp.isfinite(packed_buffers[0]))),
-        )
     return packed_buffers, h
 
 
@@ -2079,38 +1918,23 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # `V4_DECODE_STATE=1` routes through the decode-state
-                # orchestrator; default OFF preserves the prefill-only gate.
-                # `decode_start_pos` is a 0/1 meta-field gate (set by
-                # `tpu_runner._maybe_set_v4_decode_start_pos` on q0==1 /
-                # s0>1 calls). The traced absolute position comes from
-                # `seq_lens[0] - 1` — one compile fits every position.
-                #
-                # On decode steps the runner zero-pads the bucket past
-                # token 0; we slice `ids_2d[:, 0:1]` for the orchestrator
-                # and pad `h` back to T after.
                 if V4_DECODE_STATE_ENABLED:
-                    is_decode = False
-                    if attention_metadata is not None:
-                        is_decode = int(getattr(
-                            attention_metadata, "decode_start_pos", 0)) > 0
+                    is_decode = (
+                        attention_metadata is not None
+                        and int(getattr(
+                            attention_metadata, "decode_start_pos", 0)) > 0)
                     T = int(ids_2d.shape[-1])
                     state_max_seq_len = (
                         v4_state_max_seq_len_from_vllm_config(self.vllm_config))
-                    self._v4_call_count = (
-                        getattr(self, "_v4_call_count", 0) + 1)
-                    if is_decode and attention_metadata is not None:
-                        start_pos = (attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
+                    if is_decode:
+                        start_pos = (
+                            attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
+                        # Decode bucket may pad past token 0; the orchestrator
+                        # only consumes the live slot.
                         ids_for_orchestrator = ids_2d[:, 0:1]
                     else:
                         start_pos = jnp.int32(0)
                         ids_for_orchestrator = ids_2d
-                    logger.info(
-                        "[V4_DECODE_STATE] __call__ #%d: T=%d "
-                        "is_decode=%s state_max_seq_len=%d kv_caches=%d",
-                        self._v4_call_count, T, is_decode,
-                        state_max_seq_len,
-                        len(kv_caches) if kv_caches is not None else -1)
                     kv_caches, h = deepseek_v4_run_with_decode_state(
                         kv_caches, ids_for_orchestrator, params,
                         freqs_swa, freqs_comp,

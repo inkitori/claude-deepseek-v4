@@ -12,7 +12,7 @@ demo on a v6e-32 TPU slice (8 hosts × 4 chips, TP=32) to
 tool calls, real reasoning, real long contexts, real metrics,
 graceful failure modes.
 
-The Tier-8 deploy gate is already GREEN
+The smoke gate is already GREEN
 (`/v1/completions` returns deterministic `Paris`, cold compile
 ~97s, warm-cache curl sub-second). The work now is converting
 that into something that doesn't break under real traffic.

@@ -837,23 +837,15 @@ class KVCacheManager:
 
     def _initialize_kv_cache_deepseek_v4(
             self, kv_cache_config: KVCacheConfig) -> None:
-        """V4-only kv-cache allocator (S1 iter-5b).
-
-        V4's per-layer state is the packed `AttentionDecodeState` produced by
-        `models/jax/deepseek_v4.py::_pack_layer_state` — a single 1D fp32
-        array per layer, sized by `v4_layer_packed_sizes_from_cfg(cfg,
-        state_max_seq_len=max_model_len)`. We allocate replicated `P()`
-        across the mesh because the buffer is per-sequence (not per-head /
-        per-block) and every chip computes the same update under SPMD;
-        replication keeps the math correct without paying any per-chip HBM
-        cost beyond the buffer itself (~10 MB total across 50 layers at
-        max_model_len=256, well below any budget).
-
-        Bypasses the standard `kv_cache_config.kv_cache_tensors` allocation
-        path because V4's spec is just an inert placeholder (kv_cache_manager
-        gates `use_mla=False` for V4 to make engine init succeed; the spec
-        carries no real shape information for V4).
-        """
+        """V4-only kv-cache allocator. Each layer's state is a 1D fp32
+        packed `AttentionDecodeState` sized by `v4_layer_packed_sizes_from_cfg`.
+        Buffers are replicated `P()` across the mesh — the state is per-
+        sequence (not per-head/per-block) and every chip computes the same
+        update under SPMD, so replication is cheap (~10 MB total at
+        max_model_len=256) and side-steps divisibility checks for arbitrary
+        1D shapes. Bypasses the standard kv_cache_tensors allocation path
+        because V4's spec is an inert placeholder (V4 gates `use_mla=False`
+        in `__init__`)."""
         from tpu_inference.models.jax.deepseek_v4 import (  # noqa: PLC0415
             v4_layer_packed_sizes_from_cfg, DeepseekV4Config,
             v4_state_max_seq_len_from_vllm_config)

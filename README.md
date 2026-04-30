@@ -132,7 +132,7 @@ with `PASS: deterministic completion contains 'Paris'`.
 
 ## Status
 
-Tier-8 deploy gate **GREEN** as of 2026-04-30: cold
+Smoke gate **GREEN** as of 2026-04-30: cold
 `./run.sh serve` returns deterministic `Paris` for "The capital of
 France is" via `/v1/completions`; cold compile ~97s, warm-cache
 curl sub-second. Loading is ~4 min for 35020 tensors; the MoE

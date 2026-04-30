@@ -293,10 +293,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cache_dtype = self.dtype
         self.kv_cache_dtype = to_torch_dtype(cache_dtype)
 
-        # S1 iter-5b: DeepSeek V4 routes the per-step state through
-        # `attention_metadata.decode_start_pos` (a Python-static meta_field).
-        # Cache the detection at __init__ so _prepare_inputs paths don't
-        # repeat the hf_text_config / model_type lookup per request.
+        # V4 routes per-step state through `attention_metadata.decode_start_pos`;
+        # cache the detection so per-request paths don't re-read hf_text_config.
         _hf_text = getattr(self.model_config, "hf_text_config",
                            getattr(self.model_config, "hf_config", None))
         self._is_deepseek_v4 = (

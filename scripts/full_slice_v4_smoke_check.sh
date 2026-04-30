@@ -91,12 +91,7 @@ HOST="${HOST:-127.0.0.1}"
 URL="http://${HOST}:${PORT}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-V4-Flash}"
 PROMPT='The capital of France is'
-# Default 8 token-asserts the deterministic " Paris" prefix. Under
-# V4_DECODE_STATE=1, every fresh decode position triggers a ~50-100s JIT
-# recompile (per-position compile cache miss); set COMPLETION_MAX_TOK=2 to
-# stay well under CURL_MAX_TIME's 900s ceiling on cold cache. Once decode
-# kernels accept traced start_pos (one compile covers all positions), this
-# can revert to a larger default.
+# 8 tokens covers the deterministic " Paris" prefix with margin.
 MAX_TOK="${COMPLETION_MAX_TOK:-8}"
 SEED=0
 # Readiness poll cap (server-up wait).
