@@ -788,6 +788,36 @@ def transformer_body_decode_step_from_buffer(
     return h, new_buffers
 
 
+def _v4_constrain_packed_replicated(
+    buffers: List[jnp.ndarray],
+) -> List[jnp.ndarray]:
+    """Apply `lax.with_sharding_constraint(b, P())` to each packed-state
+    buffer. Forces the reshard-to-replicated to materialize at this point
+    in the trace rather than at the JIT boundary, which iter-5g hyp-3
+    pins as the trigger for R2's TPU `[USER]` FATAL on the cached prefill
+    artifact.
+
+    No-op outside an active mesh context (raises an error in some JAX
+    versions) — the unit tests run without a mesh, so guard with a
+    physical-mesh check. Inside `run_model`'s JIT (which is dispatched
+    under `nnx.merge`'s mesh context), the constraint takes effect."""
+    try:
+        # `jax.experimental.mesh_utils.thread_resources` and the
+        # `jax.sharding.use_mesh` helpers expose the active mesh; the
+        # cheapest cross-version test is to ask jax for the current
+        # physical mesh via the public `jax.sharding.get_abstract_mesh`
+        # API (jax >= 0.5) or fall back to assuming we're inside one.
+        # If no mesh is active, with_sharding_constraint raises and we
+        # let the exception propagate — that should never happen in
+        # production paths (run_model is always under a mesh).
+        spec = jax.sharding.PartitionSpec()
+        return [lax.with_sharding_constraint(b, spec) for b in buffers]
+    except Exception:
+        # Tests outside a mesh context fall through unchanged — the
+        # constraint only matters under SPMD anyway.
+        return buffers
+
+
 def deepseek_v4_run_with_decode_state(
     kv_caches: List[jnp.ndarray],
     input_ids: jnp.ndarray,
@@ -852,7 +882,22 @@ def deepseek_v4_run_with_decode_state(
     that may mean "prints disturb XLA scheduling enough to dodge the
     FATAL", not "the bug is fixed". Even so, captured prints from a
     successful R1 + a FATAL-ing R2 (or two successful runs) are
-    informative."""
+    informative.
+
+    iter-5g hyp-3 fix: each output packed_buffer / new_buffer is wrapped in
+    `lax.with_sharding_constraint(b, P())` before return. The kv_caches input
+    is `P()`-replicated (`model_loader.py:319`) and the JIT's `out_shardings`
+    enforce `P()` on the kv_caches output. Without an explicit constraint,
+    the natural sharding of `_pack_layer_state`'s output (a concat of
+    reshapes derived from `attn_dp`-sharded params) doesn't match the
+    boundary's required `P()`, so XLA inserts a JIT-boundary reshard. Under
+    `donate_argnums=2`, that boundary reshard must produce the donated
+    buffer's exact byte layout — and on the cached prefill artifact's
+    SECOND execution (R2), that reshard's interaction with the donated
+    buffer's prior contents triggers the TPU `[USER]` FATAL observed
+    iter-5e/iter-5f. Forcing the reshard to materialize at this known
+    code point (inside the function body) means the JIT-boundary then
+    sees an already-`P()` value and doesn't need to do its own reshard."""
     if is_decode_step:
         if V4_DECODE_STATE_DIAG:
             # Decode branch: kv_caches IS read by decode_step_from_buffer
@@ -869,6 +914,7 @@ def deepseek_v4_run_with_decode_state(
             kv_caches, start_pos=start_pos,
             state_max_seq_len=state_max_seq_len,
         )
+        new_buffers = _v4_constrain_packed_replicated(new_buffers)
         if V4_DECODE_STATE_DIAG:
             jax.debug.print(
                 "[V4_PREFILL] DECODE exit  start_pos={sp} "
@@ -905,6 +951,7 @@ def deepseek_v4_run_with_decode_state(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
+    packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
     if V4_DECODE_STATE_DIAG:
         jax.debug.print(
             "[V4_PREFILL] PREFILL exit  packed_buffers[0] sum={s} nonfinite={nf}",
