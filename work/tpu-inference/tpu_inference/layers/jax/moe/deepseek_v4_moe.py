@@ -122,31 +122,80 @@ def moe_forward(
 ) -> jnp.ndarray:
     """MoE forward = sum_i (route_weight_i * expert_i(x)) + shared_expert(x).
 
-    The PyTorch reference flattens (B*S, dim) and dispatches each expert via
-    a `torch.where(indices == i)` lookup. We mirror that here in JAX, using
-    `jnp.where` to construct masks. This is O(n_routed_experts * N) — fine
-    for tiny configs and Tier-1 correctness; production code should use a
-    sparse dispatch kernel.
+    Routing is mathematically the same top-k pattern as the PyTorch reference:
+    for each token n, we compute a sum over experts of
+    ``route_weight[n, e] * expert_e(x[n])`` where ``route_weight[n, e]`` is
+    nonzero only for the top_k experts the gate selected for n. The compute
+    here is "vectorized dense": rather than launching one Python-unrolled
+    expert kernel per expert (which made jit_run_model emit
+    ``n_routed_experts * 3`` separate matmul HLOs and blew up XLA compile
+    to 30+ minutes for V4-Flash), we stack the per-expert weights into a
+    single ``[E, ...]`` tensor and compute gate / up / down as three big
+    einsums. The masking is folded into a per-(token, expert) routing
+    weight that is zero for non-top_k experts, so the algebra is identical
+    to the per-expert loop modulo XLA reduction ordering.
+
+    This is still O(n_routed_experts * N) in flops — true sparse dispatch
+    (grouped matmul over only the experts each token actually picks) would
+    be ~32x cheaper for top_k=8 / E=256. That's a follow-up; this change
+    fixes the compile-time blowup without touching the param tree.
     """
     orig_shape = x.shape
-    flat_x = x.reshape(-1, params.dim)
+    flat_x = x.reshape(-1, params.dim)             # [N, dim]
     flat_ids = input_ids.reshape(-1)
-    weights, indices = gate_forward(flat_x.astype(jnp.float32), flat_ids, params.gate)
-    # weights: [N, top_k], indices: [N, top_k]
-    N = flat_x.shape[0]
-    y = jnp.zeros_like(flat_x, dtype=jnp.float32)
-    # For each routed expert i, find which (token, top_k_slot) maps to it,
-    # apply that expert, accumulate into y at those token rows.
-    for i in range(params.n_routed_experts):
-        mask = (indices == i)  # [N, top_k]
-        any_token = mask.any(axis=-1)  # [N]
-        # Pick the routing weight for each token (sum over top_k slots; in
-        # practice only one slot will be set per (token,expert) pair).
-        per_token_weight = (weights * mask).sum(axis=-1, keepdims=True)  # [N, 1]
-        # Run the expert on every token (dense path); mask its contribution.
-        out_i = expert_forward(flat_x, per_token_weight.astype(flat_x.dtype), params.experts[i])
-        y = y + jnp.where(any_token[:, None], out_i.astype(jnp.float32), 0.0)
-    # Shared expert (always on, no weighting).
+    weights, indices = gate_forward(
+        flat_x.astype(jnp.float32), flat_ids, params.gate)
+    # weights: [N, top_k] fp32, indices: [N, top_k] int32
+
+    E = params.n_routed_experts
+    fp32 = jnp.float32
+    dtype = x.dtype
+
+    # Stack the 256 ExpertParams entries into [E, ...] tensors. Inside the
+    # JIT this is a single HLO concatenate; with mesh=(attn_dp=32, others=1)
+    # each chip already holds its own slice of every expert weight (sharded
+    # on the dim axis), so the concat is a local copy, not a cross-host
+    # all-gather.
+    W1 = jnp.stack([e.w1 for e in params.experts])  # [E, inter, dim]
+    W2 = jnp.stack([e.w2 for e in params.experts])  # [E, dim, inter]
+    W3 = jnp.stack([e.w3 for e in params.experts])  # [E, inter, dim]
+    swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
+
+    # Per-(token, expert) routing weight: nonzero only for the top_k experts
+    # the gate picked for each token. Built via one_hot + einsum so it
+    # reduces to a single fp32 [N, E] matrix. We round-trip through `dtype`
+    # to preserve the bf16-cast precision behavior of the original loop's
+    # `per_token_weight.astype(flat_x.dtype)` step.
+    one_hot = jax.nn.one_hot(indices, E, dtype=fp32)        # [N, top_k, E]
+    per_expert_weight = jnp.einsum('nke,nk->ne', one_hot, weights)  # [N, E]
+    per_expert_weight = per_expert_weight.astype(dtype).astype(fp32)
+
+    # Gate / up projections in fp32 (matches expert_forward's fp32 path).
+    x_fp32 = flat_x.astype(fp32)
+    W1_fp32 = W1.astype(fp32)
+    W3_fp32 = W3.astype(fp32)
+    gate_NEi = jnp.einsum('nd,eid->nei', x_fp32, W1_fp32)   # [N, E, inter]
+    up_NEi = jnp.einsum('nd,eid->nei', x_fp32, W3_fp32)     # [N, E, inter]
+    if swiglu_limit > 0:
+        up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
+        gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
+    h_NEi = jax.nn.silu(gate_NEi) * up_NEi                  # [N, E, inter]
+
+    # Apply per-(token, expert) routing weight (mid-apply, matches
+    # expert_forward's `h = h * weights` between SwiGLU and w2).
+    h_NEi = h_NEi * per_expert_weight[..., None]            # [N, E, inter]
+
+    # Down projection in the activation dtype (bf16), matching
+    # `(h.astype(dtype) @ w2.astype(dtype).T)`.
+    out_NEd = jnp.einsum(
+        'nei,edi->ned',
+        h_NEi.astype(dtype),
+        W2.astype(dtype),
+    )                                                        # [N, E, dim]
+
+    # Sum routed experts in fp32 to match the original loop's
+    # `y` accumulator dtype, then add the always-on shared expert.
+    y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32
     shared = expert_forward(flat_x, None, params.shared_expert)
-    y = y + shared.astype(jnp.float32)
-    return y.astype(x.dtype).reshape(orig_shape)
+    y = y + shared.astype(fp32)
+    return y.astype(dtype).reshape(orig_shape)
