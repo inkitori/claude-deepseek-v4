@@ -41,7 +41,8 @@ import jax.numpy as jnp
 from jax import lax
 
 from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
-    AttentionParams, CompressorParams, IndexerParams,
+    AttentionDecodeState, AttentionParams, CompressorParams, IndexerParams,
+    attention_decode_step, attention_init_state_from_prefill,
     attention_prefill, hc_split_sinkhorn, precompute_freqs_cis, rms_norm,
     splice_rope,
 )
@@ -286,6 +287,80 @@ def block_forward(
     return hc_post(y, residual, post, comb)
 
 
+def block_init_state_and_forward(
+    x: jnp.ndarray,            # [B, T, hc, D]
+    input_ids: jnp.ndarray,    # [B, T]
+    params: BlockParams,
+    freqs_cis_full: jnp.ndarray,
+    cfg_max_seq_len: int,
+    cfg_index_head_dim: int,
+) -> Tuple[AttentionDecodeState, jnp.ndarray]:
+    """Block forward (prefill) that ALSO captures the post-prefill
+    `AttentionDecodeState` for this layer. Output `[B, T, hc, D]` is
+    bit-equivalent to `block_forward`; the captured state can drive
+    `block_decode_step` at start_pos=T without re-running prefill."""
+    residual = x
+    y, post, comb = hc_pre(
+        x, params.hc_attn_fn, params.hc_attn_scale, params.hc_attn_base,
+        params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
+    )
+    y = rms_norm(y, params.attn_norm_w, params.norm_eps)
+    # Capture decode state from this layer's attention input. The state
+    # constructor mirrors what `attention_prefill` will write to the
+    # internal kv buffers at the same `y`.
+    decode_state = attention_init_state_from_prefill(
+        y, params.attn, freqs_cis_full,
+        cfg_max_seq_len=cfg_max_seq_len,
+        cfg_index_head_dim=cfg_index_head_dim,
+        dtype=jnp.bfloat16,
+    )
+    y = attention_prefill(y, params.attn, freqs_cis_full)
+    x = hc_post(y, residual, post, comb)
+
+    residual = x
+    y, post, comb = hc_pre(
+        x, params.hc_ffn_fn, params.hc_ffn_scale, params.hc_ffn_base,
+        params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
+    )
+    y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
+    y = moe_forward(y, input_ids, params.moe)
+    return decode_state, hc_post(y, residual, post, comb)
+
+
+def block_decode_step(
+    x_step: jnp.ndarray,           # [B, 1, hc, D]
+    input_ids_step: jnp.ndarray,   # [B, 1]
+    params: BlockParams,
+    freqs_cis_full: jnp.ndarray,
+    prev_state: AttentionDecodeState,
+    start_pos: int,
+) -> Tuple[AttentionDecodeState, jnp.ndarray]:
+    """One decode step through this block. Mirrors `block_forward` but
+    swaps `attention_prefill` for `attention_decode_step` (which mutates
+    `prev_state`). Returns `(new_state, x_out)` with `x_out: [B, 1, hc, D]`.
+    `start_pos` is the absolute position of the new token (Python static
+    int — it is consumed by `attention_decode_step` via static circular-
+    buffer indexing)."""
+    residual = x_step
+    y, post, comb = hc_pre(
+        x_step, params.hc_attn_fn, params.hc_attn_scale, params.hc_attn_base,
+        params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
+    )
+    y = rms_norm(y, params.attn_norm_w, params.norm_eps)
+    new_state, y = attention_decode_step(
+        y, start_pos, params.attn, freqs_cis_full, prev_state)
+    x_step = hc_post(y, residual, post, comb)
+
+    residual = x_step
+    y, post, comb = hc_pre(
+        x_step, params.hc_ffn_fn, params.hc_ffn_scale, params.hc_ffn_base,
+        params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
+    )
+    y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
+    y = moe_forward(y, input_ids_step, params.moe)
+    return new_state, hc_post(y, residual, post, comb)
+
+
 # ------------------------------------------------------------
 # Head
 # ------------------------------------------------------------
@@ -347,6 +422,77 @@ def transformer_body_forward(
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
         h = block_forward(h, input_ids, layer, fc)
     return h
+
+
+def transformer_body_init_state_from_prefill(
+    input_ids: jnp.ndarray,        # [B, T] int32
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+    state_max_seq_len: int,
+) -> Tuple[jnp.ndarray, List[AttentionDecodeState]]:
+    """Run a prefill of `input_ids` AND capture per-layer
+    `AttentionDecodeState` for subsequent decode steps. Returns
+    `(h: [B, T, hc, D], states: List[AttentionDecodeState])`.
+
+    `h` is bit-equivalent to `transformer_body_forward(input_ids, ...)`;
+    `states[i]` is what `attention_decode_step` would have accumulated
+    after T iterations of the iterative path on layer i. Combined with
+    `transformer_body_decode_step`, the wrapper can convert vLLM's
+    every-step-recomputes-prefill path into prefill-once-then-O(1) decode.
+
+    `state_max_seq_len` sizes the per-layer kv_cache buffer (slots
+    `[win, win + state_max_seq_len/ratio)`). The caller picks this to
+    match the runtime context bound (typically vLLM's max_model_len),
+    NOT the architectural max_position_embeddings — V4-Flash's 1M HF
+    config would otherwise blow per-layer state into GiB on every chip.
+    """
+    h = params.embed_w[input_ids]  # [B, T, D]
+    h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
+    states: List[AttentionDecodeState] = []
+    for layer in params.layers:
+        cr = layer.attn.compress_ratio
+        fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
+        # index_head_dim is only consumed when this layer's attention has
+        # an indexer (ratio==4). Pass cfg.index_head_dim either way; the
+        # state-init helper itself gates on `params.indexer is not None`.
+        idx_hd = cfg.index_head_dim if (cr == 4 and layer.attn.indexer is not None) else 0
+        st, h = block_init_state_and_forward(
+            h, input_ids, layer, fc,
+            cfg_max_seq_len=state_max_seq_len,
+            cfg_index_head_dim=idx_hd,
+        )
+        states.append(st)
+    return h, states
+
+
+def transformer_body_decode_step(
+    input_ids_step: jnp.ndarray,   # [B, 1] int32
+    params: TransformerParams,
+    freqs_cis_swa: jnp.ndarray,
+    freqs_cis_compressed: jnp.ndarray,
+    cfg: DeepseekV4Config,
+    prev_states: List[AttentionDecodeState],
+    start_pos: int,
+) -> Tuple[jnp.ndarray, List[AttentionDecodeState]]:
+    """One decode step through every layer. Returns
+    `(h: [B, 1, hc, D], new_states: List[AttentionDecodeState])`.
+
+    `start_pos` is the absolute position of the new token (Python int —
+    static under JIT because `attention_decode_step` indexes its
+    circular buffers via `start_pos % win` / `start_pos // ratio` at
+    trace time)."""
+    h = params.embed_w[input_ids_step]  # [B, 1, D]
+    h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
+    new_states: List[AttentionDecodeState] = []
+    for layer, prev in zip(params.layers, prev_states):
+        cr = layer.attn.compress_ratio
+        fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
+        new_state, h = block_decode_step(
+            h, input_ids_step, layer, fc, prev, start_pos)
+        new_states.append(new_state)
+    return h, new_states
 
 
 def deepseek_v4_forward_prefill(

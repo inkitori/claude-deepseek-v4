@@ -93,10 +93,13 @@ from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
 )
 from tpu_inference.models.jax.deepseek_v4 import (
     DeepseekV4Config, BlockParams, MTPBlockParams, TransformerParams,
-    block_forward, head_forward, deepseek_v4_forward_prefill,
-    deepseek_v4_mtp_forward, hc_pre, hc_post, head_hc, make_freqs_cis,
+    block_forward, block_decode_step, block_init_state_and_forward,
+    head_forward, deepseek_v4_forward_prefill, deepseek_v4_mtp_forward,
+    hc_pre, hc_post, head_hc, make_freqs_cis,
     make_abstract_transformer_params, count_param_bytes,
     kv_cache_bytes_per_layer, map_hf_name_to_jax_path,
+    transformer_body_forward, transformer_body_decode_step,
+    transformer_body_init_state_from_prefill,
 )
 
 
@@ -1578,6 +1581,103 @@ class TestPrefillToDecodeStateParity:
             f"layer={layer_id} T={T} (max_seq_len={max_seq_len}): "
             f"closed-form-init + decode step diff {diff}"
         )
+
+
+class TestTransformerBodyDecodeRoundTrip:
+    """S1 integration milestone: validate that the transformer-body level
+    primitives `transformer_body_init_state_from_prefill` +
+    `transformer_body_decode_step` round-trip against a single
+    `transformer_body_forward` call on the prefill+1 sequence.
+
+    The promise: instead of running prefill on `ids[:, :T+1]` from scratch
+    (today's vLLM `__call__` for V4), the wrapper can prefill `ids[:, :T]`
+    once, capture per-layer `AttentionDecodeState`, then run one decode
+    step on `ids[:, T:T+1]` and get the same hidden state for the new
+    token. This is the missing primitive that makes S1's runtime threading
+    feasible (per-layer attention now O(1)/step on cached state, not
+    O((T+1)²)).
+
+    Two parts:
+      A) Prefill output equivalence: `init_state_from_prefill` must return
+         a hidden state byte-equal to `transformer_body_forward` on the
+         same input — the state-capture path is a strict superset of the
+         forward path, so the forward output is unchanged.
+      B) Decode-step parity: the captured state + one decode step must
+         produce the same hidden state at position T as a fresh prefill
+         on `ids[:, :T+1]` produces at its last position.
+
+    Together these prove the math is correct end-to-end through embed +
+    HC + attention(prefill→decode) + MoE + HC for every layer in the
+    tiny config (3 SWA + 2 CSA + 2 HCA pattern). Tolerance is the
+    accumulated bf16 noise of the per-layer kernels: per-layer
+    `attention_decode_step` is 1e-4 vs torch; six layers compound to
+    ~6×1e-4 ~= 1e-3 worst-case.
+    """
+
+    @staticmethod
+    def _build_pair(seed: int = 0):
+        torch.manual_seed(seed)
+        args = make_tiny_args(max_seq_len=64)
+        model = TorchTransformer(args)
+        from _deepseek_v4_reference.model import init_model_random
+        init_model_random(model, seed=seed)
+        params, cfg = _torch_transformer_to_jax_params_and_cfg(model)
+        # Use the torch reference's per-layer freqs_cis, exactly like
+        # TestEndToEnd._build_pair does.
+        swa = jnp.empty((0,), dtype=jnp.complex64)
+        comp = jnp.empty((0,), dtype=jnp.complex64)
+        swa_layer = next(
+            (l for l in model.layers if l.attn.compress_ratio == 0), None)
+        comp_layer = next(
+            (l for l in model.layers if l.attn.compress_ratio > 0), None)
+        if swa_layer is not None:
+            swa = t2j(swa_layer.attn.freqs_cis).astype(jnp.complex64)
+        if comp_layer is not None:
+            comp = t2j(comp_layer.attn.freqs_cis).astype(jnp.complex64)
+        return model, params, cfg, swa, comp
+
+    @pytest.mark.parametrize("T", [4, 8, 16, 24])
+    def test_body_prefill_then_decode_step_matches_full_prefill(self, T):
+        model, params, cfg, swa, comp = self._build_pair(seed=0)
+        torch.manual_seed(T + 7)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + 1), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+
+        # Path A: fresh prefill on the full T+1 sequence.
+        h_full = transformer_body_forward(
+            ids_full_j, params, swa, comp, cfg)  # [1, T+1, hc, D]
+
+        # Path B: prefill on T, capture state, decode step on the T-th
+        # token.
+        h_pref, states = transformer_body_init_state_from_prefill(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=model.args.max_seq_len,
+        )
+        # B1: prefill output equivalence — capturing state must not
+        # perturb the forward output.
+        d_pref = float(jnp.max(
+            jnp.abs(h_pref.astype(jnp.float32)
+                    - h_full[:, :T].astype(jnp.float32))))
+        assert d_pref <= 1e-3, (
+            f"T={T}: init_state_from_prefill perturbed forward output "
+            f"(max abs diff {d_pref})")
+
+        # B2: one decode step at start_pos=T.
+        h_step, _ = transformer_body_decode_step(
+            ids_full_j[:, T:T + 1], params, swa, comp, cfg, states,
+            start_pos=T,
+        )
+        # Compare to the T-th position of the full prefill.
+        d_step = float(jnp.max(
+            jnp.abs(h_step.astype(jnp.float32)
+                    - h_full[:, T:T + 1].astype(jnp.float32))))
+        # Accumulated bf16 noise across 6 layers + integration of
+        # attention_decode_step (1e-4 vs torch) + per-layer hc/moe paths.
+        # Empirically tight; if this drifts above ~5e-3 it's a real bug.
+        assert d_step <= 5e-3, (
+            f"T={T}: decode-step output diverged from full prefill at "
+            f"position T (max abs diff {d_step})")
 
 
 # =============================================================

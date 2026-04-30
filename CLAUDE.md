@@ -271,7 +271,7 @@ message and move down.
 These are issues where the smoke goes green but the model isn't
 doing what users will actually ask of it. Fix these *first*.
 
-#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context (foundational primitive landed; `__call__` integration is the next iter's job)
+#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context (transformer-body primitives landed; `__call__` integration is the next iter's job)
 
 This is the headline correctness/perf bug. `__call__` in
 `work/tpu-inference/tpu_inference/models/jax/deepseek_v4.py:1363`
@@ -330,33 +330,120 @@ helper deliberately matches torch prefill (sparse writes,
 leave the rest at init) so the parity test fires the right
 comparison.
 
+**Iter 2026-04-30 (transformer-body primitives):** the
+prefill→decode-state→step round-trip now closes at the
+`transformer_body` level, not just per-layer attention. Three
+new helpers in `models/jax/deepseek_v4.py`:
+
+* `block_init_state_and_forward(x, input_ids, params, fc, …)`
+  — `block_forward` plus per-layer `AttentionDecodeState`
+  capture (calls `attention_init_state_from_prefill` on the
+  attention input AFTER hc_pre + rms_norm, before
+  attention_prefill). Output `[B, T, hc, D]` is byte-equal to
+  `block_forward` on the same input.
+* `block_decode_step(x_step, input_ids_step, params, fc,
+  prev_state, start_pos)` — `block_forward` with
+  `attention_prefill` swapped for `attention_decode_step`.
+  Returns `(new_state, [B, 1, hc, D])`.
+* `transformer_body_init_state_from_prefill(input_ids, params,
+  swa, comp, cfg, state_max_seq_len)` — runs all layers via
+  `block_init_state_and_forward`, returns
+  `(h: [B, T, hc, D], states: List[AttentionDecodeState])`.
+* `transformer_body_decode_step(input_ids_step, params, swa,
+  comp, cfg, prev_states, start_pos)` — runs all layers via
+  `block_decode_step`, returns `(h: [B, 1, hc, D], new_states)`.
+
+`state_max_seq_len` is exposed as a parameter (not pinned to
+`cfg.max_position_embeddings`) so the integrator picks vLLM's
+`max_model_len` and avoids V4-Flash's 1M architectural cap
+blowing per-layer kv_cache to GiB.
+
+Pinned by `TestTransformerBodyDecodeRoundTrip` in
+`tests/models/jax/test_deepseek_v4.py` (4 cases, T ∈ {4, 8, 16,
+24}). For each T it runs:
+
+  A) `transformer_body_forward(ids[:, :T+1], …)` → h_full
+  B) `transformer_body_init_state_from_prefill(ids[:, :T], …)`
+     → h_pref, states; assert maxabs(h_pref - h_full[:, :T])
+     ≤ 1e-3 (forward output unchanged)
+  C) `transformer_body_decode_step(ids[:, T:T+1], states, …,
+     start_pos=T)` → h_step; assert maxabs(h_step -
+     h_full[:, T:T+1]) ≤ 5e-3 (decode step matches the T-th
+     position of fresh prefill)
+
+This pins the whole chain (embed + HC + attention(prefill →
+decode) + MoE + HC × all layers) end-to-end. Tolerance budget
+is ≈ 6 layers × 1e-4/layer accumulated bf16 noise; observed
+worst across 4 T cases ≪ 5e-3.
+
 **Next iter starts at:** thread state through `__call__`.
 
-* Add per-layer `AttentionDecodeState` to the model instance
-  via `nnx.Variable` storage (one tree-of-states alongside
-  `params_v`, NOT inside vllm's `kv_caches` — INVARIANTS I34
-  documents that kv_caches is a passthrough for V4).
-* Track `_decode_advanced_to_v` (per-slot int32) so `__call__`
-  can detect: continuation (new_len == prev_advanced + 1) →
-  run one decode step on the tail token through every layer,
-  mutating each layer's state via `attention_decode_step`;
-  else (new_len differs by more than 1, or is shorter — slot
-  reused by a new request) → fresh prefill that ALSO seeds
-  state via `attention_init_state_from_prefill`.
-* On `__call__` continuation: return shape `[B, T, D]` with
-  positions `[0, T-1)` zero-filled (vLLM only reads the
-  last-token-per-sequence position for next-token logits) and
-  position `T-1` = the new hidden state.
-* Validate via path #3 (`lower().compile()` on real config)
-  before launching a real smoke — compile-time HBM accounting
-  tells you if the per-layer state allocations (~50 layers ×
-  ~50 KB / layer at MAX_LEN=256, MAX_SEQS=1) push past
-  31.25 GiB/chip.
-* Real-smoke gate: deterministic " Paris" still passes AND a
-  multi-token decode (e.g. max_tokens=10) returns coherent
-  output, confirming the continuation path actually works end
-  to end on TPU. Throughput improvement is the prize but
-  correctness is the gate.
+The math is now ready. The remaining surgery is engine
+plumbing — figuring out where per-layer
+`List[AttentionDecodeState]` lives and how it persists across
+JIT'd `model_fn(state, kv_caches, input_ids, …)` calls. Today
+V4's `kv_caches` is a passthrough (INVARIANTS I34); the model's
+`nnx.Variable`s are read inside JIT but mutations are lost
+because `tpu_inference/models/common/model_loader.py:332`
+returns `(kv_cache, hidden, aux)` and doesn't capture the
+mutated nnx state. Two implementation options:
+
+  **Option A — use `kv_caches` as the carrier (preferred).**
+  vLLM allocates `kv_caches: List[jax.Array]` per layer and
+  donates them on the JIT'd `run_model` call (`donate_argnums=2`
+  in `model_loader.py:327`). The standard pattern in the other
+  tpu-inference models (e.g. `llama3.py:338-344`) is exactly
+  this: read `kv_cache = kv_caches[i]`, run the layer with it,
+  write `kv_caches[i] = new_kv_cache`, return the updated list.
+  V4's `AttentionDecodeState` is a 6-field dataclass; pack it
+  into the per-layer buffer (concatenate fields at known offsets,
+  or keep `kv_caches[i]` as a tuple-of-arrays — JIT inputs can
+  be pytrees). vLLM's V4 kv_cache spec is "an inert placeholder"
+  per `kv_cache_manager.py:73`, so we have layout freedom; we
+  just need to override the spec / buffer shape so the allocated
+  per-layer buffer is at least as large as our packed state.
+  Today's spec uses `head_dim, num_kv_heads=1` with V4's tiny
+  `head_dim=128` → ~few KB/layer/block — likely undersized.
+  Probable approach: extend `kv_cache_manager._create_attention_spec`
+  to size each layer for the union of all 6 AttentionDecodeState
+  fields (or, equivalently, override `KVCacheSpec.page_size_padded`).
+
+  **Option B — return state from `run_model` and thread via
+  the runner.** Add a 4th output tuple element holding the new
+  per-layer state, and teach `tpu_inference/runner/tpu_runner.py`
+  to feed it back next call. Cleaner abstractly but touches the
+  runner (CLAUDE.md "Touch the runtime sparingly") and breaks
+  the contract with non-V4 models that share the same model_fn
+  signature. Defer unless A turns out infeasible.
+
+* Recommended next-iter scope (one iter):
+  1. Extend `kv_cache_manager.py` so V4's per-layer
+     `KVCacheSpec.page_size_padded` is sized for the packed
+     `AttentionDecodeState`. Validate by inspecting allocated
+     `kv_caches[i].shape` after engine init in a smoke launch.
+  2. Add `_pack_state` / `_unpack_state` helpers next to the
+     transformer-body decode primitives (concat all 6 fields
+     into a single `[B, total_floats]` array per layer, with
+     known offsets). State pytree shape is uniform across
+     layers so packing is one schema.
+  3. Branch `__call__`: detect prefill-vs-continuation from
+     `attention_metadata.query_start_loc` + `seq_lens`. Track
+     per-slot `_decode_advanced_to_v` (per-slot int32) — store
+     it inside the kv_caches buffer too, or as the leading
+     slot of each layer's packed state.
+  4. On continuation: read `kv_caches[i]` → unpack → one
+     decode step → repack → write back. On fresh prefill: run
+     `transformer_body_init_state_from_prefill` and pack the
+     returned states into `kv_caches`.
+  5. Validate via path #3 (`lower().compile()` on real config)
+     — per-layer state at MAX_LEN=256/MAX_SEQS=1 is ~50 KB
+     × 50 layers × 32 chips after sharding ≈ 80 MB total HBM
+     budget; should fit comfortably in the existing 31.25 GiB
+     budget.
+  6. Real-smoke gate: deterministic " Paris" still passes AND
+     a multi-token decode (e.g. max_tokens=10) returns coherent
+     output. Throughput improvement is the prize; correctness
+     is the gate.
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
@@ -976,6 +1063,16 @@ when the timeout SIGTERMs the iter.
   `TestDecodeAttentionParity` /
   `TestDecodeRollingParity` matrix. ✓ math, ✗ runtime
   integration (S1 — they aren't called by `__call__`).
+* **Transformer-body decode primitives**
+  (`block_init_state_and_forward`, `block_decode_step`,
+  `transformer_body_init_state_from_prefill`,
+  `transformer_body_decode_step` in `models/jax/deepseek_v4.py`):
+  prefill→init_state→decode_step round-trip matches a
+  fresh-prefill on the T+1 sequence within ~5e-3 across
+  T ∈ {4,8,16,24} on the 6-layer tiny config (3 SWA + 2 CSA +
+  2 HCA pattern). Pinned by `TestTransformerBodyDecodeRoundTrip`.
+  ✓ math, ✗ runtime integration (S1 — `__call__` is the
+  remaining surgery; see S1's "Next iter starts at").
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
