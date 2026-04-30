@@ -183,12 +183,58 @@ when you touch.
 
 ## Current state (READ BEFORE LAUNCHING)
 
-`./run.sh serve` will reach `Application startup complete` and the
-load is fast (~4 min). **The first `/v1/completions` call fails with
-`CompileTimeHbmOom`** during XLA's late codegen pass on real
-V4-Flash. This is the **first symptom** of the bigger problem: the
-end-to-end first-curl latency. Fixing the OOM is step one toward a
-working serve; reducing the cold-compile time is the broader goal.
+`./run.sh serve` reaches `Application startup complete` (load ~4 min).
+The first `/v1/completions` call still fails with
+`CompileTimeHbmOom`, but **the OOM has moved deeper** in the XLA
+pipeline — it's no longer the original "stack-then-all-gather"
+symptom. As of 2026-04-30 the lane-1 fix
+(`with_sharding_constraint(P('attn_dp', None, None))` on the stacked
+W1/W2/W3 in `deepseek_v4_moe.py::moe_forward`) is in tree and verified
+in two ways:
+
+  1. CPU compile-only validation (`/tmp/test_moe_compile.py`,
+     32 virtual CPU devices, real V4-Flash shapes): **0 all-gathers**
+     on the stacked W tensors, compiles in <1 sec.
+  2. Real TPU smoke (2026-04-30 run): **`HLO_PASSES` finished after
+     20m9s with no OOM** (vs the previous fail-during-HLO_PASSES).
+     The compile then progressed to `BACKEND_PASSES`, where it OOM'd
+     after another 14 min:
+
+     ```
+     CompileTimeHbmOom: Used 52.75G of 31.25G hbm.
+     Exceeded hbm capacity by 21.51G.
+     ```
+
+     XLA's own pre-OOM accounting (`hlo_passes.cc:5703`):
+     ```
+     post optimization rematerialization limit 11.64G =
+       95% hbm (29.68G) - (arguments (28.13G) - aliased_output (11.09G))
+                       - overlays (1.00G)
+     ```
+     i.e. **per-chip memory plan needs ~52 GB but only 31.25 GB HBM**.
+
+The 28.13 GB of "arguments" is far above the expected ~17 GB of
+sharded weights (543 GB / 32 chips). That extra ~11 GB is the
+remaining mystery — likely some combination of (a) weights that are
+fully replicated rather than sharded (audit `pick_partition_spec` +
+loader output for `spec=P()` placements on big tensors), (b) the
+KV cache layout doubling something, (c) MLA latent buffers that
+allocate per-chip even with `enable_dp_attention=true`. The
+`max-model-len=256, max-num-seqs=1` knobs in the launcher are
+already minimal — KV cache itself is in the MB range, so it's not
+the cap.
+
+### Lane-1 follow-on already in tree (not yet TPU-validated)
+
+`deepseek_v4_moe.py::moe_forward` now also carries a `_shard_e_mid`
+helper (`P(None, 'attn_dp', None)`) applied to the four E-axis
+intermediates `gate_NEi / up_NEi / h_NEi / out_NEd`. Without those
+constraints XLA could decide to all-gather the einsum output back to
+fully-replicated `[N, E, K]` per chip (~256 MiB for [128, 256, 2048]
+bf16) and squeeze the activation budget further. CPU compile-only
+test still shows 0 all-gathers + identical HLO size — the constraints
+are being honored on CPU. Whether they help the BACKEND_PASSES OOM
+on TPU is **unverified**; the next iteration's smoke is the test.
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
@@ -267,56 +313,82 @@ without a result:
 Better to have a checkpointed WIP commit than to lose the diff
 when the timeout SIGTERMs the iter.
 
-What happened: the vectorized MoE (`deepseek_v4_moe.py::moe_forward`)
-collapses 256 per-expert matmuls into 3 stacked einsums per layer,
-which dropped `jit_run_model` HLO from 477k → 103k instructions
-(4.6×). Compile time fell with it. **But** the stack op
-`jnp.stack([e.w1 for e in params.experts])` produces an
-`[E, inter, dim] = [256, 2048, 4096]` tensor whose new "expert"
-dim has no mesh axis to shard on (mesh is `attn_dp=32, others=1`),
-so XLA all-gathers the full unsharded stack on every chip:
+### Next attack lanes (in rough ROI order)
 
-```
-1. Size: 4.00G
-   Operator: op_name="jit(run_model)/nd,eid->nei/dot_general"
-   Shape: bf16[256, 2048, 4096]
-   XLA label: all-gather.9090 ...
-   Allocation type: HLO temp
-```
+The original "stack-then-all-gather" symptom is fixed. The remaining
+problem is the per-chip memory budget itself. In ROI order:
 
-× 3 stacks (W1/W2/W3) = 12 GiB of HLO temp on top of the model
-weights (~18 GiB / chip post-load) → blows the 31.25 GiB chip HBM
-budget by ~3.5 GiB.
+1. **Audit the 28 GB of "arguments" per chip.** Expected ~17 GB
+   (sharded weights). The extra ~11 GB is the bulk of the OOM gap.
+   - Add a one-shot dump after `load_weights_from_dir done` that
+     iterates the assembled param tree, computes per-leaf
+     `numel * dtype_bytes / num_local_devices` (i.e. per-chip
+     resident bytes), and prints the top 20 leaves by size. Look for
+     anything large with `spec=P()` (fully replicated) or with a
+     sharding axis other than `attn_dp` (mesh has size 1 on
+     non-`attn_dp` axes, so non-`attn_dp` shardings are also
+     effectively replicated).
+   - Particular suspects: `gate.weight` (`[E, dim] = [256, 4096]
+     fp32 = 4 MB` — small, fine), `tid2eid` (`[vocab, top_k] =
+     [129280, 6] int32 = 3 MB` — small, fine), but the per-layer
+     `hc_attn_fn` / `hc_ffn_fn` matrices are `[mix_hc, hc_dim] =
+     [(2 + hc_mult) * hc_mult, hc_mult * hidden_size]` — if
+     `hc_mult` is large these can be 100+ MB each, ×30 layers ×
+     2 = several GB if replicated.
+   - Embedding `[vocab, dim] = [129280, 4096] bf16 = 1 GB` and head
+     of the same size — if either is replicated that's 2 GB.
 
-The original Python-unrolled per-expert loop didn't trip this
-because each expert's weights stayed independently sharded — no
-stack, no all-gather. Slow to compile (30+ min, 477k HLO
-instructions) but the memory plan fit.
+2. **Verify the lane-1 follow-on (`_shard_e_mid` on einsum
+   intermediates) actually helps on TPU.** Already in tree, CPU
+   compile-only is green, but the TPU smoke that observed the
+   BACKEND_PASSES OOM was *before* this commit — the next smoke
+   tests it. If it shrinks the activation budget far enough to fit,
+   we're done; if not, fall through to lane 1.
 
-### Attack lanes (in rough ROI order)
+3. **Fix `Involuntary full rematerialization` warnings.** These
+   spam the compile log and indicate XLA can't satisfy a sharding
+   spec without a full replicate-then-repartition. Each one
+   wastes some of the 11.64 GB activation budget.
+   Pattern from the run:
+   `cannot go from sharding {devices=[1,32]<=[32]} to {devices=[16,1,2]<=[2,16]T(1,0)}`
+   for `f32[128,16]` tensors at param indices stepping by 1592
+   (likely the per-layer attention top_k partials, given
+   `num_experts_per_tok=6` doesn't match 16 — investigate). Add
+   `with_sharding_constraint` upstream so XLA doesn't have to
+   reshard.
 
-1. **Add `with_sharding_constraint` to the stacked weights** so
-   XLA shards the inter dim across `attn_dp` instead of all-gathering
-   the new expert dim. One line per stack, e.g.:
-   `W1 = jax.lax.with_sharding_constraint(W1, NamedSharding(mesh, P(None, 'attn_dp', None)))`.
-   Lowest-risk fix; preserves the 4.6× HLO win + the existing math.
-2. **Pre-stack the experts at load time** in
-   `deepseek_v4_loader.py` so the param tree carries `[E, inter, dim]`
-   tensors instead of `list[ExpertParams]`. Place them with an
-   explicit `(expert, attn_dp, None)` PartitionSpec. Bigger
-   change (touches the loader + the `MoEParams` dataclass) but
-   cleanest.
-3. **Process experts in chunks** (e.g. 8 at a time via
-   `jax.lax.scan` over an `[E/chunk, chunk, inter, dim]` reshape).
-   Bounds peak HBM but is more complex than (1).
-4. **Revert the vectorize.** Falls back to the working-but-slow
-   30+ min cold compile path. Trade HBM safety for compile time.
-   Use only as a last resort if (1)–(3) all fail.
+4. **Pre-stack the experts at load time** in `deepseek_v4_loader.py`.
+   The current code stacks 256 separate per-leaf jax.Arrays inside
+   the JIT every forward call, which forces an all-to-all to honor
+   the `_shard_e_first` constraint. Doing the stack at load time —
+   so the param tree carries an `[E, inter, dim]` tensor with
+   PartitionSpec `(attn_dp, None, None)` from the start — eliminates
+   the per-call all-to-all *and* the per-call stack op. Bigger
+   change (touches `MoEParams` dataclass + the loader's per-leaf
+   placement loop) but eliminates a structural inefficiency.
 
-After any change, validate with the loop:
+5. **Verify cross-host JAX cache sharing.** Each of 8 hosts
+   compiles its own SPMD slice; `/tmp/jax-compile-cache-v4` is
+   per-host. After one successful compile, fingerprint the cache
+   files across hosts — if byte-equal, a tiny
+   `scripts/full_slice_v4_share_cache.sh` rsyncs host 0's cache
+   to workers and brand-new-slice first-launch is 8× faster.
+   Uncertain whether SPMD bakes in per-device IDs; verify before
+   shipping.
+
+6. **AOT precompile + binary persist.** `jit().lower().compile()`
+   serialized + loaded on subsequent launches. Real XLA-versioning
+   risk; defer until after lanes 1–5 are exhausted.
+
+Validation after any change:
 ```bash
-./run.sh serve
-./scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
+JAX_PLATFORMS=cpu work/vllm_env/bin/python3 -m pytest \
+    work/tpu-inference/tests/models/jax/test_deepseek_v4.py::TestMoEComponent -x -q
+work/vllm_env/bin/python3 /tmp/test_moe_compile.py     # if MoE-related
+scripts/full_slice_v4_reset.sh
+scripts/full_slice_v4_sync.sh
+scripts/full_slice_v4_smoke.sh
+scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
 ```
 
 ## What's been optimized + verified (load path only)
@@ -332,8 +404,19 @@ After any change, validate with the loop:
   ~25 min). ✓
 * **Vectorized MoE forward**: math byte-equivalent to the per-expert
   reference loop (maxabs=0 across 5 seeds on synthetic fixture);
-  HLO instruction count drops 4.6× (477k → 103k). ✓ correctness,
-  ✗ deploy (HBM OOM, see "Current state" above).
+  HLO instruction count drops 4.6× (477k → 103k). ✓ correctness.
+* **MoE stacked-weight sharding constraint**
+  (`_shard_e_first` / `_shard_e_last`): forces W1/W2/W3 to be
+  E-sharded across `attn_dp`, eliminating the original 4 GiB
+  all-gather per stack. ✓ HLO_PASSES no longer OOMs (smoke 2026-04-30
+  passed HLO_PASSES in 20m9s); ✗ BACKEND_PASSES still OOMs at
+  52.75 GB / 31.25 GB on real V4-Flash (separate root cause — see
+  Current state above).
+* **MoE einsum-intermediate sharding constraint** (`_shard_e_mid`):
+  added 2026-04-30; CPU compile-only verified, **not yet TPU
+  validated**. Targets a class of XLA decisions that could
+  re-replicate the [N, E, K] tensors after the stacked W tensors
+  are honored.
 * **Persistent JAX compile cache**: wired; not yet populated because
   no successful compile has completed end-to-end on real V4-Flash. ⚠
 

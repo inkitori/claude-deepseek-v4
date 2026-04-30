@@ -26,6 +26,35 @@ from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
+
+
+def _shard_e_first(x: jnp.ndarray) -> jnp.ndarray:
+    """Constrain a stacked-experts tensor `[E, ...]` to be sharded on E
+    across the `attn_dp` mesh axis. No-op outside a mesh context (CPU
+    unit tests run without `jax.set_mesh`)."""
+    if jax.sharding.get_abstract_mesh().empty:
+        return x
+    return jax.lax.with_sharding_constraint(x, P('attn_dp', None, None))
+
+
+def _shard_e_last(x: jnp.ndarray) -> jnp.ndarray:
+    """Constrain a `[N, E]` per-(token, expert) tensor to be E-sharded so
+    it broadcasts cleanly against E-sharded `h_NEi`."""
+    if jax.sharding.get_abstract_mesh().empty:
+        return x
+    return jax.lax.with_sharding_constraint(x, P(None, 'attn_dp'))
+
+
+def _shard_e_mid(x: jnp.ndarray) -> jnp.ndarray:
+    """Constrain a `[N, E, K]` per-(token, expert, feat) tensor to be
+    E-sharded on the middle axis. Without this XLA may decide to all-gather
+    the einsum output back to fully-replicated `[N, E, K]` per chip
+    (~256 MiB for [128, 256, 2048] bf16) and blow per-chip activation HBM
+    in BACKEND_PASSES, even though the W tensor is E-sharded."""
+    if jax.sharding.get_abstract_mesh().empty:
+        return x
+    return jax.lax.with_sharding_constraint(x, P(None, 'attn_dp', None))
 
 
 # --------------------- gate ---------------------
@@ -151,14 +180,24 @@ def moe_forward(
     fp32 = jnp.float32
     dtype = x.dtype
 
-    # Stack the 256 ExpertParams entries into [E, ...] tensors. Inside the
-    # JIT this is a single HLO concatenate; with mesh=(attn_dp=32, others=1)
-    # each chip already holds its own slice of every expert weight (sharded
-    # on the dim axis), so the concat is a local copy, not a cross-host
-    # all-gather.
-    W1 = jnp.stack([e.w1 for e in params.experts])  # [E, inter, dim]
-    W2 = jnp.stack([e.w2 for e in params.experts])  # [E, dim, inter]
-    W3 = jnp.stack([e.w3 for e in params.experts])  # [E, inter, dim]
+    # Stack the 256 ExpertParams entries into [E, ...] tensors. The new
+    # leading "expert" dim has no natural sharding from the per-leaf source
+    # (each w_e is sharded on `dim`), so without a constraint XLA satisfies
+    # the einsum by all-gathering each stacked operand to its full
+    # bf16[256, 2048, 4096] = 4 GiB shape on every chip — that's 12 GiB of
+    # HLO temp (W1+W2+W3) on top of the ~17 GiB resident weights, which
+    # OOMs the 31.25 GiB chip HBM budget at compile time on v6e-32.
+    #
+    # Constrain to E-sharded: each chip ends up holding 8 of the 256 experts
+    # (256 / attn_dp=32 = 8). All downstream tensors that carry the E axis
+    # then stay E-sharded, and the only cross-chip comm is a single
+    # all-reduce over `attn_dp` on the final `[N, dim]` accumulator (E is
+    # the contracting axis when we sum over experts). The reshard at each
+    # stack is an all-to-all from "dim-sharded across stacked leaves" to
+    # "E-sharded", with the same per-chip footprint (~128 MiB bf16).
+    W1 = _shard_e_first(jnp.stack([e.w1 for e in params.experts]))  # [E,i,d]
+    W2 = _shard_e_first(jnp.stack([e.w2 for e in params.experts]))  # [E,d,i]
+    W3 = _shard_e_first(jnp.stack([e.w3 for e in params.experts]))  # [E,i,d]
     swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
 
     # Per-(token, expert) routing weight: nonzero only for the top_k experts
@@ -169,13 +208,14 @@ def moe_forward(
     one_hot = jax.nn.one_hot(indices, E, dtype=fp32)        # [N, top_k, E]
     per_expert_weight = jnp.einsum('nke,nk->ne', one_hot, weights)  # [N, E]
     per_expert_weight = per_expert_weight.astype(dtype).astype(fp32)
+    per_expert_weight = _shard_e_last(per_expert_weight)    # E-sharded
 
     # Gate / up projections in fp32 (matches expert_forward's fp32 path).
     x_fp32 = flat_x.astype(fp32)
     W1_fp32 = W1.astype(fp32)
     W3_fp32 = W3.astype(fp32)
-    gate_NEi = jnp.einsum('nd,eid->nei', x_fp32, W1_fp32)   # [N, E, inter]
-    up_NEi = jnp.einsum('nd,eid->nei', x_fp32, W3_fp32)     # [N, E, inter]
+    gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))  # [N,E,i]
+    up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))    # [N,E,i]
     if swiglu_limit > 0:
         up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
         gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
@@ -183,15 +223,15 @@ def moe_forward(
 
     # Apply per-(token, expert) routing weight (mid-apply, matches
     # expert_forward's `h = h * weights` between SwiGLU and w2).
-    h_NEi = h_NEi * per_expert_weight[..., None]            # [N, E, inter]
+    h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])  # [N,E,i] E-sharded
 
     # Down projection in the activation dtype (bf16), matching
     # `(h.astype(dtype) @ w2.astype(dtype).T)`.
-    out_NEd = jnp.einsum(
+    out_NEd = _shard_e_mid(jnp.einsum(
         'nei,edi->ned',
         h_NEi.astype(dtype),
         W2.astype(dtype),
-    )                                                        # [N, E, dim]
+    ))                                                       # [N, E, dim] E-sharded
 
     # Sum routed experts in fp32 to match the original loop's
     # `y` accumulator dtype, then add the always-on shared expert.
