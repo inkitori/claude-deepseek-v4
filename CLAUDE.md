@@ -212,7 +212,7 @@ launcher echoes the active values at startup so you can confirm.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s skips small inits (`jit_sample`, etc.). |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
-| `V4_DECODE_STATE` | `0` | S1 iter-5d/5e gate. `1` flips the model's `__call__` from the green-gate baseline (`transformer_body_forward`, every step recomputes prefill on the full prompt+generated context) to the iter-5e orchestrator (`deepseek_v4_run_with_decode_state` with the runner-tagged `decode_start_pos` driving `is_decode`). Default `0` preserves the green gate. iter-5e fixed the T-padding decode-detection bug (the runner pads decode to bucket sizes, so the previous `(T==1) and (start_pos>0)` check never triggered — empty-text completions resulted), and the decode kernel chain now executes on real V4 weights for the first time (verified 2026-04-30 16:28Z). FIRST `/v1/completions` curl returns 200 OK; SECOND request still triggers a TPU `[USER]` FATAL on the cached prefill kernel — iter-5d hypotheses 1 (kv_caches donation reuse) / 3 (XLA buffer aliasing) remain candidates for iter-5f. When `1`, every JIT trace-time entry to `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)` so the smoke log correlates compile fingerprints to argument shapes. Forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. |
+| `V4_DECODE_STATE` | `0` | S1 gate. `1` flips `__call__` from the green-gate baseline (`transformer_body_forward`) to the iter-5h orchestrator (`deepseek_v4_run_with_decode_state` — path-A-h decoupling + iter-5e decode-detection fix + iter-5g sharding constraint + iter-5h `optimization_barrier(h)`, threading packed `AttentionDecodeState` through `kv_caches`). Default `0` preserves the green gate. **iter-5h FIXED Bug A** — both R1 and R2 now start with ` Paris` on real V4-Flash (was ` the same as the number...` in iter-5g). **Bug B partial** — R1 and R2 share the first ~3 tokens then diverge (R1: ` Paris, 2008-07-`, R2: ` Paris, 2015. 201` on iter-5h's smoke). Engine is stable across requests; no FATAL. iter-5e fixed the T-padding decode-detection bug; iter-5g's sharding constraint dodges the iter-5e R2 TPU `[USER]` FATAL; iter-5h's barrier prevents XLA from CSE/fusing forward and state-init in a way that flipped argmax. When `1`, every fresh JIT trace into `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)` so the smoke log correlates compile fingerprints to argument shapes. Forwarded to Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. |
 | `CHAT_REQUIRED` | `0` | Default makes the smoke_check's `/v1/chat/completions` probe informational (HTTP-success best-effort). Set to `1` to make a missing/empty chat response fail the gate (exit 4). The chat path lands in a 1024-token prefill bucket vs 256 for completions and on a tight HBM budget the engine sometimes needs `TpuLoadedExecutable::ExecutePrepareWithOomRetries` to land — usually succeeds but adds ~30s to first-chat latency. |
 | `REASONING_REQUIRED` | `0` | Set to `1` to fire a thinking-mode chat (`chat_template_kwargs={"thinking":true}`) with a reasoning-eliciting prompt and assert `message.reasoning` is non-empty (exit 5 on empty). Pins backlog item S3's runtime. Adds ~30s on first-chat-cold-cache (lands in chat path; same OOM-retry caveat as `CHAT_REQUIRED`). |
 | `STREAMING_REQUIRED` | `0` | Set to `1` to additionally fire `/v1/completions` with `stream=true`, reassemble the SSE chunks, and assert byte-equality vs the non-streaming output (exit 6 on mismatch / no chunks). Pins backlog item S7. Cheap — same prefill bucket as the existing completions probe. |
@@ -1273,24 +1273,73 @@ Real V4-Flash smoke (V4_DECODE_STATE=1, no DIAG):
   re-execute, but doesn't undo whatever buffer aliasing XLA
   performs that lets prior contents leak into the compute.
 
-**Iter 5h lane:**
+**Iter 5h status (2026-04-30, log full-slice-v4-smoke-20260430T185552Z.log):
+Bug A FIXED; Bug B persists in attenuated form (R1, R2 share
+the first 3 tokens, then diverge).**
 
-  1. **Pin Bug A via a smaller-scope test.** Run R1 alone
-     (smoke_check modified to fire only the first request)
-     and confirm the wrong-text output is reproducible. If
-     R1's text is stable across multiple runs, Bug A is real
-     and INDEPENDENT of Bug B. If R1's text varies even alone,
-     Bug A and Bug B are tangled (the same kv_caches-bleed
-     mechanism is corrupting R1 too via an earlier code path
-     that reads/donates the freshly-allocated buffer).
+iter-5h's fix: a single `lax.optimization_barrier(h)` after
+`transformer_body_forward` and before
+`transformer_body_init_state_to_buffer` in
+`deepseek_v4_run_with_decode_state`'s prefill branch
+(`models/jax/deepseek_v4.py`, ~14 lines added). iter-5c had
+"decoupled" `h` from `packed_buffers` to avoid iter-5b's NaN
+regression but both still traced into the SAME jit'd
+`__call__`. XLA's CSE/fusion between the two parallel
+43-layer forwards (both operate on identical
+`input_ids`+`params`+freqs) changed bf16 reduction order in
+`transformer_body_forward`'s `h` output enough to flip
+argmax. Tiny-config tests pinned `h` byte-equal to path-A
+within 0.000002, but on 43-layer real V4-Flash bf16 the
+accumulated drift was sufficient to corrupt the first decode
+token. The barrier prevents XLA from fusing or CSE-ing
+across it, forcing forward to fully evaluate with the same
+numerics it picks when forward is the only compute (the
+green-gate baseline).
 
-  2. **For Bug A, instrument the compiled prefill's
-     intermediate HBM** OR compare R1's logits to a fresh
-     `transformer_body_forward(prompt+next_token)` reference
-     run via direct JAX call (no vLLM). If logits at the last
-     prompt position don't match within ≤5% across all 256k
-     vocab entries, the closed-form state init is wrong.
-     Otherwise the decode step is wrong.
+Real V4-Flash smoke:
+  R1: ` Paris, 2008-07-`   (was ` the same as the number...`)
+  R2: ` Paris, 2015. 201`  (was ` the 1st of January 1`)
+
+Both finish_reason=length at max_tokens=8, both HTTP 200, no
+FATAL. R2 hits the cached prefill artifact (same fingerprint
+as R1) and re-executes safely under iter-5g's sharding
+constraint. smoke_check still exits 6 because the byte-
+equality assertion requires R1 == R2 end-to-end. The
+divergence at the 4th decode token (` 2008` vs ` 2015`)
+shows iter-5g's Bug B (kv_caches input contents leak into
+compute) is attenuated but not eliminated by barrier+constraint.
+
+The `jit_run_model` prefill artifact dropped from iter-5g's
+86,100 instructions to 81,648 — the barrier doesn't add HLO
+surface, it just prevents some optimization passes from
+fusing across it (so XLA produces a smaller, more focused
+compiled artifact). Cold compile time: ~58s
+(19:01:48Z → 19:02:46Z).
+
+Tests pinning iter-5h: `TestPackedDecodeStateBuffer` (7),
+`TestPrefillToDecodeStateParity` (26), and
+`TestTransformerBodyDecodeRoundTrip` (4) all pass on tiny
+config CPU pytest; `/tmp/test_v4_iter5c_compile.py` under
+32-virtual-CPU mesh confirms prefill `h` diff vs path-A =
+0.000002 (≪ 5e-3 budget).
+
+**Iter 5i lane (Bug B remediation, ordered by leverage):**
+
+  1. **Add a second `lax.optimization_barrier` on
+     `packed_buffers`** after `_v4_constrain_packed_replicated`,
+     before return. Cheap to try. Hypothesis: forces
+     packed_buffers to fully materialize before the JIT
+     boundary's donated-buffer commit, preventing partial
+     overwrite of the donated buffer that lets prior bytes
+     leak through. Costs nothing if XLA already evaluates
+     them in full.
+
+  2. **Audit `_layer_packed_size` vs `_pack_layer_state`'s
+     actual output size on real V4-Flash layer 0.** A size
+     mismatch (placeholder field whose actual shape doesn't
+     match the layout's predicted shape) would explain why
+     the donated buffer has bytes that packed_buffers never
+     writes.
 
   3. **For Bug B, take iter-5g lane option 4** (separate
      prefill JIT that doesn't take kv_caches as input). With
@@ -1305,19 +1354,18 @@ Real V4-Flash smoke (V4_DECODE_STATE=1, no DIAG):
      accepts donated kv_caches as before.
 
   4. **Diagnostic option.** Run another smoke with
-     `V4_DECODE_STATE_DIAG=1` (already env-gated from iter-5f).
-     If iter-5g's sharding constraint changes R1's output sum,
-     the constraint had a real effect. If R2's output sum
-     STILL differs from R1's despite no FATAL, Bug B is
-     orthogonal to Bug A (kv_caches contents really do affect
-     compute). The fingerprints and chain are critical input
-     for iter-5h.
+     `V4_DECODE_STATE_DIAG=1` to capture R1 and R2 prefill
+     entry/exit sums under iter-5h's barrier+constraint. With
+     Bug A fixed and the FATAL gone, the prints can land
+     cleanly without contamination. If R2's `packed_buffers[0]`
+     sum still differs from R1's despite barrier+constraint,
+     the buffer-bleed channel is in the JIT-boundary write,
+     not in the orchestrator's compute (favoring fix 3).
 
-iter-5g's progress: the engine is now stable. We can iterate on
-correctness without re-incurring the cluster-restart cost on
-every R2 attempt. Bug B is the root cause of both the FATAL
-(now-dodged) AND the non-determinism (still alive); fixing
-that should also help Bug A IF Bug A is downstream of Bug B.
+iter-5h's progress: Bug A is dead. The decode-state path now
+produces the right first token on real V4-Flash, the engine
+is stable, and the 4th-token divergence is a smaller surface
+for iter-5i to attack than iter-5g's full divergence.
 
 S1 still unlocks A1 (lift `max-model-len`), B1 (sparse_attn
 Pallas becomes worthwhile), and S5 (MTP speculative decoding
@@ -2149,6 +2197,41 @@ when the timeout SIGTERMs the iter.
       for the iter-5h hand-off + recommended next moves.
   ✓ FATAL dodged + engine stable across requests; ✗ output
   correctness + determinism (iter-5h's lane).
+* **iter-5h `lax.optimization_barrier(h)` fix for Bug A
+  (2026-04-30, S1 iter-5h)**: 14 lines added to
+  `deepseek_v4_run_with_decode_state`'s prefill branch in
+  `models/jax/deepseek_v4.py` — `h = lax.optimization_barrier(h)`
+  between `transformer_body_forward` and
+  `transformer_body_init_state_to_buffer`. The barrier prevents
+  XLA from CSE/fusing the two parallel 43-layer forwards' compile
+  schedules; forward picks the standalone fusion plan it would
+  use under green-gate. iter-5c had decoupled `h` (path A) from
+  `packed_buffers` (path B) but both still traced into the SAME
+  jit'd `__call__`, and tiny-config's 0.000002 byte-difference
+  evidently was enough to let real V4-Flash's 43-layer bf16
+  reduction-order drift flip argmax. Real V4-Flash smoke
+  (logs/full-slice-v4-smoke-20260430T185552Z.log,
+  V4_DECODE_STATE=1, no DIAG):
+    * R1: ` Paris, 2008-07-` (was ` the same as the number of
+      the number` in iter-5g — Bug A fixed).
+    * R2: ` Paris, 2015. 201` (was ` the 1st of January 1` —
+      both R1 and R2 first 3 tokens now match; divergence at the
+      4th token shows Bug B remains in attenuated form).
+    * Both HTTP 200, no FATAL, R2 hit cached prefill artifact
+      (same fingerprint).
+    * `jit_run_model` prefill artifact: 81,648 instructions
+      (vs iter-5g's 86,100 — barrier doesn't add HLO surface, it
+      just lets some passes re-fire on the simpler isolated
+      subgraph).
+    * Cold compile on this artifact: ~58 s
+      (19:01:48Z → 19:02:46Z).
+  Tiny-config tests pinning iter-5h: `TestPackedDecodeStateBuffer`
+  (7 cases, 124s wall), `TestPrefillToDecodeStateParity` +
+  `TestTransformerBodyDecodeRoundTrip` (30 cases, 113s wall) —
+  all pass unchanged from iter-5g. `/tmp/test_v4_iter5c_compile.py`
+  under 32-virtual-CPU mesh: prefill `h` diff vs path-A =
+  0.000002 (≪ 5e-3). ✓ Bug A FIXED + engine stable; ✗ Bug B
+  partial (iter-5i's lane — see S1 backlog).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream

@@ -947,6 +947,20 @@ def deepseek_v4_run_with_decode_state(
         )
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
+    # iter-5h: barrier `h` so XLA cannot CSE/fuse `transformer_body_forward`'s
+    # per-layer attention/MoE compute with `transformer_body_init_state_to_buffer`'s
+    # internal forward (which has the same input_ids+params and produces
+    # identical intermediate y/x but with extra side-outputs into kv/score
+    # state buffers). Without the barrier, iter-5g's real-V4 smoke produced
+    # ` the same as the number...` for R1 instead of ` Paris` despite tiny-
+    # config tests saying h is byte-equal to path-A. Hypothesis: XLA's
+    # scheduler picks a different fusion plan when `attention_prefill`'s
+    # output has additional consumers via `attention_init_state_from_prefill`,
+    # changing bf16 reduction order enough on real V4-Flash 43-layer accum
+    # to flip argmax. The barrier forces forward to fully evaluate before
+    # state-init starts — same numerics XLA picks when forward is the only
+    # compute (the green-gate baseline).
+    h = lax.optimization_barrier(h)
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
