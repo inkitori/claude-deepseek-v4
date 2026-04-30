@@ -1,53 +1,69 @@
 # Decisions log — DeepSeek V4 implementation
 
-## D1 — Reference oracle is the official DeepSeek inference/model.py, not HuggingFace transformers
-**When:** 2026-04-28 09:00 UTC.
-**Decision:** Use `/mnt/scratch/v4_pro/inference/model.py` as the ground truth for V4 architectural math. The HuggingFace `transformers` 5.6.2 release does NOT yet include `deepseek_v4` model_type — `AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V4-Pro')` raises `KeyError: 'deepseek_v4'`. The DeepSeek HF repo also does NOT ship a `modeling_deepseek_v4.py` file with `auto_map` (verified via `HfApi.list_repo_files`). DeepSeek instead ships its own reference implementation under `inference/`.
-**Why:** The user's prompt says "HF transformers is ground truth" but transformers literally cannot construct the V4 model. The DeepSeek-authored `inference/model.py` is the next best ground truth and is what `convert.py` expects to load real weights into.
-**Implications:** I will create a CPU-runnable copy of `inference/model.py` with custom kernels (sparse_attn, hc_split_sinkhorn, act_quant, fp4_act_quant, rotate_activation) replaced by pure-PyTorch equivalents. Math equivalence to those replacements is sufficient — the kernels are performance-only optimisations of operations that have well-defined math.
+Durable architectural decisions that shape the V4 implementation.
+Per-session decisions (which Tier to attack next, which test to add)
+are recorded in commit messages and live in `git log`.
 
-## D2 — All numerical work in BF16 / FP32 only; FP8 / FP4 quantization is a no-op
-**When:** 2026-04-28 09:05 UTC.
-**Decision:** When loading random weights for tiny-config tests, allocate every weight as either `bfloat16` or `float32` (matching the dtype the V4 reference uses for that param), and stub out `act_quant(..., inplace=True)` and `fp4_act_quant(..., inplace=True)` as no-ops. The V4 inference/model.py does FP8/FP4 quant as Quantization-Aware Training (QAT) noise injection; with no weights actually in those formats, the natural reference is no-op.
-**Why:** (a) FP4/FP8 kernels require `tilelang` + CUDA, neither of which we have. (b) The user's mission is mathematical correctness, not perf. (c) The `inplace=True` quant+dequant is round-trip noise; making it a no-op makes the reference deterministic.
-**Risk:** Real V4 weights are stored as FP8/FP4. The weight loader (Phase 5) will need to dequantize them to BF16 on load. Documented as a Phase-5 task.
+## D1 — Reference oracle is DeepSeek's `inference/model.py`, not HuggingFace transformers
 
-## D3 — `rotate_activation` (Hadamard) is a no-op in both reference and JAX
-**When:** 2026-04-28 09:08 UTC.
-**Decision:** Stub `rotate_activation(x) -> x` (pass-through) in both ref and JAX. The Hadamard rotation in V4 is used inside the indexer to spread information across dims before FP8 simulation, so its only effect on math is changing the score values (not their ranking, since Hadamard is orthogonal). Inner-product rankings are preserved up to a positive scalar (1/d), so topk indices are unchanged.
-**Why:** `fast_hadamard_transform` is a CUDA package and is irrelevant to math correctness for top-k selection.
-**Implications:** Both ref and JAX must apply the same stub; otherwise raw scores will differ. Tested in TOLERANCE_LOG.md for indexer scores.
+**Decision:** Use DeepSeek's official `inference/model.py` (under the
+HF repo's `inference/` dir) as the architectural ground truth for V4
+math.
 
-## D4 — TPU unavailable; use CPU with simulated mesh for all tests
-**When:** 2026-04-28 09:10 UTC.
-**Decision:** Run every test on CPU. Use `XLA_FLAGS=--xla_force_host_platform_device_count=N` plus `JAX_PLATFORMS=cpu` for both v4-8 (N=8) and v6e-32 (N=32) "mesh simulations".
-**Why:** JAX cannot acquire a TPU on this host (`FAILED_PRECONDITION: Couldn't mmap`). The user explicitly designed Tier 3 to be runnable on CPU-simulated meshes, so this is in-scope for what was requested.
-**Risk:** PROD_TOPOLOGY_RISKS.md lists everything that this CPU-only execution cannot validate (real HBM limits, real Pallas kernel availability, real XLA-on-TPU compilation, dtype-specific lowering quirks).
+**Why:** HuggingFace `transformers` (5.6.x at the time of writing)
+does not include a `deepseek_v4` model_type — `AutoConfig` raises
+`KeyError`. The DeepSeek HF repo also does not ship a
+`modeling_deepseek_v4.py` with `auto_map`. DeepSeek instead ships
+its own reference implementation. That reference is what
+`convert.py` expects to load real weights into.
 
-## D5 — JAX implementation skips the V3 `JaxMoE` backend selection and ragged_paged_attention
-**When:** 2026-04-28 09:12 UTC.
-**Decision:** The V3 deepseek_v3.py uses `JaxMoE` with backend selection between sparse / dense / EP backends, plus a `ragged_paged_attention` kernel for MLA. For V4 I will write a simpler dense-MoE forward path inline in the V4 model file. Real production code paths (paged attention, MoE backends) can be wired in later — they don't affect correctness of the math.
-**Why:** The mission goal is mathematical correctness, and ragged_paged_attention plus the EP backends are TPU-kernel infrastructure that adds risk without buying correctness.
-**Implications:** The V4 model file will not call `ragged_paged_attention`. It computes attention in a simple, dense, fully-materialized way against the full KV. Phase 7 (hardening) may swap in a more efficient kernel if time allows.
+**Implications:** A CPU-runnable copy of `inference/model.py` lives
+under `tests/models/jax/_deepseek_v4_reference/`, with custom CUDA
+kernels (`sparse_attn`, `hc_split_sinkhorn`, `act_quant`,
+`fp4_act_quant`, `rotate_activation`) replaced by pure-PyTorch
+equivalents. Math equivalence to those replacements is sufficient —
+they're performance-only optimisations of well-defined operations.
 
-## D6 — Tiny config matches V4-Flash structure (alternating CSA/HCA layers)
-**When:** 2026-04-28 09:15 UTC. See TINY_CONFIG.md for full derivation.
-**Decision:** Tiny config has 6 hidden layers with `compress_ratios = [0, 0, 4, 128, 4, 0]` so we exercise (a) pure sliding-window attention, (b) CSA with indexer, (c) HCA without indexer, (d) the trailing pure-SWA layer that V4-Pro and V4-Flash both have at the very end.
-**Why:** Each compress_ratio category triggers a different code path inside `Attention.forward`. Missing one would leave a code path untested.
+## D2 — JAX implementation does not use V3's MoE backend selection or `ragged_paged_attention`
 
-## D8 — V4-Pro compile-only test uses a truncated config (64 experts instead of 384)
-**When:** 2026-04-28 09:35 UTC.
-**Decision:** `test_compile_first_two_layers_only[V4-Pro]` truncates `n_routed_experts` from 384 to 64 and `vocab_size` from 129280 to 4096, in addition to the existing 2-layer truncation. The V4-Flash version of the same test runs at full config (no expert truncation needed; it has 256 experts).
-**Why:** Materializing the full V4-Pro 2-layer param tree as `jnp.zeros` requires ~7 TB of fp32 (or ~3.5 TB at bf16) on a CPU host. The host has ~150 GB RAM. With 64 experts, the per-test footprint drops to ~1 GB.
-**Implications:** This test verifies that V4-Pro-specific shape ratios (`q_lora_rank=1536`, `o_groups=16`, larger `hidden_size=7168`, `moe_intermediate_size=3072`) lower correctly. Bugs that depend on exactly 384 experts (vs any other count) would NOT be caught by this test, but `test_eval_shape_succeeds` runs on the FULL config and would detect those.
+**Decision:** V4 has its own MoE forward and its own `sparse_attn`
+in `layers/jax/{moe,attention}/deepseek_v4_*.py`. It does NOT route
+through V3's `JaxMoE` backend selector or
+`tpu_inference.kernels.ragged_paged_attention.v3`.
 
-## D7 — MTP layer included in tiny config, tested separately
-**When:** 2026-04-28 09:17 UTC.
-**Decision:** Tiny config has `n_mtp_layers=1` (matching V4-Pro and V4-Flash). The MTP block uses the parent embedding and head, so it is tested by feeding `(h, start_pos, input_ids)` to `model.mtp[0]` and comparing logits.
-**Why:** MTP is a real production code path in V4 and adds new params (e_proj, h_proj, enorm, hnorm, hc_head_fn/scale/base).
+**Why:** V3's `JaxMoE` selects between sparse / dense / EP backends
+designed for V3's grouped-routing pattern, which V4 does not have.
+V3's paged attention assumes a flat KV layout, which V4's
+sliding-window + compressed-pool dual-buffer attention doesn't fit.
+Building separate V4 implementations was lower-risk and lower-LOC
+than generalizing V3's machinery.
 
-## D9 — v8 iter 8 polish target: exhaustive byte-domain reference parity + cross-tensor real-data byte-equal coverage
-**When:** 2026-04-29 ~17:35 UTC (iter 8 resume).
-**Decision:** Picked Tier 4b expansion — option (3) from iter 7's residual follow-up list — over the other two open avenues (T8 architectural unblock, Tier 5 concurrent-vllm hardening). Specifically, two new self-contained byte-domain coverage tests that iterate all 256 e4m3fn / e8m0fnu byte values and assert our `_numpy_decode_*` references match torch's native cast byte-for-byte. Plus widening `TestFp8DequantIndependentReference` and `TestFp4DequantIndependentReference` parametrize lists to cover (a) FP8 attn projections we hadn't touched (`wq_b`, `wo_a`, `wo_b`, with the [out>>in] aspect of wq_b distinct from the iter-7 wq_a/wkv shape), (b) shared-experts FP8 (the dense FFN path; iter 7 only validated routed FP4 experts), and (c) deeper-layer + higher-expert-id real FP4 weights to catch shard-boundary or layer-id assumptions.
-**Why:** (a) T8 is architecturally blocked on HBM topology and resolution requires a user decision — not autonomous-session work. (b) Tier 5 concurrent-via-threads carries vllm-runtime risk that could destabilize the suite. (c) Exhaustive byte coverage is a tautology if torch is correct, but a test that's a tautology *today* turns into an early-warning canary the day torch's e4m3fn cast changes its NaN handling, subnormal rounding, or 0xFC..0xFE encoding — the spec calls "FN" without Inf, but torch has historically wavered. (d) The expanded real-data coverage tightens the link between "the loader handles V4-Flash correctly on layer 0 attn" (iter 7's claim) and "the loader handles V4-Flash correctly across all layers, projection types, and FP8 vs FP4 storage classes" (iter 8's claim). The spec's finish-early guidance is "tighten Tier 4b/5/6/7 with measured evidence, do NOT add features", and this fits exactly.
-**Implications:** No production code changes. New tests live in `tests/models/jax/test_deepseek_v4.py`. Net additions: 2 byte-exhaustive cast tests + 4 new FP8 byte-equal cases (wq_b, wo_a, wo_b, shared_experts.w1) + 2 new FP4 byte-equal cases (deep layers / high expert IDs). Total new green tests: 8.
+**Implications:** When `ragged_paged_attention` adds support for
+top-k + attn_sink + dual-buffer KV, the V4 attention can swap to it
+for a perf win without changing the math.
+
+## D3 — Tiny config matches V4-Flash structure (alternating CSA/HCA layers)
+
+**Decision:** The tiny test config uses 6 hidden layers with
+`compress_ratios = [0, 0, 4, 128, 4, 0]` so we exercise pure
+sliding-window attention, CSA-with-indexer, HCA-without-indexer,
+and the trailing pure-SWA layer that V4-Flash and V4-Pro both
+have at the very end.
+
+**Why:** Each `compress_ratio` value triggers a different code path
+inside `Attention.forward`. Missing one in the tiny config would
+leave a code path untested on the fast loop.
+
+See [TINY_CONFIG.md](TINY_CONFIG.md) for the full derivation.
+
+## D4 — MTP layer is in the tiny config; speculative-decoding integration is NOT wired
+
+**Decision:** Tiny config has `n_mtp_layers=1` (matching V4-Pro and
+V4-Flash). The MTP block is tested by feeding `(h, start_pos,
+input_ids)` to `model.mtp[0]` and comparing logits.
+
+**Why:** MTP is a real production code path in V4 and adds new
+params (`e_proj`, `h_proj`, `enorm`, `hnorm`, `hc_head_fn/scale/base`).
+Forward equivalence is verifiable on the tiny fixture; vLLM's
+speculative-decoding hook integration is downstream work outside the
+math-correctness goal.

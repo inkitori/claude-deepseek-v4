@@ -1,5 +1,5 @@
-# Failures log
+# FAILURES.md (archived)
 
-Failed tests, tracebacks, and hypotheses. Append-only.
-
-(Empty so far.)
+This file existed for a prior autonomous-task spec. Failed tests +
+tracebacks + hypotheses now live in commit messages and in
+[`../../CLAUDE.md`](../../CLAUDE.md) "Pitfalls already learned".

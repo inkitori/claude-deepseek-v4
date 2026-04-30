@@ -1,6 +1,10 @@
 # V3 → V4 architectural diff
 
-Built from `/mnt/scratch/v4_pro/inference/model.py`, `/mnt/scratch/v4_pro/config.json`, `/mnt/scratch/v4_flash/config.json`, and `tpu_inference/models/jax/deepseek_v3.py`. See README.md in the V4 HF repo for the marketing version.
+Built from DeepSeek's `inference/model.py` reference (vendored at
+`tests/models/jax/_deepseek_v4_reference/model.py`) and the V4-Pro /
+V4-Flash `config.json` files, compared against
+`tpu_inference/models/jax/deepseek_v3.py`. See README.md in the V4
+HuggingFace repo for the marketing version.
 
 ## Headline changes
 1. **Multi-head Latent Attention (MLA) → CSA / HCA / SWA hybrid.** Each layer's attention is one of three flavors selected via `compress_ratios[layer_id]`:

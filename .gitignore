@@ -5,6 +5,9 @@
 # Claude Code local settings
 .claude/
 
+# Codex agent residue
+.codex
+
 # Build/runtime artifacts
 __pycache__/
 *.pyc
