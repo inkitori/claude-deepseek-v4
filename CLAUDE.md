@@ -1073,6 +1073,128 @@ during weight loading, which is the known TPU-state-leakage
 pattern from CLAUDE.md iter-5e — required ray-restart to clear)
 but yielded a firm result that hyp-1 is dead.
 
+**Iter 5f diagnostic smoke (2026-04-30 17:49Z, log
+full-slice-v4-smoke-20260430T174401Z.log): jax.debug.print
+instrumentation confirms iter-5d hypothesis 1 in shape but the
+symptom is more subtle than expected.**
+
+After hyp-1 was reverted, iter-5f added env-gated diagnostic
+prints in `deepseek_v4_run_with_decode_state` (commit 91099ec1):
+when `V4_DECODE_STATE_DIAG=1`, the orchestrator emits
+jax.debug.print of `kv_caches[0]`'s sum + nonfinite-count at
+branch entry, and `packed_buffers[0]` / `new_buffers[0]`'s same
+statistics at exit. Side-effecting; XLA can't DCE.
+
+Captured chain (one Ray worker, COMPLETION_MAX_TOK=2,
+V4_DECODE_STATE=1 V4_DECODE_STATE_DIAG=1):
+
+  R1 prefill:
+    PREFILL entry kv_caches[0] sum=0.0          nonfinite=0
+    PREFILL exit  packed_buffers[0] sum=-649.62 nonfinite=0
+  R1 decode (start_pos=5):
+    DECODE  entry kv_caches[0] sum=-649.62      nonfinite=0
+    DECODE  exit  new_buffers[0]   sum=-635.95  nonfinite=0
+  R2 prefill (cache hit, no fresh trace):
+    PREFILL entry kv_caches[0] sum=-635.95      nonfinite=0
+    PREFILL exit  packed_buffers[0] sum=-904.07 nonfinite=0
+  17:52:15.952Z  TPU [USER] FATAL on tpu1:pe2:3 (10.164.0.36)
+  17:52:35Z      Session master: SLICE_FAILURE_SW_INJECT_ERROR
+  R3+ requests: HTTP 500
+
+**Confirmed:** the donated `kv_caches` buffer DOES carry prior-
+call data into the next call's prefill entry. R1 decode's
+`new_buffers[0]` (sum=-635.95) is exactly what R2 prefill sees
+on entry. iter-5d hypothesis 1's first half is true.
+
+**But the symptom is more interesting than expected.** R2's
+prefill OUTPUT sum (-904.07) differs from R1's (-649.62) despite
+identical `input_ids` (same prompt, same prefill bucket) and
+identical `params` (loaded weights, immutable nnx Variables).
+By code analysis, `transformer_body_init_state_to_buffer` derives
+its output entirely from `input_ids` + `params` + freqs — NO
+data dependency on `kv_caches` input. So the output sum SHOULD
+be identical across requests.
+
+**Three candidate explanations for the R2 sum drift (iter-5g
+must adjudicate):**
+
+  (a) **Print captures partial state.** The R2 PREFILL exit
+      print line lands at log position 2660, AFTER the FATAL at
+      log position 2587. jax.debug.print is async; XLA may have
+      reordered the print past the FATAL boundary, or captured
+      a value from a partially-failed compute. The "true"
+      packed_buffers value may have been -649.62 (matching R1)
+      but contaminated by the FATAL.
+
+  (b) **Donated-buffer aliasing causes incomplete overwrite.**
+      With `donate_argnums=2`, XLA aliases the output buffer
+      address to the input buffer address. If the orchestrator's
+      compute writes packed_buffers piece-by-piece into the
+      aliased buffer, and some bytes of the buffer are NEVER
+      written (e.g. zero-sized placeholder fields, padding, or
+      partial-fp32 strides), those bytes retain R1's stale data.
+      The `jnp.sum` over the buffer then mixes new+stale.
+      `_pack_layer_state` returns
+      `concatenate([flat_i for fields in layout])` which should
+      cover ALL bytes by construction — but the kv_cache_manager
+      allocates buffer with size=`_layer_packed_size(layout)`,
+      and if any field's actual flat size < layout's expected
+      size, the concat output is shorter than the buffer.
+
+  (c) **A real read of kv_caches sneaks in via the orchestrator's
+      shape graph.** Even though there's no semantic dep, the
+      diagnostic print itself reads `kv_caches[0]`. With
+      donation, XLA may be inserting code that flows the
+      diagnostic-read VALUE into the rest of the trace via
+      register-allocator aliasing. Removing the print might
+      eliminate this — but then we lose the diagnostic.
+
+**The FATAL persists with instrumentation.** Same physical TPU
+location as iter-5e R2 FATAL (`tpu1:pe2:3`). Suggests a
+deterministic bug tied to (artifact, input contents) rather than
+random TPU-state nondeterminism.
+
+**Iter 5g lane (ordered by leverage):**
+
+  1. **Adjudicate (a) vs (b) vs (c) by re-running the diag
+     smoke with COMPLETION_MAX_TOK=2 but smoke_check changed to
+     fire ONLY R1 (no R2).** If R1 alone shows
+     `PREFILL exit packed_buffers[0] sum=-649.62` and no FATAL,
+     and a SECOND fresh smoke with R1-only also shows
+     `sum=-649.62`, then (a) is the explanation: the R2 sum
+     drift was a print-during-FATAL artifact, NOT a real
+     compute difference.
+
+  2. **Audit `_layer_packed_size` vs `_pack_layer_state`'s
+     actual output size on real V4-Flash layer 0.** A size
+     mismatch would explain (b) — buffer has bytes that
+     packed_buffers never writes. Likely fixed by either
+     (i) tightening the allocator to use the actual concat-
+     output size, or (ii) explicit zero-pad in `_pack_layer_state`.
+     `_layer_decode_state_layout` and `_pack_layer_state` BOTH
+     iterate over the layout fields with `arr.reshape(-1)` — they
+     SHOULD agree on size, but real-V4 layer 0 might have a
+     placeholder field whose actual shape doesn't match the
+     layout's predicted shape.
+
+  3. **Try the sharding-constraint angle from iter-5f notes.**
+     Add `with_sharding_constraint(b, P())` on each
+     `packed_buffer` inside `_pack_layer_state` BEFORE returning.
+     Forces the reshard-to-replicated to happen at a known code
+     point inside the function rather than at the JIT boundary.
+     If the bug is in the boundary reshard, this dodges it.
+
+  4. **Restructure orchestrator to compile prefill as a JIT
+     that doesn't take kv_caches.** Currently
+     `deepseek_v4_run_with_decode_state` takes `kv_caches` as an
+     arg even on prefill. Under donation, XLA must alias output
+     to this input. If we have a SEPARATE JIT'd function for
+     prefill that doesn't have kv_caches as input, the donation
+     contract doesn't apply (no input to alias to) and XLA must
+     allocate a fresh output buffer each call. Requires touching
+     the runner/model_loader path, which violates the
+     minimum-delta rule unless this is the only viable fix.
+
 S1 still unlocks A1 (lift `max-model-len`), B1 (sparse_attn
 Pallas becomes worthwhile), and S5 (MTP speculative decoding
 becomes meaningful).
@@ -1847,13 +1969,34 @@ when the timeout SIGTERMs the iter.
   donation R1 failed outright. Conclusion: dropping donation
   produces a different compiled artifact whose first
   execution has its own bug. Hypothesis 1 dead; revert
-  shipped at commit 571a82f3. iter-5g picks up from
-  jax.debug.print instrumentation OR the new sharding-
-  constraint angle (force `with_sharding_constraint(b, P())`
-  on each packed_buffer inside `_pack_layer_state` so the
-  reshard-to-replicated happens at a known code point rather
-  than at the JIT boundary). See "Iter 5f status" above for
+  shipped at commit 571a82f3. See "Iter 5f status" above for
   full notes.
+* **iter-5f diagnostic instrumentation (2026-04-30, S1
+  iter-5f)**: env-gated `V4_DECODE_STATE_DIAG=1` adds
+  jax.debug.print of kv_caches[0]'s sum + nonfinite-count at
+  `deepseek_v4_run_with_decode_state` branch entry/exit. Default
+  OFF; forwarded to Ray workers via
+  `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. Ran one diag smoke
+  (logs/full-slice-v4-smoke-20260430T174401Z.log) which yielded
+  the chain (R1 prefill: kv_caches sum 0.0 → packed_buffers
+  sum -649.62; R1 decode: -649.62 → -635.95; R2 prefill:
+  -635.95 → -904.07; FATAL on tpu1:pe2:3). **Confirmed**: the
+  donated buffer DOES carry prior-call data into the next
+  call's prefill entry (iter-5d hyp-1's first half — true).
+  **But**: R2's prefill OUTPUT sum (-904.07) differs from R1's
+  (-649.62) despite identical input_ids/params, which the
+  orchestrator code path doesn't predict (`transformer_body_init_state_to_buffer`
+  has no kv_caches data dep). Three candidates for the drift:
+  (a) print captured value during the FATAL boundary;
+  (b) donated-buffer aliasing leaves bytes unwritten that the
+  sum picks up from R1's data; (c) a real read-of-kv_caches
+  sneaks into the orchestrator's HLO via the diagnostic-print
+  itself. iter-5g's first move: re-run the diag smoke firing
+  ONLY R1 (no R2) to adjudicate (a). FATAL persists with
+  instrumentation — same physical TPU location as iter-5e
+  R2 FATAL — so the bug is deterministic, not random TPU
+  state. ✓ diag mechanism + chain capture; ✗ root cause
+  pinned (iter-5g's lane).
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
