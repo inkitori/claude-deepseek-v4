@@ -475,7 +475,7 @@ The path is standard — V4 inherits tpu-inference's
 `deepseek_v4.py:1528`. The default smoke check fires
 `temperature=0, seed=0` only.
 
-**Sampling probe (DONE — harness-verified)**:
+**Sampling probe (DONE — verified end-to-end 2026-04-30)**:
 `scripts/full_slice_v4_smoke_check.sh` accepts `SAMPLING_REQUIRED=1`,
 which fires `/v1/completions` with
 `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and asserts the
@@ -487,14 +487,18 @@ smoke stays cheap. Mock-server self-test
 `sampling_required_bad_finish`). The mock differentiates sampling
 vs deterministic by inspecting `body.temperature > 0` so a single
 test scenario can simulate a working deterministic path **and** a
-broken sampling path simultaneously. Not yet end-to-end-verified
-on real `vllm serve` — pending the next real-smoke run with
-`SAMPLING_REQUIRED=1` in the launcher env.
+broken sampling path simultaneously. End-to-end-verified on real
+`vllm serve` 2026-04-30 09:57Z: response text=" the\n###!/\n\n\npackage",
+`finish_reason="length"`, exit 0.
 
 Determinism under sampling is **not** asserted: vLLM/TPU's runner
-doesn't honour per-request seed on non-greedy paths (CLAUDE.md
-notes this), so byte-equality across runs would be a false
-guarantee.
+doesn't honour per-request seed on non-greedy paths and in fact
+**rejects** the request with HTTP 400 ("JAX does not support
+per-request seed.") if `seed` is sent alongside `temperature>0`.
+The probe omits `seed` for that reason; the deterministic
+completions probe still sends `seed=0` because at temperature=0
+JAX accepts it (as a no-op). That asymmetry is the same reason
+byte-equality across runs would be a false guarantee.
 
 **Broader matrix still TODO** — top_k, presence_penalty, n>1,
 logprobs, stop sequences. Each is a separate code path with
@@ -866,14 +870,21 @@ when the timeout SIGTERMs the iter.
   smoke_check + 13-scenario harness self-test + real `vllm serve` run
   on 2026-04-30: reassembled SSE = non-streaming " Paris" byte-for-byte).
   ✓ See S7.
-* **Sampling probe scaffolded** (`SAMPLING_REQUIRED=1` smoke_check +
-  3 new scenarios in the 13-scenario harness self-test:
-  `sampling_required_match` / `sampling_required_empty` /
-  `sampling_required_bad_finish`). Fires
-  `temperature=0.7, top_p=0.9, frequency_penalty=0.1` and asserts the
-  response has non-empty text plus a valid `finish_reason`. ✓ harness
-  verified; ✗ not yet end-to-end-verified on real `vllm serve` —
-  pending the next real-smoke run with `SAMPLING_REQUIRED=1`. See S6.
+* **Sampling probe verified end-to-end** (`SAMPLING_REQUIRED=1`
+  smoke_check + 13-scenario harness self-test + real `vllm serve` run
+  on 2026-04-30: temperature=0.7+top_p=0.9+frequency_penalty=0.1 returns
+  non-empty text and `finish_reason=length`). ✓ See S6.
+
+  Caught a real bug along the way: vLLM/TPU's runner rejects per-request
+  `seed` on non-greedy paths with HTTP 400 ("JAX does not support
+  per-request seed."). The original probe sent `seed=0` along with
+  `temperature=0.7` and got 400 → smoke_check exit 7. Fix was
+  one-line: drop `seed` from `fire_completion_sampling`. The
+  deterministic completions probe still sends `seed=0` (greedy
+  ignores it) and the harness mock still passes (it doesn't
+  inspect `seed`). The pitfall is the deeper "TPU runner doesn't
+  support per-request seed" CLAUDE.md note showing up *as a 400*,
+  not just as silently-ignored.
 * **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
   in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
   products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates

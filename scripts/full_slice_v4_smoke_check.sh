@@ -134,11 +134,16 @@ fire_completion_stream() {
 # different known quirks under vLLM's TPU runner, and a minimum-delta probe
 # should cover the most-used parameters first. Same prompt/length budget as
 # the existing completions probe so it lands in the same prefill bucket.
+#
+# Note: no `seed` field. vLLM's TPU runner rejects per-request seed for
+# non-greedy paths with HTTP 400 ("JAX does not support per-request seed.")
+# — sending `seed` together with `temperature>0` makes the probe fail
+# spuriously even when the sampling code path itself is healthy.
 fire_completion_sampling() {
     curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
         -H "Content-Type: application/json" \
-        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"top_p":0.9,"frequency_penalty":0.1,"seed":%d}' \
-              "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"top_p":0.9,"frequency_penalty":0.1}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK")"
 }
 
 extract_text() {
