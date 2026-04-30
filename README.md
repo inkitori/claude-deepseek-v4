@@ -33,7 +33,9 @@ scratch (~5–15 min depending on compile cache state). Every launch
 after that hits the persistent JAX compile cache and is sub-minute.
 
 See [CLAUDE.md](CLAUDE.md) for the runbook (operational details,
-optimization knobs, pitfalls).
+optimization knobs, pitfalls, and the **minimum-delta rule** — agents
+working on this repo should keep changes as small as possible while
+preserving correctness + speed; CLAUDE.md spells out the specifics).
 
 ## What `./run.sh` does
 

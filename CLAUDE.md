@@ -11,6 +11,51 @@ inference with the real V4-Flash weights**. Synthetic-fixture tests
 are the fast iteration loop; real-weight `vllm serve` is the gate
 that defines "done".
 
+## Minimum-delta rule (READ THIS FIRST)
+
+The overall delta from the upstream `tpu-inference` repo before any
+DeepSeek-V4 work should be **as small as possible** while keeping
+the math correct and the serve fast. Every line you add is a line
+the next agent has to read, sync to 8 worker hosts, and reason
+about. Treat the diff against upstream as a budget, not free space.
+
+Concrete rules:
+
+1. **Don't add files when an existing one fits.** V4 already lives in
+   `models/jax/deepseek_v4.py`, `models/jax/deepseek_v4_loader.py`,
+   `layers/jax/attention/deepseek_v4_attention.py`, and
+   `layers/jax/moe/deepseek_v4_moe.py`. New helpers go in those
+   files unless they're genuinely independent and reusable.
+2. **Don't add new test classes for variants of an existing case.**
+   Add a parametrized test or fold into the existing class. Pattern
+   to avoid: `TestDecodeAttentionParity` + `TestDecodeAttentionParityExtended`
+   + `TestDecodeRollingParityLong` (each ~50 lines doing the same
+   shape of check). Prior sessions already accreted ~33 test classes
+   in `tests/models/jax/test_deepseek_v4.py` (3185 LOC, 5–10× the
+   size of any peer model's test file). Consolidate when you touch.
+3. **Reuse upstream layers.** Before writing a V4-specific helper,
+   check if `layers/jax/{attention,moe,...}/` already has a
+   primitive that does what you need (`dense_moe_fwd`, `sparse_attn`,
+   `rms_norm`, etc.). The custom `deepseek_v4_attention.py` and
+   `deepseek_v4_moe.py` exist because V4's MLA + sqrtsoftplus + hash
+   routing genuinely don't fit the generic helpers — but verify
+   that's still true for any *new* helper before duplicating.
+4. **Don't add files outside the V4 namespace.** Anything that
+   touches the runtime (`runner/`, `worker/`, `platforms/`) should
+   be a last resort, not a first resort, and needs explicit
+   justification in the commit message.
+5. **Delete dead code as you go.** If a TODO has been resolved, drop
+   it. If a "tier"/"keystone"/"sentinel" comment refers to a
+   superseded plan, remove it. Comments rot; code stays.
+6. **No re-export shim files.** `tests/models/test_deepseek_v4.py`
+   exists only to re-export from `tests/models/jax/test_deepseek_v4.py`
+   because some prior autonomous-task spec expected that path. It's
+   a candidate for removal once you confirm nothing CI-relevant
+   imports it.
+
+When in doubt: the smaller change wins. A revert + minimal patch
+beats a refactor + the same fix.
+
 This file is the durable operational knowledge that's not obvious
 from the code: cluster layout, the iterate loop, env knobs, orphan
 state surfaces, and pitfalls that have already cost real time. Read
@@ -109,6 +154,32 @@ launcher echoes the active values at startup so you can confirm.
 | `JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
+
+## Known bloat / consolidation candidates
+
+These are concrete pieces of accreted size that future cleanup
+passes should target. The math + serve work without them; they're
+just noise the next reader has to wade through.
+
+* **`tests/models/jax/test_deepseek_v4.py` (3185 LOC, 33 classes).**
+  5–10× the size of any peer model's test file
+  (`test_qwen2_5_vl.py` is the next biggest at 764). Multiple
+  pairs of duplicate-shape classes:
+  `TestDecodeAttentionParity` + `TestDecodeAttentionParityExtended`,
+  `TestDecodeRollingParity` + `TestDecodeRollingParityLong` +
+  `TestDecodeRollingEquivalenceWithPrefill`,
+  several FP8/FP4 dequant classes that overlap. Consolidate to a
+  single parametrized class per concept. Don't drop coverage; do
+  drop scaffolding.
+* **`tests/models/test_deepseek_v4.py` (31 LOC, re-export shim).**
+  Exists because a prior autonomous-task spec expected that path.
+  Verify nothing in CI imports it, then delete.
+* **`deepseek_v4.py` has 26 top-level entities vs `deepseek_v3.py`'s
+  12.** Some is legitimate (MTP, hash routing, MLA variants), but
+  worth scanning for helpers that could use upstream primitives.
+
+Numbers above are snapshots; re-measure with `wc -l` and `grep -c "^class Test"`
+when you touch.
 
 ## What's been optimized + verified
 

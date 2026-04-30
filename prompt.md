@@ -20,6 +20,25 @@ defines "done".
 You are working autonomously. The user is asleep. Make decisions,
 document them in the appropriate markdown file, and proceed.
 
+## Minimum-delta rule (read CLAUDE.md "Minimum-delta rule" first)
+
+Every line you add is a line synced to 8 worker hosts and read by
+the next agent. The overall diff against upstream `tpu-inference`
+must stay **as small as possible** while keeping math correct and
+serve fast. Specifically:
+
+* No new files when an existing one fits. V4 already has 4 source
+  files + 1 test file; new helpers go there.
+* No new test classes for variants of an existing case — parametrize
+  or fold in.
+* Reuse upstream layers (`dense_moe_fwd`, `sparse_attn`, `rms_norm`,
+  ...) before writing V4-specific copies.
+* Delete dead code, stale TODOs, superseded "tier"/"keystone"
+  comments as you touch them.
+
+When in doubt: the smaller change wins. Read CLAUDE.md's section
+for full guidance.
+
 ## Read first
 
 1. **[CLAUDE.md](CLAUDE.md)** — the runbook. Cluster topology, the
