@@ -43,6 +43,18 @@
 #                                   LOGPROBS_REQUIRED=1               → FAIL (9)
 #  17. logprobs_required_dropped  — logprobs=5 but server emits only 3 alts,
 #                                   LOGPROBS_REQUIRED=1               → FAIL (9)
+#  18. topk_required_match        — temp>0+top_k=10 returns non-empty text +
+#                                   valid finish_reason, TOPK_REQUIRED=1 → PASS (0)
+#  19. topk_required_empty        — temp>0+top_k=10 returns empty text,
+#                                   TOPK_REQUIRED=1                   → FAIL (10)
+#  20. presence_required_match    — temp>0+presence_penalty=0.5 returns
+#                                   well-formed, PRESENCE_REQUIRED=1  → PASS (0)
+#  21. presence_required_empty    — temp>0+presence_penalty=0.5 returns
+#                                   empty text, PRESENCE_REQUIRED=1   → FAIL (11)
+#  22. n_required_match           — n=2 returns 2 non-empty choices,
+#                                   N_REQUIRED=1                      → PASS (0)
+#  23. n_required_short           — server caps choices at 1 despite
+#                                   n=2, N_REQUIRED=1                 → FAIL (12)
 #
 # Exit 0 if all scenarios produced their expected exit codes; non-zero
 # otherwise (with details printed inline).
@@ -88,6 +100,21 @@ run_scenario() {
         logprobs_required_*) logprobs_required=1 ;;
     esac
 
+    local topk_required=0
+    case "$name" in
+        topk_required_*) topk_required=1 ;;
+    esac
+
+    local presence_required=0
+    case "$name" in
+        presence_required_*) presence_required=1 ;;
+    esac
+
+    local n_required=0
+    case "$name" in
+        n_required_*) n_required=1 ;;
+    esac
+
     local mpid=
     if [ "$with_server" -eq 1 ]; then
         "$PY" "$MOCK" --port "$port" "$@" >"/tmp/mock-${port}.log" 2>&1 &
@@ -106,6 +133,9 @@ run_scenario() {
         SAMPLING_REQUIRED="$sampling_required" \
         STOP_REQUIRED="$stop_required" \
         LOGPROBS_REQUIRED="$logprobs_required" \
+        TOPK_REQUIRED="$topk_required" \
+        PRESENCE_REQUIRED="$presence_required" \
+        N_REQUIRED="$n_required" \
         "$SCRIPT" >"/tmp/check-${port}.log" 2>&1
     local rc=$?
 
@@ -143,10 +173,16 @@ run_scenario stop_required_leak            18106 8 --stop-honor 0
 run_scenario logprobs_required_match       18107 0
 run_scenario logprobs_required_missing     18108 9 --logprobs-alts 0
 run_scenario logprobs_required_dropped     18109 9 --logprobs-alts 3
+run_scenario topk_required_match           18110 0
+run_scenario topk_required_empty           18111 10 --sampling-text ""
+run_scenario presence_required_match       18112 0
+run_scenario presence_required_empty       18113 11 --sampling-text ""
+run_scenario n_required_match              18114 0
+run_scenario n_required_short              18115 12 --n-cap 1
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 18/18 harness scenarios pass"
+    echo "OK: 24/24 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"

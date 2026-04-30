@@ -51,6 +51,10 @@ Args:
                           Set to 0 to emit no logprobs object — exercises the
                           missing-logprobs failure path. Set to <5 to exercise
                           the dropped-alternatives failure path.
+  --n-cap N               cap the number of choices emitted on /v1/completions
+                          at N (default 0 = no cap; honor request body's `n`
+                          field). Set to 1 to exercise the broken-n-expansion
+                          failure path (server ignores n>1).
   --flaky-readiness N     return 503 from /v1/models for the first N calls, then
                           200. Useful for exercising the readiness-wait loop.
 """
@@ -73,6 +77,7 @@ class MockHandler(BaseHTTPRequestHandler):
     sampling_finish = "length"  # finish_reason on the temp>0 path
     stop_honor = True  # if False, ignore request `stop` and emit full text
     logprobs_alts = 5  # alternatives per token when logprobs>0; 0 = omit object
+    n_cap = 0  # if >0, cap number of emitted choices at this value
     flaky_remaining = 0
 
     def log_message(self, format, *args):
@@ -179,17 +184,12 @@ class MockHandler(BaseHTTPRequestHandler):
                     text = text[:cut]
                     finish = "stop"
 
-            choice = {
-                "index": 0,
-                "text": text,
-                "finish_reason": finish,
-            }
-
             # Logprobs handling. When `logprobs` is set in the body, emit a
             # per-position object with `tokens`, `token_logprobs`, and
             # `top_logprobs`. With `--logprobs-alts 0` we omit the object
             # entirely (broken path); with a value <5 we emit fewer than
             # the requested alternatives (dropped-alternatives path).
+            logprobs_obj = None
             n_lp = body.get("logprobs")
             if isinstance(n_lp, int) and n_lp > 0 and MockHandler.logprobs_alts > 0:
                 # Naively split text on whitespace as a stand-in for tokens.
@@ -204,19 +204,36 @@ class MockHandler(BaseHTTPRequestHandler):
                     for k in range(1, alts):
                         entry[f"alt_{k}"] = -1.0 - 0.1 * k
                     top.append(entry)
-                choice["logprobs"] = {
+                logprobs_obj = {
                     "tokens": list(toks),
                     "token_logprobs": [-0.1] * len(toks),
                     "top_logprobs": top,
                     "text_offset": [0] * len(toks),
                 }
 
+            # Multi-completion handling. Honor request body's `n` field
+            # (default 1), capped by --n-cap if set. Each emitted choice
+            # carries the same text + finish_reason + logprobs for
+            # mock-determinism — the N_REQUIRED probe asserts on the
+            # cardinality of the choices array, not their distinctness.
+            n_req = body.get("n") or 1
+            if not isinstance(n_req, int) or n_req < 1:
+                n_req = 1
+            if MockHandler.n_cap > 0:
+                n_req = min(n_req, MockHandler.n_cap)
+            choices = []
+            for i in range(n_req):
+                c = {"index": i, "text": text, "finish_reason": finish}
+                if logprobs_obj is not None:
+                    c["logprobs"] = logprobs_obj
+                choices.append(c)
+
             self._json(200, {
                 "id": "cmpl-mock-deterministic",
                 "object": "text_completion",
                 "created": 0,
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
-                "choices": [choice],
+                "choices": choices,
                 "usage": {"prompt_tokens": 6, "completion_tokens": 8,
                           "total_tokens": 14},
             })
@@ -258,6 +275,7 @@ def main() -> int:
     ap.add_argument("--sampling-finish", default="length")
     ap.add_argument("--stop-honor", default="1")
     ap.add_argument("--logprobs-alts", type=int, default=5)
+    ap.add_argument("--n-cap", type=int, default=0)
     ap.add_argument("--flaky-readiness", type=int, default=0)
     args = ap.parse_args()
 
@@ -269,6 +287,7 @@ def main() -> int:
     MockHandler.sampling_finish = args.sampling_finish
     MockHandler.stop_honor = (args.stop_honor != "0")
     MockHandler.logprobs_alts = args.logprobs_alts
+    MockHandler.n_cap = args.n_cap
     MockHandler.flaky_remaining = args.flaky_readiness
 
     with HTTPServer(("127.0.0.1", args.port), MockHandler) as httpd:

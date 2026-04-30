@@ -51,6 +51,25 @@
 #       postprocessing path emits the per-token alternative distribution.
 #       Same prefill bucket. Exit 9 on missing logprobs / wrong cardinality
 #       / curl failure.
+#   TOPK_REQUIRED=1 — fires a /v1/completions probe with `temperature=0.7`
+#       and `top_k=10` and asserts the response has non-empty text plus a
+#       valid finish_reason. Pins S6 broader-matrix: the top-k filter on
+#       the TPU sampling path doesn't crash or zero-out the candidate set.
+#       Same prefill bucket. Exit 10 on empty / invalid / curl failure.
+#   PRESENCE_REQUIRED=1 — fires a /v1/completions probe with
+#       `temperature=0.7` and `presence_penalty=0.5` and asserts the
+#       response has non-empty text plus a valid finish_reason. Pins
+#       S6 broader-matrix: presence-penalty (per-token, distinct from
+#       frequency_penalty's per-occurrence semantics) is correctly
+#       applied on the TPU sampling path. Same prefill bucket. Exit 11
+#       on empty / invalid / curl failure.
+#   N_REQUIRED=1 — fires a /v1/completions probe with `n=2` and asserts
+#       the response has at least 2 choices, each with non-empty text.
+#       Pins S6 broader-matrix: multi-completion (n>1) in a single request
+#       actually emits n choices on the TPU runner. Under --max-num-seqs=1
+#       this likely sequentializes, but the choices array must still have
+#       length n. Same prefill bucket. Exit 12 on missing/short choices /
+#       empty text / curl failure.
 #
 # Usage:
 #   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
@@ -61,6 +80,9 @@
 #   SAMPLING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken sampling path
 #   STOP_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken stop-sequence path
 #   LOGPROBS_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken logprobs path
+#   TOPK_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken top-k path
+#   PRESENCE_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken presence-penalty path
+#   N_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh            # fail on broken n>1 (multi-choice) path
 
 set -euo pipefail
 
@@ -84,6 +106,9 @@ STREAMING_REQUIRED="${STREAMING_REQUIRED:-0}"
 SAMPLING_REQUIRED="${SAMPLING_REQUIRED:-0}"
 STOP_REQUIRED="${STOP_REQUIRED:-0}"
 LOGPROBS_REQUIRED="${LOGPROBS_REQUIRED:-0}"
+TOPK_REQUIRED="${TOPK_REQUIRED:-0}"
+PRESENCE_REQUIRED="${PRESENCE_REQUIRED:-0}"
+N_REQUIRED="${N_REQUIRED:-0}"
 
 readiness_wait() {
     local deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -189,6 +214,44 @@ fire_completion_logprobs() {
               "$MODEL" "$PROMPT" "$MAX_TOK" "$SEED")"
 }
 
+# Top-k probe: temperature>0 + top_k=10. Distinct from the existing sampling
+# probe (which exercises top_p + frequency_penalty); top-k gates the candidate
+# set by rank rather than cumulative-prob mass. We don't assert on a specific
+# token (depends on the model's distribution) — only that text is non-empty
+# and finish_reason is recognised. No `seed` (vLLM/TPU runner rejects per-
+# request seed on non-greedy paths with HTTP 400).
+fire_completion_topk() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"top_k":10}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK")"
+}
+
+# Presence-penalty probe: temperature>0 + presence_penalty=0.5. Distinct from
+# frequency_penalty (which scales linearly with token count); presence_penalty
+# is a fixed deduction the first time a token appears. Same well-formedness
+# assertion as the sampling/topk probes: non-empty text + valid finish_reason.
+fire_completion_presence() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"presence_penalty":0.5}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK")"
+}
+
+# Multi-completion probe: n=2 in one request. vLLM expands this into n
+# parallel sequences sharing the prompt; under --max-num-seqs=1 they run
+# sequentially but the response's choices array must still have length n
+# (each with its own non-empty text). Probe asserts len(choices) >= 2 and
+# every emitted choice has non-empty text. Uses temperature>0 because at
+# temp=0 some samplers de-dupe identical greedy outputs; we want to
+# verify the request shape is honoured, not the determinism of the result.
+fire_completion_n() {
+    curl -sf --max-time "$CURL_MAX_TIME" "${URL}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"model":"%s","prompt":"%s","max_tokens":%d,"temperature":0.7,"n":2}' \
+              "$MODEL" "$PROMPT" "$MAX_TOK")"
+}
+
 extract_text() {
     python3 -c "import json,sys; d=json.load(sys.stdin); print(d['choices'][0]['text'])"
 }
@@ -276,6 +339,21 @@ for entry in top:
     if isinstance(entry, dict):
         alts.append(len(entry))
 print(min(alts) if alts else -1)
+"
+}
+
+# Print two lines: number of choices in the response, and the count of
+# choices whose text is non-empty (after .strip()). The N_REQUIRED probe
+# asserts n_choices >= 2 AND non_empty == n_choices.
+extract_completion_n_choices() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+ch = d.get('choices') or []
+n = len(ch)
+ne = sum(1 for c in ch if (c.get('text') or '').strip())
+print(n)
+print(ne)
 "
 }
 
@@ -454,6 +532,78 @@ main() {
         else
             echo "[smoke-check] FAIL: logprobs probe failed (curl non-zero, LOGPROBS_REQUIRED=1)" >&2
             exit 9
+        fi
+    fi
+
+    if [ "$TOPK_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions top-k probe (TOPK_REQUIRED=1)"
+        if RTK="$(fire_completion_topk 2>/dev/null)"; then
+            mapfile -t TK < <(printf '%s' "$RTK" | extract_completion_text_finish 2>/dev/null || printf '0\n\n')
+            TK_LEN="${TK[0]:-0}"
+            TK_FIN="${TK[1]:-}"
+            echo "[smoke-check] top-k text len=$TK_LEN finish_reason=${TK_FIN:-<empty>}"
+            if [ "${TK_LEN:-0}" = "0" ]; then
+                echo "[smoke-check] FAIL: top-k probe returned empty/whitespace-only text (TOPK_REQUIRED=1)" >&2
+                echo "[smoke-check]       temperature>0 + top_k=10 path produced no usable output." >&2
+                exit 10
+            fi
+            case "$TK_FIN" in
+                stop|length) ;;
+                *)
+                    echo "[smoke-check] FAIL: top-k probe finish_reason=${TK_FIN:-<empty>}, expected stop/length (TOPK_REQUIRED=1)" >&2
+                    exit 10
+                    ;;
+            esac
+        else
+            echo "[smoke-check] FAIL: top-k probe failed (curl non-zero, TOPK_REQUIRED=1)" >&2
+            exit 10
+        fi
+    fi
+
+    if [ "$PRESENCE_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions presence-penalty probe (PRESENCE_REQUIRED=1)"
+        if RPP="$(fire_completion_presence 2>/dev/null)"; then
+            mapfile -t PP < <(printf '%s' "$RPP" | extract_completion_text_finish 2>/dev/null || printf '0\n\n')
+            PP_LEN="${PP[0]:-0}"
+            PP_FIN="${PP[1]:-}"
+            echo "[smoke-check] presence text len=$PP_LEN finish_reason=${PP_FIN:-<empty>}"
+            if [ "${PP_LEN:-0}" = "0" ]; then
+                echo "[smoke-check] FAIL: presence probe returned empty/whitespace-only text (PRESENCE_REQUIRED=1)" >&2
+                echo "[smoke-check]       temperature>0 + presence_penalty=0.5 path produced no usable output." >&2
+                exit 11
+            fi
+            case "$PP_FIN" in
+                stop|length) ;;
+                *)
+                    echo "[smoke-check] FAIL: presence probe finish_reason=${PP_FIN:-<empty>}, expected stop/length (PRESENCE_REQUIRED=1)" >&2
+                    exit 11
+                    ;;
+            esac
+        else
+            echo "[smoke-check] FAIL: presence probe failed (curl non-zero, PRESENCE_REQUIRED=1)" >&2
+            exit 11
+        fi
+    fi
+
+    if [ "$N_REQUIRED" = "1" ]; then
+        echo "[smoke-check] firing /v1/completions n=2 probe (N_REQUIRED=1)"
+        if RN="$(fire_completion_n 2>/dev/null)"; then
+            mapfile -t NC < <(printf '%s' "$RN" | extract_completion_n_choices 2>/dev/null || printf '0\n0\n')
+            NC_TOTAL="${NC[0]:-0}"
+            NC_NONEMPTY="${NC[1]:-0}"
+            echo "[smoke-check] n=2 probe choices=$NC_TOTAL non_empty=$NC_NONEMPTY (requested n=2)"
+            if [ "${NC_TOTAL:-0}" -lt 2 ]; then
+                echo "[smoke-check] FAIL: n=2 probe returned only $NC_TOTAL choices, expected >=2 (N_REQUIRED=1)" >&2
+                echo "[smoke-check]       vLLM TPU runner did not expand n>1 into multiple choices." >&2
+                exit 12
+            fi
+            if [ "${NC_NONEMPTY:-0}" -lt "${NC_TOTAL:-0}" ]; then
+                echo "[smoke-check] FAIL: n=2 probe has $NC_NONEMPTY/$NC_TOTAL non-empty choices (N_REQUIRED=1)" >&2
+                exit 12
+            fi
+        else
+            echo "[smoke-check] FAIL: n=2 probe failed (curl non-zero, N_REQUIRED=1)" >&2
+            exit 12
         fi
     fi
 
