@@ -62,6 +62,18 @@ logger = init_logger(__name__)
 # `[USER]` FATAL (see CLAUDE.md S1).
 V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE", "0") == "1"
 
+# S1 iter-5f diagnostic gate. When `V4_DECODE_STATE_DIAG=1`,
+# `deepseek_v4_run_with_decode_state` emits jax.debug.print of
+# kv_caches[0]'s sum + nonfinite-count at branch entry, and of the
+# returned packed_buffers[0]'s same statistics at branch exit. Used
+# to diagnose iter-5c's second-request TPU [USER] FATAL by
+# distinguishing R1 vs R2 input/output state. Caveat: side-effecting
+# prints CHANGE THE HLO (fresh JIT cache key), so a "passes with
+# DIAG=1" result may mean "prints disturb XLA scheduling enough to
+# dodge the FATAL", not "the bug is fixed". Default OFF — only
+# enable when running a diagnostic smoke.
+V4_DECODE_STATE_DIAG = os.environ.get("V4_DECODE_STATE_DIAG", "0") == "1"
+
 
 # ------------------------------------------------------------
 # Config
@@ -825,13 +837,46 @@ def deepseek_v4_run_with_decode_state(
 
     Both branches return the updated `kv_caches` as the first element
     of the tuple so the caller can pass it as a donated argument to
-    the JIT'd `run_model`."""
+    the JIT'd `run_model`.
+
+    iter-5f diagnostic: when `V4_DECODE_STATE_DIAG=1` is set in the
+    surrounding env at module import time, the orchestrator emits a
+    `jax.debug.print` of `kv_caches[0]`'s sum + nonfinite-count at
+    branch entry AND of `packed_buffers[0]` / `new_buffers[0]`'s sum
+    at exit. Side-effecting; XLA cannot DCE. Goal: distinguish R1 vs
+    R2's input/output state to pin whether prior-call data really
+    bleeds through the donated buffer (iter-5d hypothesis 1) or
+    whether the bug is in the orchestrator's intermediate compute
+    independent of input contents. CAVEAT: instrumenting changes the
+    HLO → fresh JIT cache key → if the smoke goes green when DIAG=1,
+    that may mean "prints disturb XLA scheduling enough to dodge the
+    FATAL", not "the bug is fixed". Even so, captured prints from a
+    successful R1 + a FATAL-ing R2 (or two successful runs) are
+    informative."""
     if is_decode_step:
+        if V4_DECODE_STATE_DIAG:
+            # Decode branch: kv_caches IS read by decode_step_from_buffer
+            # (it's the prev_buffers). Print before consuming.
+            jax.debug.print(
+                "[V4_PREFILL] DECODE entry start_pos={sp} "
+                "kv_caches[0] sum={s} nonfinite={nf}",
+                sp=start_pos,
+                s=jnp.sum(kv_caches[0]).astype(jnp.float32),
+                nf=jnp.sum(jnp.logical_not(jnp.isfinite(kv_caches[0]))),
+            )
         h, new_buffers = transformer_body_decode_step_from_buffer(
             input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
             kv_caches, start_pos=start_pos,
             state_max_seq_len=state_max_seq_len,
         )
+        if V4_DECODE_STATE_DIAG:
+            jax.debug.print(
+                "[V4_PREFILL] DECODE exit  start_pos={sp} "
+                "new_buffers[0] sum={s} nonfinite={nf}",
+                sp=start_pos,
+                s=jnp.sum(new_buffers[0]).astype(jnp.float32),
+                nf=jnp.sum(jnp.logical_not(jnp.isfinite(new_buffers[0]))),
+            )
         return new_buffers, h
     # iter-5c: h comes from path A (transformer_body_forward) — byte-equal
     # to the pre-iter-5b production path, so the head/lm_head sees the
@@ -841,12 +886,31 @@ def deepseek_v4_run_with_decode_state(
     # for future decode steps. XLA CSEs the shared kv/compressor
     # intermediates between the two computations, so the duplicated
     # surface is mostly free.
+    if V4_DECODE_STATE_DIAG:
+        # Prefill branch: kv_caches input is NOT consumed by the
+        # orchestrator (init_state_to_buffer derives its output from
+        # input_ids only). The print here pins what the donated buffer
+        # contains ON ENTRY — R1 sees fresh-allocator zeros, R2 should
+        # see R1's last-decode packed_buffers contents. The print's
+        # read forces XLA to materialize that input, which doubles as
+        # a hyp-1B test (read-before-write may itself dodge the FATAL).
+        jax.debug.print(
+            "[V4_PREFILL] PREFILL entry kv_caches[0] sum={s} nonfinite={nf}",
+            s=jnp.sum(kv_caches[0]).astype(jnp.float32),
+            nf=jnp.sum(jnp.logical_not(jnp.isfinite(kv_caches[0]))),
+        )
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
+    if V4_DECODE_STATE_DIAG:
+        jax.debug.print(
+            "[V4_PREFILL] PREFILL exit  packed_buffers[0] sum={s} nonfinite={nf}",
+            s=jnp.sum(packed_buffers[0]).astype(jnp.float32),
+            nf=jnp.sum(jnp.logical_not(jnp.isfinite(packed_buffers[0]))),
+        )
     return packed_buffers, h
 
 

@@ -122,10 +122,18 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 # fixes for the iter-5c second-request TPU [USER] FATAL (see CLAUDE.md S1).
 export V4_DECODE_STATE="${V4_DECODE_STATE:-0}"
 
+# S1 iter-5f diagnostic gate. When 1, the orchestrator prints
+# kv_caches[0]'s sum + nonfinite-count at branch entry/exit via
+# jax.debug.print. Only meaningful when V4_DECODE_STATE=1. Side-effecting
+# (XLA can't DCE), so the prints CHANGE THE HLO — useful for capturing
+# R1 vs R2 input state, but a green smoke under DIAG=1 doesn't necessarily
+# prove the underlying bug is fixed.
+export V4_DECODE_STATE_DIAG="${V4_DECODE_STATE_DIAG:-0}"
+
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_STATE,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_STATE,V4_DECODE_STATE_DIAG,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
@@ -145,6 +153,7 @@ fi
 echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
 echo "[smoke]   v4_decode_state=$V4_DECODE_STATE (S1 iter-5d: 1=flip __call__ to orchestrator path; 0=green-gate baseline)"
+echo "[smoke]   v4_decode_state_diag=$V4_DECODE_STATE_DIAG (S1 iter-5f: 1=jax.debug.print kv_caches[0] entry/exit in orchestrator)"
 echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set by tpu_inference)"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"

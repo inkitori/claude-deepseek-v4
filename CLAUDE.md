@@ -966,30 +966,116 @@ prefill-orchestrator HLO that iter-5e first smoke and iter-5e
 was stable. Likely TPU-state leakage from a prior process —
 iter-5d's hypothesis 1 / 3 may have a shared root cause.
 
-iter-5f starting moves (in cheapness order):
+**Iter 5f status (2026-04-30): hypothesis 1 RULED OUT —
+dropping donation REGRESSES R1, not a fix.**
 
-  1. Test hypothesis 1 by NOT donating `kv_caches` for V4.
-     `model_loader.py:340` hardcodes `donate_argnums=2`;
-     adding a V4-only branch (mirror of the existing
-     `_is_deepseek_v4` `kv_cache_sharding` override) that
-     drops the donation costs ~130 MB extra HBM (the V4
-     packed buffer is replicated, ~130 MB total per CLAUDE.md
-     iter-5b note) but should fix R2 FATAL if donation is the
-     culprit.
-  2. Test hypothesis 3 by zeroing `kv_caches` at the start
-     of the orchestrator's prefill branch
-     (`kv_caches[i] = jnp.zeros_like(kv_caches[i])` before
-     `transformer_body_init_state_to_buffer` writes). Forces
-     XLA to NOT alias the donated input. Adds one
-     zero-write per layer per prefill but should be free
-     under XLA fusion.
-  3. If both fail, instrument with `jax.debug.print` on
-     `kv_caches` pre/post values to compare R1's successful
-     execution to R2's FATAL.
+iter-5f tested CLAUDE.md's hypothesis 1 ("the donated kv_caches
+buffer reuse is what trips the cached prefill artifact on R2").
+Implementation: V4-only branch in
+`model_loader.py:347-358` that omits `donate_argnums=2` for
+`_is_deepseek_v4` (the same flag that already gates the
+`kv_cache_sharding=NamedSharding(mesh, P())` override 25 lines
+above). Non-V4 unchanged.
 
-This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
-becomes worthwhile), and S5 (MTP speculative decoding becomes
-meaningful).
+Tested on real V4-Flash + `V4_DECODE_STATE=1` after a fresh
+ray-restart (`logs/full-slice-v4-smoke-20260430T172651Z.log`).
+Timeline:
+  17:32:31Z  Application startup complete (weight load + JIT
+             setup, ~5min 40s from launcher)
+  17:32:55Z  __call__ #1: T=256 start_pos=0 is_decode=False
+             state_max_seq_len=8192 kv_caches=43
+             (R1's prefill orchestrator JIT trace; FRESH compile
+              because dropping donation changes the cache key)
+  17:33:14Z  TPU [USER] FATAL on tpu6:pe2:2 (10.164.0.45)
+             during R1's compiled-prefill execution
+  17:33:25Z  Session master detects SLICE_FAILURE_SW_INJECT_ERROR;
+             cluster shuts down
+  smoke_check times out on R1 — R2 never fires
+
+Compare iter-5e (with donation, same orchestrator code):
+  R1 succeeded (200 OK, " Paris" returned) on a freshly-compiled
+  artifact, then R2 FATAL'd on the CACHED prefill artifact ~3s
+  after firing.
+
+Conclusion: dropping donation produces a DIFFERENT compiled
+artifact (different JIT cache key) that has its own runtime
+bug on FIRST execution. Donation alone is not the root cause;
+the "with donation" artifact has a re-execution bug, the
+"without donation" artifact has a first-execution bug. Both
+manifest as the same TPU [USER] FATAL signature.
+
+iter-5f hyp-1 reverted at the source (commit 571a82f3).
+
+**Notes for iter-5g:**
+
+  * **hyp-1 (drop donation) is dead** — confirmed regression.
+
+  * **hyp-3 (zero kv_caches at orchestrator prefill entry) is
+    HARDER than CLAUDE.md's iter-5e write-up suggested.** The
+    orchestrator's `packed_buffers` output has NO data
+    dependency on input `kv_caches`
+    (`transformer_body_init_state_to_buffer` derives everything
+    from `input_ids`/`params`/`freqs`), so XLA will DCE any
+    `jnp.zeros_like(kv_caches)` we add unless we manufacture an
+    artificial dependency that itself changes the HLO. A
+    `b + 0 * z` pattern is trivially DCE'd. A `dynamic_update_slice`
+    against the input buffer would require restructuring the
+    orchestrator. iter-5g should weigh whether hyp-3 in this
+    form is worth the surgery vs the diagnostic alternative
+    below.
+
+  * **`jax.debug.print` instrumentation (CLAUDE.md iter-5f
+    option 3) is the next viable path.** Add explicit reads of
+    `kv_caches[0]`'s sum / first-element / nonfinite-count at
+    orchestrator entry and exit. XLA can't DCE `jax.debug.print`
+    side-effects, so the values WILL be observed at runtime.
+    Comparing R1's prints (success) to R2's prints
+    (pre-FATAL) should pin whether prior-call data really
+    is bleeding through, or whether the bug is in the
+    orchestrator's intermediate computations independent of
+    input contents. Caveat: adding prints CHANGES THE HLO, so
+    a new compile fingerprint fires — a "passes with prints"
+    result doesn't necessarily mean "the bug is fixed", it
+    might just mean "the prints disturb XLA's scheduling enough
+    to dodge the FATAL".
+
+  * **Sharding-constraint angle (new for iter-5g):** the
+    orchestrator's `packed_buffers` are produced by
+    `_pack_layer_state` (reshape + cast bf16→fp32 + concat).
+    Each per-field array's sharding is inherited from
+    intermediate state arrays, which inherit from
+    `attn_dp`/`attn_head`-sharded params. The JIT's
+    `out_shardings=(P(), ...)` for V4 forces a final reshard
+    to replicated. With donation, XLA must produce the output
+    INTO the donated `P()` buffer; without donation, it
+    allocates a fresh `P()` buffer. The reshard implementation
+    may differ. Try adding
+    `with_sharding_constraint(b, P())` on each `packed_buffer`
+    inside `transformer_body_init_state_to_buffer` BEFORE the
+    final return, so the reshard happens at a known point in
+    the code rather than at the JIT boundary. If R1 + R2 both
+    pass, the bug was in the JIT-boundary reshard.
+
+  * **Non-determinism caveat:** iter-5e itself observed a
+    non-deterministic R1 FATAL on its 2nd smoke without
+    ray-restart (after a 1st smoke that had R1 succeed +
+    R2 fail). iter-5f's R1 FATAL was on a fresh ray-restart,
+    so it's not the same nondeterminism — but the SLICE_FAILURE
+    pattern persisting across requests means a single-FATAL
+    observation doesn't prove "this artifact ALWAYS FATALs".
+    Re-running the same configuration multiple times after
+    ray-restart between each is the safest way to claim a
+    reliable result.
+
+iter-5f burned ~12 min of cluster time (one ray-restart + two
+smoke launches; the first hit a TPU `Halt is unexpected` error
+during weight loading, which is the known TPU-state-leakage
+pattern from CLAUDE.md iter-5e — required ray-restart to clear)
+but yielded a firm result that hyp-1 is dead.
+
+S1 still unlocks A1 (lift `max-model-len`), B1 (sparse_attn
+Pallas becomes worthwhile), and S5 (MTP speculative decoding
+becomes meaningful).
 
 #### S2. Multi-sequence dispatch is a Python loop in eager mode
 
@@ -1746,8 +1832,28 @@ when the timeout SIGTERMs the iter.
   `200 OK` — the decode kernel chain executes end-to-end on
   real bf16 V4 weights. ✓ decode-branch routing + decode
   kernel runs on real V4 (first time ever); ✗ second-request
-  stability still blocks (iter-5d hypotheses 1/3 remain —
-  iter-5f's lane).
+  stability still blocks (iter-5f hyp-1 ruled out — see next
+  entry; hyp-3 / instrumentation deferred to iter-5g).
+* **iter-5f hyp-1 RULED OUT (2026-04-30)**: dropping
+  `donate_argnums=2` for V4 only (model_loader.py V4 branch)
+  was attempted as the cheapest fix for iter-5d's "donated
+  buffer reuse" hypothesis. Tested on real V4-Flash with
+  `V4_DECODE_STATE=1` and a fresh ray-restart
+  (logs/full-slice-v4-smoke-20260430T172651Z.log): R1's
+  fresh-compile prefill orchestrator FATAL'd with the same
+  TPU `[USER]` signature within ~19s of the trace —
+  `tpu6:pe2:2` at 17:33:14Z. Whereas iter-5e's WITH-donation
+  R1 had succeeded and only R2 FATAL'd, iter-5f's WITHOUT-
+  donation R1 failed outright. Conclusion: dropping donation
+  produces a different compiled artifact whose first
+  execution has its own bug. Hypothesis 1 dead; revert
+  shipped at commit 571a82f3. iter-5g picks up from
+  jax.debug.print instrumentation OR the new sharding-
+  constraint angle (force `with_sharding_constraint(b, P())`
+  on each packed_buffer inside `_pack_layer_state` so the
+  reshard-to-replicated happens at a known code point rather
+  than at the JIT boundary). See "Iter 5f status" above for
+  full notes.
 * **MTP forward**: `deepseek_v4_mtp_forward` math validated on
   tiny fixture. ✓ math, ✗ runtime integration (S5).
 * **Chat encoding (all scopes)**: vLLM's upstream
