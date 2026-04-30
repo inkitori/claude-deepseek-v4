@@ -161,19 +161,21 @@ These are concrete pieces of accreted size that future cleanup
 passes should target. The math + serve work without them; they're
 just noise the next reader has to wade through.
 
-* **`tests/models/jax/test_deepseek_v4.py` (3185 LOC, 33 classes).**
-  5–10× the size of any peer model's test file
-  (`test_qwen2_5_vl.py` is the next biggest at 764). Multiple
-  pairs of duplicate-shape classes:
-  `TestDecodeAttentionParity` + `TestDecodeAttentionParityExtended`,
-  `TestDecodeRollingParity` + `TestDecodeRollingParityLong` +
-  `TestDecodeRollingEquivalenceWithPrefill`,
-  several FP8/FP4 dequant classes that overlap. Consolidate to a
-  single parametrized class per concept. Don't drop coverage; do
-  drop scaffolding.
-* **`tests/models/test_deepseek_v4.py` (31 LOC, re-export shim).**
-  Exists because a prior autonomous-task spec expected that path.
-  Verify nothing in CI imports it, then delete.
+* **`tests/models/jax/test_deepseek_v4.py` (2997 LOC, 30 classes).**
+  Still ~4× the size of any peer model's test file
+  (`test_qwen2_5_vl.py` is the next biggest at 764). The biggest
+  remaining wins are the FP8/FP4 dequant classes, which overlap in
+  coverage:
+  - `TestRealFp8DequantSmoke` (NaN/finiteness checks) is strictly
+    weaker than `TestFp8DequantIndependentReference` (byte-equal vs
+    independent numpy reference). Same for the FP4 pair. Either drop
+    the smokes or fold them into the reference classes as a second
+    test method.
+  - `TestFp8Dequant` (synthetic-fixture full-loader bit-identical)
+    and `TestFp8CastByteDomain` (256-byte numpy-vs-torch parity) are
+    distinct concepts — keep both.
+  - `TestFp4CodebookReference` exhaustively enumerates the 16-entry
+    codebook — distinct from the byte-equal real-data tests.
 * **`deepseek_v4.py` has 26 top-level entities vs `deepseek_v3.py`'s
   12.** Some is legitimate (MTP, hash routing, MLA variants), but
   worth scanning for helpers that could use upstream primitives.

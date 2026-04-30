@@ -1324,21 +1324,40 @@ def _build_attn_for_decode(layer_id: int, seed: int = 0, max_seq_len: int = 64):
 
 
 class TestDecodeAttentionParity:
-    """Verify attention_decode_step matches torch reference, layer by layer."""
+    """Verify attention_decode_step matches torch reference, layer by layer.
 
-    @pytest.mark.parametrize("layer_id,start_pos", [
-        (0, 1),       # SWA, very first decode token
-        (0, 8),       # SWA, just past sliding-window edge
-        (0, 9),       # SWA, window-wrap boundary
-        (2, 4),       # CSA, first compression boundary (ratio=4)
-        (2, 7),       # CSA, mid-window before next compression
-        (2, 8),       # CSA, second compression boundary
-        (2, 16),      # CSA, multiple compressions in
-        (3, 16),      # HCA (ratio=128) — no compression yet (only at start_pos+1==128)
-        (3, 32),      # HCA, well after window edge
+    Tolerance: 1e-4 (TOLERANCE_LOG "Decode step" — measured worst 3.8e-6
+    across all parametrized points; 25× margin)."""
+
+    @pytest.mark.parametrize("layer_id,start_pos,max_seq_len", [
+        (0, 1, 256),       # SWA, very first decode token
+        (0, 8, 256),       # SWA, just past sliding-window edge
+        (0, 9, 256),       # SWA, window-wrap boundary
+        (2, 4, 256),       # CSA, first compression boundary (ratio=4)
+        (2, 7, 256),       # CSA, mid-window before next compression
+        (2, 8, 256),       # CSA, second compression boundary
+        (2, 16, 256),      # CSA, multiple compressions in
+        (3, 16, 256),      # HCA (ratio=128) — no compression yet
+        (3, 32, 256),      # HCA, well after window edge
+        # Long-context coverage: spec called for points at sp ∈ {64, 128,
+        # 192, 256, 500, 768, 1023}. SWA (cheapest) every-where, CSA at
+        # sp=64/500, HCA at the compression-event boundaries (sp=128, 256,
+        # 768) and beyond (sp=192, 500).
+        (0, 64, 256),      # SWA, multiple wraparounds past window=8
+        (2, 64, 256),      # CSA: 16 compressions accumulated by sp=64
+        (3, 128, 512),     # HCA first compression event (sp+1==128)
+        (3, 192, 512),     # HCA, past first compression event
+        (0, 500, 512),     # SWA, 62 wraparounds of window=8
+        (2, 500, 512),     # CSA, 125 compressions accumulated
+        (3, 500, 512),     # HCA, 3 compressions accumulated; deep
+        (0, 1023, 1024),   # SWA, max-context single-step parity
+        (0, 256, 512),     # SWA, 32 wraparounds
+        (0, 768, 1024),    # SWA, 96 wraparounds; mid-band {500, 1023}
+        (3, 256, 512),     # HCA, just past 2nd compression event
+        (3, 768, 1024),    # HCA, 6 compression events accumulated
     ])
-    def test_decode_step_parity(self, layer_id, start_pos):
-        attn, args = _build_attn_for_decode(layer_id, seed=0, max_seq_len=256)
+    def test_decode_step_parity(self, layer_id, start_pos, max_seq_len):
+        attn, args = _build_attn_for_decode(layer_id, seed=0, max_seq_len=max_seq_len)
         bsz = 1
         with torch.inference_mode():
             # Run torch prefill of length start_pos to populate state.
@@ -1348,46 +1367,57 @@ class TestDecodeAttentionParity:
             x_step = torch.randn(bsz, 1, args.dim, dtype=torch.bfloat16)
             o_t = attn(x_step, start_pos=start_pos)
 
-        # Snapshot torch state -> JAX state. NOTE: snapshot must be after the
-        # prefill step but before the decode step. We re-run prefill on a
-        # *fresh* attn to capture the right state.
-        attn_fresh, args2 = _build_attn_for_decode(layer_id, seed=0, max_seq_len=256)
+        # Snapshot torch state -> JAX state. Snapshot must be after the
+        # prefill step but before the decode step; re-run prefill on a
+        # fresh attn to capture the right state.
+        attn_fresh, args2 = _build_attn_for_decode(layer_id, seed=0, max_seq_len=max_seq_len)
         with torch.inference_mode():
             _ = attn_fresh(prefill_x, start_pos=0)
         jax_state = _torch_attention_state_to_jax(attn_fresh, args2, bsz)
 
-        # Build JAX params.
         params_j = _torch_attention_to_jax_params(attn_fresh, args2)
         fc = t2j(attn_fresh.freqs_cis).astype(jnp.complex64)
         new_state, y_j = attention_decode_step(
             t2j(x_step), start_pos, params_j, fc, jax_state,
         )
         diff = maxabs(y_j, o_t)
-        # v8 iter 4 tightening: was 5e-2; observed worst 3.8e-6 across the
-        # 9 parametrized points. 1e-4 keeps a 25x margin while making the
-        # test catch real regressions. See TOLERANCE_LOG.md "Decode step".
         assert diff <= 1e-4, (
-            f"layer={layer_id} start_pos={start_pos}: decode step output "
-            f"diff {diff}"
+            f"layer={layer_id} sp={start_pos} (max_seq_len={max_seq_len}): "
+            f"decode step output diff {diff}"
         )
 
 
 class TestDecodeRollingParity:
     """Run a rolling decode of length K starting from a P-prefix prefill, and
-    compare the per-step outputs to the torch reference. This is a stronger
-    test that catches state-mutation bugs."""
+    compare the per-step outputs to the torch reference. Catches
+    state-mutation bugs that per-step parity alone could miss.
 
-    @pytest.mark.parametrize("layer_id,P,K", [
-        (0, 4, 4),    # SWA short
-        (0, 8, 8),    # SWA at window boundary
-        (2, 8, 8),    # CSA: 2 compressions during prefill, more during decode
-        (2, 4, 12),   # CSA: prefill < ratio, all compressions happen during decode
-        (3, 16, 16),  # HCA: small enough that no compression yet (ratio=128)
+    Tolerance: 1e-4 (TOLERANCE_LOG — measured worst 7.63e-6 across all
+    (layer, P, K) combos × seeds; 13× margin)."""
+
+    # The "long" entries (max_seq_len > 256, seed_offset=1000) exercise
+    # multi-wraparound circular-buffer paths and use a distinct rng seed
+    # so they hit a different input distribution from the short entries.
+    @pytest.mark.parametrize("layer_id,P,K,max_seq_len,seed_offset", [
+        (0, 4, 4, 256, 0),       # SWA short
+        (0, 8, 8, 256, 0),       # SWA at window boundary
+        (2, 8, 8, 256, 0),       # CSA: 2 compressions in prefill, more in decode
+        (2, 4, 12, 256, 0),      # CSA: prefill < ratio, all compressions in decode
+        (3, 16, 16, 256, 0),     # HCA (ratio=128): no compression yet
+        # SWA long: 1+31=32 steps → 4× window-8 wraparounds. P=1 because
+        # the torch reference cannot run a length-0 prefill.
+        (0, 1, 31, 64, 1000),
+        # SWA long: 16+32=48 → 6× wraparounds; prefill leaves a pattern
+        # in the circular buffer that decode then walks.
+        (0, 16, 32, 64, 1000),
+        # CSA long: 1+31=32 steps, ~8 compression events.
+        (2, 1, 31, 256, 1000),
     ])
-    def test_rolling_decode_parity(self, layer_id, P, K):
-        attn, args = _build_attn_for_decode(layer_id, seed=42, max_seq_len=256)
+    def test_rolling_decode_parity(self, layer_id, P, K, max_seq_len, seed_offset):
+        attn, args = _build_attn_for_decode(
+            layer_id, seed=42, max_seq_len=max_seq_len)
         bsz = 1
-        torch.manual_seed(P + K + layer_id)
+        torch.manual_seed(P + K + layer_id + seed_offset)
         full_x = torch.randn(bsz, P + K, args.dim, dtype=torch.bfloat16)
 
         with torch.inference_mode():
@@ -1407,10 +1437,9 @@ class TestDecodeRollingParity:
                 t2j(x_step), sp, params_j, fc, jax_state,
             )
             diff = maxabs(y_j, o_t)
-            # v8 iter 4 tightening: was 5e-2; observed worst 3.8e-6 across
-            # all (layer, P, K) combos. 1e-4 keeps a 25x margin.
             assert diff <= 1e-4, (
-                f"step k={k} (sp={sp}): rolling decode diff {diff}"
+                f"layer={layer_id} P={P} K={K} step k={k} (sp={sp}): "
+                f"rolling decode diff {diff}"
             )
 
 
@@ -2544,19 +2573,25 @@ class TestQuantToParamsApply:
 class TestCompressorDecodeStep:
     """Per-step compressor parity. The torch Compressor's prefill populates
     its kv_state/score_state; we snapshot, then run a decode step on both
-    sides and compare states + (when compressing) the output kv."""
+    sides and compare states + (when compressing) the output kv.
 
-    @pytest.mark.parametrize("ratio,P,start_pos", [
-        (4, 4, 4),       # ratio=4 (overlap), first compression event after prefill
-        (4, 8, 8),       # ratio=4, multiple compressions
-        (4, 7, 7),       # mid-window, no compression yet at start_pos (start_pos+1 % 4 != 0)
-        (4, 12, 12),     # deep
-        (128, 64, 64),   # ratio=128, no compression yet
-        (128, 128, 128), # exactly first compression
+    Tolerance: 1e-5 (TOLERANCE_LOG T-CDS — measured worst 0.0 / 7.15e-7 /
+    5.96e-7 across 72 points, all at fp32 ULP)."""
+
+    @pytest.mark.parametrize("ratio,P,start_pos,max_seq_len", [
+        (4, 4, 4, 512),          # ratio=4 (overlap), first compression event
+        (4, 8, 8, 512),          # ratio=4, multiple compressions
+        (4, 7, 7, 512),          # mid-window, no compression at start_pos
+        (4, 12, 12, 512),        # ratio=4, deep
+        (128, 64, 64, 512),      # ratio=128, no compression yet
+        (128, 128, 128, 512),    # ratio=128, exactly first compression
+        (4, 64, 64, 256),        # ratio=4, 16th compression event boundary
+        (4, 63, 63, 256),        # ratio=4, mid-window before 16th compression
+        (128, 255, 255, 512),    # ratio=128, 2nd compression event boundary
     ])
-    def test_compressor_decode_step_parity(self, ratio, P, start_pos):
+    def test_compressor_decode_step_parity(self, ratio, P, start_pos, max_seq_len):
         torch.manual_seed(0)
-        args = make_tiny_args(max_seq_len=512)
+        args = make_tiny_args(max_seq_len=max_seq_len)
         c = TorchCompressor(args, compress_ratio=ratio, head_dim=args.head_dim, rotate=False)
         for n, p in c.named_parameters():
             t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
@@ -2590,15 +2625,12 @@ class TestCompressorDecodeStep:
         else:
             assert did, f"JAX did not compress but torch did at sp={start_pos}"
             diff = maxabs(kv_compressed_j, kv_t)
-            # Measured worst across 24 hits (3 compress configs × 8 seeds): 0.0.
-            # Tightened from 5e-2 to 1e-5 (TOLERANCE_LOG entry T-CDS).
             assert diff <= 1e-5, f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
 
-        # State after step must match torch.
+        # State after step must match torch. score_state contains -inf in
+        # unfilled slots; isfinite-mask before diff to avoid nan.
         diff_kvst = float(np.abs(np.asarray(new_kvst) -
                                   c.kv_state[:bsz].detach().float().numpy()).max())
-        # score_state contains -inf in unfilled slots; diff with torch's -inf -> nan if torch
-        # also has -inf. Use isfinite comparison.
         sc_j = np.asarray(new_scst)
         sc_t = c.score_state[:bsz].detach().float().numpy()
         finite_mask = np.isfinite(sc_t)
@@ -2606,99 +2638,8 @@ class TestCompressorDecodeStep:
             diff_sc = float(np.abs(sc_j[finite_mask] - sc_t[finite_mask]).max())
         else:
             diff_sc = 0.0
-        # Measured worst across 72 points (9 configs × 8 seeds):
-        # kv_state 7.15e-7, score_state 5.96e-7 — both at fp32 ULP. Tightened
-        # from 5e-2 to 1e-5 (TOLERANCE_LOG T-CDS).
         assert diff_kvst <= 1e-5, f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
         assert diff_sc <= 1e-5, f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
-
-
-# =============================================================
-# v3 hardening — extended decode parity coverage
-# =============================================================
-#
-# The original W1 (v2) parity tests covered start_pos ∈ {1, 8, 9, 16, 32}
-# and rolling decodes up to length 16+16=32. The spec calls for points at
-# 64 and 256, plus a 32-step rolling-decode equivalence test against
-# prefill-of-the-same-prefix. These tests are added here in v3.
-#
-# Tolerances follow TOLERANCE_LOG.md T8 — atol=5e-2 for per-step output,
-# atol=2e-2 for state-equivalence (per the spec's allowance for
-# accumulation drift across 32 sequential decode steps).
-
-
-class TestDecodeAttentionParityExtended:
-    """Extra start_pos points called for in the v3 spec resume mandate
-    ({1, 8, 9, 64, 256}). Layer-by-layer like TestDecodeAttentionParity."""
-
-    @pytest.mark.parametrize("layer_id,start_pos,max_seq_len", [
-        # SWA, multiple wraparounds past window=8.
-        (0, 64, 256),
-        # CSA (ratio=4): 16 compressions accumulated by sp=64.
-        (2, 64, 256),
-        # HCA (ratio=128): exact first compression event at sp+1==128, so
-        # sp=128 is the first decode step where the compressed pool is
-        # non-empty.
-        (3, 128, 512),
-        # HCA deep — past the first compression event.
-        (3, 192, 512),
-        # v8 long-context additions per spec post-v3 resume hint
-        # (sp ∈ {500, 1023}): exercise the decode path past the initial
-        # compression schedule to catch state-buffer wraparound bugs that
-        # only surface deep in a sequence.
-        # SWA at sp=500: 62 wraparounds of window=8.
-        (0, 500, 512),
-        # CSA at sp=500: 125 compressions accumulated.
-        (2, 500, 512),
-        # HCA at sp=500: 3 compressions accumulated; deep past 1st event.
-        (3, 500, 512),
-        # SWA at sp=1023: max-context single-step parity, 127 window
-        # wraparounds. The SWA path is the cheapest end-of-context probe.
-        (0, 1023, 1024),
-        # v8 iter 4 additions — fill gaps in {0..1023} between sp=192 and
-        # sp=500, and between sp=500 and sp=1023. SWA only (the cheapest
-        # probe) and HCA with multiple compression events accumulated.
-        # SWA at sp=256: 32 wraparounds of window=8.
-        (0, 256, 512),
-        # SWA at sp=768: 96 wraparounds; mid-band between {500, 1023}.
-        (0, 768, 1024),
-        # HCA at sp=256: just past the 2nd compression event (event at
-        # sp+1 == 256). Tests that the compressor pool is consistent
-        # immediately after a compression.
-        (3, 256, 512),
-        # HCA at sp=768: 6 compression events accumulated (events at
-        # sp+1 ∈ {128, 256, 384, 512, 640, 768}). Deep state probe.
-        (3, 768, 1024),
-    ])
-    def test_decode_step_parity_extended(self, layer_id, start_pos, max_seq_len):
-        attn, args = _build_attn_for_decode(
-            layer_id, seed=0, max_seq_len=max_seq_len)
-        bsz = 1
-        with torch.inference_mode():
-            prefill_x = torch.randn(bsz, start_pos, args.dim, dtype=torch.bfloat16)
-            _ = attn(prefill_x, start_pos=0)
-            x_step = torch.randn(bsz, 1, args.dim, dtype=torch.bfloat16)
-            o_t = attn(x_step, start_pos=start_pos)
-
-        attn_fresh, args2 = _build_attn_for_decode(
-            layer_id, seed=0, max_seq_len=max_seq_len)
-        with torch.inference_mode():
-            _ = attn_fresh(prefill_x, start_pos=0)
-        jax_state = _torch_attention_state_to_jax(attn_fresh, args2, bsz)
-        params_j = _torch_attention_to_jax_params(attn_fresh, args2)
-        fc = t2j(attn_fresh.freqs_cis).astype(jnp.complex64)
-        new_state, y_j = attention_decode_step(
-            t2j(x_step), start_pos, params_j, fc, jax_state,
-        )
-        diff = maxabs(y_j, o_t)
-        # v8 iter 4 tightening: was 5e-2, observed worst 3.8e-6 across the
-        # 8 parametrized points. 1e-4 keeps a 25x margin while making the
-        # test catch real regressions instead of waving them through.
-        # See TOLERANCE_LOG.md "Decode step (extended)".
-        assert diff <= 1e-4, (
-            f"layer={layer_id} sp={start_pos} (max_seq_len={max_seq_len}): "
-            f"decode step output diff {diff}"
-        )
 
 
 class TestDecodeRollingEquivalenceWithPrefill:
@@ -2761,135 +2702,6 @@ class TestDecodeRollingEquivalenceWithPrefill:
             "SWA kv_cache after 32 decode steps not byte-equal to prefill "
             "state despite max-abs == 0"
         )
-
-
-class TestCompressorDecodeStepExtended:
-    """Compressor decode parity at deeper start_pos values, including the
-    second + third compression events for ratio=4 and the second event
-    for ratio=128."""
-
-    @pytest.mark.parametrize("ratio,P,start_pos,max_seq_len", [
-        # ratio=4 CSA, sp=64 → 16th compression event boundary.
-        (4, 64, 64, 256),
-        # ratio=4 CSA, sp=63 → mid-window before 16th compression.
-        (4, 63, 63, 256),
-        # ratio=128 HCA, sp=255 → 2nd compression event boundary
-        # (start_pos+1 == 256, divisible by 128).
-        (128, 255, 255, 512),
-    ])
-    def test_compressor_decode_step_parity_extended(
-        self, ratio, P, start_pos, max_seq_len,
-    ):
-        torch.manual_seed(0)
-        args = make_tiny_args(max_seq_len=max_seq_len)
-        c = TorchCompressor(args, compress_ratio=ratio,
-                            head_dim=args.head_dim, rotate=False)
-        for n, p in c.named_parameters():
-            t = torch.empty_like(p, dtype=torch.float32).normal_(0, 0.02)
-            p.data.copy_(t.to(p.dtype))
-        kv_cache = torch.zeros(args.max_batch_size,
-                               args.max_seq_len // ratio, args.head_dim)
-        c.kv_cache = kv_cache
-        c.freqs_cis = torch_freqs(args.rope_head_dim, args.max_seq_len, 0,
-                                   args.compress_rope_theta, args.rope_factor,
-                                   args.beta_fast, args.beta_slow)
-        bsz = 1
-        prefill_x = torch.randn(bsz, P, args.dim, dtype=torch.bfloat16)
-        with torch.inference_mode():
-            _ = c(prefill_x, start_pos=0)
-
-        kv_state_j = t2j(c.kv_state[:bsz].clone()).astype(jnp.float32)
-        score_state_j = t2j(c.score_state[:bsz].clone()).astype(jnp.float32)
-        params_j = _torch_compressor_to_jax_params(c)
-        fc_j = t2j(c.freqs_cis).astype(jnp.complex64)
-
-        x_step = torch.randn(bsz, 1, args.dim, dtype=torch.bfloat16)
-        with torch.inference_mode():
-            kv_t = c(x_step, start_pos=start_pos)
-        new_kvst, new_scst, kv_compressed_j, did = compressor_decode_step(
-            t2j(x_step), start_pos, params_j, fc_j,
-            kv_state_j, score_state_j,
-        )
-        if kv_t is None:
-            assert not did, (
-                f"JAX claims compression but torch said no at "
-                f"ratio={ratio} sp={start_pos}"
-            )
-        else:
-            assert did, (
-                f"JAX did not compress but torch did at "
-                f"ratio={ratio} sp={start_pos}"
-            )
-            diff = maxabs(kv_compressed_j, kv_t)
-            # See TOLERANCE_LOG T-CDS — measured worst 0.0 / 24 points.
-            assert diff <= 1e-5, (
-                f"ratio={ratio} sp={start_pos}: kv_compressed diff {diff}"
-            )
-        diff_kvst = float(np.abs(np.asarray(new_kvst) -
-                                  c.kv_state[:bsz].detach().float().numpy()).max())
-        sc_j = np.asarray(new_scst)
-        sc_t = c.score_state[:bsz].detach().float().numpy()
-        finite_mask = np.isfinite(sc_t)
-        if finite_mask.any():
-            diff_sc = float(np.abs(sc_j[finite_mask] - sc_t[finite_mask]).max())
-        else:
-            diff_sc = 0.0
-        # See TOLERANCE_LOG T-CDS — measured worst 7.15e-7 (kv_state) /
-        # 5.96e-7 (score_state) across 72 points (9 configs × 8 seeds).
-        assert diff_kvst <= 1e-5, (
-            f"ratio={ratio} sp={start_pos}: kv_state diff {diff_kvst}"
-        )
-        assert diff_sc <= 1e-5, (
-            f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
-        )
-
-
-class TestDecodeRollingParityLong:
-    """Rolling decode for longer K, exercising more compression events."""
-
-    @pytest.mark.parametrize("layer_id,P,K,max_seq_len", [
-        # SWA: 1+31 = 4× window-8 wraparounds. P=1 because the torch
-        # reference cannot run a length-0 prefill (sparse_attn_torch would
-        # max over an empty axis).
-        (0, 1, 31, 64),
-        # SWA: 16+32 = 48 total → 6× window wraparounds; prefill leaves a
-        # specific pattern in the circular buffer that decode then walks.
-        (0, 16, 32, 64),
-        # CSA: 1+31 = 32 steps total, ~8 compression events. P=1 for the
-        # same length-0 reason as above.
-        (2, 1, 31, 256),
-    ])
-    def test_rolling_decode_parity_long(self, layer_id, P, K, max_seq_len):
-        attn, args = _build_attn_for_decode(
-            layer_id, seed=42, max_seq_len=max_seq_len)
-        bsz = 1
-        torch.manual_seed(P + K + layer_id + 1000)
-        full_x = torch.randn(bsz, P + K, args.dim, dtype=torch.bfloat16)
-
-        with torch.inference_mode():
-            _ = attn(full_x[:, :P], start_pos=0)
-        jax_state = _torch_attention_state_to_jax(attn, args, bsz)
-        params_j = _torch_attention_to_jax_params(attn, args)
-        fc = t2j(attn.freqs_cis).astype(jnp.complex64)
-
-        for k in range(K):
-            sp = P + k
-            x_step = full_x[:, sp:sp + 1]
-            with torch.inference_mode():
-                o_t = attn(x_step, start_pos=sp)
-            jax_state, y_j = attention_decode_step(
-                t2j(x_step), sp, params_j, fc, jax_state,
-            )
-            diff = maxabs(y_j, o_t)
-            # v8 iter 6 tightening: was 5e-2; observed worst 7.63e-6 across
-            # 3 configs × 6 seeds × up to 32 decode steps (~500 measurements,
-            # scripts/measure_rolling_long_parity.py). 13× margin under 1e-4.
-            # Same path as TestDecodeAttentionParity / TestDecodeRollingParity
-            # which iter 4 already tightened to 1e-4.
-            assert diff <= 1e-4, (
-                f"layer={layer_id} P={P} K={K} step k={k} sp={sp}: "
-                f"rolling decode diff {diff}"
-            )
 
 
 # ------------------------------------------------------------
