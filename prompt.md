@@ -96,36 +96,74 @@ toward the latency goal, but **don't treat it as the end goal**.
 ### Fast iteration discipline (READ THIS — it's why prior sessions burned hours)
 
 **Do NOT use `./run.sh serve` as your tight inner test loop.** Each
-attempt is 25–35 min of waiting (load + cold compile + curl). At
-that cadence you get 1–2 attempts per hour. That's not iteration,
-that's prayer.
+attempt is 25–45 min of waiting (4 min load + 10–30 min cold compile
++ curl). At that cadence you get 1–2 attempts per hour. That's not
+iteration, that's prayer.
 
 Use these in order, fastest first:
 
-1. **Standalone math scripts** — write a small file under `/tmp/`
-   that imports just the function you changed and asserts byte
-   equivalence vs a reference. ~10–30s per run. Example:
-   `/tmp/test_moe_vectorize.py` already validated the vectorized
-   MoE math against the per-expert reference loop on 5 seeds in
-   ~10s. Mirror that pattern for any math change.
+1. **Standalone math scripts** under `/tmp/` (~10–30s) — example:
+   `/tmp/test_moe_vectorize.py`.
 2. **Tiny-fixture pytest classes** under
-   `tests/models/jax/test_deepseek_v4.py` (the synthetic-config
-   ones — `TestMoEComponent`, `TestAttentionComponent`,
-   `TestBlockComponent`). ~30s–2min per class on CPU.
-3. **`eval_shape` / `lower(...).compile()` only** on the real
-   config. Catches sharding bugs + HLO-emit failures (like the
-   current OOM!) without paying the actual compile time. ~1–3 min.
-   Pattern: `jax.eval_shape(fn, *abstract_args)` then
-   `jit_fn.lower(*abstract_args).compile()`.
+   `tests/models/jax/test_deepseek_v4.py` (~30s–2min on CPU).
+3. **`eval_shape` / `lower(...).compile()` on the real config**
+   (~1–3 min). The agent has used
+   `XLA_FLAGS=--xla_force_host_platform_device_count=32` +
+   `JAX_PLATFORMS=cpu` to compile against a virtual mesh — that
+   pattern works and surfaces all-gather sizes from HLO inspection
+   in seconds. Catches sharding/OOM bugs without paying compile
+   time.
 4. **Real `./run.sh serve` only when 1–3 are green.** Budget at
    most 1–2 of these per session.
 
-**Hard rule: if any single step takes longer than ~5 minutes
-without producing a useful signal, STOP, kill it, and try a
-different approach.** A stuck XLA compile is not "almost done";
-it's silently burning compute. Look for `slow_operation_alarm.cc`
-in the log — that's XLA telling you a single pass is taking
->5 min and you should reconsider.
+### When you DO have to run the real smoke — DON'T BAIL TOO EARLY
+
+Each phase has a known duration. Silence during a phase is normal as
+long as it's the right kind of silence. Use this table to decide
+genuinely-stuck vs. paying-the-cost. **Read CLAUDE.md "Real-smoke
+phase budgets" for the full version**:
+
+| Phase | Expected | Bail trigger |
+|---|---|---|
+| Weight load | ~4 min | No heartbeat for >2 min |
+| `Application startup complete` | ~30s after load | Absent >2 min after load done |
+| **`jit_run_model` cold compile** | **10–30 min, mostly silent** | **Three or more `slow_operation_alarm.cc` warnings — one is normal**, OR iter-timeout in <15 min |
+| First curl response | sub-second after compile | Curl 900s timeout fires |
+
+**Critical rule:** silence during the `jit_run_model` PostOpt phase
+is **expected for up to ~25 min**. **Do NOT bail before 25 min**
+unless the iter timeout is closing in or you see a hard error
+(`RESOURCE_EXHAUSTED`, `Worker exit type`, `Traceback`).
+
+The previous sessions' "5 min without signal" rule applies only to
+*quick probes* (CPU pytest, `lower().compile()`). For the real
+smoke's `jit_run_model` compile, 5 min of silence means nothing.
+
+### Spend the compile-wait window productively
+
+The smoke compile is going to take 10–30 min no matter what. Don't
+just sit in a Monitor waiting. While it runs:
+
+* Sketch the next-lane fix in a `/tmp/` test so it's ready to ship
+  the moment the current smoke confirms (or fails differently).
+* Audit `Involuntary full rematerialization` warnings in the smoke
+  log — each one is a sharding inefficiency you can fix later.
+* Consolidate test bloat (CLAUDE.md "Known bloat" list) — test
+  edits don't conflict with the running smoke.
+
+### Iter-timeout management
+
+If you're approaching `ITER_TIMEOUT_SEC=5400` (90 min) without a
+result:
+
+* **At T-15 min:** stop launching new long-running steps. Commit
+  whatever code change you've made (with `WIP:` prefix describing
+  what was tried + what's unverified) so iter N+1 can pick up
+  from the same on-disk state.
+* **At T-5 min:** reset the cluster + push the WIP commit.
+
+Better a checkpointed WIP commit than losing the diff when timeout
+SIGTERMs the iter.
 
 ### Attack lanes (in rough ROI order)
 

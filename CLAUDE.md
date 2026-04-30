@@ -193,10 +193,11 @@ working serve; reducing the cold-compile time is the broader goal.
 ## Iteration discipline (READ — applies to humans + agents alike)
 
 **Do NOT use `./run.sh serve` as your inner test loop.** Each attempt
-is 25–35 min (5 min load + 20–30 min cold compile + curl wait).
-That's 1–2 attempts per hour. Prior sessions burned real time this
-way. Use the fastest validation that catches the bug class you're
-working on:
+is 25–45 min (4 min load + 10–30 min cold compile + curl wait). That
+budget is fixed by XLA, not by anything we can shorten in a single
+iteration. Prior sessions burned real time treating it as if it
+should be fast. Use the fastest validation that catches the bug
+class you're working on:
 
 1. **Standalone math scripts** under `/tmp/` (~10–30s) — example
    pattern: `/tmp/test_moe_vectorize.py` validated the vectorized
@@ -206,14 +207,65 @@ working on:
 3. **`eval_shape` / `lower().compile()` on the real config**
    (~1–3min). Catches sharding bugs + HLO-emit failures (like
    the current HBM OOM!) without paying the runtime compile cost.
+   The agent has used `XLA_FLAGS=--xla_force_host_platform_device_count=32`
+   + `JAX_PLATFORMS=cpu` to compile against a virtual mesh — that
+   pattern works and surfaces all-gather sizes from HLO inspection
+   in seconds.
 4. **Real `./run.sh serve`** only when 1–3 are green. Budget at
    most 1–2 of these per session.
 
-**Hard rule: if any step takes >~5 minutes without a useful signal,
-stop and try a different approach.** A stuck XLA compile is not
-"almost done" — it's burning compute silently. Look for
-`slow_operation_alarm.cc` in the log; that's XLA telling you a
-single pass has been running >5 min.
+### Real-smoke phase budgets (don't bail too early!)
+
+When you have to run the real smoke (path #4), each phase has a
+*known* duration. Silence during a phase is normal as long as it's
+the right kind of silence. Use these to decide if something's
+genuinely stuck vs. just paying the cost:
+
+| Phase | Expected duration | What you should see | Bail signal |
+|---|---|---|---|
+| **vLLM startup + Ray cluster init** | ~30s | `Init mesh \| mesh=Mesh(...)`, `Init kv-cache`, route registration | No log activity for >2 min, OR `Worker exit type: SYSTEM_ERROR`. |
+| **Weight load** | ~4 min | `[deepseek_v4] placed N tensors (R/s, ...)` heartbeat every ~7s, then `load_weights_from_dir done` | No heartbeat for >2 min, OR `placed N` count stops growing. |
+| **`capture_model` precompile** | ~30s | A handful of small `running hlo passes for N instructions, module: jit_*` lines (`jit__threefry_seed`, `jit__allocate`, `jit_iota`, `jit_unpack_arrays`, etc.), each tiny | Any `RESOURCE_EXHAUSTED` / `CompileTimeHbmOom`. |
+| **`Application startup complete`** | fires immediately after capture_model | Single line | If absent >2 min after capture_model finishes. |
+| **`jit_run_model` cold compile** | **10–30 min** | One `running hlo passes for ~100k instructions, module: jit_run_model`, then **long silence punctuated by `HLO PostOptimizationPipeline` lines and SPMD warnings**. The silence is normal — XLA's late codegen passes don't emit progress. | Three or more separate `slow_operation_alarm.cc` warnings (each fires after a single pass exceeds 5 min). One alarm = one slow pass; that alone is *not* enough to bail. Also: any `RESOURCE_EXHAUSTED` / `Worker exit`. |
+| **First curl returning** | sub-second after compile finishes | `INFO 127.0.0.1:... "POST /v1/completions" 200 OK` and the `[smoke-check] response 1: ...` line | Curl 900s timeout fires, OR the engine crashes mid-execute. |
+
+**Rule of thumb during real smoke:** silence in the `jit_run_model`
+phase ≤ ~25 min is *expected*, not stuck. **Don't bail before 25
+min unless the iter timeout is closing in.** The 90-min
+ITER_TIMEOUT_SEC has plenty of slack for one full smoke + one bail.
+
+**Concurrent work while compile runs:** the compile is going to
+take 10–30 min no matter what you do. Spend that time productively
+— don't just sit in a Monitor. Good uses of the wait window:
+
+* Sketch the next-lane fix (lane 2 cache-rsync helper, lane 3
+  SPMD remat-warning audit) in a `/tmp/` standalone test so it's
+  ready to ship the moment the current smoke confirms.
+* Audit the `Involuntary full rematerialization` warnings
+  accumulating in the smoke log — each one points at a
+  resharding inefficiency you can fix on a future iter.
+* Consolidate test bloat (CLAUDE.md "Known bloat" list) — test
+  edits don't conflict with the running smoke.
+
+**Quick-test rule (still applies for code edits, NOT for smoke):**
+if a CPU pytest / `lower().compile()` probe takes >5 min without a
+useful signal, kill it and rethink — that *is* stuck.
+
+### Iter-timeout management
+
+`ITER_TIMEOUT_SEC=5400` (90 min). If you're approaching the deadline
+without a result:
+
+1. **At T-15 min:** stop launching new long-running steps. Commit
+   whatever code change you've made so far (with a "WIP:" prefix
+   describing what was tried + what's still unverified) so iter N+1
+   can pick up from the same on-disk state.
+2. **At T-5 min:** reset the cluster + push the WIP commit. Don't
+   risk the iter being killed mid-`./run.sh serve`.
+
+Better to have a checkpointed WIP commit than to lose the diff
+when the timeout SIGTERMs the iter.
 
 What happened: the vectorized MoE (`deepseek_v4_moe.py::moe_forward`)
 collapses 256 per-expert matmuls into 3 stacked einsums per layer,
