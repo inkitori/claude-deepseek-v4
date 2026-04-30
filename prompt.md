@@ -85,13 +85,11 @@ See CLAUDE.md "What's been optimized + verified" for the latest.
 **Make the first `/v1/completions` request after `./run.sh serve`
 return as fast as possible**, while keeping the math correct.
 
-This is currently impossible to even *test* end-to-end:
-`./run.sh serve` takes ~5 min to load weights + a 20–30 min XLA
-compile before any curl can return. The compile currently fails
-with `CompileTimeHbmOom` (see [CLAUDE.md](CLAUDE.md) "Current state"
-for the root cause + ranked attack lanes). So the OOM is the
-*first symptom* of the latency problem — fix it as the first step
-toward the latency goal, but **don't treat it as the end goal**.
+End-to-end is now working: cold-compile finishes in ~97 s and the
+deterministic curl returns " Paris" twice (Tier 8 GREEN). The next
+wins are compile-time (cache reuse, AOT) and headroom (lifting
+`max-model-len` / `max-num-seqs`). See [CLAUDE.md](CLAUDE.md) "Next
+attack lanes" for the ranked list.
 
 ### Fast iteration discipline (READ THIS — it's why prior sessions burned hours)
 
@@ -167,16 +165,7 @@ SIGTERMs the iter.
 
 ### Attack lanes (in rough ROI order)
 
-1. **Fix the MoE-vectorize HBM OOM.** The vectorize cuts HLO
-   instructions 4.6× (huge compile-time win) but currently OOMs.
-   Lane 1 in CLAUDE.md is a one-liner:
-   `jax.lax.with_sharding_constraint` on each stacked weight to
-   force sharding on the inter dim instead of all-gathering the
-   new expert dim. Validate via path #3 above (compile-only
-   `lower().compile()` on the abstract real config) — *don't*
-   relaunch the full smoke until that compiles.
-
-2. **Verify cross-host JAX cache sharing.** Each of 8 hosts
+1. **Verify cross-host JAX cache sharing.** Each of 8 hosts
    compiles its own SPMD slice; `/tmp/jax-compile-cache-v4` is
    per-host. After one successful compile, fingerprint the cache
    files across hosts — if byte-equal, a tiny
@@ -185,24 +174,19 @@ SIGTERMs the iter.
    Uncertain whether SPMD bakes in per-device IDs; verify before
    shipping.
 
-3. **Fix `Involuntary full rematerialization` warnings.** Each
-   one in the compile log is XLA giving up on a sharding spec
-   (e.g. `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`).
-   Track down each and pre-shard or annotate with
-   `with_sharding_constraint`. Shrinks HLO and removes runtime
-   barriers. Validate via path #3.
+2. **Bump `max-model-len` / `max-num-seqs` and re-smoke.** We
+   compiled under `max-model-len=256, max-num-seqs=1`. The next
+   iter that lifts the cap should re-run the smoke and watch for
+   BACKEND_PASSES OOMs.
 
-4. **AOT precompile + binary persist.** `jit().lower().compile()`
+3. **AOT precompile + binary persist.** `jit().lower().compile()`
    serialized + loaded on subsequent launches. Real XLA-versioning
-   risk; defer until after lanes 1–3 are exhausted.
+   risk; defer until lanes 1–2 are exhausted.
 
 ### Realistic targets
 
-* Cold cache: ~5 min (architectural floor on TPU XLA for a graph
-  of this size — once the OOM is fixed and HLO count is in the
-  100k range).
-* Warm cache: ~30–60s (cache load + first execute).
-* Sub-10s is the stretch goal; needs AOT work.
+* Cold cache: ~97 s (current). Drop it via lane 3 (AOT) → seconds.
+* Warm cache: sub-second curl after cache load.
 
 After each change, report observed latency (or the failure mode)
 in the commit message so we can see the trend.

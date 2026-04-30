@@ -30,9 +30,21 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import PartitionSpec as P
 
 
 # --------------------- general helpers ---------------------
+
+def _replicate(x: jnp.ndarray) -> jnp.ndarray:
+    """Force `x` fully replicated. Used on tiny constant tables (ape)
+    that the loader heuristically sharded along `attn_dp`; without this
+    constraint XLA emits a 32-way reshard at every broadcast site, which
+    `Involuntary full rematerialization`-warns and wastes activation HBM.
+    No-op outside a mesh context (CPU unit tests run without `jax.set_mesh`).
+    """
+    if jax.sharding.get_abstract_mesh().empty:
+        return x
+    return jax.lax.with_sharding_constraint(x, P())
 
 def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
     """RMSNorm: out = weight * x / sqrt(mean(x*x) + eps). Computation in fp32,
@@ -267,7 +279,7 @@ def compressor_prefill(
     score = score[:, :cutoff, :]
     # Reshape to ratio groups.
     kv = kv.reshape(B, cutoff // ratio, ratio, coff * d)
-    score = score.reshape(B, cutoff // ratio, ratio, coff * d) + params.ape  # [ratio, coff*d] broadcasts
+    score = score.reshape(B, cutoff // ratio, ratio, coff * d) + _replicate(params.ape)  # [ratio, coff*d] broadcasts
     if overlap:
         # Insert prev-step + current-step into a doubled-ratio bin.
         kv = _overlap_transform(kv, ratio, d, fill_value=0.0)
@@ -492,7 +504,7 @@ def compressor_decode_step(
     score = xf @ params.wgate.T     # [B, 1, coff*d]
 
     pos_in_ratio = start_pos % ratio
-    score = score + params.ape[pos_in_ratio]
+    score = score + _replicate(params.ape)[pos_in_ratio]
 
     kv_one = kv.squeeze(1)
     score_one = score.squeeze(1)

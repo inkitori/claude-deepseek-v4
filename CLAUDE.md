@@ -249,23 +249,16 @@ Still loose ends worth tracking:
     a `scripts/full_slice_v4_share_cache.sh` rsync'ing host 0's
     cache after one good launch would 8× brand-new-slice
     first-launch on a freshly bootstrapped slice.
-  * **`Involuntary full rematerialization` warnings** still appear
-    in the compile log — 126 of them in the GREEN smoke log
-    (2026-04-30T041423Z), all on `f32[128, 16]` tensors reshard
-    `{devices=[1,32]}` → `{devices=[16,1,2]} last_tile_dim_replicate`.
-    Diagnosed: every warning is on either `compressor.ape` (op_name
-    `state['params_v'].value[1][L][0][8][0]`) or
-    `indexer.compressor.ape` (`[1][L][0][9][2][0]`) — the absolute
-    positional embedding tensors of the HCA / CSA compressors. Total
-    HBM cost ≈ 528 KB across all layers (66 tensors × 8 KB), so the
-    cheap fix is to mark these as fully replicated either by special-
-    casing them in `pick_partition_spec` (return `P()` when the leaf
-    is a small ape: shape == (cr, coff*Dh) with cr ≥ 4) or with a
-    `with_sharding_constraint(params.ape, P())` at the top of
-    `compressor_prefill` / `compressor_decode_step` in
-    `deepseek_v4_attention.py`. They didn't block the compile this
-    iter, but each one wastes activation budget. Validate with a
-    CPU-only `lower().compile()` probe before paying for a smoke.
+  * ~~`Involuntary full rematerialization` warnings~~ FIXED
+    (2026-04-30T044814Z smoke). The 126 baseline warnings on
+    `compressor.ape` / `indexer.compressor.ape` resharding from
+    `{devices=[1,32]}` were eliminated by `_replicate(params.ape)`
+    (a no-op-outside-mesh `with_sharding_constraint(_, P())`)
+    inside `compressor_prefill` and `compressor_decode_step` in
+    `deepseek_v4_attention.py`. Smoke is text-identical and
+    cold-compile time is unchanged (~97 s). HLO instruction count
+    is unchanged (47k optimized) — the savings were activation HBM,
+    not graph size.
 
 ## Iteration discipline (READ — applies to humans + agents alike)
 
@@ -346,70 +339,27 @@ when the timeout SIGTERMs the iter.
 
 ### Next attack lanes (in rough ROI order)
 
-The original "stack-then-all-gather" symptom is fixed. The remaining
-problem is the per-chip memory budget itself. In ROI order:
+Tier 8 deploy gate is GREEN (cold compile ~97 s, warm-cache curl
+sub-second). The OOM and the rematerialization warnings are both
+fixed. Remaining work is compile-time + headroom:
 
-1. **Audit the 28 GB of "arguments" per chip.** Expected ~17 GB
-   (sharded weights). The extra ~11 GB is the bulk of the OOM gap.
-   - Add a one-shot dump after `load_weights_from_dir done` that
-     iterates the assembled param tree, computes per-leaf
-     `numel * dtype_bytes / num_local_devices` (i.e. per-chip
-     resident bytes), and prints the top 20 leaves by size. Look for
-     anything large with `spec=P()` (fully replicated) or with a
-     sharding axis other than `attn_dp` (mesh has size 1 on
-     non-`attn_dp` axes, so non-`attn_dp` shardings are also
-     effectively replicated).
-   - Particular suspects: `gate.weight` (`[E, dim] = [256, 4096]
-     fp32 = 4 MB` — small, fine), `tid2eid` (`[vocab, top_k] =
-     [129280, 6] int32 = 3 MB` — small, fine), but the per-layer
-     `hc_attn_fn` / `hc_ffn_fn` matrices are `[mix_hc, hc_dim] =
-     [(2 + hc_mult) * hc_mult, hc_mult * hidden_size]` — if
-     `hc_mult` is large these can be 100+ MB each, ×30 layers ×
-     2 = several GB if replicated.
-   - Embedding `[vocab, dim] = [129280, 4096] bf16 = 1 GB` and head
-     of the same size — if either is replicated that's 2 GB.
+1. **Verify cross-host JAX cache sharing.** Each of 8 hosts compiles
+   its own SPMD slice; `/tmp/jax-compile-cache-v4` is per-host.
+   After one successful compile, fingerprint the cache files across
+   hosts — if byte-equal, a tiny `scripts/full_slice_v4_share_cache.sh`
+   rsyncs host 0's cache to workers and brand-new-slice first-launch
+   is 8× faster. Uncertain whether SPMD bakes in per-device IDs;
+   verify before shipping.
 
-2. **Verify the lane-1 follow-on (`_shard_e_mid` on einsum
-   intermediates) actually helps on TPU.** Already in tree, CPU
-   compile-only is green, but the TPU smoke that observed the
-   BACKEND_PASSES OOM was *before* this commit — the next smoke
-   tests it. If it shrinks the activation budget far enough to fit,
-   we're done; if not, fall through to lane 1.
+2. **Bump `max-model-len` / `max-num-seqs` and re-smoke.** We compiled
+   under `max-model-len=256, max-num-seqs=1`; activation HBM scales
+   roughly linearly with both. We don't yet know the per-chip
+   activation ceiling. The iter that lifts the cap should re-run the
+   smoke and watch for new OOMs (BACKEND_PASSES temp).
 
-3. **Fix `Involuntary full rematerialization` warnings.** These
-   spam the compile log and indicate XLA can't satisfy a sharding
-   spec without a full replicate-then-repartition. Each one
-   wastes some of the 11.64 GB activation budget.
-   Pattern from the run:
-   `cannot go from sharding {devices=[1,32]<=[32]} to {devices=[16,1,2]<=[2,16]T(1,0)}`
-   for `f32[128,16]` tensors at param indices stepping by 1592
-   (likely the per-layer attention top_k partials, given
-   `num_experts_per_tok=6` doesn't match 16 — investigate). Add
-   `with_sharding_constraint` upstream so XLA doesn't have to
-   reshard.
-
-4. **Pre-stack the experts at load time** in `deepseek_v4_loader.py`.
-   The current code stacks 256 separate per-leaf jax.Arrays inside
-   the JIT every forward call, which forces an all-to-all to honor
-   the `_shard_e_first` constraint. Doing the stack at load time —
-   so the param tree carries an `[E, inter, dim]` tensor with
-   PartitionSpec `(attn_dp, None, None)` from the start — eliminates
-   the per-call all-to-all *and* the per-call stack op. Bigger
-   change (touches `MoEParams` dataclass + the loader's per-leaf
-   placement loop) but eliminates a structural inefficiency.
-
-5. **Verify cross-host JAX cache sharing.** Each of 8 hosts
-   compiles its own SPMD slice; `/tmp/jax-compile-cache-v4` is
-   per-host. After one successful compile, fingerprint the cache
-   files across hosts — if byte-equal, a tiny
-   `scripts/full_slice_v4_share_cache.sh` rsyncs host 0's cache
-   to workers and brand-new-slice first-launch is 8× faster.
-   Uncertain whether SPMD bakes in per-device IDs; verify before
-   shipping.
-
-6. **AOT precompile + binary persist.** `jit().lower().compile()`
+3. **AOT precompile + binary persist.** `jit().lower().compile()`
    serialized + loaded on subsequent launches. Real XLA-versioning
-   risk; defer until after lanes 1–5 are exhausted.
+   risk; defer until lanes 1–2 are exhausted.
 
 Validation after any change:
 ```bash
