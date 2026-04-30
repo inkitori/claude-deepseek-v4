@@ -515,7 +515,7 @@ completions probe still sends `seed=0` because at temperature=0
 JAX accepts it (as a no-op). That asymmetry is the same reason
 byte-equality across runs would be a false guarantee.
 
-**Stop-sequence probe (DONE — harness-verified, real-V4 verification deferred)**:
+**Stop-sequence probe (DONE — verified end-to-end 2026-04-30)**:
 `STOP_REQUIRED=1` fires `/v1/completions` with `stop=["Paris"]` and
 asserts (a) the response text does NOT contain `Paris` and
 (b) `finish_reason="stop"`; exit 8 on either. The deterministic
@@ -524,10 +524,13 @@ token at temp=0/seed=0, so a working stop-sequence handler MUST
 intercept that token, truncate, and report `stop`. Mock harness
 covers `stop_required_match` (mock truncates correctly →
 exit 0) and `stop_required_leak` (mock with `--stop-honor 0`
-ignores the field → exit 8). Real-V4 verification deferred to
-the next real-smoke run.
+ignores the field → exit 8). End-to-end-verified on real
+`vllm serve` 2026-04-30 10:16Z: `contains_needle=0 text_len=0
+finish_reason=stop`, exit 0. The empty-text outcome is correct:
+the model's first generated token IS the stop sequence, so a
+correctly-truncated response is empty.
 
-**Logprobs probe (DONE — harness-verified, real-V4 verification deferred)**:
+**Logprobs probe (DONE — verified end-to-end 2026-04-30)**:
 `LOGPROBS_REQUIRED=1` fires `/v1/completions` with `logprobs=5`
 and asserts every emitted position's `top_logprobs` entry has at
 least 5 alternatives (exit 9 on missing object / dropped
@@ -535,11 +538,11 @@ alternatives). Mock harness covers `logprobs_required_match`
 (mock emits 5 alts → exit 0), `logprobs_required_missing`
 (mock with `--logprobs-alts 0` omits the object → exit 9), and
 `logprobs_required_dropped` (mock with `--logprobs-alts 3` emits
-fewer than requested → exit 9). Real-V4 verification deferred.
-Production clients (confidence scoring, reranking, structured-
-output likelihood) depend on this path; vLLM's TPU runner has
-historically had quirks here (per-position emission can be
-silently dropped under some sampling configs).
+fewer than requested → exit 9). End-to-end-verified on real
+`vllm serve` 2026-04-30 10:16Z: `min_alternatives=5 (requested 5)`,
+exit 0. Production clients (confidence scoring, reranking,
+structured-output likelihood) depend on this path; vLLM's TPU
+runner has historically had quirks here.
 
 **Still TODO** — `top_k` (typically combined with `top_p` to bound
 the candidate set), `presence_penalty` (different from
@@ -927,16 +930,22 @@ when the timeout SIGTERMs the iter.
   inspect `seed`). The pitfall is the deeper "TPU runner doesn't
   support per-request seed" CLAUDE.md note showing up *as a 400*,
   not just as silently-ignored.
-* **Stop-sequence + logprobs probes scaffolded** (`STOP_REQUIRED=1`
-  + `LOGPROBS_REQUIRED=1` smoke_check + 18-scenario harness self-test).
-  ✓ harness; ✗ real-V4 verification (deferred to next real-smoke run).
+* **Stop-sequence + logprobs probes verified end-to-end** (`STOP_REQUIRED=1`
+  + `LOGPROBS_REQUIRED=1` smoke_check + 18-scenario harness self-test +
+  real `vllm serve` run on 2026-04-30 10:16Z). ✓ See S6.
+
   Stop probe sends `stop=["Paris"]` against the deterministic prompt
-  whose first token is ` Paris` — a working handler MUST truncate
-  before that token and report `finish_reason="stop"`. Logprobs probe
-  sends `logprobs=5` and asserts every position's `top_logprobs` has
-  at least 5 alternatives. Mock covers leak (stop ignored) and dropped/
-  missing (logprobs alts fewer than requested or omitted entirely).
-  See S6.
+  whose first token is ` Paris` — a working handler must truncate
+  before that token and report `finish_reason="stop"`. Real-V4
+  outcome: `contains_needle=0 text_len=0 finish_reason=stop`. The
+  empty text is correct — the *very* first emitted token is the
+  stop sequence, so a correctly-truncated response IS empty.
+
+  Logprobs probe sends `logprobs=5` and asserts every position's
+  `top_logprobs` has at least 5 alternatives. Real-V4 outcome:
+  `min_alternatives=5 (requested 5)`, exit 0. Production clients
+  (confidence scoring, reranking, structured-output likelihood)
+  depend on this path.
 * **Tiny-tensor replication at load** (B3 fix): `pick_partition_spec`
   in `models/jax/deepseek_v4_loader.py` returns `P()` for shape
   products below `_MIN_SHARD_ELEMENTS=8K` (~32 KiB f32). Eliminates
