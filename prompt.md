@@ -82,69 +82,98 @@ See CLAUDE.md "What's been optimized + verified" for the latest.
 
 ## Your job — primary objective
 
-**Fix the `CompileTimeHbmOom` so `./run.sh serve` actually returns
-a curl response.** The detailed failure breakdown lives in
-[CLAUDE.md](CLAUDE.md) "Current state (READ BEFORE LAUNCHING)" with
-4 ranked attack lanes. Start with lane 1 (`with_sharding_constraint`
-on the stacked MoE weights) — it's a one-line fix per stack and
-should preserve the 4.6× HLO instruction count win.
+**Make the first `/v1/completions` request after `./run.sh serve`
+return as fast as possible**, while keeping the math correct.
 
-Once curl returns, the **secondary objective** is reducing first-curl
-latency. The graph is currently ~103k HLO instructions; cold compile
-takes ~10 min. Realistic targets:
+This is currently impossible to even *test* end-to-end:
+`./run.sh serve` takes ~5 min to load weights + a 20–30 min XLA
+compile before any curl can return. The compile currently fails
+with `CompileTimeHbmOom` (see [CLAUDE.md](CLAUDE.md) "Current state"
+for the root cause + ranked attack lanes). So the OOM is the
+*first symptom* of the latency problem — fix it as the first step
+toward the latency goal, but **don't treat it as the end goal**.
 
-* Cold cache: ~5-10 min (architectural floor on TPU XLA for a graph
-  of this size).
-* Warm cache: ~30-60s (cache load + first execute).
-* Sub-10s is the stretch goal but requires AOT-precompile work.
+### Fast iteration discipline (READ THIS — it's why prior sessions burned hours)
 
-Attack lanes for first-curl (after the OOM is fixed):
+**Do NOT use `./run.sh serve` as your tight inner test loop.** Each
+attempt is 25–35 min of waiting (load + cold compile + curl). At
+that cadence you get 1–2 attempts per hour. That's not iteration,
+that's prayer.
 
-1. **Verify cross-host JAX cache sharing is safe.** Each of the 8
-   hosts currently compiles its own slice of the SPMD program;
-   `/tmp/jax-compile-cache-v4` is per-host. After a successful
-   compile, fingerprint the cache files (sha256 the .pb / .bin
-   contents on every host) — if host 0's matches hosts 1-7, write
-   `scripts/full_slice_v4_share_cache.sh` to rsync host 0's cache
-   to all workers after a bootstrap-time warmup. Brand-new-slice
-   first-launch becomes 8× faster on cold. Uncertain: SPMD might
-   bake in per-device identifiers that break byte-equality. Verify
-   before shipping.
+Use these in order, fastest first:
 
-2. **Fix `Involuntary full rematerialization` warnings.** Every one
-   in the smoke log is XLA giving up on a sharding spec (e.g.
-   `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`). Track
-   down which leaf or activation generates each and either pre-shard
-   it at load-time or annotate the forward with
+1. **Standalone math scripts** — write a small file under `/tmp/`
+   that imports just the function you changed and asserts byte
+   equivalence vs a reference. ~10–30s per run. Example:
+   `/tmp/test_moe_vectorize.py` already validated the vectorized
+   MoE math against the per-expert reference loop on 5 seeds in
+   ~10s. Mirror that pattern for any math change.
+2. **Tiny-fixture pytest classes** under
+   `tests/models/jax/test_deepseek_v4.py` (the synthetic-config
+   ones — `TestMoEComponent`, `TestAttentionComponent`,
+   `TestBlockComponent`). ~30s–2min per class on CPU.
+3. **`eval_shape` / `lower(...).compile()` only** on the real
+   config. Catches sharding bugs + HLO-emit failures (like the
+   current OOM!) without paying the actual compile time. ~1–3 min.
+   Pattern: `jax.eval_shape(fn, *abstract_args)` then
+   `jit_fn.lower(*abstract_args).compile()`.
+4. **Real `./run.sh serve` only when 1–3 are green.** Budget at
+   most 1–2 of these per session.
+
+**Hard rule: if any single step takes longer than ~5 minutes
+without producing a useful signal, STOP, kill it, and try a
+different approach.** A stuck XLA compile is not "almost done";
+it's silently burning compute. Look for `slow_operation_alarm.cc`
+in the log — that's XLA telling you a single pass is taking
+>5 min and you should reconsider.
+
+### Attack lanes (in rough ROI order)
+
+1. **Fix the MoE-vectorize HBM OOM.** The vectorize cuts HLO
+   instructions 4.6× (huge compile-time win) but currently OOMs.
+   Lane 1 in CLAUDE.md is a one-liner:
+   `jax.lax.with_sharding_constraint` on each stacked weight to
+   force sharding on the inter dim instead of all-gathering the
+   new expert dim. Validate via path #3 above (compile-only
+   `lower().compile()` on the abstract real config) — *don't*
+   relaunch the full smoke until that compiles.
+
+2. **Verify cross-host JAX cache sharing.** Each of 8 hosts
+   compiles its own SPMD slice; `/tmp/jax-compile-cache-v4` is
+   per-host. After one successful compile, fingerprint the cache
+   files across hosts — if byte-equal, a tiny
+   `scripts/full_slice_v4_share_cache.sh` rsyncs host 0's cache
+   to workers and brand-new-slice first-launch is 8× faster.
+   Uncertain whether SPMD bakes in per-device IDs; verify before
+   shipping.
+
+3. **Fix `Involuntary full rematerialization` warnings.** Each
+   one in the compile log is XLA giving up on a sharding spec
+   (e.g. `cannot go from {devices=[1,32]} to {devices=[16,1,2]}`).
+   Track down each and pre-shard or annotate with
    `with_sharding_constraint`. Shrinks HLO and removes runtime
-   barriers.
+   barriers. Validate via path #3.
 
-3. **Reduce HLO instruction count further.** Look for Python-level
-   loops over heads / layers / hash shards that XLA is unrolling.
-   Consolidate where the same memory-safety considerations as the
-   MoE vectorize are met (don't create unsharded stacks).
+4. **AOT precompile + binary persist.** `jit().lower().compile()`
+   serialized + loaded on subsequent launches. Real XLA-versioning
+   risk; defer until after lanes 1–3 are exhausted.
 
-4. **AOT precompile + binary persist.** Use
-   `jit().lower().compile()` to produce a serializable XLA
-   executable, load on subsequent launches without re-tracing. Real
-   work; non-trivial XLA-versioning risk.
+### Realistic targets
 
-After each change, validate with the loop:
+* Cold cache: ~5 min (architectural floor on TPU XLA for a graph
+  of this size — once the OOM is fixed and HLO count is in the
+  100k range).
+* Warm cache: ~30–60s (cache load + first execute).
+* Sub-10s is the stretch goal; needs AOT work.
 
-```bash
-./run.sh serve
-./scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
-```
-
-Report observed first-curl latency (or the failure mode) in the
-commit message so we can see the trend.
+After each change, report observed latency (or the failure mode)
+in the commit message so we can see the trend.
 
 ## Secondary: keep cleaning up
 
-If the OOM is fixed and first-curl is already optimal, fall back to
-consolidating the known-bloat targets in CLAUDE.md "Known bloat /
-consolidation candidates" — particularly the 3185-LOC test file
-with 33 classes.
+If first-curl is solid, fall back to consolidating the known-bloat
+targets in CLAUDE.md "Known bloat / consolidation candidates" —
+particularly the 3185-LOC test file with 33 classes.
 
 ## Commit + push hygiene
 

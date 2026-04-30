@@ -186,7 +186,34 @@ when you touch.
 `./run.sh serve` will reach `Application startup complete` and the
 load is fast (~4 min). **The first `/v1/completions` call fails with
 `CompileTimeHbmOom`** during XLA's late codegen pass on real
-V4-Flash. This is the **#1 thing to fix**.
+V4-Flash. This is the **first symptom** of the bigger problem: the
+end-to-end first-curl latency. Fixing the OOM is step one toward a
+working serve; reducing the cold-compile time is the broader goal.
+
+## Iteration discipline (READ — applies to humans + agents alike)
+
+**Do NOT use `./run.sh serve` as your inner test loop.** Each attempt
+is 25–35 min (5 min load + 20–30 min cold compile + curl wait).
+That's 1–2 attempts per hour. Prior sessions burned real time this
+way. Use the fastest validation that catches the bug class you're
+working on:
+
+1. **Standalone math scripts** under `/tmp/` (~10–30s) — example
+   pattern: `/tmp/test_moe_vectorize.py` validated the vectorized
+   MoE math vs the per-expert reference on 5 seeds in ~10s.
+2. **Tiny-fixture pytest classes** in
+   `tests/models/jax/test_deepseek_v4.py` (~30s–2min on CPU).
+3. **`eval_shape` / `lower().compile()` on the real config**
+   (~1–3min). Catches sharding bugs + HLO-emit failures (like
+   the current HBM OOM!) without paying the runtime compile cost.
+4. **Real `./run.sh serve`** only when 1–3 are green. Budget at
+   most 1–2 of these per session.
+
+**Hard rule: if any step takes >~5 minutes without a useful signal,
+stop and try a different approach.** A stuck XLA compile is not
+"almost done" — it's burning compute silently. Look for
+`slow_operation_alarm.cc` in the log; that's XLA telling you a
+single pass has been running >5 min.
 
 What happened: the vectorized MoE (`deepseek_v4_moe.py::moe_forward`)
 collapses 256 per-expert matmuls into 3 stacked einsums per layer,
