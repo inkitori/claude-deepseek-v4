@@ -999,6 +999,75 @@ def _build_class():
                 else:
                     setattr(cur, last, arr)
 
+            # Incremental MoE consolidation: as soon as all 256 experts of
+            # a (layer, wname) group are placed, build a single stacked
+            # `[E, inter, dim]` jax.Array sharded `P('attn_dp', None, None)`
+            # and release the per-leaf references. Doing this incrementally
+            # — not as a post-load pass — is critical: post-load, HBM is
+            # fragmented across 33 000 small allocations and the
+            # `device_put` reshard's 256 MB transient can't find a
+            # contiguous block (we burned an iter learning this). Doing it
+            # as soon as a group is full means we only ever hold one
+            # group's per-leaf set alongside its stacked tensor at a time
+            # (peak ~512 MB / chip during the reshard, well within budget).
+            import threading as _threading
+            from jax.sharding import NamedSharding, PartitionSpec as _P
+            from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams as _MoEParams
+            _expert_path_re = _re.compile(
+                r'^layers\[(\d+)\]\.moe\.experts\[(\d+)\]\.(w[123])$')
+            _mtp_expert_path_re = _re.compile(
+                r'^mtp\[(\d+)\]\.block\.moe\.experts\[(\d+)\]\.(w[123])$')
+            _expert_group_lock = _threading.Lock()
+            _expert_group_counter: Dict[Tuple[str, int, str], int] = {}
+            _consolidated_groups: set = set()
+
+            def _maybe_consolidate(jax_path: str):
+                # Identify group key, increment counter; if we hit 256,
+                # consolidate now (under the lock so we only consolidate
+                # each group once).
+                m = _expert_path_re.match(jax_path)
+                kind = None
+                if m is not None:
+                    kind, idx, wname = "layer", int(m.group(1)), m.group(3)
+                else:
+                    m = _mtp_expert_path_re.match(jax_path)
+                    if m is None:
+                        return
+                    kind, idx, wname = "mtp", int(m.group(1)), m.group(3)
+                key = (kind, idx, wname)
+                with _expert_group_lock:
+                    cnt = _expert_group_counter.get(key, 0) + 1
+                    _expert_group_counter[key] = cnt
+                    if cnt < self.config.n_routed_experts:
+                        return
+                    if key in _consolidated_groups:
+                        return
+                    _consolidated_groups.add(key)
+                # All 256 placed — outside the lock, run the stack.
+                if self.mesh is None:
+                    return
+                if kind == "layer":
+                    moe = current.layers[idx].moe
+                else:
+                    moe = current.mtp[idx].block.moe
+                weights = [getattr(e, wname) for e in moe.experts]
+                if any(w is None for w in weights):
+                    # Late race after another thread already consolidated
+                    # — defensive; shouldn't happen given the lock.
+                    return
+                e_spec = NamedSharding(self.mesh, _P('attn_dp', None, None))
+                stacked = jax.device_put(jnp.stack(weights), e_spec)
+                stacked.block_until_ready()
+                # Release the per-leaf references so the device buffers can
+                # be reclaimed before we move on to the next group.
+                for e in moe.experts:
+                    setattr(e, wname, None)
+                # Attach the stacked tensor + record the swiglu_limit (we
+                # captured it from any expert; uniform across the layer).
+                setattr(moe, f"{wname}_stacked", stacked)
+                if moe.swiglu_limit is None and moe.experts:
+                    moe.swiglu_limit = float(moe.experts[0].swiglu_limit)
+
             # 3. Stream-load every weight, placing each as a sharded array.
             #    Logs heartbeat progress every 200 placements (~1% of a real
             #    V4-Flash checkpoint's tensor count) so a long load doesn't
@@ -1079,6 +1148,7 @@ def _build_class():
                     return False
                 _assign(jax_path, arr)
                 placed_paths.add(jax_path)
+                _maybe_consolidate(jax_path)
                 return True
 
             if slice_aware:
@@ -1097,6 +1167,7 @@ def _build_class():
                         continue
                     _assign(jax_path, arr)
                     placed_paths.add(jax_path)
+                    _maybe_consolidate(jax_path)
                     placed_count += 1
                     if placed_count % 200 == 0:
                         now = _time.time()
