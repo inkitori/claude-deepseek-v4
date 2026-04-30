@@ -882,3 +882,186 @@ def attention_prefill(
     o_proj = jnp.einsum("bsgd,grd->bsgr", o_grouped.astype(jnp.float32), wo_a_view)
     o_flat = o_proj.reshape(B, S, G * R).astype(x.dtype)
     return _linear(o_flat, params.wo_b)
+
+
+# --------------------- prefill→decode state init (S1) ---------------------
+#
+# Closed-form derivation of `AttentionDecodeState` from a prefill input. The
+# state is what `attention_decode_step`'s rolling buffers would contain after
+# T steps from zero state. Used by the model wrapper to seed decode state
+# after running `attention_prefill` once on a new sequence — subsequent
+# decode calls then advance one position at a time, O(1)/step instead of
+# O(T²)/step. (Backlog item S1.)
+#
+# Why closed-form rather than iterating attention_decode_step T times: the
+# decode kernel takes start_pos as a Python int and uses static control
+# flow (`if did_compress`, `kv_state.at[:, pos_in_ratio]`). Iterating it
+# inside `lax.scan` would require a refactor to traced start_pos; iterating
+# in Python unrolls T copies into HLO at compile time, which scales 50×T
+# across layers and blows up compile cost. The closed-form below mirrors
+# the reference state semantics directly. Pinned by parity tests in
+# `test_deepseek_v4.py::TestPrefillToDecodeStateParity`.
+
+def _compressor_state_from_prefill(
+    x: jnp.ndarray,             # [B, T, dim]
+    params: CompressorParams,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Return (kv_state, score_state) matching torch reference's
+    `Compressor.forward(start_pos=0)` post-state at end of T prefill steps.
+
+    Layout (B = x.shape[0], ratio = params.compress_ratio, d = head_dim,
+    cutoff = T - T%ratio, remainder = T % ratio):
+      overlap (ratio==4), shape [B, 8, 2*d]:
+        slots [0, ratio):           kv at positions [cutoff-ratio, cutoff)
+                                    + ape (only if cutoff >= ratio)
+        slots [ratio, ratio+rem):   kv at positions [cutoff, T) + ape[:rem]
+        slots [ratio+rem, 2*ratio): init (zero kv, -inf score)
+      no-overlap (ratio==128), shape [B, 128, d]:
+        slots [0, remainder):       kv at positions [cutoff, T) + ape[:rem]
+        slots [remainder, ratio):   init
+
+    NB: this state DIFFERS at the field level from running
+    `compressor_decode_step` T times from zero state — torch leaves the
+    "back" slots (overlap) or "right" slots (no-overlap) at init values
+    that the iterative path would have populated with stale data — but
+    both produce identical compression outputs at the next compression
+    boundary because those slots are fully overwritten before then.
+    Pin via `TestPrefillToDecodeStateParity::test_field_parity`.
+    """
+    B, T, _ = x.shape
+    ratio = params.compress_ratio
+    overlap = (ratio == 4)
+    coff = 2 if overlap else 1
+    d = params.head_dim
+
+    if T == 0:
+        return compressor_init_state(B, d, ratio)
+
+    xf = x.astype(jnp.float32)
+    kv_full = xf @ params.wkv.T          # [B, T, coff*d]
+    score_full = xf @ params.wgate.T     # [B, T, coff*d]
+
+    full_d = coff * d
+    n_slots = 2 * ratio if overlap else ratio
+    kv_state = jnp.zeros((B, n_slots, full_d), dtype=jnp.float32)
+    score_state = jnp.full((B, n_slots, full_d), -jnp.inf, dtype=jnp.float32)
+
+    remainder = T % ratio
+    cutoff = T - remainder
+    offset = ratio if overlap else 0
+    ape = _replicate(params.ape)  # [ratio, coff*d]
+
+    # Most-recent completed window (overlap only): slots [:ratio] = kv at
+    # positions [cutoff-ratio, cutoff) + ape (full ratio slice).
+    if overlap and cutoff >= ratio:
+        kv_state = kv_state.at[:, :ratio, :].set(kv_full[:, cutoff - ratio:cutoff, :])
+        score_state = score_state.at[:, :ratio, :].set(
+            score_full[:, cutoff - ratio:cutoff, :] + ape)
+
+    # In-progress window: slots [offset, offset+remainder) = kv at
+    # positions [cutoff, T) + ape[:remainder].
+    if remainder > 0:
+        kv_state = kv_state.at[:, offset:offset + remainder, :].set(
+            kv_full[:, cutoff:T, :])
+        score_state = score_state.at[:, offset:offset + remainder, :].set(
+            score_full[:, cutoff:T, :] + ape[:remainder])
+
+    return kv_state, score_state
+
+
+def _swa_kv_cache_from_prefill(
+    kv: jnp.ndarray,             # [B, T, head_dim] — already rms_normed + RoPE'd
+    win: int,
+) -> jnp.ndarray:
+    """Build the SWA portion of attention's kv_cache after T prefill steps.
+
+    Mirrors what `attention_decode_step.kv_cache[:, :win]` holds after T
+    decode calls from zero state. Slot i holds the most recent kv at position
+    p with `p % win == i`. Returns shape [B, win, head_dim]. dtype matches kv.
+    """
+    B, T, D = kv.shape
+    if T == 0:
+        return jnp.zeros((B, win, D), dtype=kv.dtype)
+    if T < win:
+        out = jnp.zeros((B, win, D), dtype=kv.dtype)
+        return out.at[:, :T, :].set(kv)
+    # T >= win: cache[i] = kv[T-1 - ((T-1-i) % win)].
+    # Equivalent: take the last win positions and roll by T % win so slot
+    # (T-win+k) % win = (k + T) % win lands at index (k + T) % win.
+    last = kv[:, T - win:T, :]                  # [B, win, D]
+    return jnp.roll(last, shift=T % win, axis=1)
+
+
+def attention_init_state_from_prefill(
+    x: jnp.ndarray,                # [B, T, dim]
+    params: AttentionParams,
+    freqs_cis_full: jnp.ndarray,
+    cfg_max_seq_len: int,
+    cfg_index_head_dim: int = 0,
+    dtype=jnp.bfloat16,
+) -> AttentionDecodeState:
+    """Closed-form construction of `AttentionDecodeState` after a prefill of
+    length T = x.shape[1]. Equivalent to running `attention_decode_step` T
+    times from `attention_decode_init_state(...)` zero state.
+
+    The decode state can then drive `attention_decode_step` at start_pos=T
+    without re-running prefill. This is the missing primitive that lets S1
+    convert vLLM's "every step is a fresh prefill" path into "first call
+    prefills and seeds state, subsequent calls do O(1) decode steps."
+    """
+    B, T, _ = x.shape
+    win = params.window_size
+    ratio = params.compress_ratio
+    Dh = params.head_dim
+    rd = params.rope_head_dim
+    eps = params.norm_eps
+
+    # SWA kv (matches attention_prefill's kv computation).
+    kv = _linear(x, params.wkv)
+    kv = rms_norm(kv, params.kv_norm_w, eps)
+    fc = freqs_cis_full[:T] if T > 0 else freqs_cis_full[:0]
+    if T > 0:
+        kv = splice_rope(kv, rd, fc, inverse=False)
+    kv = kv.astype(dtype)
+
+    extra = (cfg_max_seq_len // ratio) if ratio else 0
+    kv_cache = jnp.zeros((B, win + extra, Dh), dtype=dtype)
+    swa = _swa_kv_cache_from_prefill(kv, win)
+    kv_cache = kv_cache.at[:, :win, :].set(swa)
+
+    if ratio > 0:
+        # Compressed positions [win, win + T//ratio) come from compressor_prefill.
+        kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full).astype(dtype)
+        Tcomp = kv_compressed.shape[1]  # = T // ratio
+        if Tcomp > 0:
+            kv_cache = kv_cache.at[:, win:win + Tcomp, :].set(kv_compressed)
+        c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor)
+    else:
+        c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
+        c_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
+
+    if ratio == 4 and params.indexer is not None:
+        # Indexer state: same compressor logic on params.indexer.compressor.
+        i_kv, i_sc = _compressor_state_from_prefill(x, params.indexer.compressor)
+        # indexer_kv_cache: [B, max/ratio, index_head_dim] with [:T//ratio]
+        # populated from the indexer's compressor_prefill output.
+        max_iidx = cfg_max_seq_len // ratio
+        i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
+        if T >= ratio:
+            idx_kv_compressed = compressor_prefill(
+                x, params.indexer.compressor, freqs_cis_full).astype(dtype)
+            Ti = idx_kv_compressed.shape[1]
+            i_cache = i_cache.at[:, :Ti, :].set(idx_kv_compressed)
+    else:
+        i_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
+        i_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
+        i_cache = jnp.zeros((B, 0, 0), dtype=dtype)
+
+    return AttentionDecodeState(
+        kv_cache=kv_cache,
+        compressor_kv_state=c_kv,
+        compressor_score_state=c_sc,
+        indexer_kv_state=i_kv,
+        indexer_score_state=i_sc,
+        indexer_kv_cache=i_cache,
+    )

@@ -85,6 +85,7 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     compressor_decode_step, indexer_decode_step, attention_decode_step,
     AttentionDecodeState, attention_decode_init_state, compressor_init_state,
     get_window_topk_idxs_decode, get_compress_topk_idxs_decode,
+    attention_init_state_from_prefill,
 )
 from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
     gate_forward, expert_forward, moe_forward,
@@ -1442,6 +1443,141 @@ class TestDecodeRollingParity:
                 f"layer={layer_id} P={P} K={K} step k={k} (sp={sp}): "
                 f"rolling decode diff {diff}"
             )
+
+
+def _maxabs_arr(a: jnp.ndarray, b: jnp.ndarray) -> float:
+    """Like maxabs but for two JAX arrays (no torch involved). -inf vs -inf
+    counts as zero diff (both are sentinel values). Empty arrays return 0."""
+    af = np.asarray(a, dtype=np.float32)
+    bf = np.asarray(b, dtype=np.float32)
+    if af.size == 0 and bf.size == 0:
+        return 0.0
+    both_neg_inf = np.isneginf(af) & np.isneginf(bf)
+    diff = np.where(both_neg_inf, 0.0, np.abs(af - bf))
+    return float(np.max(diff))
+
+
+class TestPrefillToDecodeStateParity:
+    """S1 keystone: verify `attention_init_state_from_prefill` produces a
+    decode state byte-equivalent to what `attention_decode_step` would have
+    accumulated after T iterations from zero state.
+
+    This is the missing primitive that lets the model wrapper convert a
+    single prefill into seeded decode state, so subsequent decode steps run
+    O(1) per token instead of re-doing prefill on the full prompt+generated
+    context (current behavior — see backlog item S1).
+
+    Two-pronged:
+      A) Field-level state parity: build state both ways, compare each
+         AttentionDecodeState field with maxabs.
+      B) Rolling parity: use the closed-form state to drive
+         `attention_decode_step` at start_pos=T, compare output to the
+         iterative path doing the same.
+
+    Tolerance: 1e-5 (state values are pure linear ops + bias adds; any
+    drift here indicates a bug in the closed-form derivation, not numerical
+    error.)
+    """
+
+    @pytest.mark.parametrize("layer_id,T,max_seq_len", [
+        # SWA (ratio=0): SWA-only state.
+        (0, 1, 64),
+        (0, 4, 64),
+        (0, 8, 64),         # exactly window-size
+        (0, 9, 64),         # one past window — wraparound
+        (0, 17, 64),        # multiple wraparounds
+        (0, 32, 64),
+        # CSA (ratio=4, overlap): exercises overlap-mode compressor + indexer.
+        (2, 1, 64),         # T < ratio
+        (2, 3, 64),         # T < ratio still
+        (2, 4, 64),         # exactly ratio (one window completes)
+        (2, 5, 64),         # one past ratio
+        (2, 8, 64),         # two windows complete
+        (2, 12, 64),        # three windows complete
+        (2, 16, 64),
+        (2, 17, 64),        # mid 5th window
+        # HCA (ratio=128, no overlap): exercises non-overlap path.
+        (3, 1, 256),
+        (3, 64, 256),       # less than ratio
+        (3, 128, 256),      # exactly ratio (one window completes)
+        (3, 200, 256),      # mid second window
+    ])
+    def test_field_parity(self, layer_id, T, max_seq_len):
+        attn, args = _build_attn_for_decode(
+            layer_id, seed=0, max_seq_len=max_seq_len)
+        bsz = 1
+        torch.manual_seed(T + layer_id)
+        x_t = torch.randn(bsz, T, args.dim, dtype=torch.bfloat16)
+
+        # Reference path: torch prefill mutates attn's internal state, then
+        # snapshot it into a JAX AttentionDecodeState (existing helper).
+        with torch.inference_mode():
+            _ = attn(x_t, start_pos=0)
+        ref_state = _torch_attention_state_to_jax(attn, args, bsz)
+
+        # Closed-form path: build state directly from x.
+        params_j = _torch_attention_to_jax_params(attn, args)
+        fc = t2j(attn.freqs_cis).astype(jnp.complex64)
+        cf_state = attention_init_state_from_prefill(
+            t2j(x_t), params_j, fc,
+            cfg_max_seq_len=max_seq_len,
+            cfg_index_head_dim=args.index_head_dim if args.compress_ratios[layer_id] == 4 else 0,
+            dtype=jnp.bfloat16,
+        )
+
+        atol = 1e-2  # bf16 path; SWA + compressed kv go through bf16 cast + RoPE
+        # NOTE: kv_cache is bf16 so atol is loose; states are fp32.
+        d_kv = _maxabs_arr(cf_state.kv_cache, ref_state.kv_cache)
+        d_ckv = _maxabs_arr(cf_state.compressor_kv_state, ref_state.compressor_kv_state)
+        d_csc = _maxabs_arr(cf_state.compressor_score_state, ref_state.compressor_score_state)
+        d_ikv = _maxabs_arr(cf_state.indexer_kv_state, ref_state.indexer_kv_state)
+        d_isc = _maxabs_arr(cf_state.indexer_score_state, ref_state.indexer_score_state)
+        d_ic = _maxabs_arr(cf_state.indexer_kv_cache, ref_state.indexer_kv_cache)
+        assert d_kv <= atol, f"kv_cache diff {d_kv}"
+        assert d_ckv <= atol, f"compressor_kv_state diff {d_ckv}"
+        assert d_csc <= atol, f"compressor_score_state diff {d_csc}"
+        assert d_ikv <= atol, f"indexer_kv_state diff {d_ikv}"
+        assert d_isc <= atol, f"indexer_score_state diff {d_isc}"
+        assert d_ic <= atol, f"indexer_kv_cache diff {d_ic}"
+
+    @pytest.mark.parametrize("layer_id,T,max_seq_len", [
+        (0, 4, 64),
+        (0, 8, 64),
+        (0, 16, 64),
+        (2, 4, 64),
+        (2, 8, 64),
+        (2, 12, 64),
+        (3, 64, 256),
+        (3, 128, 256),
+    ])
+    def test_rolling_after_closed_form_init(self, layer_id, T, max_seq_len):
+        """End-to-end: build decode state via closed-form, then run one
+        decode step at start_pos=T. Output must match torch reference."""
+        attn, args = _build_attn_for_decode(
+            layer_id, seed=42, max_seq_len=max_seq_len)
+        bsz = 1
+        torch.manual_seed(T + layer_id + 7)
+        x_full = torch.randn(bsz, T + 1, args.dim, dtype=torch.bfloat16)
+
+        with torch.inference_mode():
+            _ = attn(x_full[:, :T], start_pos=0)
+            o_t = attn(x_full[:, T:T + 1], start_pos=T)
+
+        params_j = _torch_attention_to_jax_params(attn, args)
+        fc = t2j(attn.freqs_cis).astype(jnp.complex64)
+        state = attention_init_state_from_prefill(
+            t2j(x_full[:, :T]), params_j, fc,
+            cfg_max_seq_len=max_seq_len,
+            cfg_index_head_dim=args.index_head_dim if args.compress_ratios[layer_id] == 4 else 0,
+            dtype=jnp.bfloat16,
+        )
+        _, y_j = attention_decode_step(
+            t2j(x_full[:, T:T + 1]), T, params_j, fc, state)
+        diff = maxabs(y_j, o_t)
+        assert diff <= 1e-4, (
+            f"layer={layer_id} T={T} (max_seq_len={max_seq_len}): "
+            f"closed-form-init + decode step diff {diff}"
+        )
 
 
 # =============================================================

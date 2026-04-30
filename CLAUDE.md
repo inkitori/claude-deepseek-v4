@@ -271,22 +271,18 @@ message and move down.
 These are issues where the smoke goes green but the model isn't
 doing what users will actually ask of it. Fix these *first*.
 
-#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context
+#### S1. Decode is not real decode — every step recomputes prefill on the full prompt+generated context (foundational primitive landed; `__call__` integration is the next iter's job)
 
 This is the headline correctness/perf bug. `__call__` in
 `work/tpu-inference/tpu_inference/models/jax/deepseek_v4.py:1363`
-always routes to `transformer_body_forward` →
-`block_forward` → `attention_prefill`. The decode-step kernels
-are fully implemented and correctness-tested
-(`attention_decode_step` at
+still routes every step (prefill or decode) through
+`transformer_body_forward` → `block_forward` → `attention_prefill`.
+The decode-step kernels are fully implemented and
+correctness-tested (`attention_decode_step` at
 `layers/jax/attention/deepseek_v4_attention.py:710`,
 `TestDecodeRollingParity` at
 `tests/models/jax/test_deepseek_v4.py:1390` — 1e-4 vs torch
-reference) but **never invoked** by the production `__call__`.
-
-The `__call__` docstring at `deepseek_v4.py:1403` admits this:
-"vllm in `--enforce-eager` paged-KV-disabled mode passes the full
-prompt+generated context on each step, which makes this correct".
+reference) but **not yet invoked** by the production `__call__`.
 
 Net effect: every decode step is O((prompt + generated)²) in
 attention compute and re-runs the full MoE per step instead of
@@ -295,24 +291,72 @@ O(1)/step over a cached state. Throughput at 1k context is
 non-functional, not just slow. V4-Flash's 1M-token claim is
 unreachable on the current path.
 
-What to do:
-* Thread `AttentionDecodeState`
-  (`deepseek_v4_attention.py:659`) through `nnx.Variable` storage
-  on the model instance. The state is per-(layer, batch-slot) so
-  it lives alongside `params_v` rather than in vllm's
-  `kv_caches` list (which is a passthrough placeholder for V4 —
-  see INVARIANTS I34).
-* In `__call__`, branch on `attention_metadata.input_positions`
-  per active sequence: `>0` ⇒ run a decode step using
-  `attention_decode_step` per layer, mutating the state in
-  place; `==0 .. N-1` ⇒ prefill a fresh state.
-* Persist the new state back into `params_v`'s pytree leaves so
-  the next call sees it. Verify byte-equivalence vs a
-  prefill-only forward over the concatenated prompt+generated
-  on at least 2 sequences from `TestConcurrentMultiSeqDispatch`.
-* Validate via path #3 (`lower().compile()`) before launching a
-  real smoke; the compile-time HBM accounting will tell you if
-  the per-batch state allocations push you over 31.25 GiB / chip.
+**Iter 2026-04-30 (foundational primitive):** the missing
+piece that blocked threading state through `__call__` is now
+landed. `attention_init_state_from_prefill` in
+`layers/jax/attention/deepseek_v4_attention.py` constructs an
+`AttentionDecodeState` byte-equivalent to the torch reference's
+post-prefill state in **closed form** — i.e., directly from x
+without iterating the decode kernel T times.
+
+Why closed-form rather than iterating the decode kernel:
+`attention_decode_step` (and the compressor / indexer decode
+steps it calls) take `start_pos: int` as a Python static and
+use static control flow (`if did_compress`, `kv_state.at[:,
+start_pos % win].set(...)`). A `lax.scan` over T positions
+would require refactoring the kernels to traced-`start_pos`
+form (lots of code changes, heavy regression risk on
+correctness). A Python-loop unroll inside jit would copy T
+graphs into HLO at compile time — for ~50 layers × T=256, that
+explodes compile cost. The closed-form version mirrors torch
+reference's `Compressor.forward(start_pos=0)` semantics
+directly: sparse writes into the slots that prefill would
+populate, leaving the rest at init. Pinned by
+`TestPrefillToDecodeStateParity` (26 cases — SWA / CSA / HCA at
+T values spanning window/ratio boundaries; both field-level
+state parity AND rolling parity where the closed-form state
+drives one decode step at start_pos=T and is compared to torch
+reference's prefill+1-step output, ≤1e-4 on bf16).
+
+Subtlety surfaced during this work and folded into the helper:
+torch's `Compressor.forward` prefill path leaves the "back"
+slots of `kv_state` (overlap mode) / the "right" slots
+(non-overlap mode) at INIT values, while an
+iterative-decode-from-zero path would leave them holding stale
+data from prior writes. Both paths produce identical
+compression outputs at the next compression boundary because
+those slots are fully overwritten before then. The closed-form
+helper deliberately matches torch prefill (sparse writes,
+leave the rest at init) so the parity test fires the right
+comparison.
+
+**Next iter starts at:** thread state through `__call__`.
+
+* Add per-layer `AttentionDecodeState` to the model instance
+  via `nnx.Variable` storage (one tree-of-states alongside
+  `params_v`, NOT inside vllm's `kv_caches` — INVARIANTS I34
+  documents that kv_caches is a passthrough for V4).
+* Track `_decode_advanced_to_v` (per-slot int32) so `__call__`
+  can detect: continuation (new_len == prev_advanced + 1) →
+  run one decode step on the tail token through every layer,
+  mutating each layer's state via `attention_decode_step`;
+  else (new_len differs by more than 1, or is shorter — slot
+  reused by a new request) → fresh prefill that ALSO seeds
+  state via `attention_init_state_from_prefill`.
+* On `__call__` continuation: return shape `[B, T, D]` with
+  positions `[0, T-1)` zero-filled (vLLM only reads the
+  last-token-per-sequence position for next-token logits) and
+  position `T-1` = the new hidden state.
+* Validate via path #3 (`lower().compile()` on real config)
+  before launching a real smoke — compile-time HBM accounting
+  tells you if the per-layer state allocations (~50 layers ×
+  ~50 KB / layer at MAX_LEN=256, MAX_SEQS=1) push past
+  31.25 GiB/chip.
+* Real-smoke gate: deterministic " Paris" still passes AND a
+  multi-token decode (e.g. max_tokens=10) returns coherent
+  output, confirming the continuation path actually works end
+  to end on TPU. Throughput improvement is the prize but
+  correctness is the gate.
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes
