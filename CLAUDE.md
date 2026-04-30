@@ -186,7 +186,7 @@ Ray workers via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during first inference if `jit_run_model` recompiles. Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (see pitfall #4). |
-| `V4_DECODE_STATE` | `0` | S1 gate. `1` flips `__call__` to `deepseek_v4_run_with_decode_state` (orchestrator path threading packed `AttentionDecodeState` through `kv_caches`). Default `0` preserves the green gate. When `1`, every JIT trace into `__call__` logs `(call_idx, T, start_pos, is_decode, state_max_seq_len, kv_caches_count)`. |
+| `V4_DECODE_STATE` | `0` | S1 gate. `1` flips `__call__` to `deepseek_v4_run_with_decode_state` (orchestrator path threading packed `AttentionDecodeState` through `kv_caches`). Default `0` preserves the green gate. When `1`, `__call__` logs `(call_idx, T, is_decode, state_max_seq_len, kv_caches_count)` per call. With iter-6 traced start_pos there are at most 2 distinct JIT cache keys (prefill + decode). |
 | `V4_DECODE_STATE_DIAG` | `0` | Adds `jax.debug.print` of kv_caches[0] sum + nonfinite-count at orchestrator entry/exit. Forwarded to workers. Use only when debugging Bug B (S1). |
 | `CHAT_REQUIRED` | `0` | smoke_check chat probe; exit 4 on missing/empty content. Adds ~30 s for first-chat OOM-retry (pitfall #9). |
 | `REASONING_REQUIRED` | `0` | Thinking-mode chat probe; exit 5 on empty `message.reasoning`. Pins S3 runtime. Passes under `V4_DECODE_STATE=1` (S1 iter-5j); fails under default `V4_DECODE_STATE=0` (broken-decode prefill-only path produces all-newlines). Pair with `REASONING_MAX_TOKENS=8` to bound per-position decode-compile cost when run under `V4_DECODE_STATE=1`. |
@@ -270,15 +270,20 @@ may-alias) }` markers, while compute on CPU stays byte-equal
 between zeros and random `kv_caches` inputs (opaque_zero is
 0 at runtime).
 
-The decode runtime is now real-V4-correct. **Remaining S1
-work**: per-position decode JIT cache misses (each new
-`start_pos` triggers a fresh ~50s compile because
-`decode_start_pos` is hashed into the cache key — see
-optimization-knobs row for `V4_DECODE_STATE`). Refactor
-decode kernels to accept traced `start_pos` for one-compile-
-fits-all positions (iter-5b "Tactical pick (a)"). Until then,
-warm-cache amortization + AOT precompile (A2 / B4) makes
-this a perf nit, not a correctness blocker.
+The decode runtime is now real-V4-correct AND throughput-
+amortized: iter-6 traced `start_pos` through the decode
+kernel chain (`get_window_topk_idxs_decode`,
+`get_compress_topk_idxs_decode`, `compressor_decode_step`,
+`indexer_decode_step`, `attention_decode_step` all use
+`lax.dynamic_slice_in_dim` / `lax.dynamic_index_in_dim` /
+`jnp.where` with constant output shapes — `-1` sentinels
+fill unused topk slots, `lax.top_k` always uses constant
+K = `index_topk`). `decode_start_pos` collapsed to a 0/1
+prefill/decode meta-gate; absolute position threads through
+`seq_lens[0] - 1` at trace time. One JIT trace fits every
+decode position. Pinned by
+`TestPackedDecodeStateBuffer.test_buffer_decode_jit_cache_hits_across_positions`
+(asserts `_cache_size()` delta == 1 over 4 positions).
 
 S1 unlocks A1 (`max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), S5 (MTP speculative decoding).
