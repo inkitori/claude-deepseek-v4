@@ -63,15 +63,18 @@ export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-8}"
 # CPU dequant, is the bottleneck. Kept as a knob for future work.
 export V4_LOADER_PREFETCH_WORKERS="${V4_LOADER_PREFETCH_WORKERS:-0}"
 
-# Persistent JAX compile cache: every Ray worker reuses XLA-compiled modules
-# across launches as long as the cache dir is reachable. Per-host (not GCS),
-# so each worker has its own cache. Survives process restarts; lost if the
-# worker host is rebuilt. Set V4_JAX_CACHE_DIR= to disable.
-export V4_JAX_CACHE_DIR="${V4_JAX_CACHE_DIR:-/tmp/jax-compile-cache-v4}"
-if [ -n "$V4_JAX_CACHE_DIR" ]; then
-    mkdir -p "$V4_JAX_CACHE_DIR"
-    export JAX_COMPILATION_CACHE_DIR="$V4_JAX_CACHE_DIR"
-fi
+# Persistent JAX compile cache: tpu_inference's compilation_manager.py
+# overrides jax_compilation_cache_dir to vllm_envs.VLLM_XLA_CACHE_PATH
+# (default ~/.cache/vllm/xla_cache) at engine startup. Setting
+# JAX_COMPILATION_CACHE_DIR here is a no-op — point users at the right
+# path via VLLM_XLA_CACHE_PATH if they want to relocate.
+#
+# Per-host (not GCS), so each worker has its own cache. Survives process
+# restarts; lost if the worker host is rebuilt. Cross-host rsync is
+# *not* sound: SPMD compiles to host-specific binaries even when JAX's
+# cache key is identical (verified 2026-04-30 via
+# scripts/full_slice_v4_cache_fingerprint.sh — same filename, 8 distinct
+# sha256s).
 
 # NOTE on XLA flags: don't add unverified flags here. An earlier attempt
 # at `--xla_tpu_impure_hlo_parallel_compile=true` *crashed every worker*
@@ -100,15 +103,22 @@ esac
 # path room while still failing fast on actual hangs.
 export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-3600}"
 
-# Cache even small / fast-to-compile modules. Default JAX policy skips
-# them, but on a flagship MoE every cache hit shaves real seconds.
-export JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
-export JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS="${JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS:-0}"
+# Cache even small / fast-to-compile modules. Default JAX policy
+# (min_compile_time_secs=1.0) silently skips them, which leaves
+# /tmp/jax-compile-cache-v4 empty even after a successful smoke and
+# defeats the whole point of the persistent cache.
+#
+# These env-var names follow JAX 0.9's `jax_persistent_cache_*` config
+# option family. The older `JAX_COMPILATION_CACHE_MIN_*` names are
+# silently ignored (no such config option exists), which masked this
+# for previous launches — verify by `jax.config.jax_persistent_cache_min_compile_time_secs`.
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,JAX_COMPILATION_CACHE_DIR,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_COMPILATION_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_COMPILATION_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
@@ -117,7 +127,7 @@ fi
 
 echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
-echo "[smoke]   jax_cache=$JAX_COMPILATION_CACHE_DIR"
+echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set by tpu_inference)"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \

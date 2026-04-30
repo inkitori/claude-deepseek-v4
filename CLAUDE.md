@@ -149,9 +149,9 @@ launcher echoes the active values at startup so you can confirm.
 | `V4_LOADER_SLICE_AWARE` | `1` | Each host reads only the rows its local devices own (vs full-tensor read on every host). |
 | `V4_LOADER_PLACE_WORKERS` | `8` | Threads driving `place_spec_as_jax_sharded` per host. Most per-tensor work releases the GIL (safetensors mmap reads + JAX C calls), so parallelism is real. Set to `1` for single-thread parity testing. |
 | `V4_LOADER_PREFETCH_WORKERS` | `0` | Thread-pool prefetch in the non-slice-aware iterator. Empirically didn't help on real V4 (placement is the bottleneck, not dequant). Knob retained for future work. |
-| `JAX_COMPILATION_CACHE_DIR` | `/tmp/jax-compile-cache-v4` | Local-disk persistent compile cache. Each host has its own; survives process restarts; lost if the worker host is rebuilt. **Not GCS** — the bucket the venv mounts is shared, do not write cache there without explicit user authorization. |
-| `JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES` | `0` | Cache even small modules. JAX 0.9 config name; `JAX_COMPILATION_CACHE_MIN_*` is silently ignored, leaving the cache empty. |
-| `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s drops everything except multi-second compiles — silently a no-op on the wrong env var name. |
+| `VLLM_XLA_CACHE_PATH` | `~/.cache/vllm/xla_cache` | Per-host JAX persistent compile cache. tpu_inference's `compilation_manager.py:53` calls `jax.config.update("jax_compilation_cache_dir", VLLM_XLA_CACHE_PATH)` — overriding any `JAX_COMPILATION_CACHE_DIR` env var the launcher might set. **Not GCS** — the bucket the venv mounts is shared, do not relocate the cache there without explicit user authorization. **Cross-host rsync is unsound** — SPMD compiles to host-specific binaries even when JAX's cache filename is identical (verified by `scripts/full_slice_v4_cache_fingerprint.sh`: same name, 8 distinct sha256s). |
+| `JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES` | `0` | Cache even small modules. JAX 0.9 config name. |
+| `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache even fast-to-compile modules. Default `1.0`s skips small inits (`jit_sample`, etc.). |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph channel timeout. Default 300 trips during the first inference if `jit_run_model` recompiles for an unseen shape (already burned us once at 5m1s). Don't lower. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` string for one launch. The smoke script does **not** inherit `XLA_FLAGS` from the parent shell (a stale autorunner env once SIGSEGV'd every Ray worker — see pitfall #4). |
 
@@ -244,11 +244,14 @@ Still loose ends worth tracking:
     either knob raises HLO temp roughly linearly; we don't yet
     know how far we can push before a new OOM. Iter that lifts
     the cap should re-run the smoke.
-  * **Cross-host JAX cache sharing (lane 2 from the original
-    plan)** is still untouched. Each host compiles independently;
-    a `scripts/full_slice_v4_share_cache.sh` rsync'ing host 0's
-    cache after one good launch would 8× brand-new-slice
-    first-launch on a freshly bootstrapped slice.
+  * ~~**Cross-host JAX cache sharing (lane 2 from the original
+    plan)**~~ RESOLVED — verified unsound 2026-04-30 via
+    `scripts/full_slice_v4_cache_fingerprint.sh`. SPMD compiles
+    produce host-specific binaries: same JAX cache filename appears
+    on all 8 hosts but with 8 distinct sha256s. Rsync'ing host 0's
+    cache to workers would serve them code compiled for host 0's
+    chip topology coords. The fingerprint script remains as a
+    diagnostic for future cache debugging.
   * ~~`Involuntary full rematerialization` warnings~~ FIXED
     (2026-04-30T044814Z smoke). The 126 baseline warnings on
     `compressor.ape` / `indexer.compressor.ape` resharding from
@@ -385,23 +388,22 @@ Tier 8 deploy gate is GREEN (cold compile ~97 s, warm-cache curl
 sub-second). The OOM and the rematerialization warnings are both
 fixed. Remaining work is compile-time + headroom:
 
-1. **Verify cross-host JAX cache sharing.** Each of 8 hosts compiles
-   its own SPMD slice; `/tmp/jax-compile-cache-v4` is per-host.
-   After one successful compile, fingerprint the cache files across
-   hosts — if byte-equal, a tiny `scripts/full_slice_v4_share_cache.sh`
-   rsyncs host 0's cache to workers and brand-new-slice first-launch
-   is 8× faster. Uncertain whether SPMD bakes in per-device IDs;
-   verify before shipping.
-
-2. **Bump `max-model-len` / `max-num-seqs` and re-smoke.** We compiled
+1. **Bump `max-model-len` / `max-num-seqs` and re-smoke.** We compiled
    under `max-model-len=256, max-num-seqs=1`; activation HBM scales
    roughly linearly with both. We don't yet know the per-chip
    activation ceiling. The iter that lifts the cap should re-run the
    smoke and watch for new OOMs (BACKEND_PASSES temp).
 
-3. **AOT precompile + binary persist.** `jit().lower().compile()`
+2. **AOT precompile + binary persist.** `jit().lower().compile()`
    serialized + loaded on subsequent launches. Real XLA-versioning
-   risk; defer until lanes 1–2 are exhausted.
+   risk and SPMD compiles are per-host (per the fingerprint finding),
+   so AOT artifacts would also need a host-0-only-then-broadcast guard
+   — i.e. each host needs its own AOT artifact captured during a
+   warm-up pass.
+
+3. ~~**Verify cross-host JAX cache sharing**~~ — RESOLVED unsound
+   2026-04-30. See "Still loose ends" above for the fingerprint
+   evidence.
 
 Validation after any change:
 ```bash
@@ -445,11 +447,15 @@ scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
   uses `vllm_config.model_config.max_model_len` instead of
   `cfg.max_position_embeddings`, shrinking the YaRN freqs table
   from 1 GB / chip to KB. ✓ Smoke green 2026-04-30.
-* **Persistent JAX compile cache**: wired; populated by the
-  2026-04-30 successful smoke. Subsequent launches on the same
-  worker host should hit the cache and skip the ~96 s compile.
-  Lane 2 (`scripts/full_slice_v4_share_cache.sh` to rsync host 0's
-  cache to other 7 hosts) is the next compile-time win.
+* **Persistent JAX compile cache**: wired; populated under
+  `~/.cache/vllm/xla_cache` on every host (set by tpu_inference's
+  `compilation_manager.py`, *not* by the smoke launcher's
+  `JAX_COMPILATION_CACHE_DIR`, which it overrides). Subsequent
+  launches on the same worker host hit the cache and skip the
+  ~96 s compile (observed 2026-04-30: `Application startup
+  complete` fires within seconds of weight load on a warm host,
+  curl returns sub-second). Cross-host sharing was investigated
+  and verified unsound — see "Still loose ends" above.
 
 ## Pitfalls already learned (don't repeat)
 
@@ -504,6 +510,17 @@ scripts/full_slice_v4_smoke_check.sh   # PASS = "Paris"
    `--enforce-eager` (already in the smoke launcher) skips that
    pre-compile and lets the first request pay the single-shape
    compile cost lazily.
+
+8. **`JAX_COMPILATION_CACHE_DIR` does nothing under vLLM.**
+   `tpu_inference/runner/compilation_manager.py:53` calls
+   `jax.config.update("jax_compilation_cache_dir",
+   vllm_envs.VLLM_XLA_CACHE_PATH)` during engine init, *overriding*
+   whatever the launcher set. The real cache always lives at
+   `~/.cache/vllm/xla_cache` (or `VLLM_XLA_CACHE_PATH`). The smoke
+   launcher had a `V4_JAX_CACHE_DIR=/tmp/jax-compile-cache-v4`
+   that was a no-op for ~24h before being noticed — verify cache
+   activity by `ls -la ~/.cache/vllm/xla_cache` after a smoke, not
+   by the launcher's echoed path.
 
 ## Layout
 
