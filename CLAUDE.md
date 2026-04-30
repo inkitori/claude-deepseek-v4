@@ -597,45 +597,127 @@ Two real blockers to resolve in iter-5b:
   risk is high enough to merit its own iter, and (b) lands
   the runtime correctness immediately).
 
-* Recommended iter-5b scope:
-  1. **model_loader.py**: detect V4 (via
-     `vllm_config.model_config.hf_config.model_type ==
-     'deepseek_v4'`), override `kv_cache_sharding` to
-     `NamedSharding(mesh, P())`. Stays gated to the V4
-     path; non-V4 unchanged.
-  2. **kv_cache_manager.py**: re-add the V4 branch (the
-     iter-5a draft is in commit history, just fix the
-     sharding to `P()` and shape to 1D `[packed_size_i]`
-     fp32).
-  3. **attention_metadata.py**: add `decode_start_pos: int =
-     0` as a meta_field. Default 0 = "prefill at position 0"
-     (matches existing pre-iter-5 behavior for non-V4
-     callers).
-  4. **tpu_runner.py**: in `_prepare_inputs_dp` /
-     `_prepare_inputs_non_dp`, after `build_attn`, when V4
-     and `query_len[0] == 1 and seq_lens[0] > 1`, set
-     `attention_metadata.decode_start_pos =
-     int(seq_lens_cpu[0] - 1)`.
-  5. **deepseek_v4.py `__call__`**: branch on
-     `input_ids.shape[-1] > 1` (multi-token prefill) vs
-     `== 1` (decode-or-1-token-prefill). For the decode
-     branch read `attention_metadata.decode_start_pos` as
-     Python static. Reshape `kv_caches[i]` from 1D buffer →
-     `_unpack_layer_state` input, run
-     `deepseek_v4_run_with_decode_state(kv_caches, ids, ...,
-     is_decode_step=(start_pos > 0), start_pos)`, write back
-     1D buffer.
-  6. **Validate** via `eval_shape` / `lower().compile()` on
-     real V4-Flash config under virtual CPU mesh
-     (`XLA_FLAGS=--xla_force_host_platform_device_count=32
-     JAX_PLATFORMS=cpu`): no shape mismatches, fp32 dtype
-     actually allocated, no extra all-gathers.
-  7. **Real-smoke gate**: deterministic " Paris" still
-     passes AND a multi-token decode returns coherent output.
-     With (B2.b), expect ~7–15 min added first-launch
-     compile time per unique decode position; that's the
-     known cost of per-position compile until iter-5c lifts
-     the kernel refactor.
+**Iter 5b status (2026-04-30): runtime infra LANDED + GREEN; the
+final `__call__` flip is GATED — produces NaN logits on real
+V4-Flash.**
+
+What landed and is verified green on real `vllm serve`:
+  1. **model_loader.py**: V4 detection +
+     `kv_cache_sharding = NamedSharding(mesh, P())` override.
+     Non-V4 unchanged.
+  2. **kv_cache_manager.py**: V4-only `_initialize_kv_cache_deepseek_v4`
+     allocates 1D fp32 `[packed_size_i]` buffers per layer, sized
+     via `v4_layer_packed_sizes_from_cfg` + new helper
+     `v4_state_max_seq_len_from_vllm_config`, sharded P()
+     replicated. Real-smoke log line:
+     `Init kv-cache (DeepSeek V4) | num_layers=43 |
+     state_max_seq_len=8192 | total_packed_bytes=136200192
+     (~129.9 MB) | sharding=replicated`. Allocator runs in
+     under a second; hbm change negligible.
+  3. **attention_metadata.py**: `decode_start_pos: int = 0` as
+     a meta_field (Python-static; hashed into JIT cache key).
+     Default 0 = prefill / non-V4. Pytree round-trip verified.
+  4. **tpu_runner.py**: `_maybe_set_v4_decode_start_pos` helper
+     called after `build_attn` in both `_prepare_inputs_dp` and
+     `_prepare_inputs_non_dp`. Sets
+     `decode_start_pos = seq_lens_cpu[0] - 1` when V4 + the
+     request shape is decode (query_len[0]==1, seq_lens[0]>1).
+     Cached `runner._is_deepseek_v4` flag avoids per-request
+     hf_config lookup.
+  5. **module-level `v4_state_max_seq_len_from_vllm_config`**:
+     single source of truth so the engine allocator and the
+     model __call__ agree on buffer size. Mirrors
+     `_effective_freqs_seq_len`'s decision tree.
+  6. **scripts/full_slice_v4_smoke_check.sh**: new
+     `COMPLETION_MAX_TOK` env knob (defaults 8 unchanged) — under
+     iter-5b each new decode position triggers a fresh JIT trace,
+     so smoke validation against the orchestrator path benefits
+     from a smaller MAX_TOK to fit under `CURL_MAX_TIME`.
+
+What was attempted and **REVERTED at the source** because it
+breaks real V4-Flash:
+  7. **deepseek_v4.py `__call__` flip** to call
+     `deepseek_v4_run_with_decode_state(kv_caches, ids_2d,
+     params, ..., is_decode_step, start_pos)` instead of
+     `transformer_body_forward`. Tiny-config tests pass byte-
+     equal vs `transformer_body_forward` at all positions
+     (verified by /tmp/test_v4_orchestrator_padded.py with
+     T_padded=64, N_actual=5: maxabs=0, no NaN). Virtual 32-CPU
+     mesh `lower().compile()` succeeds with replicated `P()`
+     kv_caches (verified by /tmp/test_v4_iter5b_compile.py).
+     But on the real v6e-32 + V4-Flash + bf16 + replicated SPMD:
+
+       * `/v1/completions` returns 200 with `text=""`,
+         `finish_reason="length"`, `completion_tokens=4` —
+         the model emits 4 tokens that all decode to empty
+         (likely BOS-id 0 repeated).
+       * Adding `logprobs=1` triggers
+         `HTTP 400: ValueError: Out of range float values are
+         not JSON compliant: nan` — the logits at the prompt's
+         last position contain NaN values. The argmax somehow
+         lands on an empty-decode token (BOS) instead of " Paris".
+       * Reproducer (smoke up):
+         ```bash
+         curl -s --max-time 60 http://127.0.0.1:18081/v1/completions \
+           -H "Content-Type: application/json" \
+           -d '{"model":"deepseek-ai/DeepSeek-V4-Flash",
+                "prompt":"The capital of France is",
+                "max_tokens":4,"temperature":0,"seed":0,
+                "logprobs":1}'
+         ```
+
+     Root cause UNDIAGNOSED. CPU-tiny tests pass. Suspects:
+       * 43-layer bf16 accumulation on real weights might
+         exhibit a NaN that doesn't show on tiny-config tests
+         (which use 6-layer fp32-on-CPU) — but the OLD path
+         through `transformer_body_forward` works, and the NEW
+         path is supposed to be byte-equal forward + extra state
+         capture. So bf16 drift alone isn't a complete story.
+       * `attention_init_state_from_prefill` allocates extra
+         intermediates (kv_state, compressor_score_state,
+         indexer_kv_state) that may interact with XLA's
+         operation reordering under SPMD in a way that changes
+         the effective reduction order in `attention_prefill`.
+       * The HCA layer's compressor_score_state init at -inf,
+         when `state_max_seq_len=8192` (vs T_padded=256), means
+         many slots stay at -inf. Some downstream reduction
+         (logsumexp?) might hit `exp(-inf) - exp(-inf) = NaN`
+         if a row of all -inf is consumed.
+
+     `models/jax/deepseek_v4.py::__call__` is reverted to the
+     pre-iter-5b path: `transformer_body_forward(ids_2d, ...)`
+     for prefill, `kv_caches` passed through unchanged. The V4
+     allocator from #2 still runs (kv_caches are 1D fp32
+     buffers carrying no semantic load yet); the runner still
+     tags `decode_start_pos` (consumed by no one, but kept so
+     the `v4_state_max_seq_len_from_vllm_config` agreement is
+     wired end-to-end).
+
+* Recommended iter-5c scope (NaN root-cause + flip):
+  1. **Logit-comparison probe on real V4-Flash**: write a
+     standalone script that runs both `transformer_body_forward`
+     and `deepseek_v4_run_with_decode_state(is_decode_step=False)`
+     on the same input under a real-weights launch (or under a
+     half-width loaded checkpoint to fit on a CPU host), saves
+     each layer's `h` output, and finds the first layer at
+     which a NaN appears in the orchestrator's path but not the
+     forward path. That pinpoints which kernel's state-capture
+     side-effect is responsible.
+  2. **NaN-mask check**: extend the closed-form `attention_init_state_from_prefill`
+     to assert (under a debug flag) that no non-init slot of
+     compressor_score_state remains at -inf after init at
+     T_padded=full bucket. If "init then mask all-tail-positions
+     → -inf" is leaking into a downstream consumer, that's the
+     bug. The fix is to either (a) cap T to actual prompt
+     length via `query_start_loc_cpu[1]` (but that's a Python
+     dynamic shape, harder under JIT), or (b) treat -inf
+     score-state slots as "future" and skip them in the score
+     reduction.
+  3. **Real-smoke gate**: deterministic " Paris" still
+     passes AND a multi-token decode returns coherent output
+     on at least 4 generated tokens. With per-position recompile
+     each new start_pos costs ~1 min cold (verified by the
+     iter-5b smoke that hit 200 OK on prefill within 1 min).
 
 This unlocks A1 (lift `max-model-len`), B1 (sparse_attn Pallas
 becomes worthwhile), and S5 (MTP speculative decoding becomes

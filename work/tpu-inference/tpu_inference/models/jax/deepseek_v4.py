@@ -1892,25 +1892,29 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5b: single-active-seq path threads packed
-                # `AttentionDecodeState` through `kv_caches`. The runner
-                # tags `attention_metadata.decode_start_pos` (Python-static
-                # meta_field) to N-1 on a decode step; default 0 = prefill.
-                start_pos = 0
-                if attention_metadata is not None:
-                    start_pos = int(getattr(
-                        attention_metadata, "decode_start_pos", 0))
-                T = int(ids_2d.shape[-1])
-                is_decode = (T == 1) and (start_pos > 0)
-                state_max_seq_len = v4_state_max_seq_len_from_vllm_config(
-                    self.vllm_config)
-                kv_caches, h = deepseek_v4_run_with_decode_state(
-                    kv_caches, ids_2d, params, freqs_swa, freqs_comp,
-                    self.config,
-                    state_max_seq_len=state_max_seq_len,
-                    is_decode_step=is_decode,
-                    start_pos=start_pos,
-                )
+                # S1 iter-5b is partially landed: the runtime allocator
+                # (kv_cache_manager) + sharding override + decode_start_pos
+                # meta_field + runner-side tagging are wired and verified.
+                # The __call__ flip to deepseek_v4_run_with_decode_state is
+                # disabled — on real V4-Flash that path produces NaN logits
+                # (visible via /v1/completions logprobs=1: HTTP 400 with
+                # "Out of range float values are not JSON compliant: nan").
+                # Tiny-config CPU tests pass byte-equal vs
+                # transformer_body_forward; the divergence appears only
+                # under the full 43-layer V4-Flash + bf16 + replicated
+                # SPMD path, suggesting the state-init's intermediate
+                # allocations re-order something XLA-side. Iter-5c will
+                # isolate (logit-comparison probe between
+                # transformer_body_forward and orchestrator output on a
+                # short prefill against real weights, NaN-mask check on
+                # each layer's output) before flipping __call__ over.
+                # Until then the prefill path is the pre-iter-5b
+                # transformer_body_forward and kv_caches passes through
+                # unchanged (the V4-allocated 1D fp32 buffer carries no
+                # semantic load yet — model_loader's V4 sharding override
+                # guarantees the JIT donation still type-checks).
+                h = transformer_body_forward(
+                    ids_2d, params, freqs_swa, freqs_comp, self.config)
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,

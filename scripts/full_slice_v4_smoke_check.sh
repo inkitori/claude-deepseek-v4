@@ -91,7 +91,14 @@ HOST="${HOST:-127.0.0.1}"
 URL="http://${HOST}:${PORT}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-V4-Flash}"
 PROMPT='The capital of France is'
-MAX_TOK=8
+# Default 8 keeps the historical smoke. Under S1 iter-5b every fresh decode
+# position triggers a JIT recompile (~50–100s cold), so at MAX_TOK=8 the
+# first cold completion can land near CURL_MAX_TIME's 900s ceiling. Setting
+# COMPLETION_MAX_TOK=2 keeps the deterministic Paris assertion intact (the
+# first generated token is " Paris") while staying well under the curl cap
+# during iter-5b validation. Once iter-5c lifts start_pos to traced and one
+# decode compile covers all positions, this can revert to 8.
+MAX_TOK="${COMPLETION_MAX_TOK:-8}"
 SEED=0
 # Readiness poll cap (server-up wait).
 TIMEOUT_S="${TIMEOUT_S:-1800}"
