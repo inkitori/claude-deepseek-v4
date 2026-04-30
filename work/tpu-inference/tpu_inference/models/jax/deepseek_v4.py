@@ -1177,18 +1177,21 @@ def _build_class():
                     file=_sys.stderr, flush=True,
                 )
 
-            # 5. Consolidate per-expert MoE weights into stacked tensors
-            #    sharded on the leading expert axis. This eliminates the
-            #    per-forward `jnp.stack(experts[*].wN)` + the all-to-all
-            #    that follows it (XLA was burning ~16 GB / chip of HLO
-            #    temp staging the stacked tensor on every layer × every
-            #    forward call). After this pass each MoEParams carries
-            #    `w1_stacked / w2_stacked / w3_stacked` of shape
-            #    [E, inter, dim] with PartitionSpec ('attn_dp', None, None),
-            #    and the per-expert `experts` list is cleared. The
-            #    consolidate-and-clear is a one-time cost paid here.
-            if self.mesh is not None:
-                current = self._consolidate_moe_after_load(current)
+            # NOTE: a post-load `_consolidate_moe_after_load` pass was
+            # tried here (jnp.stack(per-leaf experts) + device_put to
+            # P('attn_dp', None, None)) to eliminate the per-forward
+            # all-to-all storm. It fails with TPU
+            # `RuntimeProgramAllocationFailure: reserve 256 MB at the
+            # bottom of memory` because HBM is heavily fragmented after
+            # 33 000 small per-leaf allocations and there's no
+            # contiguous 256 MB free buffer for the device_put's
+            # transient. The right fix is to stack at LOAD time (so the
+            # per-leaf leaves never exist on TPU) — i.e. change
+            # `make_abstract_moe_params` to carry stacked
+            # `[E, inter, dim]` tensors and have the loader fill them
+            # via host-side accumulation. That's a bigger change and is
+            # the next-iter target; this iter ships the moe_forward
+            # branch + freqs cap so the change isn't wasted.
 
             self.params_v = nnx.Param(current)
             self.initialize_cache()
