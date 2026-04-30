@@ -276,30 +276,44 @@ others.
 S2 can land independently of S1 but they multiply each other:
 real concurrency only matters once decode is fast.
 
-#### S3. `--reasoning-parser deepseek_v4` and `--tool-call-parser deepseek_v4` are NOT enabled in the smoke launcher
+#### S3. `--reasoning-parser deepseek_v4` and `--tool-call-parser deepseek_v4` enabled in smoke launcher (launcher portion DONE; runtime assertion deferred)
 
-`work/vllm/vllm/reasoning/__init__.py:31-32` already registers
-`deepseek_v4 → deepseek_v3_reasoning_parser` (handles
+`work/vllm/vllm/reasoning/__init__.py:31-32` registers
+`deepseek_v4 → DeepSeekV3ReasoningParser` (handles
 `<think>...</think>` block extraction →
-`reasoning_content` field). `work/vllm/vllm/tool_parsers/deepseekv4_tool_parser.py`
-already exists with tests at
-`work/vllm/tests/tool_parsers/test_deepseekv4_tool_parser.py`.
+`reasoning` / `reasoning_content` field).
+`work/vllm/vllm/tool_parsers/deepseekv4_tool_parser.py`
+provides `DeepSeekV4ToolParser` (DSML tool tokens → `tool_calls`).
+Both are wired into `scripts/full_slice_v4_smoke.sh` via
+`--reasoning-parser deepseek_v4`,
+`--enable-auto-tool-choice`, `--tool-call-parser deepseek_v4`.
+vLLM validates these names at startup and refuses to launch if
+they're misregistered, so the smoke gate green = parsers loaded.
 
-But neither flag is passed by `scripts/full_slice_v4_smoke.sh`.
-Without `--reasoning-parser deepseek_v4` and
-`--enable-auto-tool-choice --tool-call-parser deepseek_v4`,
-every chat request that emits `<think>` blocks or DSML tool
-calls returns them as raw text in `content` instead of
-populating `reasoning_content` / `tool_calls`. Most clients
-(OpenRouter, OpenAI SDK, downstream agents) treat this as
-malformed output.
+What's left for S3 (depends on S4): a runtime assertion that a
+think-mode-triggering chat request produces a non-empty
+`reasoning` field. Today's chat template
+(`scripts/v4_chat_template.jinja`) emits `<｜Assistant｜></think>`
+unconditionally — i.e. it tells the model "thinking is done,
+answer now" — so the model never produces `<think>` blocks
+regardless of the parser being wired. Once S4 lands a
+thinking-mode-aware template that omits the `</think>` open and
+respects `chat_template_kwargs.thinking=True`, add a smoke_check
+chat probe that sets `chat_template_kwargs={"thinking": true}`
+plus a reasoning-eliciting prompt and asserts the response's
+`reasoning` field is non-empty. Same applies to a tool-using
+probe — depends on S4's `tools` scope.
 
-This is a one-line launcher fix + a smoke_check addition that
-asserts a `/v1/chat/completions` request with a
-think-mode-triggering prompt produces a non-empty
-`reasoning_content` field. Do that *first* in any iter that
-touches the chat surface — the test alone catches future
-regressions.
+Sanity check that the parsers are still wired (no TPU needed):
+
+```bash
+PYTHONPATH=work/vllm:work/tpu-inference work/vllm_env/bin/python3 -c "
+from vllm.reasoning import ReasoningParserManager
+from vllm.tool_parsers import ToolParserManager
+ReasoningParserManager.get_reasoning_parser('deepseek_v4')
+ToolParserManager.get_tool_parser('deepseek_v4')
+print('OK')"
+```
 
 #### S4. Chat template covers chat-mode only — think and tool modes silently produce wrong tokens
 
@@ -682,6 +696,12 @@ when the timeout SIGTERMs the iter.
 * **Chat template (chat-mode subset)**: byte-equivalent to
   `encode_messages(thinking_mode="chat")` on representative
   inputs. ✓ for chat-mode only — see S4 for the missing scopes.
+* **Reasoning + tool parsers wired** (`--reasoning-parser deepseek_v4`,
+  `--enable-auto-tool-choice --tool-call-parser deepseek_v4` in
+  `scripts/full_slice_v4_smoke.sh`). Registry lookup verified via
+  the snippet in S3. vLLM validates parser names at startup, so
+  smoke-green = parsers loaded. ✓ wiring, ✗ runtime emission test
+  (S3 — depends on S4's thinking-mode template).
 
 ## Chat template (chat-completions)
 

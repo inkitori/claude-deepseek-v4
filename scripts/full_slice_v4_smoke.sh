@@ -140,6 +140,13 @@ echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set 
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
 echo "[smoke]   chat_template=$CHAT_TEMPLATE"
+echo "[smoke]   reasoning_parser=deepseek_v4 tool_call_parser=deepseek_v4 (auto-tool-choice on)"
+# Reasoning + tool parsers: both registered upstream as "deepseek_v4"
+# (vllm/reasoning/__init__.py and vllm/tool_parsers/__init__.py).
+# Without these, chat responses return raw <think>...</think> blocks and
+# DSML tool tokens in `content` instead of `reasoning_content` / `tool_calls`,
+# which most clients treat as malformed. Safe to enable: when a request has
+# no tools and no thinking, both parsers default to passthrough.
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
     --tensor-parallel-size 32 \
@@ -151,6 +158,9 @@ echo "[smoke]   chat_template=$CHAT_TEMPLATE"
     --dtype bfloat16 \
     --enforce-eager \
     --chat-template "$CHAT_TEMPLATE" \
+    --reasoning-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --tool-call-parser deepseek_v4 \
     --additional_config '{"sharding":{"sharding_strategy":{"enable_dp_attention":true}}}' \
     > "$LOG" 2>&1 &
 
