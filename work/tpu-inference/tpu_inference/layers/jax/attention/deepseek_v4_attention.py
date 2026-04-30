@@ -477,25 +477,24 @@ def compressor_init_state(
 
 def compressor_decode_step(
     x_step: jnp.ndarray,           # [B, 1, dim]
-    start_pos: int,                # absolute decoded position
+    start_pos,                     # absolute decoded position (int or jnp.int32)
     params: CompressorParams,
     freqs_cis_full: jnp.ndarray,
     kv_state: jnp.ndarray,         # [B, coff*ratio, coff*head_dim] fp32
     score_state: jnp.ndarray,      # [B, coff*ratio, coff*head_dim] fp32
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, bool]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, "jnp.ndarray | bool"]:
     """One decode step. Returns (kv_state', score_state', kv_compressed, did_compress).
-    `kv_compressed` is `[B, 1, head_dim]` (the new compressed position) when
-    `did_compress` is True. When `did_compress` is False, the returned
-    `kv_compressed` is undefined (zeros-of-correct-shape); the caller must
-    not use it.
 
-    `did_compress` is a Python bool determined by `start_pos`, so it is
-    safe to branch on at trace time.
+    `kv_compressed` is `[B, 1, head_dim]`. When `did_compress` is False the
+    value is mathematically defined (softmax over the partially-filled
+    current window) but the caller should ignore it — the corresponding
+    cache slot will be overwritten on the next compression boundary.
+
+    All control flow on `start_pos` is traced (jnp.where), so a single
+    JIT trace fits every position.
     """
-    B = x_step.shape[0]
     ratio = params.compress_ratio
     overlap = (ratio == 4)
-    coff = 2 if overlap else 1
     d = params.head_dim
     rd = params.rope_head_dim
 
@@ -504,73 +503,62 @@ def compressor_decode_step(
     score = xf @ params.wgate.T     # [B, 1, coff*d]
 
     pos_in_ratio = start_pos % ratio
-    score = score + _replicate(params.ape)[pos_in_ratio]
+    score = score + lax.dynamic_index_in_dim(
+        _replicate(params.ape), pos_in_ratio, axis=0, keepdims=False)
 
     kv_one = kv.squeeze(1)
     score_one = score.squeeze(1)
 
+    write_idx = (ratio + pos_in_ratio) if overlap else pos_in_ratio
+    kv_state = kv_state.at[:, write_idx].set(kv_one)
+    score_state = score_state.at[:, write_idx].set(score_one)
+
     if overlap:
-        # Reference (paraphrased):
-        #   kv_state[:, ratio + pos_in_ratio] = kv.squeeze(1)
-        #   score_state[:, ratio + pos_in_ratio] = score.squeeze(1)
-        kv_state = kv_state.at[:, ratio + pos_in_ratio].set(kv_one)
-        score_state = score_state.at[:, ratio + pos_in_ratio].set(score_one)
+        kv_concat = jnp.concatenate(
+            [kv_state[:, :ratio, :d], kv_state[:, ratio:, d:]], axis=1)
+        score_concat = jnp.concatenate(
+            [score_state[:, :ratio, :d], score_state[:, ratio:, d:]], axis=1)
     else:
-        kv_state = kv_state.at[:, pos_in_ratio].set(kv_one)
-        score_state = score_state.at[:, pos_in_ratio].set(score_one)
+        kv_concat = kv_state[..., :d]
+        score_concat = score_state
+    softmax_score = jax.nn.softmax(score_concat, axis=1)
+    kv_compressed = (kv_concat * softmax_score).sum(axis=1, keepdims=True)
+
+    kv_norm = rms_norm(kv_compressed.astype(x_step.dtype), params.norm_w, params.norm_eps)
+    # rope_pos = start_pos + 1 - ratio; can be negative when not did_compress
+    # (lax.dynamic_slice_in_dim clamps; the value is unused when did=False).
+    rope_pos = start_pos + 1 - ratio
+    fc = lax.dynamic_slice_in_dim(freqs_cis_full, rope_pos, 1, axis=0)
+    kv_norm = splice_rope(kv_norm, rd, fc, inverse=False)
+
+    if overlap:
+        rotated_front = kv_state[:, ratio:]
+        rotated_score_front = score_state[:, ratio:]
+        kv_state_rotated = kv_state.at[:, :ratio].set(rotated_front)
+        score_state_rotated = score_state.at[:, :ratio].set(rotated_score_front)
+        did_arr = ((start_pos + 1) % ratio) == 0
+        kv_state = jnp.where(did_arr, kv_state_rotated, kv_state)
+        score_state = jnp.where(did_arr, score_state_rotated, score_state)
 
     did_compress = ((start_pos + 1) % ratio) == 0
-
-    if did_compress:
-        if overlap:
-            kv_concat = jnp.concatenate(
-                [kv_state[:, :ratio, :d], kv_state[:, ratio:, d:]], axis=1)
-            score_concat = jnp.concatenate(
-                [score_state[:, :ratio, :d], score_state[:, ratio:, d:]], axis=1)
-        else:
-            kv_concat = kv_state[..., :d]
-            score_concat = score_state
-        softmax_score = jax.nn.softmax(score_concat, axis=1)
-        kv_compressed = (kv_concat * softmax_score).sum(axis=1, keepdims=True)  # [B, 1, d]
-
-        # RMSNorm + RoPE on the new compressed position.
-        kv_norm = rms_norm(kv_compressed.astype(x_step.dtype), params.norm_w, params.norm_eps)
-        rope_pos = start_pos + 1 - ratio
-        fc = freqs_cis_full[rope_pos:rope_pos + 1]
-        kv_norm = splice_rope(kv_norm, rd, fc, inverse=False)
-
-        # In overlap mode, slide the front half of the buffer up by one ratio
-        # group: kv_state[:, :ratio] = kv_state[:, ratio:].
-        if overlap:
-            kv_state = kv_state.at[:, :ratio].set(kv_state[:, ratio:])
-            score_state = score_state.at[:, :ratio].set(score_state[:, ratio:])
-
-        return kv_state, score_state, kv_norm, True
-    else:
-        # No new compressed position this step. Return zeros placeholder.
-        kv_norm = jnp.zeros((B, 1, d), dtype=x_step.dtype)
-        return kv_state, score_state, kv_norm, False
+    return kv_state, score_state, kv_norm, did_compress
 
 
 def indexer_decode_step(
     x_step: jnp.ndarray,                  # [B, 1, dim]
     qr_step: jnp.ndarray,                 # [B, 1, q_lora_rank]
-    start_pos: int,
+    start_pos,                            # int or jnp.int32 scalar
     params: IndexerParams,
     freqs_cis_full: jnp.ndarray,
     offset: int,
     inner_kv_state: jnp.ndarray,          # compressor's kv_state for this indexer
     inner_score_state: jnp.ndarray,
-    inner_kv_cache: jnp.ndarray,          # [B, max/ratio, index_head_dim] — the indexer's compressed cache
+    inner_kv_cache: jnp.ndarray,          # [B, max/ratio, index_head_dim]
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Returns (inner_kv_state, inner_score_state, inner_kv_cache, topk_idxs).
 
-    `topk_idxs` shape: [B, 1, K] where K = min(index_topk, end_pos//ratio).
-    K depends on start_pos statically.
-
-    The indexer maintains its OWN kv_cache (separate from attention's). Real
-    width is `[B, max_seq_len // ratio, index_head_dim]`. This function reads
-    and writes that cache.
+    `topk_idxs` shape: [B, 1, params.index_topk] (constant). Slots beyond
+    `(start_pos+1)//ratio` carry -1 sentinels.
     """
     B = x_step.shape[0]
     H = params.n_heads
@@ -578,23 +566,23 @@ def indexer_decode_step(
     rd = params.rope_head_dim
     ratio = params.compressor.compress_ratio
 
-    fc = freqs_cis_full[start_pos:start_pos + 1]
+    fc = lax.dynamic_slice_in_dim(freqs_cis_full, start_pos, 1, axis=0)
     q = (qr_step.astype(jnp.float32) @ params.wq_b.astype(jnp.float32).T).astype(qr_step.dtype)
     q = q.reshape(B, 1, H, Dh)
     q = splice_rope(q, rd, fc, inverse=False)
-    # rotate_activation = identity (D3); fp4_act_quant no-op.
 
-    # Run inner compressor step.
-    inner_kv_state, inner_score_state, kv_compressed, did = compressor_decode_step(
+    inner_kv_state, inner_score_state, kv_compressed, _did = compressor_decode_step(
         x_step, start_pos, params.compressor, freqs_cis_full,
         inner_kv_state, inner_score_state,
     )
-    if did:
-        write_idx = start_pos // ratio
-        inner_kv_cache = inner_kv_cache.at[:, write_idx].set(kv_compressed.squeeze(1))
+    # Unconditional write at `start_pos // ratio`: when not did, we store
+    # the partial-window softmax which is ignored (slots past
+    # `(start_pos+1)//ratio` are masked out below) and overwritten on the
+    # next compression boundary.
+    write_idx = start_pos // ratio
+    inner_kv_cache = inner_kv_cache.at[:, write_idx].set(kv_compressed.squeeze(1))
 
-    end_pos = start_pos + 1
-    end_pos_div_ratio = end_pos // ratio  # number of compressed positions filled
+    end_pos_div_ratio = (start_pos + 1) // ratio
 
     weights = (x_step.astype(jnp.float32) @ params.weights_proj.astype(jnp.float32).T)
     weights = weights * params.softmax_scale * (H ** -0.5)
@@ -607,52 +595,49 @@ def indexer_decode_step(
     valid_mask = t_arange[None, None, :] < end_pos_div_ratio
     index_score = jnp.where(valid_mask, index_score, -jnp.inf)
 
-    K = min(params.index_topk, end_pos_div_ratio)
-    if K == 0:
-        topk_idxs = jnp.zeros((B, 1, 0), dtype=jnp.int32)
-    else:
-        _, topk_idxs = lax.top_k(index_score, K)
-        topk_idxs = topk_idxs + offset
+    K = params.index_topk  # constant
+    _, topk_raw = lax.top_k(index_score, K)
+    k_arange = jnp.arange(K)
+    sentinel_mask = k_arange[None, None, :] < end_pos_div_ratio
+    topk_idxs = jnp.where(sentinel_mask, topk_raw + offset, -1)
     return inner_kv_state, inner_score_state, inner_kv_cache, topk_idxs.astype(jnp.int32)
 
 
 # --------------------- attention decode helpers ---------------------
 
-def get_window_topk_idxs_decode(window_size: int, bsz: int, start_pos: int) -> jnp.ndarray:
+def get_window_topk_idxs_decode(window_size: int, bsz: int, start_pos) -> jnp.ndarray:
     """Decode-time window topk indices. Shape [B, 1, window_size].
 
-    Mirrors `get_window_topk_idxs(start_pos > 0)` from the reference. We
-    require `start_pos` to be a Python int so the index pattern can be built
-    at trace time. (vLLM's scheduler knows absolute positions per request.)
+    `start_pos` may be a Python int or a traced jnp.int32 scalar; the result
+    shape is constant either way so a single JIT trace fits all positions.
+    Slots beyond `start_pos` are filled with -1 sentinels (sparse_attn drops
+    them).
     """
     win = window_size
-    if start_pos >= win - 1:
-        sp = start_pos % win
-        # arange(sp+1, win) ++ arange(0, sp+1)
-        front = jnp.arange(sp + 1, win, dtype=jnp.int32)
-        back = jnp.arange(0, sp + 1, dtype=jnp.int32)
-        matrix = jnp.concatenate([front, back], axis=0)
-    elif start_pos > 0:
-        front = jnp.arange(start_pos + 1, dtype=jnp.int32)
-        pad = jnp.full((win - start_pos - 1,), -1, dtype=jnp.int32)
-        matrix = jnp.concatenate([front, pad], axis=0)
-    else:
-        head = jnp.zeros((1,), dtype=jnp.int32)
-        pad = jnp.full((win - 1,), -1, dtype=jnp.int32)
-        matrix = jnp.concatenate([head, pad], axis=0)
+    sp = start_pos % win
+    i = jnp.arange(win, dtype=jnp.int32)
+    # When start_pos >= win - 1 the window is fully populated, indexed
+    # circularly: matrix[k] = (sp + 1 + k) % win.
+    case_full = (sp + 1 + i) % win
+    # Otherwise only positions [0, start_pos] are valid; the rest are -1.
+    case_partial = jnp.where(i <= start_pos, i, -1)
+    matrix = jnp.where(start_pos >= win - 1, case_full, case_partial)
     return jnp.broadcast_to(matrix.reshape(1, 1, win), (bsz, 1, win))
 
 
 def get_compress_topk_idxs_decode(
-    ratio: int, bsz: int, start_pos: int, offset: int) -> jnp.ndarray:
-    """Decode-time compressed topk indices for HCA.
-    Mirrors `get_compress_topk_idxs(start_pos>0)`:
-        arange(0, (start_pos+1) // ratio) + offset
-    Returns shape [B, 1, T] where T = (start_pos+1) // ratio.
+    ratio: int, bsz: int, start_pos, offset: int,
+    max_compress_slots: int,
+) -> jnp.ndarray:
+    """Decode-time compressed topk indices for HCA layers without an indexer.
+
+    Returns shape [B, 1, max_compress_slots]; entries past `(start_pos+1)//ratio`
+    are -1 sentinels. Constant shape lets a single compile fit all positions.
     """
-    T = (start_pos + 1) // ratio
-    matrix = jnp.arange(T, dtype=jnp.int32) + offset
-    return jnp.broadcast_to(matrix.reshape(1, 1, T), (bsz, 1, T))
+    n_valid = (start_pos + 1) // ratio
+    i = jnp.arange(max_compress_slots, dtype=jnp.int32)
+    matrix = jnp.where(i < n_valid, i + offset, -1)
+    return jnp.broadcast_to(matrix.reshape(1, 1, max_compress_slots), (bsz, 1, max_compress_slots))
 
 
 @dataclass
@@ -709,7 +694,7 @@ def attention_decode_init_state(
 
 def attention_decode_step(
     x_step: jnp.ndarray,           # [B, 1, dim]
-    start_pos: int,
+    start_pos,                     # int or jnp.int32 scalar
     params: AttentionParams,
     freqs_cis_full: jnp.ndarray,
     state: AttentionDecodeState,
@@ -718,8 +703,12 @@ def attention_decode_step(
 
     Mirrors `Attention.forward(x, start_pos>0)` from the reference. Writes:
       - state.kv_cache[:, start_pos % win] = current step's kv (SWA write).
-      - state.kv_cache[:, win + start_pos // ratio] = newly-compressed kv,
-        when (start_pos+1) % ratio == 0.
+      - state.kv_cache[:, win + start_pos // ratio] = newly-compressed kv
+        on every step; slots past `(start_pos+1)//ratio` carry placeholder
+        values that aren't read (the topk indices mask them out).
+
+    All control flow on `start_pos` is traced — one JIT trace fits all
+    positions.
 
     Returns (new_state, y_step) with y_step shape [B, 1, dim].
     """
@@ -730,7 +719,7 @@ def attention_decode_step(
     win = params.window_size
     ratio = params.compress_ratio
     eps = params.norm_eps
-    fc = freqs_cis_full[start_pos:start_pos + 1]
+    fc = lax.dynamic_slice_in_dim(freqs_cis_full, start_pos, 1, axis=0)
 
     # q
     qr = _linear(x_step, params.wq_a)
@@ -745,21 +734,21 @@ def attention_decode_step(
     kv = rms_norm(kv, params.kv_norm_w, eps)
     kv = splice_rope(kv, rd, fc, inverse=False)
 
-    # SWA write to kv_cache[:, start_pos % win].
     new_kv_cache = state.kv_cache.at[:, start_pos % win].set(kv.squeeze(1))
 
     topk_idxs = get_window_topk_idxs_decode(win, B, start_pos)
 
     if ratio > 0:
         offset = win
-        # Run attention's compressor step (separate state from indexer).
-        c_kvst, c_scst, kv_compressed, did = compressor_decode_step(
+        c_kvst, c_scst, kv_compressed, _did = compressor_decode_step(
             x_step, start_pos, params.compressor, freqs_cis_full,
             state.compressor_kv_state, state.compressor_score_state,
         )
-        if did:
-            write_idx = win + (start_pos // ratio)
-            new_kv_cache = new_kv_cache.at[:, write_idx].set(kv_compressed.squeeze(1))
+        # Unconditional write at `(start_pos // ratio) + win`. When not did,
+        # the slot's data is unreferenced (topk excludes slots past
+        # (start_pos+1)//ratio) and gets overwritten on the next compression.
+        write_idx = win + (start_pos // ratio)
+        new_kv_cache = new_kv_cache.at[:, write_idx].set(kv_compressed.squeeze(1))
 
         if params.indexer is not None:
             i_kvst, i_scst, i_kvcache, compress_topk = indexer_decode_step(
@@ -768,7 +757,9 @@ def attention_decode_step(
                 state.indexer_kv_cache,
             )
         else:
-            compress_topk = get_compress_topk_idxs_decode(ratio, B, start_pos, offset)
+            max_compress_slots = state.kv_cache.shape[1] - win
+            compress_topk = get_compress_topk_idxs_decode(
+                ratio, B, start_pos, offset, max_compress_slots)
             i_kvst = state.indexer_kv_state
             i_scst = state.indexer_score_state
             i_kvcache = state.indexer_kv_cache
@@ -884,23 +875,11 @@ def attention_prefill(
     return _linear(o_flat, params.wo_b)
 
 
-# --------------------- prefill→decode state init (S1) ---------------------
+# --------------------- prefill→decode state init ---------------------
 #
-# Closed-form derivation of `AttentionDecodeState` from a prefill input. The
-# state is what `attention_decode_step`'s rolling buffers would contain after
-# T steps from zero state. Used by the model wrapper to seed decode state
-# after running `attention_prefill` once on a new sequence — subsequent
-# decode calls then advance one position at a time, O(1)/step instead of
-# O(T²)/step. (Backlog item S1.)
-#
-# Why closed-form rather than iterating attention_decode_step T times: the
-# decode kernel takes start_pos as a Python int and uses static control
-# flow (`if did_compress`, `kv_state.at[:, pos_in_ratio]`). Iterating it
-# inside `lax.scan` would require a refactor to traced start_pos; iterating
-# in Python unrolls T copies into HLO at compile time, which scales 50×T
-# across layers and blows up compile cost. The closed-form below mirrors
-# the reference state semantics directly. Pinned by parity tests in
-# `test_deepseek_v4.py::TestPrefillToDecodeStateParity`.
+# Closed-form derivation of `AttentionDecodeState` from a prefill input.
+# Equivalent to running `attention_decode_step` T times from zero state but
+# materialized in a single pass. Pinned by `TestPrefillToDecodeStateParity`.
 
 def _compressor_state_from_prefill(
     x: jnp.ndarray,             # [B, T, dim]

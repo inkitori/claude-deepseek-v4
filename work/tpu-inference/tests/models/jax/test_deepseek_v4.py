@@ -1925,15 +1925,12 @@ class TestPackedDecodeStateBuffer:
             return transformer_body_init_state_to_buffer(
                 ids, p, sw, cp, cfg, state_max_seq_len=state_max_seq_len)
 
-        # `start_pos` is a Python int — must be threaded as a static
-        # argument because `attention_decode_step` indexes its circular
-        # buffers via `start_pos % win` / `start_pos // ratio` at trace
-        # time. Without `static_argnums` jax converts the int to a
-        # tracer and the kernel raises `IndexError: Slice entries must
-        # be static integers`. Production runtime hits this same
-        # constraint — each new decode position triggers a fresh trace
-        # but the per-position compile is cached.
-        @functools.partial(jax.jit, static_argnums=(5,))
+        # `start_pos` is threaded as a TRACED jnp.int32 scalar — the
+        # decode kernels use `lax.dynamic_slice_in_dim` / `lax.dynamic_index`
+        # / `jnp.where` on traced positions so a single JIT trace fits
+        # every position. (Pinned by `test_buffer_decode_jit_cache_hits_across_positions`
+        # below.)
+        @jax.jit
         def jitted_step(ids_step, p, sw, cp, prev_buffers, start_pos):
             return transformer_body_decode_step_from_buffer(
                 ids_step, p, sw, cp, cfg, prev_buffers, start_pos=start_pos,
@@ -1949,7 +1946,7 @@ class TestPackedDecodeStateBuffer:
             state_max_seq_len=state_max_seq_len)
         jitted_step.lower(
             ids_full_j[:, T:T + 1], params, swa, comp,
-            buffers_eager, T).compile()
+            buffers_eager, jnp.int32(T)).compile()
 
         # Execute jit'd path; compare against eager.
         h_jit, buffers_jit = jitted_init(
@@ -1985,7 +1982,8 @@ class TestPackedDecodeStateBuffer:
 
         # One decode step jit'd vs eager.
         h_step_jit, _ = jitted_step(
-            ids_full_j[:, T:T + 1], params, swa, comp, buffers_jit, T)
+            ids_full_j[:, T:T + 1], params, swa, comp, buffers_jit,
+            jnp.int32(T))
         h_step_e, _ = transformer_body_decode_step_from_buffer(
             ids_full_j[:, T:T + 1], params, swa, comp, cfg,
             buffers_e, start_pos=T,
@@ -1996,6 +1994,41 @@ class TestPackedDecodeStateBuffer:
         assert d_step <= 5e-3, (
             f"jit'd decode_step_from_buffer drifted from eager beyond "
             f"bf16-reorder budget (max abs {d_step})")
+
+    def test_buffer_decode_jit_cache_hits_across_positions(self):
+        """One compile fits every decode position. With traced `start_pos`,
+        running the decode step at multiple positions must reuse the same
+        compiled artifact (the throughput unlock the prior static-int
+        impl missed: each new position used to trigger a fresh ~50s XLA
+        compile under V4_DECODE_STATE=1)."""
+        model, params, cfg, swa, comp = self._build_pair(seed=0)
+        T = 16
+        torch.manual_seed(T + 99)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, T + 4), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+        state_max_seq_len = model.args.max_seq_len
+
+        @jax.jit
+        def jitted_step(ids_step, p, sw, cp, prev_buffers, start_pos):
+            return transformer_body_decode_step_from_buffer(
+                ids_step, p, sw, cp, cfg, prev_buffers,
+                start_pos=start_pos, state_max_seq_len=state_max_seq_len)
+
+        _, buffers = transformer_body_init_state_to_buffer(
+            ids_full_j[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=state_max_seq_len)
+
+        cache_size_before = jitted_step._cache_size()
+        for offset in range(4):
+            sp = jnp.int32(T + offset)
+            ids_step = ids_full_j[:, T + offset:T + offset + 1]
+            _, buffers = jitted_step(
+                ids_step, params, swa, comp, buffers, sp)
+        cache_size_after = jitted_step._cache_size()
+        assert cache_size_after - cache_size_before == 1, (
+            f"expected 1 compile for 4 traced positions, "
+            f"got {cache_size_after - cache_size_before}")
 
     def test_run_with_decode_state_kv_caches_round_trip(self):
         """S1 iter-4 orchestration: pin that

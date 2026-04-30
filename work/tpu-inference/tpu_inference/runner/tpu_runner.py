@@ -1327,23 +1327,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _maybe_set_v4_decode_start_pos(
             self, attention_metadata, query_start_loc_view, seq_lens_view):
-        """S1 iter-5b: tag V4's `attention_metadata.decode_start_pos` so the
-        model's __call__ branches between prefill and decode.
+        """Set V4's `attention_metadata.decode_start_pos` to 1 on a decode
+        step so the model's __call__ takes the decode-state branch. The
+        actual position is read at trace time from `seq_lens[0] - 1`, so
+        the meta-field is just a 0/1 prefill/decode gate (2 cache keys
+        total, regardless of how many positions the request walks through).
 
         Hits only the V4 single-active-seq decode shape (query_len[0]==1
-        with prior prefilled tokens). Non-V4 models leave the field at 0
-        — the field has no semantic meaning for them and the JIT cache
-        key includes 0 unconditionally, so no extra compiles.
-
-        Today's smoke is `MAX_SEQS=1`. If we ever lift S2 (multi-seq), the
-        first-active-seq's start_pos is what V4's `attention_decode_step`
-        consumes; multi-seq decode is per-slot and lands on the iter-5c
-        kernel-refactor path.
+        with prior prefilled tokens). Non-V4 models leave the field at 0.
         """
         if not self._is_deepseek_v4:
             return
-        # query_start_loc_view[0] == 0 always; query_start_loc_view[1] is
-        # the cumulative end of req 0 == its query length.
         try:
             q0 = int(query_start_loc_view[1])
             s0 = int(seq_lens_view[0])
@@ -1351,12 +1345,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return
         if q0 != 1 or s0 <= 1:
             return
-        start_pos = s0 - 1
         if isinstance(attention_metadata, dict):
             for am in attention_metadata.values():
-                am.decode_start_pos = start_pos
+                am.decode_start_pos = 1
         else:
-            attention_metadata.decode_start_pos = start_pos
+            attention_metadata.decode_start_pos = 1
 
     def _prepare_inputs_dp(self, scheduler_output: "VllmSchedulerOutput"):
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens

@@ -357,14 +357,13 @@ def block_decode_step(
     params: BlockParams,
     freqs_cis_full: jnp.ndarray,
     prev_state: AttentionDecodeState,
-    start_pos: int,
+    start_pos,
 ) -> Tuple[AttentionDecodeState, jnp.ndarray]:
     """One decode step through this block. Mirrors `block_forward` but
     swaps `attention_prefill` for `attention_decode_step` (which mutates
     `prev_state`). Returns `(new_state, x_out)` with `x_out: [B, 1, hc, D]`.
-    `start_pos` is the absolute position of the new token (Python static
-    int — it is consumed by `attention_decode_step` via static circular-
-    buffer indexing)."""
+    `start_pos` is the absolute position of the new token (Python int or
+    traced jnp.int32 scalar)."""
     residual = x_step
     y, post, comb = hc_pre(
         x_step, params.hc_attn_fn, params.hc_attn_scale, params.hc_attn_base,
@@ -498,15 +497,13 @@ def transformer_body_decode_step(
     freqs_cis_compressed: jnp.ndarray,
     cfg: DeepseekV4Config,
     prev_states: List[AttentionDecodeState],
-    start_pos: int,
+    start_pos,
 ) -> Tuple[jnp.ndarray, List[AttentionDecodeState]]:
     """One decode step through every layer. Returns
     `(h: [B, 1, hc, D], new_states: List[AttentionDecodeState])`.
 
-    `start_pos` is the absolute position of the new token (Python int —
-    static under JIT because `attention_decode_step` indexes its
-    circular buffers via `start_pos % win` / `start_pos // ratio` at
-    trace time)."""
+    `start_pos` is the absolute position of the new token (Python int or
+    traced jnp.int32 scalar)."""
     h = params.embed_w[input_ids_step]  # [B, 1, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
     new_states: List[AttentionDecodeState] = []
@@ -763,17 +760,15 @@ def transformer_body_decode_step_from_buffer(
     freqs_cis_compressed: jnp.ndarray,
     cfg: DeepseekV4Config,
     prev_buffers: List[jnp.ndarray],
-    start_pos: int,
+    start_pos,
     state_max_seq_len: int,
 ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
     """One decode step driven by per-layer packed-state buffers. Wraps
     `transformer_body_decode_step` with unpack-before / pack-after.
     Returns `(h: [B, 1, hc, D], new_buffers: List[jnp.ndarray])`.
 
-    Iter-4 calls this on the continuation branch of `__call__`, with
-    `prev_buffers[i]` read from `kv_caches[i]` and the returned buffers
-    written back. `start_pos` must equal the absolute position of the new
-    token — the Python staticness propagates from `attention_decode_step`."""
+    `start_pos` is the absolute position of the new token (Python int or
+    traced jnp.int32 scalar — the kernel handles either)."""
     layouts = transformer_body_layout(
         params, cfg, state_max_seq_len,
         batch_size=int(input_ids_step.shape[0]))
@@ -851,7 +846,7 @@ def deepseek_v4_run_with_decode_state(
     cfg: DeepseekV4Config,
     state_max_seq_len: int,
     is_decode_step: bool,
-    start_pos: int,
+    start_pos,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
     """S1 iter-4: orchestrate one prefill OR one decode step with the
     per-layer `AttentionDecodeState` packed into / unpacked from
@@ -885,9 +880,8 @@ def deepseek_v4_run_with_decode_state(
       * `is_decode_step=True`: reads `kv_caches[i]` as layer i's prior
         packed `AttentionDecodeState`, advances by one position, and
         returns `(new_buffers, h)`. `start_pos` is the absolute
-        position of the new token — must be a Python static under JIT
-        (the underlying `attention_decode_step` indexes circular
-        buffers via `start_pos % win` at trace time).
+        position of the new token — accepts a Python int or a traced
+        jnp.int32 scalar (one compile fits all positions).
 
     Both branches return the updated `kv_caches` as the first element
     of the tuple so the caller can pass it as a donated argument to
@@ -2085,48 +2079,38 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                # S1 iter-5e: env-gated orchestrator flip. `V4_DECODE_STATE=1`
-                # routes through `deepseek_v4_run_with_decode_state`; default
-                # OFF preserves the green-gate baseline.
+                # `V4_DECODE_STATE=1` routes through the decode-state
+                # orchestrator; default OFF preserves the prefill-only gate.
+                # `decode_start_pos` is a 0/1 meta-field gate (set by
+                # `tpu_runner._maybe_set_v4_decode_start_pos` on q0==1 /
+                # s0>1 calls). The traced absolute position comes from
+                # `seq_lens[0] - 1` — one compile fits every position.
                 #
-                # Decode signal: `attention_metadata.decode_start_pos > 0`,
-                # set by the runner only on q0==1 / s0>1 calls
-                # (`tpu_runner._maybe_set_v4_decode_start_pos`). T from
-                # ids_2d.shape[-1] is NOT a reliable decode signal — the TPU
-                # runner pads decode calls to bucket size (T=64 typical), so
-                # T==1 never trips. Iter-5e diagnostic confirmed this:
-                # `__call__ #1: T=64 start_pos=5 is_decode=False` for what
-                # should have been a decode step, which produced empty
-                # completions text on real V4-Flash 2026-04-30 16:08Z.
-                #
-                # On the decode branch, only `ids_2d[:, 0:1]` is the real
-                # query token (the runner zero-pads the rest of the bucket
-                # via `tpu_runner.py:1475 input_ids_cpu[total_num_scheduled_tokens:] = 0`).
-                # The orchestrator's `transformer_body_decode_step_from_buffer`
-                # expects shape [B, 1]; we pad the returned `h` back to
-                # [B, T_padded, hc, D] with zeros so the run_model JIT's
-                # output shape stays consistent across cache keys.
+                # On decode steps the runner zero-pads the bucket past
+                # token 0; we slice `ids_2d[:, 0:1]` for the orchestrator
+                # and pad `h` back to T after.
                 if V4_DECODE_STATE_ENABLED:
-                    start_pos = 0
+                    is_decode = False
                     if attention_metadata is not None:
-                        start_pos = int(getattr(
-                            attention_metadata, "decode_start_pos", 0))
+                        is_decode = int(getattr(
+                            attention_metadata, "decode_start_pos", 0)) > 0
                     T = int(ids_2d.shape[-1])
-                    is_decode = start_pos > 0
                     state_max_seq_len = (
                         v4_state_max_seq_len_from_vllm_config(self.vllm_config))
                     self._v4_call_count = (
                         getattr(self, "_v4_call_count", 0) + 1)
-                    logger.info(
-                        "[V4_DECODE_STATE] __call__ #%d: T=%d start_pos=%d "
-                        "is_decode=%s state_max_seq_len=%d kv_caches=%d",
-                        self._v4_call_count, T, start_pos, is_decode,
-                        state_max_seq_len,
-                        len(kv_caches) if kv_caches is not None else -1)
-                    if is_decode:
+                    if is_decode and attention_metadata is not None:
+                        start_pos = (attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
                         ids_for_orchestrator = ids_2d[:, 0:1]
                     else:
+                        start_pos = jnp.int32(0)
                         ids_for_orchestrator = ids_2d
+                    logger.info(
+                        "[V4_DECODE_STATE] __call__ #%d: T=%d "
+                        "is_decode=%s state_max_seq_len=%d kv_caches=%d",
+                        self._v4_call_count, T, is_decode,
+                        state_max_seq_len,
+                        len(kv_caches) if kv_caches is not None else -1)
                     kv_caches, h = deepseek_v4_run_with_decode_state(
                         kv_caches, ids_for_orchestrator, params,
                         freqs_swa, freqs_comp,
@@ -2136,11 +2120,6 @@ def _build_class():
                         start_pos=start_pos,
                     )
                     if is_decode and T > 1:
-                        # h is [B, 1, hc, D]; pad to [B, T, hc, D] so the
-                        # downstream reshape keeps the runner's expected
-                        # (B*T_padded, D) hidden_TD shape. Padding values
-                        # are unused — the runner samples logits[0] for
-                        # decode and ignores the rest.
                         pad_shape = (h.shape[0], T - 1, *h.shape[2:])
                         pad = jnp.zeros(pad_shape, h.dtype)
                         h = jnp.concatenate([h, pad], axis=1)
