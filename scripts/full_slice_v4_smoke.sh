@@ -115,19 +115,16 @@ export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-3600}"
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 
-# S1 iter-5d gate: flip the model's __call__ from the green-gate baseline
-# (transformer_body_forward, prefill-recompute every step) to the iter-5c
-# orchestrator path (deepseek_v4_run_with_decode_state, threaded through
-# kv_caches). Default OFF preserves the green gate. Set to 1 to test
-# fixes for the iter-5c second-request TPU [USER] FATAL (see CLAUDE.md S1).
+# S1 gate: 1 flips __call__ from prefill-recompute baseline to the real
+# decode orchestrator (deepseek_v4_run_with_decode_state, packed
+# AttentionDecodeState threaded through kv_caches). Default 0 keeps the
+# baseline until per-position decode-compile cost is amortized.
 export V4_DECODE_STATE="${V4_DECODE_STATE:-0}"
 
-# S1 iter-5f diagnostic gate. When 1, the orchestrator prints
-# kv_caches[0]'s sum + nonfinite-count at branch entry/exit via
-# jax.debug.print. Only meaningful when V4_DECODE_STATE=1. Side-effecting
-# (XLA can't DCE), so the prints CHANGE THE HLO — useful for capturing
-# R1 vs R2 input state, but a green smoke under DIAG=1 doesn't necessarily
-# prove the underlying bug is fixed.
+# Side-effecting jax.debug.print of kv_caches[0] sum + nonfinite-count at
+# orchestrator branch entry/exit. Only meaningful when V4_DECODE_STATE=1.
+# Prints change the HLO (XLA can't DCE), so a green smoke under DIAG=1 is
+# weaker than under DIAG=0.
 export V4_DECODE_STATE_DIAG="${V4_DECODE_STATE_DIAG:-0}"
 
 # Forward these to Ray workers (vLLM only carries over a curated env-var
@@ -152,8 +149,8 @@ fi
 
 echo "[smoke] launching vllm serve | log=$LOG"
 echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLACE_WORKERS prefetch_workers=$V4_LOADER_PREFETCH_WORKERS"
-echo "[smoke]   v4_decode_state=$V4_DECODE_STATE (S1 iter-5d: 1=flip __call__ to orchestrator path; 0=green-gate baseline)"
-echo "[smoke]   v4_decode_state_diag=$V4_DECODE_STATE_DIAG (S1 iter-5f: 1=jax.debug.print kv_caches[0] entry/exit in orchestrator)"
+echo "[smoke]   v4_decode_state=$V4_DECODE_STATE (1=real decode orchestrator; 0=prefill-recompute baseline)"
+echo "[smoke]   v4_decode_state_diag=$V4_DECODE_STATE_DIAG (1=jax.debug.print kv_caches[0] at orchestrator entry/exit)"
 echo "[smoke]   jax_cache=\${VLLM_XLA_CACHE_PATH:-~/.cache/vllm/xla_cache} (set by tpu_inference)"
 echo "[smoke]   xla_flags=$XLA_FLAGS"
 echo "[smoke]   ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
