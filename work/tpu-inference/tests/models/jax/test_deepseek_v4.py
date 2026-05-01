@@ -2280,6 +2280,53 @@ class TestPackedDecodeStateBuffer:
                     f"kv_caches contains NaN — `_v4_force_kv_caches_read` "
                     f"contaminated buffer via 0.0 * (-inf)")
 
+    def test_decode_nan_tripwire_when_enabled_runs_clean(self, monkeypatch, capfd):
+        """`V4_DECODE_NAN_TRIPWIRE=1` adds `jax.debug.print` of NaN counts at
+        each decode-step sub-block boundary. Validate the tripwire-on path
+        still produces a NaN-free run (no degenerate input the tripwire
+        itself induces) and emits the expected per-layer log lines so a
+        smoke can grep for the first non-zero `nan=` value to localize the
+        bug from CLAUDE.md S1."""
+        from tpu_inference.models.jax import deepseek_v4 as v4mod
+        monkeypatch.setattr(v4mod, "_V4_DECODE_NAN_TRIPWIRE", True)
+
+        model, params, cfg, swa, comp = self._build_pair(seed=7)
+        L_real = 6
+        state_max = model.args.max_seq_len
+        torch.manual_seed(L_real + 91)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, L_real + 1), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+
+        layouts = transformer_body_layout(
+            params, cfg, state_max, batch_size=1)
+        kv_caches = [
+            jnp.zeros((_layer_packed_size(lo),), dtype=jnp.float32)
+            for lo in layouts
+        ]
+        kv_caches, _ = deepseek_v4_run_with_decode_state(
+            kv_caches, ids_full_j[:, :L_real], params, swa, comp, cfg,
+            state_max_seq_len=state_max,
+            is_decode_step=False, start_pos=jnp.int32(0),
+        )
+        kv_caches, h_step = deepseek_v4_run_with_decode_state(
+            kv_caches, ids_full_j[:, L_real:L_real + 1],
+            params, swa, comp, cfg,
+            state_max_seq_len=state_max,
+            is_decode_step=True, start_pos=jnp.int32(L_real),
+        )
+        assert not bool(jnp.any(jnp.isnan(h_step)))
+        out = capfd.readouterr().out
+        assert "[v4nan]" in out, "tripwire log lines must appear when gate is on"
+        # Every emitted line must end with a `nan=N` field that's 0 on tiny —
+        # tiny CPU is the canonical NaN-free baseline (see CLAUDE.md S1).
+        for line in out.splitlines():
+            if "[v4nan]" not in line:
+                continue
+            assert " nan=0 " in line, (
+                f"tiny CPU baseline emitted NaN at {line!r} — tripwire is "
+                f"reporting NaN where there should be none")
+
 
 # =============================================================
 # Tier 6 — Real-TPU compile + tiny forward

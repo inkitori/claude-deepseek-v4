@@ -32,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -329,6 +330,27 @@ def block_init_state_and_forward(
     return decode_state, hc_post(y, residual, post, comb)
 
 
+_V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
+
+
+def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx: int, position) -> None:
+    """Emit per-call NaN/+inf/-inf counts of `x` to the runtime log.
+    No-op unless `V4_DECODE_NAN_TRIPWIRE=1` was set at process start
+    (gated at module import; production HLO unchanged when disabled).
+    Used to localize which decode-step sub-block first produces NaN on
+    real V4 — see CLAUDE.md S1."""
+    if not _V4_DECODE_NAN_TRIPWIRE:
+        return
+    xf = x.astype(jnp.float32)
+    nans = jnp.sum(jnp.isnan(xf))
+    pinfs = jnp.sum(jnp.isposinf(xf))
+    ninfs = jnp.sum(jnp.isneginf(xf))
+    jax.debug.print(
+        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z}",
+        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs,
+    )
+
+
 def block_decode_step(
     x_step: jnp.ndarray,           # [B, 1, hc, D]
     input_ids_step: jnp.ndarray,   # [B, 1]
@@ -336,30 +358,39 @@ def block_decode_step(
     freqs_cis_full: jnp.ndarray,
     prev_state: AttentionDecodeState,
     start_pos,
+    layer_idx: int = -1,
 ) -> Tuple[AttentionDecodeState, jnp.ndarray]:
     """One decode step through this block. Mirrors `block_forward` but
     swaps `attention_prefill` for `attention_decode_step` (which mutates
     `prev_state`). Returns `(new_state, x_out)` with `x_out: [B, 1, hc, D]`.
     `start_pos` is the absolute position of the new token (Python int or
     traced jnp.int32 scalar)."""
+    _v4_nan_tripwire("attn_in", x_step, layer_idx, start_pos)
     residual = x_step
     y, post, comb = hc_pre(
         x_step, params.hc_attn_fn, params.hc_attn_scale, params.hc_attn_base,
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
+    _v4_nan_tripwire("attn_hcpre_y", y, layer_idx, start_pos)
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
     new_state, y = attention_decode_step(
         y, start_pos, params.attn, freqs_cis_full, prev_state)
+    _v4_nan_tripwire("attn_decode_y", y, layer_idx, start_pos)
     x_step = hc_post(y, residual, post, comb)
+    _v4_nan_tripwire("attn_block_out", x_step, layer_idx, start_pos)
 
     residual = x_step
     y, post, comb = hc_pre(
         x_step, params.hc_ffn_fn, params.hc_ffn_scale, params.hc_ffn_base,
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
+    _v4_nan_tripwire("ffn_hcpre_y", y, layer_idx, start_pos)
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids_step, params.moe)
-    return new_state, hc_post(y, residual, post, comb)
+    _v4_nan_tripwire("moe_y", y, layer_idx, start_pos)
+    out = hc_post(y, residual, post, comb)
+    _v4_nan_tripwire("ffn_block_out", out, layer_idx, start_pos)
+    return new_state, out
 
 
 # ------------------------------------------------------------
@@ -484,12 +515,13 @@ def transformer_body_decode_step(
     traced jnp.int32 scalar)."""
     h = params.embed_w[input_ids_step]  # [B, 1, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
+    _v4_nan_tripwire("embed_h", h, -1, start_pos)
     new_states: List[AttentionDecodeState] = []
-    for layer, prev in zip(params.layers, prev_states):
+    for i, (layer, prev) in enumerate(zip(params.layers, prev_states)):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
         new_state, h = block_decode_step(
-            h, input_ids_step, layer, fc, prev, start_pos)
+            h, input_ids_step, layer, fc, prev, start_pos, layer_idx=i)
         new_states.append(new_state)
     return h, new_states
 

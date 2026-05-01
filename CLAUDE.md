@@ -117,6 +117,7 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
+| `V4_DECODE_NAN_TRIPWIRE` | `0` | Per-sub-block NaN/Inf logger inside `block_decode_step` (S1 diagnostic). When `1`, every decode emits `[v4nan] L{i} pos={p} {name}: nan=N +inf=N -inf=N` per layer. Read at module import; no-op when off (HLO byte-identical). |
 
 `*_REQUIRED` smoke-check knobs (exit code in parens): `CHAT_REQUIRED` (4),
 `REASONING_REQUIRED` (5), `STREAMING_REQUIRED` (6), `SAMPLING_REQUIRED` (7),
@@ -161,52 +162,49 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Iter 2026-05-01 (HEAD):** one real NaN source closed; user-visible
-bug still red.
+**Status (2026-05-01): NaN localized to L5 `attention_decode_step`.**
 
-`_v4_force_kv_caches_read` was folding `b + opaque_zero * kv` to force
-XLA to emit a real read of donated `kv_caches`. Compressor / indexer
-`score_state` init slots hold `-inf` (intended; softmax-zeros them).
-IEEE: `0.0 * -inf = NaN`. Every decode step poisoned its output buffer
-at every -inf slot. CPU localize probe (`/tmp/test_v4_decode_nan_localize.py`):
-prefill ratio>0 layers had 256/512 -inf slots (correct); after decode
-step 0 those flipped to 256/512 NaN slots; by step 3 NaN reached `h`.
+Prior iter shipped a NaN-safe `_v4_force_kv_caches_read` rewrite (pinned
+by `test_run_with_decode_state_does_not_propagate_nan_through_kv_caches`);
+real-V4 user-visible symptom stayed red. Per-sub-block NaN tripwire
+added (gated by `V4_DECODE_NAN_TRIPWIRE=1`, no-op when off so production
+HLO is unchanged). Smoke `logs/full-slice-v4-smoke-20260501T023517Z.log`
+at decode step 0 (start_pos=5):
 
-Fix: replace `b + opaque_zero * kv` with `where(opaque_false, b + kv, b)`.
-The where reads `kv` (HLO retains it; donation alias marker preserved
-per `/tmp/test_v4_force_read_alt_hlo.py`) but `b + (-inf) = -inf`
-(finite, never NaN) and runtime selects `b`. Pinned by
-`test_run_with_decode_state_does_not_propagate_nan_through_kv_caches`
-(13/13 in `TestPackedDecodeStateBuffer`).
+```
+L0..L4: clean across all 7 sub-blocks
+L5  attn_in       : nan=0
+L5  attn_hcpre_y  : nan=0
+L5  attn_decode_y : nan=4096   ← FIRST NaN (entire output)
+... fully NaN-poisoned through L42 final layer.
+```
 
-**Real-V4 smoke after fix:** basic Paris R1==R2 green; `LONG_GEN_REQUIRED=1`
-still red with the same symptom (`completion_tokens=64 visible_words=1`).
-`logprobs` at `max_tokens=1` is finite (-1.066 for " Paris"); at
-`max_tokens=2+` HTTP 400 "nan". So **decode step 0** is still producing
-NaN h on real V4 — separate from the kv_caches contamination my fix
-addressed. Tiny CPU does NOT reproduce (orchestrator over 6 layers /
-random bf16 weights / 4 decode steps stays NaN-free).
+L5 is the SECOND `compress_ratio=128` layer (V4-Flash `compress_ratios`
+= `[0,0,4,128,4,128,...]`); L3 is the FIRST and runs clean. So NOT a
+structural ratio=128 bug. The NaN originates between `attn_hcpre_y`
+(clean) and `attn_decode_y` (all NaN). Ops in between: `rms_norm(y,
+attn_norm_w, eps)` + `attention_decode_step`. `rms_norm` can't NaN
+finite inputs unless `attn_norm_w` itself has NaN.
 
-Remaining hypotheses, in order of likelihood:
-1. **Quantization-specific NaN at decode step 0.** Real V4 uses FP4
-   experts and FP8 attention; tiny config uses bf16 throughout. A
-   dequant kernel may produce NaN on a path decode hits but prefill
-   doesn't (e.g. single-token dequant tile vs multi-token, or zero
-   activation tiles). Probe: read smoke logs for FP8/FP4 dequant warnings,
-   or instrument a `jax.debug.print(jnp.any(jnp.isnan(...)))` at the
-   block-output boundary inside `block_decode_step`.
-2. **SPMD partitioner divergence in `attention_decode_step` or
-   `compressor_decode_step`.** Real V4 runs with
-   `attention_data_parallelism=32`; tiny CPU is fully replicated.
-   `lax.dynamic_update_slice` semantics under sharded `start_pos`,
-   or `top_k` over a -inf-padded `index_score`, may differ.
-3. **HC head / sigmoid saturation on real-V4 weights.** `head_hc`
-   does `sigmoid(mixes * hc_scale + hc_base) + hc_eps`; if `mixes`
-   has extreme values, sigmoid grad overflows / underflows. Decode-
-   only because decode's `x_step` shape is `[B, 1, hc, D]` vs prefill's
-   `[B, T, hc, D]` — accumulation order differs.
-4. **SWA wraparound under traced `start_pos`:** off-by-one in
-   `lax.dynamic_update_slice` for slot `start_pos % win`.
+Refined hypotheses, in order:
+1. **Bad weights from FP4/FP8 dequant on L5's tensors.** Loader
+   (`deepseek_v4_loader.py`) does per-layer dequant. A NaN-producing
+   scale or packed-FP4 value in L5's checkpoint could yield an
+   all-NaN bf16 tensor. Cheap and conclusive: `V4_WEIGHT_NAN_AUDIT=1`
+   one-shot at engine init walks `params.layers[*]` + head.
+2. **L5's `attn_norm_w` non-finite.** Stored fp32, no quant — but
+   the loader's ckpt-key resolution may pick the wrong shard.
+3. **Runtime overflow inside `attention_decode_step`** triggered only
+   by L5's input magnitude (depth-cumulative). Site to suspect:
+   `q_f * lax.rsqrt(jnp.square(q_f).mean(-1) + eps)` — if `q_f`
+   overflows `jnp.square` to inf, `inf*rsqrt(inf)=NaN`. Probe:
+   extend tripwire with `max_abs(x)`.
+
+**Next-iter first move:** `V4_WEIGHT_NAN_AUDIT=1` engine-init audit
+that prints `[weight_nan] L{i} {tensor}` for any leaf with NaN. If
+anything shows up, hypothesis 1 confirmed → fix the loader. If clean,
+add inner tripwires inside `attention_decode_step` (q_postrope,
+kv_postrope, sparse_attn_o, wo_b_y).
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
