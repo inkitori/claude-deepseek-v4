@@ -118,6 +118,7 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
 | `V4_DECODE_NAN_TRIPWIRE` | `0` | Per-sub-block NaN/Inf logger inside `block_decode_step` (S1 diagnostic). When `1`, every decode emits `[v4nan] L{i} pos={p} {name}: nan=N +inf=N -inf=N` per layer. Read at module import; no-op when off (HLO byte-identical). |
+| `V4_WEIGHT_NAN_AUDIT` | `0` | One-shot finiteness audit of the loaded V4 param tree (S1 hyp 1: bad FP4/FP8 dequant on a single layer). When `1`, `load_weights_from_dir` emits `[weight_nan] {path}: nan_any=B inf_any=B` per non-finite leaf + a `[weight_nan_audit] examined=N nan_leaves=N inf_leaves=N` summary right before forward starts. Read on every load; loader code-path unchanged when off. |
 
 `*_REQUIRED` smoke-check knobs (exit code in parens): `CHAT_REQUIRED` (4),
 `REASONING_REQUIRED` (5), `STREAMING_REQUIRED` (6), `SAMPLING_REQUIRED` (7),
@@ -162,49 +163,49 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01): NaN localized to L5 `attention_decode_step`.**
+**Status (2026-05-01): hypothesis 1 (bad weights) RULED OUT. NaN
+originates inside `attention_decode_step` itself at L5.**
 
-Prior iter shipped a NaN-safe `_v4_force_kv_caches_read` rewrite (pinned
-by `test_run_with_decode_state_does_not_propagate_nan_through_kv_caches`);
-real-V4 user-visible symptom stayed red. Per-sub-block NaN tripwire
-added (gated by `V4_DECODE_NAN_TRIPWIRE=1`, no-op when off so production
-HLO is unchanged). Smoke `logs/full-slice-v4-smoke-20260501T023517Z.log`
-at decode step 0 (start_pos=5):
-
-```
-L0..L4: clean across all 7 sub-blocks
-L5  attn_in       : nan=0
-L5  attn_hcpre_y  : nan=0
-L5  attn_decode_y : nan=4096   ← FIRST NaN (entire output)
-... fully NaN-poisoned through L42 final layer.
-```
-
+The decode-step NaN tripwire (`V4_DECODE_NAN_TRIPWIRE=1`, gated at
+module import; production HLO unchanged when off) localized the first
+non-finite tensor to L5's `attn_decode_y` — the OUTPUT of
+`attention_decode_step`. Inputs (`attn_in`, `attn_hcpre_y`) are clean.
 L5 is the SECOND `compress_ratio=128` layer (V4-Flash `compress_ratios`
-= `[0,0,4,128,4,128,...]`); L3 is the FIRST and runs clean. So NOT a
-structural ratio=128 bug. The NaN originates between `attn_hcpre_y`
-(clean) and `attn_decode_y` (all NaN). Ops in between: `rms_norm(y,
-attn_norm_w, eps)` + `attention_decode_step`. `rms_norm` can't NaN
-finite inputs unless `attn_norm_w` itself has NaN.
+= `[0,0,4,128,4,128,...]`); L3 is the FIRST and runs clean. NOT a
+structural ratio=128 bug — L5-specific.
 
-Refined hypotheses, in order:
-1. **Bad weights from FP4/FP8 dequant on L5's tensors.** Loader
-   (`deepseek_v4_loader.py`) does per-layer dequant. A NaN-producing
-   scale or packed-FP4 value in L5's checkpoint could yield an
-   all-NaN bf16 tensor. Cheap and conclusive: `V4_WEIGHT_NAN_AUDIT=1`
-   one-shot at engine init walks `params.layers[*]` + head.
-2. **L5's `attn_norm_w` non-finite.** Stored fp32, no quant — but
-   the loader's ckpt-key resolution may pick the wrong shard.
-3. **Runtime overflow inside `attention_decode_step`** triggered only
-   by L5's input magnitude (depth-cumulative). Site to suspect:
+The weight-finiteness audit (`V4_WEIGHT_NAN_AUDIT=1`, one-shot walk
+of the loaded tree at end of `load_weights_from_dir`, pinned by
+`test_weight_nan_audit_localizes_bad_leaves`) examined 1360 array
+leaves on each of 8 hosts and reported `nan_leaves=0 inf_leaves=0`
+across the entire param tree (smoke
+`logs/full-slice-v4-smoke-20260501T030626Z.log`). FP4/FP8 dequant is
+clean; L5's `attn_norm_w` is finite; the bug is purely runtime.
+
+Surviving hypotheses (next-iter order):
+1. **Runtime overflow inside `attention_decode_step` at L5's input
+   magnitude.** Site to suspect first:
    `q_f * lax.rsqrt(jnp.square(q_f).mean(-1) + eps)` — if `q_f`
-   overflows `jnp.square` to inf, `inf*rsqrt(inf)=NaN`. Probe:
-   extend tripwire with `max_abs(x)`.
+   overflows `jnp.square` to `+inf` despite the fp32 cast, `inf *
+   rsqrt(inf) = NaN`. Less plausible in fp32 (max ~3.4e38) than bf16,
+   but L5 is the second pass through the residual stream so depth-
+   cumulative hidden magnitudes are highest there.
+2. **A reduction in `sparse_attn` overflows on L5's tensor scale.**
+   Top-k softmax over a NaN-tainted score row, attention sink
+   denominator, or kv-cache lookup at a stale slot.
+3. **Inverse-RoPE on `o` produces NaN** when freqs at
+   `start_pos=5` interact with a degenerate RoPE-tail in the
+   ratio=128 code path.
 
-**Next-iter first move:** `V4_WEIGHT_NAN_AUDIT=1` engine-init audit
-that prints `[weight_nan] L{i} {tensor}` for any leaf with NaN. If
-anything shows up, hypothesis 1 confirmed → fix the loader. If clean,
-add inner tripwires inside `attention_decode_step` (q_postrope,
-kv_postrope, sparse_attn_o, wo_b_y).
+**Next-iter first move:** extend `_v4_nan_tripwire` to also report
+`max_abs(x)` and add inner probes inside `attention_decode_step`
+between every numeric step (`qr_postnorm`, `q_postrope`,
+`kv_postrope`, `kv_cache_post_write`, `sparse_attn_o`,
+`o_post_inv_rope`, `wo_b_y`). Run a real-V4 smoke; the FIRST sub-block
+inside L5's `attention_decode_step` to flip from finite-with-bounded-
+max-abs to NaN/inf points at the bug. Hypothesis-3 (rsqrt overflow)
+falsified if `q_f` `max_abs` is < 1e15 on entry. Hypothesis on
+`sparse_attn` confirmed if `o` is the first NaN.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.

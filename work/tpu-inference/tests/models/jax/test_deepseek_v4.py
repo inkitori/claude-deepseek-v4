@@ -2327,6 +2327,52 @@ class TestPackedDecodeStateBuffer:
                 f"tiny CPU baseline emitted NaN at {line!r} — tripwire is "
                 f"reporting NaN where there should be none")
 
+    def test_weight_nan_audit_localizes_bad_leaves(self, capfd):
+        """`_v4_weight_nan_audit` walks a loaded param tree and emits one
+        `[weight_nan] {path}` line per non-finite leaf, plus a summary.
+        Validate that NaN/Inf injected into specific leaves is reported
+        with the correct path strings and that finite leaves stay silent
+        (CLAUDE.md S1 hyp 1)."""
+        import dataclasses as _dc
+        from tpu_inference.models.jax import deepseek_v4 as v4mod
+
+        @_dc.dataclass
+        class _Inner:
+            w: jnp.ndarray
+
+        @_dc.dataclass
+        class _Outer:
+            layers: list
+            head: jnp.ndarray
+            cfg_int: int = 0    # static metadata — must be skipped
+            tag: str = "t"      # static metadata — must be skipped
+
+        tree = _Outer(
+            layers=[
+                _Inner(w=jnp.ones((4,), dtype=jnp.float32)),
+                _Inner(w=jnp.array(
+                    [1.0, jnp.nan, 0.0, 0.0], dtype=jnp.float32)),
+                _Inner(w=jnp.array(
+                    [jnp.inf, 0.0, 0.0, 0.0], dtype=jnp.float32)),
+            ],
+            head=jnp.zeros((2,), dtype=jnp.float32),
+            cfg_int=42,
+        )
+
+        v4mod._v4_weight_nan_audit(tree)
+        err = capfd.readouterr().err
+
+        assert "layers[1].w: nan_any=True" in err
+        assert "layers[2].w" in err and "inf_any=True" in err
+        # Clean leaves must not appear.
+        for clean in ("layers[0].w", " head:"):
+            assert clean not in err, f"clean leaf {clean!r} should not log"
+        # Summary line: 4 array leaves examined (3 layers + head),
+        # 1 with NaN, 1 with Inf. cfg_int / tag are static metadata.
+        assert (
+            "[weight_nan_audit] examined=4 nan_leaves=1 inf_leaves=1"
+        ) in err
+
 
 # =============================================================
 # Tier 6 — Real-TPU compile + tiny forward

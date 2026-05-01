@@ -351,6 +351,66 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx: int, position) -> Non
     )
 
 
+def _v4_weight_nan_audit(tree) -> None:
+    """One-shot finiteness audit of a loaded V4 param tree. For each array
+    leaf, emits a `[weight_nan] {path}` line if the tensor contains any NaN
+    or Inf, plus a `[weight_nan_audit]` summary. Used to confirm/refute
+    CLAUDE.md S1 hyp 1: a NaN-producing FP4/FP8 scale or packed-FP4 nibble
+    on a single layer's weights yields an all-NaN bf16 leaf that
+    poisons the decode forward at e.g. L5 attention.
+    Gated at the call site by `V4_WEIGHT_NAN_AUDIT=1`."""
+    import sys as _sys
+    leaves: List[Tuple[str, Any]] = []
+
+    def _walk(obj, path: str) -> None:
+        if hasattr(obj, "shape") and hasattr(obj, "dtype") and not hasattr(
+                obj, "__dataclass_fields__"):
+            leaves.append((path, obj))
+            return
+        if isinstance(obj, list):
+            for i, item in enumerate(obj):
+                _walk(item, f"{path}[{i}]")
+            return
+        if hasattr(obj, "__dataclass_fields__"):
+            for fname in obj.__dataclass_fields__:
+                sub = getattr(obj, fname, None)
+                if sub is None:
+                    continue
+                sub_path = f"{path}.{fname}" if path else fname
+                _walk(sub, sub_path)
+            return
+
+    _walk(tree, "")
+    nan_count = 0
+    inf_count = 0
+    for path, t in leaves:
+        try:
+            tf = t.astype(jnp.float32)
+            nan_any = bool(jnp.any(jnp.isnan(tf)))
+            inf_any = bool(jnp.any(jnp.isinf(tf)))
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[weight_nan] {path}: AUDIT_FAILED {e!r}",
+                file=_sys.stderr, flush=True,
+            )
+            continue
+        if nan_any or inf_any:
+            print(
+                f"[weight_nan] {path}: nan_any={nan_any} inf_any={inf_any} "
+                f"shape={tuple(t.shape)} dtype={t.dtype}",
+                file=_sys.stderr, flush=True,
+            )
+            if nan_any:
+                nan_count += 1
+            if inf_any:
+                inf_count += 1
+    print(
+        f"[weight_nan_audit] examined={len(leaves)} nan_leaves={nan_count} "
+        f"inf_leaves={inf_count}",
+        file=_sys.stderr, flush=True,
+    )
+
+
 def block_decode_step(
     x_step: jnp.ndarray,           # [B, 1, hc, D]
     input_ids_step: jnp.ndarray,   # [B, 1]
@@ -1731,6 +1791,9 @@ def _build_class():
             # via host-side accumulation. That's a bigger change and is
             # the next-iter target; this iter ships the moe_forward
             # branch + freqs cap so the change isn't wasted.
+
+            if _os.environ.get("V4_WEIGHT_NAN_AUDIT", "0") == "1":
+                _v4_weight_nan_audit(current)
 
             self.params_v = nnx.Param(current)
             self.initialize_cache()
