@@ -13,7 +13,10 @@ OpenAI-compatible HTTP endpoint to many concurrent users.
 **State of the system (read before claiming progress):** the
 basic ` Paris` smoke probe passes on a fresh engine. **Anything
 past 1 generated token is broken** — the `LONG_GEN_REQUIRED=1`
-gate has never passed end-to-end. See S1 below.
+gate has never passed end-to-end. The current S1 partial fix
+suppresses NaN but the model still emits degenerate attractors
+(repetition / numeric runs / date-format lists) instead of prose
+on any multi-token completion. See S1 below.
 
 ## Discipline
 
@@ -117,9 +120,7 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
-| `V4_DECODE_NAN_TRIPWIRE` | `0` | S1 always-on barrier (silent when `0`, prints when `1`). Reductions + host-callback at every probe site force XLA to commit donated kv_cache writes that would otherwise be elided (S1 heisenbug). HLO is **NOT byte-identical** when `0` — the silent callbacks are still emitted. Set to `1` for diagnostics. |
-| `V4_WEIGHT_NAN_AUDIT` | `0` | One-shot finiteness audit of the loaded V4 param tree (S1 diagnostic, hyp ruled out). Loader code-path unchanged when `0`. |
-| `V4_DECODE_ARGMAX_PROBE` | `0` | S1 diagnostic. Prints `[v4probe] logits ...` (top-3 token ids + logit values) from `compute_logits` and `[v4probe] call_hidden ...` (max_abs) from `__call__`. No-op (HLO byte-identical) when `0`. Distinguishes "model emits pad-favoring logits" vs "model emits real-vocab argmax that detokenizes empty". |
+| `V4_DECODE_NAN_TRIPWIRE` | `0` | When `1`, `_v4_nan_tripwire` prints reductions; when `0`, the silent callback still runs (the side-effect is what anchors SSA values to block XLA elision — see S1). HLO is **not** byte-identical between `0` and `1`, but the silent path is the load-bearing one. |
 
 `*_REQUIRED` smoke-check knobs (exit code in parens): `CHAT_REQUIRED` (4),
 `REASONING_REQUIRED` (5), `STREAMING_REQUIRED` (6), `SAMPLING_REQUIRED` (7),
@@ -135,120 +136,100 @@ later. Per-iter narrative goes in commit messages.
 
 ### Tier S — silent correctness bombs (fix before perf)
 
-#### S1. Decode-state generation produces empty/garbage past pos ~2
+#### S1. Decode produces degenerate output past pos ~2
 
 **The single most important item.** All other backlog work is
-blocked on this.
+blocked on this. `__call__` routes through
+`deepseek_v4_run_with_decode_state`, threading per-layer
+`AttentionDecodeState` through `kv_caches`. Tiny-config tests pass;
+real-V4 generation falls off the prose manifold within 2-3 tokens.
 
-`__call__` always routes through `deepseek_v4_run_with_decode_state`
-(threading per-layer `AttentionDecodeState` through
-`kv_caches`). Tiny-config tests pass; real-V4 generation
-fails the moment a real decode step runs.
-
-**Reproducer (real V4, fresh engine):**
+**Reproducer (real V4, fresh engine, fix #4 active):**
 ```
 prompt: "Tell me a short story about a robot exploring Mars:"
-max_tokens=64, temperature=0, seed=0
-→ completion_tokens=64, finish_reason=length, visible_words=1
-→ visible text: ' This' (1 word; 63 tokens decode to empty)
+max_tokens=64, temperature=0
+→ visible text: " 0.0 0.0 0.0 0.0 0.0 0.0 …" (numeric attractor)
+
+prompt: "The capital of France is" (3 runs, byte-identical, temp=0)
+→ run 1: " Paris, 2014-2015, 2016-2017"
+→ run 2: " Paris, Paris, 巴黎，法国，..."
+→ run 3: " Paris, Paris, Paris, Paris, Paris,"
 ```
 
-The basic Paris probe (`max_tokens=8` on
-`"The capital of France is"`) returns " Paris" — the FIRST decoded
-token is correct. But `usage.completion_tokens=8` while visible
-text is just " Paris": the trailing 7 decode steps emit pad/control
-tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
-(default-on) catches this via the `visible_words >= 10` floor.
-**Don't trust `usage.completion_tokens` and don't trust
-`max_word_run`/`ends_clean`** — those metrics all read healthy
-on the corrupted output (pinned by `long_gen_required_invisible`
-in the harness self-test).
+The first decoded token is correct; subsequent tokens collapse into
+a degenerate attractor (repetition, list, numeric run). Outputs are
+also non-deterministic from byte-identical input at temperature=0.
 
-**Status (2026-05-01 — partial fix landed; determinism follow-on):**
-HEISENBUG confirmed. The bug is XLA donation-aliased write elision
-under SPMD: `kv_caches` is donated (`donate_argnums=2`), and partial
-writes inside `block_decode_step` (e.g. `state.kv_cache.at[idx].set(kv)`)
-get elided by XLA's alias analysis, leaving subsequent decode steps to
-read uninitialized memory → NaN propagation through the residual stream.
+**Don't trust `usage.completion_tokens`, `max_word_run`, or
+`ends_clean`** — all read healthy on corrupted output (pinned by
+`long_gen_required_invisible` in the harness self-test). Closure
+gate is `LONG_GEN_REQUIRED=1`: `visible_words >= 10` AND
+`max_word_run < 5`. Today: visible_words can pass; max_word_run
+fails on every prompt.
 
-**Fix (commit `f1ec28f8`+):** `_v4_nan_tripwire` is **always-on**.
-When `V4_DECODE_NAN_TRIPWIRE=0` it runs reductions + a no-op
-`jax.debug.callback` (silent). When `=1` it also prints. The
-side-effect ops force XLA to materialize the partial-write outputs
-(SSA barriers like `lax.optimization_barrier` are NOT enough — only
-effectful ops fix this; this is the heisenbug class).
+**Root cause (audited 2026-05-01):** V4 writes its KV-cache via
+pure JAX `at[].set` partial writes on a manually-packed fp32
+buffer (sites in `attention_decode_step` and
+`_compressor_state_from_prefill`), then re-packs through
+`_pack_layer_state`. V3 and Qwen3 work fine under the same
+`donate_argnums=2` because their kv_caches are written by Pallas
+kernels whose outputs are consumed and returned (opaque to XLA's
+alias analysis). V4's pack/unpack indirection gives XLA a long
+sequence of pure functional ops where alias analysis can elide
+writes whose only consumer is the JIT output tuple. Replicated
+`P()` sharding silently masks per-chip elision.
 
-**Result with full silent barrier:** Paris probe produces multi-token
-coherent text (e.g. " Paris, 2024年7月"). Long-gen drifts into
-degenerate attractors (e.g. " 0.0 0.0 0.0…"). Outputs are
-non-deterministic across runs at temperature=0 — the ~600 callbacks
-per decode step perturb SPMD floating-point reduction order, flipping
-argmax ties.
+The prefill seed in `attention_init_state_from_prefill` is the
+likely first-corruption site — `_compressor_state_from_prefill`
+uses `zeros + at[].set`; the produced state is the JIT output that
+gets aliased into the donated buffer.
 
-**Bisection results (don't repeat):**
-* 1 callback at `kv_cache_post_write` only (fix #5, `98b0a677`):
-  insufficient — NaN returns, `visible_words=1`.
-* 7 callback args at at_entry + post_write (fix #5b, `14e11136`):
-  also insufficient — same `visible_words=1`.
-* Full coverage (~14 sites/layer in block_decode_step + tripwire's
-  prefill/embed sites): suppresses NaN, multi-token coherent.
-* Per-layer callback in `transformer_body_decode_step` (fix #3,
-  `ac8d2077`): insufficient (1 site/layer too far from elision).
+**Current band-aid (commit `f1ec28f8` — fix #4):**
+`_v4_nan_tripwire` runs ~14 silent host-callbacks per attention
+layer (~600/decode_step). Each callback anchors one field's SSA
+value as a side-effect, blocking the elision. **This suppresses
+the NaN→pad pathway but does NOT produce coherent prose** — output
+is real-vocab tokens that still fall into degenerate attractors.
+The callback count perturbs SPMD floating-point reduction order,
+breaking determinism at temperature=0.
 
-**Closure gate (still failing):** `LONG_GEN_REQUIRED=1` requires
-`visible_words >= 10` AND `max_word_run < 5`. Current state hits
-visible_words but max_word_run hits 5+ on degenerate attractors.
+**Cleanest untried path (Option C, recommended next):**
+Replace the 600 callbacks with a single `lax.optimization_barrier`
+on the *output* packed buffer per layer (~43 ops/decode_step,
+deterministic, no host callbacks). Fix #7 applied a barrier on the
+*input* before `at[].set` — XLA could see through that
+algebraically. Output-side barrier is structurally different.
+Implementation site: between `_pack_layer_state` and the return in
+`deepseek_v4_run_with_decode_state`.
 
-**Open follow-on (S1.1 — determinism + degenerate attractors):**
-Paths investigated and ruled out:
-* **Un-donate kv_caches for V4** (fix #6, commit `5c9d9213`, reverted
-  in `c32fe431`): conditional `donate_argnums=() if _is_deepseek_v4
-  else 2` in `model_loader.py:332`. Engine compiled but TPU UserFatal'd
-  on the first inference call (`tpu_program_termination_validation.cc:186`,
-  `core location: 2x6x0_SC0 ... error type: UserFatal`). Likely
-  incompatibility between un-donation and V4's `P()` replicated
-  kv_cache sharding or a downstream kernel that assumed donated
-  buffer behavior. Don't retry without understanding which kernel
-  asserts donation.
-* **In-body opaque copy + single entry callback** (fix #7, commit
-  `75b92f4b`, reverted in `9d2f15ec`): added `kv_caches = [k +
-  lax.optimization_barrier(0.)]` + 1 callback at start of V4 __call__.
-  Engine compiled, ran, but NaN returned (`visible_words=1`). XLA
-  optimized the opaque-zero add in-place against the donated buffer,
-  so no fresh allocation actually happened.
+**Other untried paths:**
+1. Fold `at[].set` writes into a `pl.pallas_call` whose output is
+   the new state (matches V3/Qwen3 pattern; merges naturally with
+   B1's sparse-attention Pallas kernel).
+2. Special-case `donate_argnums` for V4 prefill JIT only (decode
+   keeps donation). The prefill path doesn't actually use arg2;
+   fix #6 attempted full un-donation and crashed, so partial
+   un-donation needs diagnosis of which kernel asserted donation.
 
-Remaining paths:
-1. **Reduce callback count** while preserving NaN suppression.
-   Bisect *which* tripwire sites are load-bearing. Fix #5/5b
-   ruled out single-site / 6-field-input-only. Try
-   {at_entry × 6} ∪ {kv_cache_post_write} ∪ {sparse_attn_o} ∪
-   {wo_b_y} (~9 sites/layer) — hypothesis: q/qr/kv intermediate
-   sites aren't load-bearing, only state-touching sites are.
-2. **Force a fresh allocation that XLA can't elide.** Try
-   `jax.tree.map(lax.full_like, kv_caches, fill_value=0.) + kv_caches`
-   or shard-then-reshard via `with_sharding_constraint` to a
-   different mesh axis — these may allocate fresh memory.
-3. **Investigate WHY un-donation crashed.** Determine if a
-   specific kernel (sparse_attn, megablox/gmm) requires donation
-   semantics. If so, gate that kernel only — V4 may need a
-   different attention path.
-
-Determinism diagnostic: run 3+ Paris probes with `temperature=0,
-seed=0`. Healthy = byte-equal. Current state = different completions
-(" Paris, 2024…", " Paris, 2020…", " Paris, Paris, …").
+**Don't repeat (full traces in `git log`):**
+- `ac8d2077` — single per-layer callback in transformer body. Insufficient.
+- `98b0a677` — single callback at kv_cache_post_write. NaN returns.
+- `14e11136` — callbacks at at_entry × 6 fields. NaN returns.
+- `5c9d9213` (rev `c32fe431`) — full un-donate kv_caches for V4. TPU UserFatal.
+- `75b92f4b` (rev `9d2f15ec`) — input-side opaque copy. XLA optimized in-place.
 
 **Real-V4 verification:**
-* Diagnostics: `V4_DECODE_NAN_TRIPWIRE=1 V4_DECODE_ARGMAX_PROBE=1
-  scripts/full_slice_v4_smoke{,_check}.sh`.
+* Diagnostics: `V4_DECODE_NAN_TRIPWIRE=1 scripts/full_slice_v4_smoke{,_check}.sh`.
 * End-to-end gate (default-on): `LONG_GEN_REQUIRED=1
-  scripts/full_slice_v4_smoke_check.sh`. Closed gate is
-  `visible_words >= 10` AND `max_word_run < 5`.
+  scripts/full_slice_v4_smoke_check.sh`.
+* Determinism check: run 3+ Paris probes, healthy = byte-equal.
 
-**Runtime-hook locations** (read before touching plumbing):
-* `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
+**Plumbing locations** (read before touching):
+* `layers/jax/attention/deepseek_v4_attention.py::attention_init_state_from_prefill` — likely first-corruption site.
+* `models/jax/deepseek_v4.py::deepseek_v4_run_with_decode_state` — Option C goes here.
+* `models/common/model_loader.py:332+` — `donate_argnums=2`, V4 `kv_cache_sharding=P()`.
 * `runner/kv_cache_manager.py::_initialize_kv_cache_deepseek_v4`.
 * `runner/tpu_runner.py::_maybe_set_v4_decode_start_pos`.
-* `models/jax/deepseek_v4.py::v4_state_max_seq_len_from_vllm_config`.
 
 S1 closure unlocks A1, B1, S5.
 

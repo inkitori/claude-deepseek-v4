@@ -54,29 +54,6 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
-_V4_DECODE_ARGMAX_PROBE = os.environ.get("V4_DECODE_ARGMAX_PROBE", "0") == "1"
-
-
-def _v4_argmax_probe(name: str, x: jnp.ndarray) -> None:
-    """S1 diagnostic: print max_abs(x) and (if x is logits-shaped) the
-    top-3 token ids + their logit values. Gated at module import so HLO is
-    unchanged when `V4_DECODE_ARGMAX_PROBE=0`. Used to distinguish whether
-    the model emits real-vocab argmax that detokenizes empty vs collapses
-    to pad/EOS — see CLAUDE.md S1."""
-    if not _V4_DECODE_ARGMAX_PROBE:
-        return
-    xf = x.astype(jnp.float32)
-    max_abs = jnp.max(jnp.abs(xf))
-    if x.ndim >= 1 and x.shape[-1] >= 4:
-        top_vals, top_ids = jax.lax.top_k(xf, 3)
-        jax.debug.print(
-            "[v4probe] {n} max_abs={m} top_ids={i} top_vals={v}",
-            n=name, m=max_abs, i=top_ids, v=top_vals,
-        )
-    else:
-        jax.debug.print("[v4probe] {n} max_abs={m}", n=name, m=max_abs)
-
-
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
@@ -353,66 +330,6 @@ def block_init_state_and_forward(
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids, params.moe)
     return decode_state, hc_post(y, residual, post, comb)
-
-
-def _v4_weight_nan_audit(tree) -> None:
-    """One-shot finiteness audit of a loaded V4 param tree. For each array
-    leaf, emits a `[weight_nan] {path}` line if the tensor contains any NaN
-    or Inf, plus a `[weight_nan_audit]` summary. Used to confirm/refute
-    CLAUDE.md S1 hyp 1: a NaN-producing FP4/FP8 scale or packed-FP4 nibble
-    on a single layer's weights yields an all-NaN bf16 leaf that
-    poisons the decode forward at e.g. L5 attention.
-    Gated at the call site by `V4_WEIGHT_NAN_AUDIT=1`."""
-    import sys as _sys
-    leaves: List[Tuple[str, Any]] = []
-
-    def _walk(obj, path: str) -> None:
-        if hasattr(obj, "shape") and hasattr(obj, "dtype") and not hasattr(
-                obj, "__dataclass_fields__"):
-            leaves.append((path, obj))
-            return
-        if isinstance(obj, list):
-            for i, item in enumerate(obj):
-                _walk(item, f"{path}[{i}]")
-            return
-        if hasattr(obj, "__dataclass_fields__"):
-            for fname in obj.__dataclass_fields__:
-                sub = getattr(obj, fname, None)
-                if sub is None:
-                    continue
-                sub_path = f"{path}.{fname}" if path else fname
-                _walk(sub, sub_path)
-            return
-
-    _walk(tree, "")
-    nan_count = 0
-    inf_count = 0
-    for path, t in leaves:
-        try:
-            tf = t.astype(jnp.float32)
-            nan_any = bool(jnp.any(jnp.isnan(tf)))
-            inf_any = bool(jnp.any(jnp.isinf(tf)))
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"[weight_nan] {path}: AUDIT_FAILED {e!r}",
-                file=_sys.stderr, flush=True,
-            )
-            continue
-        if nan_any or inf_any:
-            print(
-                f"[weight_nan] {path}: nan_any={nan_any} inf_any={inf_any} "
-                f"shape={tuple(t.shape)} dtype={t.dtype}",
-                file=_sys.stderr, flush=True,
-            )
-            if nan_any:
-                nan_count += 1
-            if inf_any:
-                inf_count += 1
-    print(
-        f"[weight_nan_audit] examined={len(leaves)} nan_leaves={nan_count} "
-        f"inf_leaves={inf_count}",
-        file=_sys.stderr, flush=True,
-    )
 
 
 def block_decode_step(
@@ -856,11 +773,10 @@ def _v4_force_kv_caches_read(
     buffers: List[jnp.ndarray],
     kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Force XLA to read donated `kv_caches` (prevents aliased write
-    elision under SPMD donation). Output equals `b` at runtime; the
-    `where(opaque_false, b + kv, b)` shape keeps the kv-read branch
-    in HLO. NaN-safe: discarded branch holds `b + (-inf) = -inf`,
-    never NaN, so compressor `score_state` -inf init slots are fine."""
+    """Anchor donated `kv_caches` as a live read in HLO via
+    `where(opaque_false, b + kv, b)`. Output equals `b` at runtime; the
+    discarded branch holds `b + (-inf) = -inf`, never NaN, so compressor
+    `score_state` -inf init slots are unaffected."""
     opaque_false = lax.optimization_barrier(jnp.bool_(False))
     return [
         jnp.where(opaque_false, b + kv.astype(jnp.float32), b)
@@ -891,16 +807,10 @@ def deepseek_v4_run_with_decode_state(
 
     `state_init_ids` (prefill only): when set, state is seeded from this
     sliced-to-real-length tensor while `h` is still computed on the
-    padded `input_ids`. Required because state init is positional (padding
-    tokens encoded into SWA / compressor / indexer slots produce wrong
-    decode reads), but `transformer_body_forward` on the padded shape
-    is what the runtime's logits path reads — running the body on a
-    sliced shape changes the SPMD compile and the prefill `h` argmax
-    no longer matches the real-V4 reference.
-
-    Donation-safety scaffolding (`optimization_barrier(h)`,
-    `_v4_force_kv_caches_read`, `_v4_constrain_packed_replicated`) blocks
-    XLA from eliding aliased writes / CSEing across the two prefill paths.
+    padded `input_ids`. State init is positional — encoding pad tokens
+    into SWA / compressor / indexer slots yields wrong decode reads — but
+    `transformer_body_forward` must run on the padded shape so the SPMD
+    compile and `h` argmax match the real-V4 reference.
     """
     if is_decode_step:
         h, new_buffers = transformer_body_decode_step_from_buffer(
@@ -1780,9 +1690,6 @@ def _build_class():
                     file=_sys.stderr, flush=True,
                 )
 
-            if _os.environ.get("V4_WEIGHT_NAN_AUDIT", "0") == "1":
-                _v4_weight_nan_audit(current)
-
             self.params_v = nnx.Param(current)
             self.initialize_cache()
 
@@ -1935,7 +1842,6 @@ def _build_class():
                     start_pos=start_pos,
                     state_init_ids=state_init_ids,
                 )
-                _v4_argmax_probe("body_out", h.reshape(-1, h.shape[-1]))
                 if is_decode and T > 1:
                     pad_shape = (h.shape[0], T - 1, *h.shape[2:])
                     pad = jnp.zeros(pad_shape, h.dtype)
@@ -1947,7 +1853,6 @@ def _build_class():
                 )
                 B, S, D = h_BSD.shape
                 hidden_TD = h_BSD.reshape(B * S, D)
-                _v4_argmax_probe("call_hidden", hidden_TD)
                 return kv_caches, hidden_TD, []
 
             # Multi-sequence dispatch.
@@ -2051,7 +1956,6 @@ def _build_class():
             )
             x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
             logits = x.astype(jnp.float32) @ params.head_w.T
-            _v4_argmax_probe("logits", logits)
             return logits
 
         def load_weights(self, rng=None, *args, **kwargs):

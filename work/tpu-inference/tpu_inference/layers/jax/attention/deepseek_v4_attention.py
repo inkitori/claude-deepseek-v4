@@ -38,17 +38,11 @@ _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
 
 
 def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
-    """Always-on silent barrier: reductions + host callback at every site
-    so XLA cannot elide donated kv_cache writes (S1 heisenbug — only
-    effectful ops fix this; SSA barriers don't). Prints reductions when
-    `V4_DECODE_NAN_TRIPWIRE=1` (set at process start); otherwise the
-    callback is silent.
-
-    Trade-off: ~600 callbacks/decode_step perturb SPMD floating-point
-    reduction order, breaking per-call determinism (different
-    completions across runs at temperature=0). NaN-suppression is the
-    primary correctness goal; sustained-generation determinism is a
-    known follow-on (S1.1)."""
+    """Anchors per-field SSA values via host callback so XLA cannot elide
+    the writes flowing into the packed-state output buffer. Effectful
+    callback (not `lax.optimization_barrier`) is required — SSA barriers
+    are insufficient. Prints reductions when `V4_DECODE_NAN_TRIPWIRE=1`;
+    otherwise the callback is silent."""
     if x.size == 0:
         if _V4_DECODE_NAN_TRIPWIRE:
             jax.debug.print(
@@ -1007,10 +1001,7 @@ def attention_init_state_from_prefill(
     times from `attention_decode_init_state(...)` zero state.
 
     The decode state can then drive `attention_decode_step` at start_pos=T
-    without re-running prefill. This is the missing primitive that lets S1
-    convert vLLM's "every step is a fresh prefill" path into "first call
-    prefills and seeds state, subsequent calls do O(1) decode steps."
-    """
+    without re-running prefill."""
     B, T, _ = x.shape
     win = params.window_size
     ratio = params.compress_ratio
@@ -1035,8 +1026,8 @@ def attention_init_state_from_prefill(
     _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
 
     # Concatenate, not zeros + at[].set(): the partial-write pattern lets
-    # XLA alias the buffer to a donated `kv_caches[i]` slot and elide the
-    # zero broadcast, leaving `[win + Tcomp:]` holding stale data.
+    # XLA alias the buffer to a donated kv_caches[i] slot and elide the
+    # zero broadcast.
     if ratio > 0:
         kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full).astype(dtype)
         _v4_nan_tripwire("init_kv_compressed", kv_compressed, layer_idx, -1)
