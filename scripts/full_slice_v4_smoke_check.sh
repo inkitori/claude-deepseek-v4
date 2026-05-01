@@ -1,99 +1,26 @@
 #!/usr/bin/env bash
 # Validate the running v6e-32 v4-flash smoke once the server is ready.
 #
-# Polls /v1/models until 200, fires the deterministic /v1/completions
-# request twice, asserts responses are byte-identical and contain
-# "Paris", and prints the produced text. Exits non-zero on any failure
-# so it can be wired into a watcher.
+# Polls /v1/models, fires the deterministic /v1/completions probe twice,
+# asserts byte-identical responses containing "Paris". Exits 0 on PASS,
+# 2 on non-determinism, 3 on missing-Paris.
 #
-# After the completions gate passes, also fires a /v1/chat/completions
-# probe and prints the response. This is INFORMATIONAL — set
-# CHAT_REQUIRED=1 to make a missing/empty chat response fail the gate
-# (exit 4). Default is best-effort: the chat path lands in a bigger
-# prefill bucket (1024 total tokens for an 18-token chat prompt vs 256
-# for a 5-token completion prompt) and on a tight HBM budget the
-# engine may need TpuLoadedExecutable's OOM-defragment-retry to land
-# the program — it usually succeeds but adds ~30s to first-chat
-# latency. Asserting on chat content also requires a separate
-# heuristic we don't have a robust one for yet (the model's first
-# 16 tokens at temp=0/seed=0 don't reliably contain a fixed string,
-# even when the template is applied correctly).
+# Optional probes (each gated by *_REQUIRED=1, fails the gate when set):
+#   CHAT_REQUIRED=1      → exit 4   non-empty chat content
+#   REASONING_REQUIRED=1 → exit 5   non-empty message.reasoning under
+#                                   chat_template_kwargs={"thinking":true}
+#   STREAMING_REQUIRED=1 → exit 6   SSE reassembly byte-equals non-stream
+#   SAMPLING_REQUIRED=1  → exit 7   temperature+top_p+freq_penalty path
+#   STOP_REQUIRED=1      → exit 8   stop=["Paris"] truncates + finish=stop
+#   LOGPROBS_REQUIRED=1  → exit 9   logprobs=5 returns >=5 alts/position
+#   TOPK_REQUIRED=1      → exit 10  temperature+top_k path
+#   PRESENCE_REQUIRED=1  → exit 11  temperature+presence_penalty path
+#   N_REQUIRED=1         → exit 12  n=2 returns 2 non-empty choices
+#   LONG_GEN_REQUIRED=1  → exit 13  max_tokens=64 produces >=30 coherent
+#                                   tokens (no 5+ word repeats, alnum tail)
+#                         default-on; the basic Paris probe is too thin.
 #
-# Two further probes are gated off by default and turn on individually:
-#   REASONING_REQUIRED=1 — fires a thinking-mode chat (chat_template_kwargs
-#       {"thinking": true}) with a reasoning-eliciting prompt and asserts
-#       message.reasoning is non-empty. Pins the S3 runtime: --reasoning-parser
-#       deepseek_v4 actually emitting <think>...</think> → reasoning field.
-#       Adds ~30s on cold cache (lands in chat path, may OOM-retry once).
-#       Exit 5 on empty reasoning.
-#   STREAMING_REQUIRED=1 — fires the /v1/completions probe a second time with
-#       stream=true, reassembles the SSE chunks, and asserts the reassembled
-#       text byte-equals the non-streaming response from the first probe.
-#       Pins S7: streaming path produces the same output as non-streaming.
-#       Exit 6 on mismatch / no chunks.
-#   SAMPLING_REQUIRED=1 — fires a /v1/completions probe with temperature>0,
-#       top_p, and frequency_penalty set, and asserts the response has
-#       non-empty text and a valid finish_reason. Pins S6: the sampling code
-#       path (temperature scaling + top-p filter + token penalties) doesn't
-#       crash or produce empty/garbage output. Cheap (same prefill bucket as
-#       the existing completions probe). Exit 7 on empty text / invalid
-#       finish_reason / curl failure.
-#   STOP_REQUIRED=1 — fires a /v1/completions probe with `stop=["Paris"]`
-#       and asserts (a) the response text does NOT contain "Paris" and (b)
-#       finish_reason is "stop". Pins S6 broader-matrix: the stop-sequence
-#       handler in vLLM's TPU runner actually truncates the generation at
-#       the matched token and reports it. Same prefill bucket as the
-#       existing completions probe. Exit 8 on bad text / wrong finish_reason
-#       / curl failure.
-#   LOGPROBS_REQUIRED=1 — fires a /v1/completions probe with `logprobs=5`
-#       and asserts every emitted token's `logprobs.top_logprobs` entry has
-#       at least 5 alternatives. Pins S6 broader-matrix: the logprobs
-#       postprocessing path emits the per-token alternative distribution.
-#       Same prefill bucket. Exit 9 on missing logprobs / wrong cardinality
-#       / curl failure.
-#   TOPK_REQUIRED=1 — fires a /v1/completions probe with `temperature=0.7`
-#       and `top_k=10` and asserts the response has non-empty text plus a
-#       valid finish_reason. Pins S6 broader-matrix: the top-k filter on
-#       the TPU sampling path doesn't crash or zero-out the candidate set.
-#       Same prefill bucket. Exit 10 on empty / invalid / curl failure.
-#   PRESENCE_REQUIRED=1 — fires a /v1/completions probe with
-#       `temperature=0.7` and `presence_penalty=0.5` and asserts the
-#       response has non-empty text plus a valid finish_reason. Pins
-#       S6 broader-matrix: presence-penalty (per-token, distinct from
-#       frequency_penalty's per-occurrence semantics) is correctly
-#       applied on the TPU sampling path. Same prefill bucket. Exit 11
-#       on empty / invalid / curl failure.
-#   N_REQUIRED=1 — fires a /v1/completions probe with `n=2` and asserts
-#       the response has at least 2 choices, each with non-empty text.
-#       Pins S6 broader-matrix: multi-completion (n>1) in a single request
-#       actually emits n choices on the TPU runner. Under --max-num-seqs=1
-#       this likely sequentializes, but the choices array must still have
-#       length n. Same prefill bucket. Exit 12 on missing/short choices /
-#       empty text / curl failure.
-#   LONG_GEN_REQUIRED=1 — fires a /v1/completions probe with max_tokens=64
-#       on a long-answer-eliciting prompt and asserts the response is
-#       sustained-coherent: (a) completion_tokens >= 30, (b) no word repeats
-#       5+ times in a row (token-loop detector), (c) the last 5 characters
-#       of the stripped text contain >= 2 alphanumerics (rejects `....`
-#       endings + trailing whitespace). Pins S8: the basic Paris gate only
-#       validates ~2-3 tokens; this is the minimum sustained-generation
-#       check. Logs observed tok/s (completion_tokens / wall_clock).
-#       Exit 13 on short / repetition-loop / degenerate-ending / curl
-#       failure. Override: LONG_GEN_MAX_TOKENS (default 64).
-#
-# Usage:
-#   scripts/full_slice_v4_smoke_check.sh                # default: localhost:18081
-#   PORT=18082 scripts/full_slice_v4_smoke_check.sh
-#   CHAT_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on empty chat
-#   REASONING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on empty reasoning
-#   STREAMING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh    # fail on stream/non-stream mismatch
-#   SAMPLING_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken sampling path
-#   STOP_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken stop-sequence path
-#   LOGPROBS_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken logprobs path
-#   TOPK_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh         # fail on broken top-k path
-#   PRESENCE_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail on broken presence-penalty path
-#   N_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh            # fail on broken n>1 (multi-choice) path
-#   LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh     # fail if generation degenerates past ~30 tokens
+# Self-test: scripts/test_smoke_check_harness.sh (28 mock scenarios).
 
 set -euo pipefail
 

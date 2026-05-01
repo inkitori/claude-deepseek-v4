@@ -32,7 +32,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,12 +51,6 @@ from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
-
-# `1` routes `__call__` through `deepseek_v4_run_with_decode_state` (real
-# packed-state decode); `0` keeps the prefill-recompute baseline.
-V4_DECODE_STATE_ENABLED = os.environ.get("V4_DECODE_STATE", "0") == "1"
-logger.info("[V4_DECODE_STATE] module import: enabled=%s",
-            V4_DECODE_STATE_ENABLED)
 
 
 # ------------------------------------------------------------
@@ -747,10 +740,10 @@ def transformer_body_decode_step_from_buffer(
 def _v4_constrain_packed_replicated(
     buffers: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Force each packed-state buffer to materialize as `P()`-replicated
-    inside the trace. Without this, the JIT-boundary reshard interacts with
-    the donated `kv_caches` buffer's prior contents and triggers a TPU
-    `[USER]` FATAL on the cached prefill artifact's second execution."""
+    """Constrain each packed-state buffer to `P()` inside the trace.
+    Required: without it the JIT-boundary reshard interacts with donated
+    `kv_caches` contents and SIGSEGVs on the second execution of a cached
+    prefill artifact."""
     try:
         spec = jax.sharding.PartitionSpec()
         return [lax.with_sharding_constraint(b, spec) for b in buffers]
@@ -762,13 +755,9 @@ def _v4_force_kv_caches_read(
     buffers: List[jnp.ndarray],
     kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Fold `b + opaque_zero * kv` into each output buffer where
-    `opaque_zero = lax.optimization_barrier(jnp.zeros(()))`. Compute output
-    equals `b` byte-for-byte at runtime, but XLA must emit a real read of
-    `kv_caches[i]` and a real elementwise add. Without this, XLA can elide
-    the donation-aliased write when output value is statically derivable
-    without reading the input — leaving prior-call contents bleeding
-    through under TPU SPMD's `donate_argnums=2`."""
+    """Fold `b + opaque_zero * kv` so XLA emits a real read of the donated
+    `kv_caches`. Output equals `b` byte-for-byte; the read forces the
+    donation-aliased write to commit instead of being elided."""
     opaque_zero = lax.optimization_barrier(
         jnp.zeros((), dtype=jnp.float32))
     return [
@@ -788,31 +777,19 @@ def deepseek_v4_run_with_decode_state(
     is_decode_step: bool,
     start_pos,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
-    """Orchestrate one prefill OR one decode step, threading the per-layer
-    `AttentionDecodeState` through `kv_caches` (each `kv_caches[i]` is a 1D
-    fp32 buffer sized by `v4_layer_packed_sizes_from_cfg`).
+    """Run one prefill or one decode step, threading per-layer
+    `AttentionDecodeState` through `kv_caches` (each entry a 1D fp32 buffer
+    sized by `v4_layer_packed_sizes_from_cfg`).
 
-    Prefill (`is_decode_step=False`): runs `transformer_body_forward` for
-    `h` (drives head + lm_head) and `transformer_body_init_state_to_buffer`
-    separately for the seeded packed state. The decoupling keeps `h`
-    byte-equal to the prefill-only baseline; XLA CSEs shared kv/compressor
-    intermediates so the duplication is mostly free.
+    Prefill seeds fresh packed state from `input_ids`. Decode reads prior
+    state from `kv_caches`, advances one position at traced `start_pos`,
+    and returns updated buffers. Returns `(updated_kv_caches, h)` so the
+    caller can pass `kv_caches` as a donated JIT argument.
 
-    Decode (`is_decode_step=True`): reads `kv_caches[i]` as the prior
-    packed state, advances by one position, and returns the new buffers.
-    `start_pos` is the absolute position of the new token — accepts a
-    traced `jnp.int32` scalar (one compile fits all positions).
-
-    Both branches return `(updated_kv_caches, h)` so the caller can pass
-    `kv_caches` as a donated JIT argument.
-
-    Bug-fix scaffolding (DO NOT REMOVE without re-running the second-
-    request smoke): `lax.optimization_barrier(h)` blocks XLA from CSE-ing
-    forward with the state-init's internal forward (bf16 reduction-order
-    drift on 43-layer accumulation flipped argmax otherwise);
-    `_v4_force_kv_caches_read` + `_v4_constrain_packed_replicated` block
-    XLA from eliding donation-aliased writes (would leave prior-call
-    contents bleeding through R2 of a cached prefill artifact)."""
+    Donation-safety scaffolding (`optimization_barrier(h)`,
+    `_v4_force_kv_caches_read`, `_v4_constrain_packed_replicated`) blocks
+    XLA from eliding aliased writes / CSEing across the two prefill paths.
+    """
     if is_decode_step:
         h, new_buffers = transformer_body_decode_step_from_buffer(
             input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
@@ -1814,62 +1791,49 @@ def _build_class():
                     ids_2d = ids.reshape(1, -1)
                 else:
                     ids_2d = ids
-                if V4_DECODE_STATE_ENABLED:
-                    is_decode = (
-                        attention_metadata is not None
-                        and int(getattr(
-                            attention_metadata, "decode_start_pos", 0)) > 0)
-                    T = int(ids_2d.shape[-1])
-                    state_max_seq_len = (
-                        v4_state_max_seq_len_from_vllm_config(self.vllm_config))
-                    L_real = T
-                    if is_decode:
-                        start_pos = (
-                            attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
-                        # Decode bucket may pad past token 0; the orchestrator
-                        # only consumes the live slot.
-                        ids_for_orchestrator = ids_2d[:, 0:1]
-                    else:
-                        start_pos = jnp.int32(0)
-                        # vLLM pads prefill input_ids to a token bucket. The
-                        # orchestrator's SWA / compressor / indexer state
-                        # initialization is positional — if it sees T_pad
-                        # ids it treats positions [L_real:T_pad] as real
-                        # prompt tokens. Decode then attends to padding-token
-                        # kvs at SWA slots and reads compressor slots that
-                        # encode padding. Slice to the real prompt length.
-                        qsl_cpu = getattr(
-                            attention_metadata, "query_start_loc_cpu", None)
-                        if qsl_cpu is not None:
-                            try:
-                                import numpy as _np
-                                L_real = int(_np.asarray(qsl_cpu)[1])
-                            except Exception:  # noqa: BLE001
-                                L_real = T
-                        L_real = max(1, min(L_real, T))
-                        ids_for_orchestrator = ids_2d[:, :L_real]
-                    kv_caches, h = deepseek_v4_run_with_decode_state(
-                        kv_caches, ids_for_orchestrator, params,
-                        freqs_swa, freqs_comp,
-                        self.config,
-                        state_max_seq_len=state_max_seq_len,
-                        is_decode_step=is_decode,
-                        start_pos=start_pos,
-                    )
-                    if is_decode and T > 1:
-                        pad_shape = (h.shape[0], T - 1, *h.shape[2:])
-                        pad = jnp.zeros(pad_shape, h.dtype)
-                        h = jnp.concatenate([h, pad], axis=1)
-                    elif (not is_decode) and T > L_real:
-                        # head_hc + lm_head expect h of shape [B, T_pad, ...];
-                        # the runtime selects logits at logits_indices (within
-                        # the real-prompt range) so padded slots are never read.
-                        pad_shape = (h.shape[0], T - L_real, *h.shape[2:])
-                        pad = jnp.zeros(pad_shape, h.dtype)
-                        h = jnp.concatenate([h, pad], axis=1)
+                is_decode = (
+                    attention_metadata is not None
+                    and int(getattr(
+                        attention_metadata, "decode_start_pos", 0)) > 0)
+                T = int(ids_2d.shape[-1])
+                state_max_seq_len = (
+                    v4_state_max_seq_len_from_vllm_config(self.vllm_config))
+                L_real = T
+                if is_decode:
+                    start_pos = (
+                        attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
+                    ids_for_orchestrator = ids_2d[:, 0:1]
                 else:
-                    h = transformer_body_forward(
-                        ids_2d, params, freqs_swa, freqs_comp, self.config)
+                    start_pos = jnp.int32(0)
+                    # vLLM pads prefill ids to a token bucket; SWA / compressor
+                    # / indexer state init is positional, so feeding T_pad ids
+                    # encodes padding tokens into kv slots. Slice to real len.
+                    qsl_cpu = getattr(
+                        attention_metadata, "query_start_loc_cpu", None)
+                    if qsl_cpu is not None:
+                        try:
+                            import numpy as _np
+                            L_real = int(_np.asarray(qsl_cpu)[1])
+                        except Exception:  # noqa: BLE001
+                            L_real = T
+                    L_real = max(1, min(L_real, T))
+                    ids_for_orchestrator = ids_2d[:, :L_real]
+                kv_caches, h = deepseek_v4_run_with_decode_state(
+                    kv_caches, ids_for_orchestrator, params,
+                    freqs_swa, freqs_comp,
+                    self.config,
+                    state_max_seq_len=state_max_seq_len,
+                    is_decode_step=is_decode,
+                    start_pos=start_pos,
+                )
+                if is_decode and T > 1:
+                    pad_shape = (h.shape[0], T - 1, *h.shape[2:])
+                    pad = jnp.zeros(pad_shape, h.dtype)
+                    h = jnp.concatenate([h, pad], axis=1)
+                elif (not is_decode) and T > L_real:
+                    pad_shape = (h.shape[0], T - L_real, *h.shape[2:])
+                    pad = jnp.zeros(pad_shape, h.dtype)
+                    h = jnp.concatenate([h, pad], axis=1)
                 h_BSD = head_hc(
                     h, params.hc_head_fn, params.hc_head_scale,
                     params.hc_head_base,

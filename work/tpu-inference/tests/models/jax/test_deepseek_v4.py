@@ -2046,9 +2046,8 @@ class TestPackedDecodeStateBuffer:
     def test_buffer_decode_jit_cache_hits_across_positions(self):
         """One compile fits every decode position. With traced `start_pos`,
         running the decode step at multiple positions must reuse the same
-        compiled artifact (the throughput unlock the prior static-int
-        impl missed: each new position used to trigger a fresh ~50s XLA
-        compile under V4_DECODE_STATE=1)."""
+        compiled artifact (each new position previously triggered a fresh
+        ~50s XLA compile)."""
         model, params, cfg, swa, comp = self._build_pair(seed=0)
         T = 16
         torch.manual_seed(T + 99)
