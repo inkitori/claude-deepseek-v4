@@ -588,6 +588,12 @@ def transformer_body_decode_step(
         new_state, h = block_decode_step(
             h, input_ids_step, layer, fc, prev, start_pos, layer_idx=i)
         new_states.append(new_state)
+        # S1 elision barrier: side-effect callback per layer forces XLA
+        # to commit each layer's kv_cache writes (donation-aliased
+        # writes that would otherwise be elided cause NaN downstream;
+        # see commit 82da0f22).
+        jax.debug.callback(
+            lambda *_: None, h, new_state.kv_cache)
     return h, new_states
 
 
