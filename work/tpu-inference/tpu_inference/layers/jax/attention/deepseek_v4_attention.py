@@ -46,6 +46,15 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
     overflow inside `jnp.square` / rsqrt — see CLAUDE.md S1."""
     if not _V4_DECODE_NAN_TRIPWIRE:
         return
+    if x.size == 0:
+        # Zero-size buffers (e.g. compressor output for T < ratio) carry no
+        # information and break jnp.max — emit a sentinel so the probe still
+        # fires once per layer and the test pin counts it.
+        jax.debug.print(
+            "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
+            l=layer_idx, p=position, n=name,
+        )
+        return
     xf = x.astype(jnp.float32)
     nans = jnp.sum(jnp.isnan(xf))
     pinfs = jnp.sum(jnp.isposinf(xf))
@@ -985,6 +994,7 @@ def attention_init_state_from_prefill(
     cfg_max_seq_len: int,
     cfg_index_head_dim: int = 0,
     dtype=jnp.bfloat16,
+    layer_idx: int = -1,
 ) -> AttentionDecodeState:
     """Closed-form construction of `AttentionDecodeState` after a prefill of
     length T = x.shape[1]. Equivalent to running `attention_decode_step` T
@@ -1002,25 +1012,33 @@ def attention_init_state_from_prefill(
     rd = params.rope_head_dim
     eps = params.norm_eps
 
+    _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     # SWA kv (matches attention_prefill's kv computation).
     kv = _linear(x, params.wkv)
+    _v4_nan_tripwire("init_kv_postlinear", kv, layer_idx, -1)
     kv = rms_norm(kv, params.kv_norm_w, eps)
+    _v4_nan_tripwire("init_kv_postnorm", kv, layer_idx, -1)
     fc = freqs_cis_full[:T] if T > 0 else freqs_cis_full[:0]
     if T > 0:
         kv = splice_rope(kv, rd, fc, inverse=False)
+    _v4_nan_tripwire("init_kv_postrope", kv, layer_idx, -1)
     kv = kv.astype(dtype)
 
     extra = (cfg_max_seq_len // ratio) if ratio else 0
     kv_cache = jnp.zeros((B, win + extra, Dh), dtype=dtype)
     swa = _swa_kv_cache_from_prefill(kv, win)
+    _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
     kv_cache = kv_cache.at[:, :win, :].set(swa)
+    _v4_nan_tripwire("init_kv_cache_post_swa_set", kv_cache, layer_idx, -1)
 
     if ratio > 0:
         # Compressed positions [win, win + T//ratio) come from compressor_prefill.
         kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full).astype(dtype)
+        _v4_nan_tripwire("init_kv_compressed", kv_compressed, layer_idx, -1)
         Tcomp = kv_compressed.shape[1]  # = T // ratio
         if Tcomp > 0:
             kv_cache = kv_cache.at[:, win:win + Tcomp, :].set(kv_compressed)
+        _v4_nan_tripwire("init_kv_cache_post_comp_set", kv_cache, layer_idx, -1)
         c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor)
     else:
         c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)

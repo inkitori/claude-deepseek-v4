@@ -2323,7 +2323,20 @@ class TestPackedDecodeStateBuffer:
         assert not bool(jnp.any(jnp.isnan(h_step)))
         out = capfd.readouterr().out
         assert "[v4nan]" in out, "tripwire log lines must appear when gate is on"
-        seen_inner = set()
+        decode_probes = {
+            "kv_cache_at_entry", "qr_postnorm", "q_postrsqrt", "q_postrope",
+            "kv_postrope", "kv_cache_post_write", "sparse_attn_o",
+            "o_post_inv_rope", "wo_b_y",
+        }
+        prefill_probes = {
+            "prefill_state_kv_cache", "packed_buffer_post_pack",
+            "packed_buffer_post_force_read",
+            "init_x_in", "init_kv_postlinear", "init_kv_postnorm",
+            "init_kv_postrope", "init_swa", "init_kv_cache_post_swa_set",
+            "init_kv_compressed", "init_kv_cache_post_comp_set",
+        }
+        all_probes = decode_probes | prefill_probes
+        seen = set()
         for line in out.splitlines():
             if "[v4nan]" not in line:
                 continue
@@ -2334,16 +2347,11 @@ class TestPackedDecodeStateBuffer:
             assert "max_abs=" in line, (
                 f"tripwire must emit `max_abs=` for fp32-overflow detection: "
                 f"{line!r}")
-            for name in ("kv_cache_at_entry", "qr_postnorm", "q_postrsqrt",
-                         "q_postrope", "kv_postrope", "kv_cache_post_write",
-                         "sparse_attn_o", "o_post_inv_rope", "wo_b_y"):
+            for name in all_probes:
                 if f" {name}:" in line:
-                    seen_inner.add(name)
-        missing = {"kv_cache_at_entry", "qr_postnorm", "q_postrsqrt",
-                   "q_postrope", "kv_postrope", "kv_cache_post_write",
-                   "sparse_attn_o", "o_post_inv_rope", "wo_b_y"} - seen_inner
-        assert not missing, (
-            f"attention_decode_step inner probes missing: {missing}")
+                    seen.add(name)
+        missing = all_probes - seen
+        assert not missing, f"tripwire probes missing: {missing}"
 
     def test_weight_nan_audit_localizes_bad_leaves(self, capfd):
         """`_v4_weight_nan_audit` walks a loaded param tree and emits one

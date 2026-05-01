@@ -297,6 +297,7 @@ def block_init_state_and_forward(
     freqs_cis_full: jnp.ndarray,
     cfg_max_seq_len: int,
     cfg_index_head_dim: int,
+    layer_idx: int = -1,
 ) -> Tuple[AttentionDecodeState, jnp.ndarray]:
     """Block forward (prefill) that ALSO captures the post-prefill
     `AttentionDecodeState` for this layer. Output `[B, T, hc, D]` is
@@ -316,6 +317,7 @@ def block_init_state_and_forward(
         cfg_max_seq_len=cfg_max_seq_len,
         cfg_index_head_dim=cfg_index_head_dim,
         dtype=jnp.bfloat16,
+        layer_idx=layer_idx,
     )
     y = attention_prefill(y, params.attn, freqs_cis_full)
     x = hc_post(y, residual, post, comb)
@@ -522,7 +524,7 @@ def transformer_body_init_state_from_prefill(
     h = params.embed_w[input_ids]  # [B, T, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
     states: List[AttentionDecodeState] = []
-    for layer in params.layers:
+    for i, layer in enumerate(params.layers):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
         # index_head_dim is only consumed when this layer's attention has
@@ -533,6 +535,7 @@ def transformer_body_init_state_from_prefill(
             h, input_ids, layer, fc,
             cfg_max_seq_len=state_max_seq_len,
             cfg_index_head_dim=idx_hd,
+            layer_idx=i,
         )
         states.append(st)
     return h, states
@@ -772,9 +775,13 @@ def transformer_body_init_state_to_buffer(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
+    for i, st in enumerate(states):
+        _v4_nan_tripwire("prefill_state_kv_cache", st.kv_cache, i, -1)
     layouts = transformer_body_layout(
         params, cfg, state_max_seq_len, batch_size=int(input_ids.shape[0]))
     packed_buffers = [_pack_layer_state(s, lo) for s, lo in zip(states, layouts)]
+    for i, b in enumerate(packed_buffers):
+        _v4_nan_tripwire("packed_buffer_post_pack", b, i, -1)
     return h, packed_buffers
 
 
@@ -896,6 +903,8 @@ def deepseek_v4_run_with_decode_state(
         state_max_seq_len=state_max_seq_len,
     )
     packed_buffers = _v4_force_kv_caches_read(packed_buffers, kv_caches)
+    for i, b in enumerate(packed_buffers):
+        _v4_nan_tripwire("packed_buffer_post_force_read", b, i, -1)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
     return packed_buffers, h
 
