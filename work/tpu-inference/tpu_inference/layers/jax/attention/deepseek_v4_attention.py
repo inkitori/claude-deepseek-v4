@@ -735,20 +735,17 @@ def attention_decode_step(
     eps = params.norm_eps
     fc = lax.dynamic_slice_in_dim(freqs_cis_full, start_pos, 1, axis=0)
 
-    # Probe state.kv_cache *before* this step writes — distinguishes a
-    # pre-poisoned input buffer from an in-step write that corrupts neighbors
-    # (CLAUDE.md S1: real-V4 L5 sees nan_post_write=28672 with nan_at_entry=?).
     _v4_nan_tripwire("kv_cache_at_entry", state.kv_cache, layer_idx, start_pos)
-    # Probes for the OTHER 5 AttentionDecodeState fields at decode entry —
-    # localize the residual S1 bug (kv_cache is now clean post-v5 concat fix
-    # but LONG_GEN still pad-tokens). Hypothesis: compressor/indexer score_state
-    # `-inf` slots leak NaN via XLA aliasing on the same partial-write pattern
-    # that bit kv_cache.
     _v4_nan_tripwire("compressor_kv_at_entry", state.compressor_kv_state, layer_idx, start_pos)
     _v4_nan_tripwire("compressor_score_at_entry", state.compressor_score_state, layer_idx, start_pos)
     _v4_nan_tripwire("indexer_kv_at_entry", state.indexer_kv_state, layer_idx, start_pos)
     _v4_nan_tripwire("indexer_score_at_entry", state.indexer_score_state, layer_idx, start_pos)
     _v4_nan_tripwire("indexer_kv_cache_at_entry", state.indexer_kv_cache, layer_idx, start_pos)
+    _v4_force_kv_write(
+        state.kv_cache,
+        state.compressor_kv_state, state.compressor_score_state,
+        state.indexer_kv_state, state.indexer_score_state, state.indexer_kv_cache,
+    )
 
     # q
     qr = _linear(x_step, params.wq_a)
