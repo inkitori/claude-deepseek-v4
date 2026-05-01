@@ -117,7 +117,7 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
-| `V4_DECODE_NAN_TRIPWIRE` | `0` | S1 diagnostic. Per-layer NaN/Inf logger inside decode-step + at-entry probes for all 6 `AttentionDecodeState` fields. No-op (HLO byte-identical) when `0`. **Side-effect callbacks suppress the bug** — use only for NaN localization, not gate validation. |
+| `V4_DECODE_NAN_TRIPWIRE` | `0` | S1 always-on barrier (silent when `0`, prints when `1`). Reductions + host-callback at every probe site force XLA to commit donated kv_cache writes that would otherwise be elided (S1 heisenbug). HLO is **NOT byte-identical** when `0` — the silent callbacks are still emitted. Set to `1` for diagnostics. |
 | `V4_WEIGHT_NAN_AUDIT` | `0` | One-shot finiteness audit of the loaded V4 param tree (S1 diagnostic, hyp ruled out). Loader code-path unchanged when `0`. |
 | `V4_DECODE_ARGMAX_PROBE` | `0` | S1 diagnostic. Prints `[v4probe] logits ...` (top-3 token ids + logit values) from `compute_logits` and `[v4probe] call_hidden ...` (max_abs) from `__call__`. No-op (HLO byte-identical) when `0`. Distinguishes "model emits pad-favoring logits" vs "model emits real-vocab argmax that detokenizes empty". |
 
@@ -164,48 +164,68 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01 reframe — NaN may not be ruled out):** Smoke
-`20260501T103209Z` ran with `V4_DECODE_ARGMAX_PROBE=1` (downstream-only
-probe at `__call__` output and `compute_logits` output). All 258
-`[v4probe]` lines emitted `max_abs=nan` — every prefill, every decode,
-every probe shape. Decode `top_ids=[0 1 2]` (argmax of fully-NaN array
-returns first 3 indices = bos/eos/pad). Prefill `top_ids` look real
-(e.g. `[3999 3201 1207]`) — top-k extracts non-NaN values from a
-PARTIALLY-NaN array, which is why "Paris" works but LONG_GEN fails.
+**Status (2026-05-01 — partial fix landed; determinism follow-on):**
+HEISENBUG confirmed. The bug is XLA donation-aliased write elision
+under SPMD: `kv_caches` is donated (`donate_argnums=2`), and partial
+writes inside `block_decode_step` (e.g. `state.kv_cache.at[idx].set(kv)`)
+get elided by XLA's alias analysis, leaving subsequent decode steps to
+read uninitialized memory → NaN propagation through the residual stream.
 
-The earlier smoke `20260501T083332Z` (`TRIPWIRE=1`, 13,583 lines all
-`nan=0`) was probably **callback-suppressed**: tripwire's many
-`jax.debug.print` calls inside the decode pipeline force XLA to not
-elide the writes that produce NaN downstream. Heisenbug class.
+**Fix (commit `f1ec28f8`+):** `_v4_nan_tripwire` is **always-on**.
+When `V4_DECODE_NAN_TRIPWIRE=0` it runs reductions + a no-op
+`jax.debug.callback` (silent). When `=1` it also prints. The
+side-effect ops force XLA to materialize the partial-write outputs
+(SSA barriers like `lax.optimization_barrier` are NOT enough — only
+effectful ops fix this; this is the heisenbug class).
 
-**Cumulative rule-outs (still valid):**
-* Bad weights (audited finite via `V4_WEIGHT_NAN_AUDIT=1`).
-* Sub-block math at every site `_v4_nan_tripwire` covers (attention
-  internals, block_decode_step, embed_h, prefill init, packing) —
-  but only when those sites are being PROBED. With probes off,
-  cannot conclude.
+**Result with full silent barrier:** Paris probe produces multi-token
+coherent text (e.g. " Paris, 2024年7月"). Long-gen drifts into
+degenerate attractors (e.g. " 0.0 0.0 0.0…"). Outputs are
+non-deterministic across runs at temperature=0 — the ~600 callbacks
+per decode step perturb SPMD floating-point reduction order, flipping
+argmax ties.
 
-**What's left:**
-1. **Heisenbug class — XLA elision producing NaN at a tripwire-uncovered
-   site.** Most likely `head_hc` (HC head mixer in `__call__`, post-
-   transformer-body, pre-`hidden_TD` reshape). Tripwire has no probe
-   sites in `head_hc`. Discriminate by running smoke with BOTH
-   `V4_DECODE_NAN_TRIPWIRE=1` AND `V4_DECODE_ARGMAX_PROBE=1`:
-   - Argmax shows real `max_abs` → tripwire suppresses, fix is
-     extending barriers (`_v4_force_kv_caches_read`-style) to the
-     elided site.
-   - Argmax still NaN AND tripwire fires `nan>0` somewhere → real
-     math NaN at that site.
-2. **Fix shape if class 1 confirmed:** Wrap `head_hc` output (or
-   the elided write) in the proven-working shape
-   `where(opaque_false, b + dependency, b)`.
+**Bisection results (don't repeat):**
+* 1 callback at `kv_cache_post_write` only (fix #5, `98b0a677`):
+  insufficient — NaN returns, `visible_words=1`.
+* 7 callback args at at_entry + post_write (fix #5b, `14e11136`):
+  also insufficient — same `visible_words=1`.
+* Full coverage (~14 sites/layer in block_decode_step + tripwire's
+  prefill/embed sites): suppresses NaN, multi-token coherent.
+* Per-layer callback in `transformer_body_decode_step` (fix #3,
+  `ac8d2077`): insufficient (1 site/layer too far from elision).
+
+**Closure gate (still failing):** `LONG_GEN_REQUIRED=1` requires
+`visible_words >= 10` AND `max_word_run < 5`. Current state hits
+visible_words but max_word_run hits 5+ on degenerate attractors.
+
+**Open follow-on (S1.1 — determinism + degenerate attractors):**
+Two paths to investigate:
+1. **Reduce callback count** while preserving NaN suppression.
+   Bisect *which* tripwire sites are load-bearing. Fix #5/5b
+   ruled out single-site / 6-field-input-only. Try
+   {at_entry × 6} ∪ {kv_cache_post_write} ∪ {sparse_attn_o} ∪
+   {wo_b_y} (~9 sites/layer) — hypothesis: q/qr/kv intermediate
+   sites aren't load-bearing, only state-touching sites are.
+2. **Break donation aliasing for V4 specifically.** Either
+   un-donate kv_cache in `model_loader.py::run_model` (broad
+   blast radius — affects all models), or insert a per-call
+   "uncoupling" step in V4's `__call__` (`kv_caches = jax.tree.map(
+   lax.full_like_then_add_zero, kv_caches)`-style dance to force
+   a fresh-buffer copy). The latter sacrifices the donation perf
+   benefit but should restore determinism since XLA can't elide
+   what it can't alias.
+
+Determinism diagnostic: run 3+ Paris probes with `temperature=0,
+seed=0`. Healthy = byte-equal. Current state = different completions
+(" Paris, 2024…", " Paris, 2020…", " Paris, Paris, …").
 
 **Real-V4 verification:**
-* Discriminator probe: `V4_DECODE_NAN_TRIPWIRE=1
-  V4_DECODE_ARGMAX_PROBE=1 scripts/full_slice_v4_smoke{,_check}.sh`.
+* Diagnostics: `V4_DECODE_NAN_TRIPWIRE=1 V4_DECODE_ARGMAX_PROBE=1
+  scripts/full_slice_v4_smoke{,_check}.sh`.
 * End-to-end gate (default-on): `LONG_GEN_REQUIRED=1
   scripts/full_slice_v4_smoke_check.sh`. Closed gate is
-  `visible_words >= 10`.
+  `visible_words >= 10` AND `max_word_run < 5`.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.

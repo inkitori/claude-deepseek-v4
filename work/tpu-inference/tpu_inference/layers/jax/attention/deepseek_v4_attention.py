@@ -38,19 +38,23 @@ _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
 
 
 def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
-    """Emit per-call NaN/+inf/-inf counts and `max_abs(x)` to the runtime
-    log. No-op unless `V4_DECODE_NAN_TRIPWIRE=1` was set at process start
-    (gated at module import; production HLO unchanged when disabled).
-    Used to localize which decode-step sub-block first produces NaN on
-    real V4, and to spot pre-NaN magnitude blow-up that points at fp32
-    overflow inside `jnp.square` / rsqrt — see CLAUDE.md S1."""
-    if not _V4_DECODE_NAN_TRIPWIRE:
-        return
+    """Always-on silent barrier: reductions + host callback at every site
+    so XLA cannot elide donated kv_cache writes (S1 heisenbug — only
+    effectful ops fix this; SSA barriers don't). Prints reductions when
+    `V4_DECODE_NAN_TRIPWIRE=1` (set at process start); otherwise the
+    callback is silent.
+
+    Trade-off: ~600 callbacks/decode_step perturb SPMD floating-point
+    reduction order, breaking per-call determinism (different
+    completions across runs at temperature=0). NaN-suppression is the
+    primary correctness goal; sustained-generation determinism is a
+    known follow-on (S1.1)."""
     if x.size == 0:
-        jax.debug.print(
-            "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
-            l=layer_idx, p=position, n=name,
-        )
+        if _V4_DECODE_NAN_TRIPWIRE:
+            jax.debug.print(
+                "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
+                l=layer_idx, p=position, n=name,
+            )
         return
     xf = x.astype(jnp.float32)
     nans = jnp.sum(jnp.isnan(xf))
@@ -58,24 +62,13 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
     ninfs = jnp.sum(jnp.isneginf(xf))
     finite = jnp.where(jnp.isfinite(xf), jnp.abs(xf), jnp.float32(0.0))
     max_abs = jnp.max(finite)
-    jax.debug.print(
-        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
-        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
-    )
-
-
-def _v4_force_kv_write(*xs: jnp.ndarray) -> None:
-    """Always-on silent barrier: reductions + no-op host callback. Called
-    at the kv_cache_post_write site inside `block_decode_step` so XLA
-    cannot elide the donation-aliased partial write that would otherwise
-    leave subsequent decode steps reading stale/uninitialized memory
-    (S1 heisenbug — only side-effect ops fix this; SSA barriers don't).
-
-    Single site (vs full tripwire coverage) keeps determinism perturbation
-    minimal while still suppressing the elision."""
-    sums = [jnp.sum(x.astype(jnp.float32)) for x in xs if x.size > 0]
-    if sums:
-        jax.debug.callback(lambda *_: None, *sums)
+    if _V4_DECODE_NAN_TRIPWIRE:
+        jax.debug.print(
+            "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
+            l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
+        )
+    else:
+        jax.debug.callback(lambda *_: None, nans, pinfs, ninfs, max_abs)
 
 
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:
@@ -741,11 +734,6 @@ def attention_decode_step(
     _v4_nan_tripwire("indexer_kv_at_entry", state.indexer_kv_state, layer_idx, start_pos)
     _v4_nan_tripwire("indexer_score_at_entry", state.indexer_score_state, layer_idx, start_pos)
     _v4_nan_tripwire("indexer_kv_cache_at_entry", state.indexer_kv_cache, layer_idx, start_pos)
-    _v4_force_kv_write(
-        state.kv_cache,
-        state.compressor_kv_state, state.compressor_score_state,
-        state.indexer_kv_state, state.indexer_score_state, state.indexer_kv_cache,
-    )
 
     # q
     qr = _linear(x_step, params.wq_a)
@@ -804,7 +792,6 @@ def attention_decode_step(
 
     topk_idxs = topk_idxs.astype(jnp.int32)
     _v4_nan_tripwire("kv_cache_post_write", new_kv_cache, layer_idx, start_pos)
-    _v4_force_kv_write(new_kv_cache, c_kvst, c_scst, i_kvst, i_scst, i_kvcache)
 
     o = sparse_attn(q, new_kv_cache, params.attn_sink, topk_idxs, params.softmax_scale)
     _v4_nan_tripwire("sparse_attn_o", o, layer_idx, start_pos)
