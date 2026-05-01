@@ -715,6 +715,11 @@ def attention_decode_step(
     eps = params.norm_eps
     fc = lax.dynamic_slice_in_dim(freqs_cis_full, start_pos, 1, axis=0)
 
+    # Probe state.kv_cache *before* this step writes — distinguishes a
+    # pre-poisoned input buffer from an in-step write that corrupts neighbors
+    # (CLAUDE.md S1: real-V4 L5 sees nan_post_write=28672 with nan_at_entry=?).
+    _v4_nan_tripwire("kv_cache_at_entry", state.kv_cache, layer_idx, start_pos)
+
     # q
     qr = _linear(x_step, params.wq_a)
     qr = rms_norm(qr, params.q_norm_w, eps)

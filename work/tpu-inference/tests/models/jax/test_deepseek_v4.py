@@ -2283,8 +2283,8 @@ class TestPackedDecodeStateBuffer:
     def test_decode_nan_tripwire_when_enabled_runs_clean(self, monkeypatch, capfd):
         """`V4_DECODE_NAN_TRIPWIRE=1` adds `jax.debug.print` of NaN/+inf/-inf
         counts and `max_abs(x)` at each decode-step sub-block boundary,
-        including 8 inner probes inside `attention_decode_step` (qr_postnorm,
-        q_postrsqrt, q_postrope, kv_postrope, kv_cache_post_write,
+        including 9 inner probes inside `attention_decode_step` (kv_cache_at_entry,
+        qr_postnorm, q_postrsqrt, q_postrope, kv_postrope, kv_cache_post_write,
         sparse_attn_o, o_post_inv_rope, wo_b_y). Validate the tripwire-on
         path still produces a NaN-free run on tiny CPU and emits per-layer
         log lines including the new `max_abs=` field so a real-V4 smoke can
@@ -2334,14 +2334,14 @@ class TestPackedDecodeStateBuffer:
             assert "max_abs=" in line, (
                 f"tripwire must emit `max_abs=` for fp32-overflow detection: "
                 f"{line!r}")
-            for name in ("qr_postnorm", "q_postrsqrt", "q_postrope",
-                         "kv_postrope", "kv_cache_post_write",
+            for name in ("kv_cache_at_entry", "qr_postnorm", "q_postrsqrt",
+                         "q_postrope", "kv_postrope", "kv_cache_post_write",
                          "sparse_attn_o", "o_post_inv_rope", "wo_b_y"):
                 if f" {name}:" in line:
                     seen_inner.add(name)
-        missing = {"qr_postnorm", "q_postrsqrt", "q_postrope", "kv_postrope",
-                   "kv_cache_post_write", "sparse_attn_o", "o_post_inv_rope",
-                   "wo_b_y"} - seen_inner
+        missing = {"kv_cache_at_entry", "qr_postnorm", "q_postrsqrt",
+                   "q_postrope", "kv_postrope", "kv_cache_post_write",
+                   "sparse_attn_o", "o_post_inv_rope", "wo_b_y"} - seen_inner
         assert not missing, (
             f"attention_decode_step inner probes missing: {missing}")
 
