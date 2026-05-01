@@ -1886,6 +1886,19 @@ def _build_class():
             freqs_swa = self._freqs_swa_v.get_value()
             freqs_comp = self._freqs_compressed_v.get_value()
 
+            # S1 elision barrier: opaque-zero add forces XLA to allocate
+            # a fresh buffer for kv_caches inside this JIT, breaking the
+            # donation-aliased write elision that corrupts decode-state
+            # writes (heisenbug; see CLAUDE.md S1). Single callback consumes
+            # the copies so XLA can't simplify them away — minimum FP
+            # perturbation (1 callback per JIT call, not per layer).
+            _opaque_zero = lax.optimization_barrier(jnp.float32(0.0))
+            kv_caches = [k + _opaque_zero for k in kv_caches]
+            if kv_caches:
+                _kv_red = jnp.sum(jnp.stack(
+                    [jnp.sum(k.astype(jnp.float32)) for k in kv_caches]))
+                jax.debug.callback(lambda *_: None, _kv_red)
+
             seg_bounds = self._extract_seq_segments(ids, attention_metadata)
             if seg_bounds is None or len(seg_bounds) <= 1:
                 if ids.ndim == 1:
