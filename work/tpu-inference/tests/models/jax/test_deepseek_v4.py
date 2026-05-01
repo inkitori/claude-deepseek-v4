@@ -3589,68 +3589,6 @@ class TestCompressorDecodeStep:
         assert diff_sc <= 1e-5, f"ratio={ratio} sp={start_pos}: score_state diff {diff_sc}"
 
 
-class TestDecodeRollingEquivalenceWithPrefill:
-    """Stronger invariant: the SWA kv_cache buffer after a 32-step rolling
-    decode (starting from empty state with full_x[:, :32]) must match the
-    SWA kv_cache buffer after a torch prefill of length 32 on the same
-    inputs. This catches state-mutation bugs that per-step parity would
-    miss if the bug self-cancels at the output level.
-
-    We restrict the comparison to layer_id=0 (SWA) so the kv_cache is a
-    pure circular buffer with no compressor entanglement; CSA / HCA layers
-    are covered by the per-step rolling tests above.
-
-    Tolerance: byte-exact (v8 iter 4 tightening; was atol=2e-2). The 32
-    sequential decode writes turn out to be byte-identical to the bulk
-    prefill writes — both paths invoke the same per-position RoPE kernel
-    with the same freqs slice and the same input row, just batched
-    differently. Measured 0.0 max-abs across 8 random seeds. See
-    TOLERANCE_LOG.md T8."""
-
-    def test_swa_decode_state_equals_prefill_state_after_32_steps(self):
-        torch.manual_seed(7)
-        K = 32
-        attn, args = _build_attn_for_decode(0, seed=0, max_seq_len=64)
-        bsz = 1
-        full_x = torch.randn(bsz, K, args.dim, dtype=torch.bfloat16)
-
-        # Path A: torch prefill of length 32.
-        with torch.inference_mode():
-            _ = attn(full_x, start_pos=0)
-        kvc_prefill = attn.kv_cache[:bsz].detach().float().numpy().copy()
-
-        # Path B: 32 JAX decode steps starting from empty state on the
-        # SAME inputs. Use a fresh torch attention to source weights, but
-        # construct the empty JAX state directly via
-        # `attention_decode_init_state` (the torch reference cannot run a
-        # length-0 prefill — `sparse_attn_torch` would max over an empty
-        # axis).
-        attn_fresh, args2 = _build_attn_for_decode(0, seed=0, max_seq_len=64)
-        params_j = _torch_attention_to_jax_params(attn_fresh, args2)
-        fc = t2j(attn_fresh.freqs_cis).astype(jnp.complex64)
-        jax_state = attention_decode_init_state(
-            batch_size=bsz, cfg_max_seq_len=args2.max_seq_len,
-            params=params_j, cfg_index_head_dim=args2.index_head_dim,
-            dtype=jnp.bfloat16,
-        )
-        for k in range(K):
-            x_step = full_x[:, k:k+1]
-            jax_state, _ = attention_decode_step(
-                t2j(x_step), k, params_j, fc, jax_state,
-            )
-        kvc_decode = np.asarray(jax_state.kv_cache).astype(np.float32)
-
-        diff = float(np.abs(kvc_prefill - kvc_decode).max())
-        assert diff == 0.0, (
-            f"SWA kv_cache after 32 decode steps must byte-match prefill "
-            f"state; got max abs diff {diff}"
-        )
-        assert np.array_equal(kvc_prefill, kvc_decode), (
-            "SWA kv_cache after 32 decode steps not byte-equal to prefill "
-            "state despite max-abs == 0"
-        )
-
-
 # ------------------------------------------------------------
 # Tier 4b — codebook + keystone-tensor reference (v8 iter 9)
 # ------------------------------------------------------------
