@@ -872,24 +872,24 @@ def _v4_force_h_kv_dependence(
     h: jnp.ndarray,
     kv_caches: List[jnp.ndarray],
 ) -> jnp.ndarray:
-    """Force `h` to depend on `kv_caches` via the same proven barrier
-    shape as `_v4_force_kv_caches_read`. Output equals `h` byte-for-byte;
-    the where-discarded branch keeps a kv read in HLO so XLA cannot
-    elide intermediate writes to the donated buffer that `h` does not
-    transitively read. NaN-safe: discarded branch holds finite value.
+    """Force `h` to commit by introducing a no-op side-effect callback
+    that consumes `h` and the first `kv_caches` buffer. XLA cannot elide
+    effectful ops, so this forces every upstream computation feeding `h`
+    (including donated-buffer kv-cache writes inside the body's layer
+    loop) to materialize.
 
-    Defense-in-depth for S1: `_v4_force_kv_caches_read` only protects
-    the returned `new_buffers`; without this barrier, smoke shows NaN
-    at `body_out` (h directly out of `deepseek_v4_run_with_decode_state`)
-    when TRIPWIRE callbacks are off."""
+    Why a callback instead of the proven `where(opaque_false, h+kv, h)`
+    shape used in `_v4_force_kv_caches_read`: that shape works for
+    donated output buffers (its branch forces an aliased write to
+    commit). `h` is NOT a donated output; the elision is on intermediate
+    kv_cache writes inside the body that `h` transitively reads. A
+    callback is the only proven mechanism per prior testing (commit
+    82da0f22). Trade-off: callbacks may break per-call determinism;
+    that's tracked separately as a follow-on to S1."""
     if not kv_caches:
         return h
-    opaque_false = lax.optimization_barrier(jnp.bool_(False))
-    kv_dep = jnp.float32(0.0)
-    for kv in kv_caches:
-        kv_dep = kv_dep + kv.astype(jnp.float32).sum()
-    h_alt = h + kv_dep.astype(h.dtype)
-    return jnp.where(opaque_false, h_alt, h)
+    jax.debug.callback(lambda *_: None, h, kv_caches[0], ordered=True)
+    return h
 
 
 def deepseek_v4_run_with_decode_state(
