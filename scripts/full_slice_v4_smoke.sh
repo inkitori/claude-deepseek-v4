@@ -47,6 +47,11 @@ export V4_DECODE_NAN_TRIPWIRE="${V4_DECODE_NAN_TRIPWIRE:-0}"
 # default; set V4_WEIGHT_NAN_AUDIT=1 to print `[weight_nan] {path}` for any
 # leaf containing NaN/Inf right after `load_weights_from_dir` finishes.
 export V4_WEIGHT_NAN_AUDIT="${V4_WEIGHT_NAN_AUDIT:-0}"
+# Per-decode-step argmax probe (CLAUDE.md S1). Off by default; set
+# V4_DECODE_ARGMAX_PROBE=1 to print top-3 token ids + logit values from
+# compute_logits and max_abs(hidden_TD) from __call__. Distinguishes
+# "logits favor pad" vs "logits pick normal id that detokenizes empty".
+export V4_DECODE_ARGMAX_PROBE="${V4_DECODE_ARGMAX_PROBE:-0}"
 
 # Don't inherit parent-shell XLA_FLAGS (stale value SIGSEGVs workers; see
 # CLAUDE.md pitfall #4). Opt-in via V4_XLA_FLAGS.
@@ -70,7 +75,7 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,V4_WEIGHT_NAN_AUDIT,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,V4_WEIGHT_NAN_AUDIT,V4_DECODE_ARGMAX_PROBE,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else

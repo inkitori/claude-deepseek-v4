@@ -117,8 +117,9 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
-| `V4_DECODE_NAN_TRIPWIRE` | `0` | Per-sub-block NaN/Inf logger inside `block_decode_step` (S1 diagnostic). When `1`, every decode emits `[v4nan] L{i} pos={p} {name}: nan=N +inf=N -inf=N` per layer. Read at module import; no-op when off (HLO byte-identical). |
-| `V4_WEIGHT_NAN_AUDIT` | `0` | One-shot finiteness audit of the loaded V4 param tree (S1 hyp 1: bad FP4/FP8 dequant on a single layer). When `1`, `load_weights_from_dir` emits `[weight_nan] {path}: nan_any=B inf_any=B` per non-finite leaf + a `[weight_nan_audit] examined=N nan_leaves=N inf_leaves=N` summary right before forward starts. Read on every load; loader code-path unchanged when off. |
+| `V4_DECODE_NAN_TRIPWIRE` | `0` | S1 diagnostic. Per-layer NaN/Inf logger inside decode-step + at-entry probes for all 6 `AttentionDecodeState` fields. No-op (HLO byte-identical) when `0`. **Side-effect callbacks suppress the bug** — use only for NaN localization, not gate validation. |
+| `V4_WEIGHT_NAN_AUDIT` | `0` | One-shot finiteness audit of the loaded V4 param tree (S1 diagnostic, hyp ruled out). Loader code-path unchanged when `0`. |
+| `V4_DECODE_ARGMAX_PROBE` | `0` | S1 diagnostic. Prints `[v4probe] logits ...` (top-3 token ids + logit values) from `compute_logits` and `[v4probe] call_hidden ...` (max_abs) from `__call__`. No-op (HLO byte-identical) when `0`. Distinguishes "model emits pad-favoring logits" vs "model emits real-vocab argmax that detokenizes empty". |
 
 `*_REQUIRED` smoke-check knobs (exit code in parens): `CHAT_REQUIRED` (4),
 `REASONING_REQUIRED` (5), `STREAMING_REQUIRED` (6), `SAMPLING_REQUIRED` (7),
@@ -163,81 +164,47 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01 v6): NaN/Inf RULED OUT. The bug is logic-level,
-not numerical.** Smoke `20260501T083332Z` (TRIPWIRE=1, all 6
-AttentionDecodeState fields probed at decode entry) emitted 13,583
-`[v4nan]` lines and EXACTLY ZERO of them have `nan>0`. Every input
-field to every decode step at every layer at every position is
-finite. kv_cache_at_entry max_abs grows monotonically over decode
-positions (5.16 → 5.34 → 5.38 ...), confirming new tokens ARE being
-written. Yet LONG_GEN still produces 1 visible word of 64 tokens.
+**Status (2026-05-01 reframe — NaN may not be ruled out):** Smoke
+`20260501T103209Z` ran with `V4_DECODE_ARGMAX_PROBE=1` (downstream-only
+probe at `__call__` output and `compute_logits` output). All 258
+`[v4probe]` lines emitted `max_abs=nan` — every prefill, every decode,
+every probe shape. Decode `top_ids=[0 1 2]` (argmax of fully-NaN array
+returns first 3 indices = bos/eos/pad). Prefill `top_ids` look real
+(e.g. `[3999 3201 1207]`) — top-k extracts non-NaN values from a
+PARTIALLY-NaN array, which is why "Paris" works but LONG_GEN fails.
 
-So the next iter must move PAST NaN debugging entirely.
+The earlier smoke `20260501T083332Z` (`TRIPWIRE=1`, 13,583 lines all
+`nan=0`) was probably **callback-suppressed**: tripwire's many
+`jax.debug.print` calls inside the decode pipeline force XLA to not
+elide the writes that produce NaN downstream. Heisenbug class.
 
-`V4_DECODE_NAN_TRIPWIRE=1` runs:
-* 9 decode-step inner probes (`kv_cache_at_entry`, `qr_postnorm`,
-  `q_postrsqrt`, `q_postrope`, `kv_postrope`, `kv_cache_post_write`,
-  `sparse_attn_o`, `o_post_inv_rope`, `wo_b_y`)
-* 5 decode-entry probes for the OTHER state fields
-  (`compressor_kv_at_entry`, `compressor_score_at_entry`,
-  `indexer_kv_at_entry`, `indexer_score_at_entry`,
-  `indexer_kv_cache_at_entry`)
-* 3 prefill→buffer probes (`prefill_state_kv_cache`,
-  `packed_buffer_post_pack`, `packed_buffer_post_force_read`)
-* 8 inner prefill-init probes inside `attention_init_state_from_prefill`
+**Cumulative rule-outs (still valid):**
+* Bad weights (audited finite via `V4_WEIGHT_NAN_AUDIT=1`).
+* Sub-block math at every site `_v4_nan_tripwire` covers (attention
+  internals, block_decode_step, embed_h, prefill init, packing) —
+  but only when those sites are being PROBED. With probes off,
+  cannot conclude.
 
-All share the same `V4_DECODE_NAN_TRIPWIRE` gate; HLO unchanged when
-off. Pinned by `test_decode_nan_tripwire_when_enabled_runs_clean`.
-**Tripwire-on breaks Paris determinism** (callback side effects
-prevent some XLA optimizations); use ONLY for NaN localization, not
-for end-to-end gate validation.
-
-**What's ruled out (cumulative):**
-* Bad weights (`V4_WEIGHT_NAN_AUDIT`).
-* rsqrt / sparse_attn / inverse-RoPE numerics.
-* `attention_init_state_from_prefill` math (inner probes clean).
-* `_pack_layer_state` / `_v4_force_kv_caches_read` (no propagation).
-* kv_cache field aliasing (v5 concat fix).
-* ANY NaN/Inf anywhere in the decode pipeline (smoke 083332Z).
-
-**What's left — strictly logic-level hypotheses:**
-1. **Sampler / lm_head**: model emits finite logits, sampler picks
-   pad/EOS/control tokens. Add a probe on `hidden_TD` (output of
-   `__call__`) and on the post-`compute_logits` array — measure
-   argmax id and top-3 logit values per decode step. The
-   `completions text` shows real first token then pad; the logit
-   trajectory will show whether the first decode genuinely picks
-   the right token via argmax and subsequent ones converge to a
-   pad-token-favoring fixed point.
-2. **Stale residual stream**: if the per-decode-step h doesn't
-   actually advance (the kv_cache write happens but the attention
-   READ of new positions is wrong), the residual stream stays
-   essentially fixed and logits collapse to a vocabulary-prior
-   fixed point that often favors special tokens. Probe `h` (the
-   per-layer post-MoE output) at decode pos 5 and pos 11; it should
-   be substantively different. If max_abs(h_pos11 - h_pos5) ≈ 0,
-   the bug is in attention READS not writes.
-3. **start_pos plumbing**: observed positions in smoke 083332Z were
-   5,6,7,...11 (correct: prompt has ~5 tokens, max_tokens=8 → 7
-   decodes). So start_pos is incrementing. But maybe the WRITE
-   slot is wrong: SWA writes go to `start_pos % win`, compressor
-   writes at `start_pos // ratio`. If those are off-by-one, attention
-   reads stale slots. Add a probe that prints `start_pos`, `start_pos
-   % win`, and `(start_pos+1) // ratio` per layer per step.
-4. **vLLM-side cache management**: `_initialize_kv_cache_deepseek_v4`
-   creates one `kv_caches` list at engine init and never resets per
-   request. If two unrelated requests collide on the same buffer
-   (which they shouldn't — vLLM's scheduler runs one request at a
-   time on V4 due to MAX_SEQS=1), there's no issue. But verify the
-   donation chain: after a request completes, what holds the
-   `kv_caches[i]` reference, and does the next request's prefill
-   actually overwrite it? `runner/kv_cache_manager.py` line 884.
+**What's left:**
+1. **Heisenbug class — XLA elision producing NaN at a tripwire-uncovered
+   site.** Most likely `head_hc` (HC head mixer in `__call__`, post-
+   transformer-body, pre-`hidden_TD` reshape). Tripwire has no probe
+   sites in `head_hc`. Discriminate by running smoke with BOTH
+   `V4_DECODE_NAN_TRIPWIRE=1` AND `V4_DECODE_ARGMAX_PROBE=1`:
+   - Argmax shows real `max_abs` → tripwire suppresses, fix is
+     extending barriers (`_v4_force_kv_caches_read`-style) to the
+     elided site.
+   - Argmax still NaN AND tripwire fires `nan>0` somewhere → real
+     math NaN at that site.
+2. **Fix shape if class 1 confirmed:** Wrap `head_hc` output (or
+   the elided write) in the proven-working shape
+   `where(opaque_false, b + dependency, b)`.
 
 **Real-V4 verification:**
-* Localize the bug: TRIPWIRE=1 + add a probe on `h` and on logits.
+* Discriminator probe: `V4_DECODE_NAN_TRIPWIRE=1
+  V4_DECODE_ARGMAX_PROBE=1 scripts/full_slice_v4_smoke{,_check}.sh`.
 * End-to-end gate (default-on): `LONG_GEN_REQUIRED=1
-  scripts/full_slice_v4_smoke_check.sh`. Pre-fix and post-fix both
-  produce `visible_words=1` of 64 tokens. The closed gate is
+  scripts/full_slice_v4_smoke_check.sh`. Closed gate is
   `visible_words >= 10`.
 
 **Runtime-hook locations** (read before touching plumbing):

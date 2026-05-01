@@ -1126,6 +1126,210 @@ class TestRealConfigCompile:
 import dataclasses
 
 
+class TestRealConfigDecodeStability:
+    """S1 fast reproducer: prefill + N decode steps via the prod entry
+    `deepseek_v4_run_with_decode_state` on real V4-Flash config truncated
+    to 4 layers (covering compress_ratios [0, 0, 4, 128] — SWA, SWA,
+    CSA+indexer, HCA). Random synthetic weights, CPU virtual mesh.
+
+    Asserts the math identity that
+    `transformer_body_decode_step_from_buffer` is supposed to satisfy:
+    each decode-step's hidden state must equal the corresponding position
+    of a fresh prefill on the full T+N-token sequence. Same invariant as
+    `TestPackedDecodeStateBuffer.test_buffer_multi_step_matches_prefill_sequence`
+    (tiny config, N=3) but at REAL V4 dimensions (256 experts, 4096
+    hidden, 64-head attention, real indexer config) and N=12. The smallest
+    config expected to surface S1 (first decode token correct, rest
+    decode to pad/control).
+
+    Skips when the V4-Flash HF config.json isn't available.
+    """
+
+    @staticmethod
+    def _build_setup(n_layers: int = 4, n_experts: int = 8):
+        cfg_full = _load_real_config("V4-Flash")
+        # Truncate routed experts to keep eager dispatch tractable on CPU
+        # (real V4-Flash has 256 — that's ~256 small matmul launches per
+        # decode step, dominated by Python overhead). 8 experts preserves
+        # the routing path while making the harness ~30× faster.
+        cfg_dict = {
+            **dataclasses.asdict(cfg_full),
+            "num_hidden_layers": n_layers,
+            "num_nextn_predict_layers": 0,
+            "compress_ratios": tuple(cfg_full.compress_ratios[:n_layers]),
+            "n_routed_experts": n_experts,
+            "num_experts_per_tok": min(cfg_full.num_experts_per_tok, n_experts),
+        }
+        cfg = DeepseekV4Config(**cfg_dict)
+        # Random init (small std). Zeros would null out attention/MLP
+        # outputs and mask any decode-step mismatch — every position would
+        # collapse to the same residual stream.
+        params_struct = make_abstract_transformer_params(cfg)
+        leaves, treedef = jax.tree_util.tree_flatten(
+            params_struct,
+            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct))
+        keys = jax.random.split(jax.random.PRNGKey(0), len(leaves))
+        randomized = [
+            (jax.random.normal(k, x.shape, dtype=jnp.float32) * 0.02
+             ).astype(x.dtype)
+            for k, x in zip(keys, leaves)
+        ]
+        params = jax.tree_util.tree_unflatten(treedef, randomized)
+        # state_max_seq must satisfy `state_max_seq // 4 >= index_topk` so
+        # `lax.top_k(index_score, K=index_topk)` has enough slots to index.
+        # Production runs derive this from `max_num_batched_tokens × dp_size`
+        # (~32k); 4× index_topk (~2048) is the floor. 4096 gives margin.
+        max_seq = 4096
+        swa, comp = make_freqs_cis(cfg, max_seq)
+        return cfg, params, swa, comp, max_seq
+
+    @staticmethod
+    def _run_decode_and_compare(cfg, params, swa, comp, max_seq, T, N, seed):
+        """Runs the prod entry for prefill + N decode steps. Returns a list
+        of dicts with per-step `h_diff` (vs fresh prefill) and `argmax_match`
+        (decode-step argmax over logits == fresh-prefill argmax)."""
+        rng = np.random.default_rng(seed=seed)
+        ids_full = jnp.asarray(
+            rng.integers(0, cfg.vocab_size, size=(1, T + N)),
+            dtype=jnp.int32)
+        h_full = transformer_body_forward(
+            ids_full, params, swa, comp, cfg)
+        # Apply head_hc + final norm + lm_head to get fresh-prefill logits.
+        logits_full = head_forward(
+            h_full, params.head_w, params.final_norm_w,
+            params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+            cfg.rms_norm_eps, cfg.hc_eps)
+        argmax_full = jnp.argmax(logits_full, axis=-1)  # [1, T+N]
+        sizes = v4_layer_packed_sizes_from_cfg(cfg, max_seq, batch_size=1)
+        kv_caches = [jnp.zeros((s,), dtype=jnp.float32) for s in sizes]
+        kv_caches, _ = deepseek_v4_run_with_decode_state(
+            kv_caches, ids_full[:, :T], params, swa, comp, cfg,
+            state_max_seq_len=max_seq, is_decode_step=False,
+            start_pos=jnp.int32(0))
+        traj = []
+        for step in range(N):
+            pos = T + step
+            kv_caches, h_step = deepseek_v4_run_with_decode_state(
+                kv_caches, ids_full[:, pos:pos + 1], params, swa, comp, cfg,
+                state_max_seq_len=max_seq, is_decode_step=True,
+                start_pos=jnp.int32(pos))
+            logits_step = head_forward(
+                h_step, params.head_w, params.final_norm_w,
+                params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+                cfg.rms_norm_eps, cfg.hc_eps)
+            argmax_step = int(jnp.argmax(logits_step[0, 0]))
+            argmax_ref = int(argmax_full[0, pos])
+            h_diff = float(jnp.max(
+                jnp.abs(h_step.astype(jnp.float32)
+                        - h_full[:, pos:pos + 1].astype(jnp.float32))))
+            logit_diff = float(jnp.max(jnp.abs(
+                logits_step[0, 0].astype(jnp.float32)
+                - logits_full[0, pos].astype(jnp.float32))))
+            traj.append({
+                "step": step, "pos": pos, "h_diff": h_diff,
+                "logit_diff": logit_diff, "argmax_step": argmax_step,
+                "argmax_ref": argmax_ref,
+                "argmax_match": argmax_step == argmax_ref,
+            })
+        return traj
+
+    @pytest.mark.parametrize("n_layers", [4, 16])
+    def test_buffered_decode_matches_fresh_prefill(self, n_layers):
+        cfg, params, swa, comp, max_seq = self._build_setup(
+            n_layers=n_layers)
+        traj = self._run_decode_and_compare(
+            cfg, params, swa, comp, max_seq, T=8, N=12, seed=1234)
+        print()
+        print("[decode-stability] step pos  h_diff       logit_diff   "
+              "argmax_step argmax_ref  match")
+        for r in traj:
+            mark = "**" if r["h_diff"] > 5e-3 or not r["argmax_match"] else "  "
+            print(f"  {mark} {r['step']:>3} {r['pos']:>3}  "
+                  f"{r['h_diff']:.3e}  {r['logit_diff']:.3e}  "
+                  f"{r['argmax_step']:>11}  {r['argmax_ref']:>10}  "
+                  f"{'✓' if r['argmax_match'] else '✗'}")
+        # The hard invariant is `argmax_match` — that's what S1 violates.
+        # `h_diff` scales mechanically with layer count from accumulated
+        # bf16 noise (4 layers → ~1e-3, 16 layers → ~4e-3, 43 layers → ~1e-2)
+        # and isn't actionable on its own.
+        bad_argmax = [r for r in traj if not r["argmax_match"]]
+        assert not bad_argmax, (
+            f"{len(bad_argmax)}/{len(traj)} steps: argmax disagrees with "
+            f"fresh-prefill argmax; first bad: {bad_argmax[0]}")
+
+    def test_jit_donated_buffered_decode_matches_fresh_prefill(self):
+        """Same invariant as the eager variant, but wraps the prod entry in
+        `jax.jit(donate_argnums=0)` to mirror production's
+        `model_loader.py:338` setup. This is the regime the prior agent
+        identified as harboring an XLA donation-aliased-write-elision
+        HEISENBUG ("fix requires side-effect ops, not just barrier"). Eager
+        runs cannot reproduce that class — JIT+donation is the minimum
+        faithful repro.
+
+        4 layers (no parametrize) keeps compile under ~3 min on CPU.
+        """
+        cfg, params, swa, comp, max_seq = self._build_setup(n_layers=4)
+        T, N = 8, 12
+        rng = np.random.default_rng(seed=1234)
+        ids_full = jnp.asarray(
+            rng.integers(0, cfg.vocab_size, size=(1, T + N)),
+            dtype=jnp.int32)
+        h_full = transformer_body_forward(
+            ids_full, params, swa, comp, cfg)
+        logits_full = head_forward(
+            h_full, params.head_w, params.final_norm_w,
+            params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+            cfg.rms_norm_eps, cfg.hc_eps)
+        argmax_full = jnp.argmax(logits_full, axis=-1)
+
+        @functools.partial(jax.jit, donate_argnums=0)
+        def jit_prefill(kv_caches, ids):
+            return deepseek_v4_run_with_decode_state(
+                kv_caches, ids, params, swa, comp, cfg,
+                state_max_seq_len=max_seq, is_decode_step=False,
+                start_pos=jnp.int32(0))
+
+        @functools.partial(jax.jit, donate_argnums=0)
+        def jit_decode(kv_caches, ids, start_pos):
+            return deepseek_v4_run_with_decode_state(
+                kv_caches, ids, params, swa, comp, cfg,
+                state_max_seq_len=max_seq, is_decode_step=True,
+                start_pos=start_pos)
+
+        sizes = v4_layer_packed_sizes_from_cfg(cfg, max_seq, batch_size=1)
+        kv_caches = [jnp.zeros((s,), dtype=jnp.float32) for s in sizes]
+        kv_caches, _ = jit_prefill(kv_caches, ids_full[:, :T])
+
+        traj = []
+        for step in range(N):
+            pos = T + step
+            kv_caches, h_step = jit_decode(
+                kv_caches, ids_full[:, pos:pos + 1], jnp.int32(pos))
+            logits_step = head_forward(
+                h_step, params.head_w, params.final_norm_w,
+                params.hc_head_fn, params.hc_head_scale, params.hc_head_base,
+                cfg.rms_norm_eps, cfg.hc_eps)
+            argmax_step = int(jnp.argmax(logits_step[0, 0]))
+            argmax_ref = int(argmax_full[0, pos])
+            traj.append({
+                "step": step, "pos": pos, "argmax_step": argmax_step,
+                "argmax_ref": argmax_ref,
+                "argmax_match": argmax_step == argmax_ref,
+            })
+        print()
+        print("[jit-donate-stability] step pos  argmax_step  argmax_ref  match")
+        for r in traj:
+            mark = "**" if not r["argmax_match"] else "  "
+            print(f"  {mark} {r['step']:>3} {r['pos']:>3}  "
+                  f"{r['argmax_step']:>11}  {r['argmax_ref']:>10}  "
+                  f"{'✓' if r['argmax_match'] else '✗'}")
+        bad = [r for r in traj if not r["argmax_match"]]
+        assert not bad, (
+            f"JIT+donation: {len(bad)}/{len(traj)} steps argmax mismatch; "
+            f"first bad: {bad[0]}. If eager passed but this fails, S1 is "
+            f"reproduced — donation-aliased write elision under JIT.")
+
+
 # =============================================================
 # Tier 4 — weight-loading smoke test
 # =============================================================

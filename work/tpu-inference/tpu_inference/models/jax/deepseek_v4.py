@@ -54,6 +54,29 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
+_V4_DECODE_ARGMAX_PROBE = os.environ.get("V4_DECODE_ARGMAX_PROBE", "0") == "1"
+
+
+def _v4_argmax_probe(name: str, x: jnp.ndarray) -> None:
+    """S1 diagnostic: print max_abs(x) and (if x is logits-shaped) the
+    top-3 token ids + their logit values. Gated at module import so HLO is
+    unchanged when `V4_DECODE_ARGMAX_PROBE=0`. Used to distinguish whether
+    the model emits real-vocab argmax that detokenizes empty vs collapses
+    to pad/EOS — see CLAUDE.md S1."""
+    if not _V4_DECODE_ARGMAX_PROBE:
+        return
+    xf = x.astype(jnp.float32)
+    max_abs = jnp.max(jnp.abs(xf))
+    if x.ndim >= 1 and x.shape[-1] >= 4:
+        top_vals, top_ids = jax.lax.top_k(xf, 3)
+        jax.debug.print(
+            "[v4probe] {n} max_abs={m} top_ids={i} top_vals={v}",
+            n=name, m=max_abs, i=top_ids, v=top_vals,
+        )
+    else:
+        jax.debug.print("[v4probe] {n} max_abs={m}", n=name, m=max_abs)
+
+
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
@@ -1935,6 +1958,7 @@ def _build_class():
                     start_pos=start_pos,
                     state_init_ids=state_init_ids,
                 )
+                _v4_argmax_probe("body_out", h.reshape(-1, h.shape[-1]))
                 if is_decode and T > 1:
                     pad_shape = (h.shape[0], T - 1, *h.shape[2:])
                     pad = jnp.zeros(pad_shape, h.dtype)
@@ -1946,6 +1970,7 @@ def _build_class():
                 )
                 B, S, D = h_BSD.shape
                 hidden_TD = h_BSD.reshape(B * S, D)
+                _v4_argmax_probe("call_hidden", hidden_TD)
                 return kv_caches, hidden_TD, []
 
             # Multi-sequence dispatch.
@@ -2048,7 +2073,9 @@ def _build_class():
                 f"compute_logits expected last dim {D}, got {hidden_states.shape[-1]}"
             )
             x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
-            return (x.astype(jnp.float32) @ params.head_w.T)
+            logits = x.astype(jnp.float32) @ params.head_w.T
+            _v4_argmax_probe("logits", logits)
+            return logits
 
         def load_weights(self, rng=None, *args, **kwargs):
             """vLLM weight-loading entry.
