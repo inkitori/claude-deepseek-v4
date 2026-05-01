@@ -868,6 +868,30 @@ def _v4_force_kv_caches_read(
     ]
 
 
+def _v4_force_h_kv_dependence(
+    h: jnp.ndarray,
+    kv_caches: List[jnp.ndarray],
+) -> jnp.ndarray:
+    """Force `h` to depend on `kv_caches` via the same proven barrier
+    shape as `_v4_force_kv_caches_read`. Output equals `h` byte-for-byte;
+    the where-discarded branch keeps a kv read in HLO so XLA cannot
+    elide intermediate writes to the donated buffer that `h` does not
+    transitively read. NaN-safe: discarded branch holds finite value.
+
+    Defense-in-depth for S1: `_v4_force_kv_caches_read` only protects
+    the returned `new_buffers`; without this barrier, smoke shows NaN
+    at `body_out` (h directly out of `deepseek_v4_run_with_decode_state`)
+    when TRIPWIRE callbacks are off."""
+    if not kv_caches:
+        return h
+    opaque_false = lax.optimization_barrier(jnp.bool_(False))
+    kv_dep = jnp.float32(0.0)
+    for kv in kv_caches:
+        kv_dep = kv_dep + kv.astype(jnp.float32).sum()
+    h_alt = h + kv_dep.astype(h.dtype)
+    return jnp.where(opaque_false, h_alt, h)
+
+
 def deepseek_v4_run_with_decode_state(
     kv_caches: List[jnp.ndarray],
     input_ids: jnp.ndarray,
@@ -910,10 +934,10 @@ def deepseek_v4_run_with_decode_state(
         )
         new_buffers = _v4_force_kv_caches_read(new_buffers, kv_caches)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
+        h = _v4_force_h_kv_dependence(h, kv_caches)
         return new_buffers, h
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
-    h = lax.optimization_barrier(h)
     state_ids = state_init_ids if state_init_ids is not None else input_ids
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         state_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
@@ -923,6 +947,7 @@ def deepseek_v4_run_with_decode_state(
     for i, b in enumerate(packed_buffers):
         _v4_nan_tripwire("packed_buffer_post_force_read", b, i, -1)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
+    h = _v4_force_h_kv_dependence(h, kv_caches)
     return packed_buffers, h
 
 
