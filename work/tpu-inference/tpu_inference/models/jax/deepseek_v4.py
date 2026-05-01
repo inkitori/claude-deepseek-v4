@@ -588,12 +588,6 @@ def transformer_body_decode_step(
         new_state, h = block_decode_step(
             h, input_ids_step, layer, fc, prev, start_pos, layer_idx=i)
         new_states.append(new_state)
-        # S1 elision barrier: side-effect callback per layer forces XLA
-        # to commit each layer's kv_cache writes (donation-aliased
-        # writes that would otherwise be elided cause NaN downstream;
-        # see commit 82da0f22).
-        jax.debug.callback(
-            lambda *_: None, h, new_state.kv_cache)
     return h, new_states
 
 
@@ -874,30 +868,6 @@ def _v4_force_kv_caches_read(
     ]
 
 
-def _v4_force_h_kv_dependence(
-    h: jnp.ndarray,
-    kv_caches: List[jnp.ndarray],
-) -> jnp.ndarray:
-    """Force `h` to commit by introducing a no-op side-effect callback
-    that consumes `h` and the first `kv_caches` buffer. XLA cannot elide
-    effectful ops, so this forces every upstream computation feeding `h`
-    (including donated-buffer kv-cache writes inside the body's layer
-    loop) to materialize.
-
-    Why a callback instead of the proven `where(opaque_false, h+kv, h)`
-    shape used in `_v4_force_kv_caches_read`: that shape works for
-    donated output buffers (its branch forces an aliased write to
-    commit). `h` is NOT a donated output; the elision is on intermediate
-    kv_cache writes inside the body that `h` transitively reads. A
-    callback is the only proven mechanism per prior testing (commit
-    82da0f22). Trade-off: callbacks may break per-call determinism;
-    that's tracked separately as a follow-on to S1."""
-    if not kv_caches:
-        return h
-    jax.debug.callback(lambda *_: None, h, kv_caches[0])
-    return h
-
-
 def deepseek_v4_run_with_decode_state(
     kv_caches: List[jnp.ndarray],
     input_ids: jnp.ndarray,
@@ -940,7 +910,6 @@ def deepseek_v4_run_with_decode_state(
         )
         new_buffers = _v4_force_kv_caches_read(new_buffers, kv_caches)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
-        h = _v4_force_h_kv_dependence(h, kv_caches)
         return new_buffers, h
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
@@ -953,7 +922,6 @@ def deepseek_v4_run_with_decode_state(
     for i, b in enumerate(packed_buffers):
         _v4_nan_tripwire("packed_buffer_post_force_read", b, i, -1)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
-    h = _v4_force_h_kv_dependence(h, kv_caches)
     return packed_buffers, h
 
 
