@@ -2229,6 +2229,57 @@ class TestPackedDecodeStateBuffer:
                 f"layer {i} packed state diverged from "
                 f"init_state_to_buffer(state_init_ids)")
 
+    def test_run_with_decode_state_does_not_propagate_nan_through_kv_caches(self):
+        """Compressor / indexer `score_state` init slots hold -inf after
+        prefill. The donation-aliasing barrier `_v4_force_kv_caches_read`
+        must NOT propagate NaN into the output buffers via `0.0 * -inf`,
+        or every subsequent decode step reads NaN and `h` eventually
+        argmaxes to pad token 0. Run prefill + 4 decode steps through the
+        orchestrator and assert no NaN appears in any returned buffer or
+        in any decode-step `h`."""
+        model, params, cfg, swa, comp = self._build_pair(seed=11)
+        L_real, N = 8, 4
+        state_max = model.args.max_seq_len
+        torch.manual_seed(L_real + N + 173)
+        ids_full = torch.randint(
+            0, model.args.vocab_size, (1, L_real + N), dtype=torch.int64)
+        ids_full_j = t2j(ids_full).astype(jnp.int32)
+
+        layouts = transformer_body_layout(
+            params, cfg, state_max, batch_size=1)
+        kv_caches = [
+            jnp.zeros((_layer_packed_size(lo),), dtype=jnp.float32)
+            for lo in layouts
+        ]
+
+        kv_caches, h_pref = deepseek_v4_run_with_decode_state(
+            kv_caches, ids_full_j[:, :L_real], params, swa, comp, cfg,
+            state_max_seq_len=state_max,
+            is_decode_step=False, start_pos=jnp.int32(0),
+        )
+        assert not bool(jnp.any(jnp.isnan(h_pref))), \
+            "prefill h must not contain NaN"
+        for i, kv in enumerate(kv_caches):
+            assert not bool(jnp.any(jnp.isnan(kv))), (
+                f"layer {i} prefill kv_caches contains NaN — barrier "
+                f"corrupted -inf placeholders into NaN")
+
+        for step in range(N):
+            pos = L_real + step
+            kv_caches, h_step = deepseek_v4_run_with_decode_state(
+                kv_caches, ids_full_j[:, pos:pos + 1], params, swa, comp, cfg,
+                state_max_seq_len=state_max,
+                is_decode_step=True, start_pos=jnp.int32(pos),
+            )
+            assert not bool(jnp.any(jnp.isnan(h_step))), (
+                f"decode step {step} (pos={pos}): h has NaN — likely "
+                f"NaN propagated from corrupted kv_caches input")
+            for i, kv in enumerate(kv_caches):
+                assert not bool(jnp.any(jnp.isnan(kv))), (
+                    f"decode step {step} (pos={pos}): layer {i} "
+                    f"kv_caches contains NaN — `_v4_force_kv_caches_read` "
+                    f"contaminated buffer via 0.0 * (-inf)")
+
 
 # =============================================================
 # Tier 6 — Real-TPU compile + tiny forward

@@ -755,13 +755,20 @@ def _v4_force_kv_caches_read(
     buffers: List[jnp.ndarray],
     kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Fold `b + opaque_zero * kv` so XLA emits a real read of the donated
-    `kv_caches`. Output equals `b` byte-for-byte; the read forces the
-    donation-aliased write to commit instead of being elided."""
-    opaque_zero = lax.optimization_barrier(
-        jnp.zeros((), dtype=jnp.float32))
+    """Force XLA to read the donated `kv_caches` and write the output
+    buffer (preventing donation-aliased write elision). Output equals
+    `b` byte-for-byte at runtime.
+
+    `where(opaque_false, b + kv, b)` keeps the read-of-kv branch in HLO
+    (XLA cannot constant-fold `opaque_false` past the barrier) while
+    selecting `b` at runtime. NaN-safe: compressor / indexer
+    `score_state` init slots hold -inf, and `0.0 * -inf = NaN` would
+    contaminate the buffer at every decode step. The where-discarded
+    branch holds `b + (-inf) = -inf`, never NaN; selection drops it.
+    """
+    opaque_false = lax.optimization_barrier(jnp.bool_(False))
     return [
-        b + opaque_zero * kv.astype(jnp.float32)
+        jnp.where(opaque_false, b + kv.astype(jnp.float32), b)
         for b, kv in zip(buffers, kv_caches)
     ]
 

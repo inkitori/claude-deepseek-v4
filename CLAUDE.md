@@ -161,43 +161,50 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Iter 2026-05-01 (HEAD):** prefill `h` is now correct. The S1
-diagnosis was partly wrong — slicing ids before
-`transformer_body_forward` changed the SPMD compile and broke
-the prefill argmax (basic Paris dropped to " a" on real V4).
-Fix landed: split prefill input — `h` runs on the full padded
-ids (preserves SPMD compile), state init runs on ids sliced to
-`query_start_loc_cpu[1]` (no padding tokens encoded into SWA /
-compressor / indexer slots). Pinned by
-`test_run_with_decode_state_state_init_ids_does_not_affect_h`
-(L_real=6, T_pad=32).
+**Iter 2026-05-01 (HEAD):** one real NaN source closed; user-visible
+bug still red.
 
-**What this iter unlocks:**
-* Basic Paris probe returns " Paris" deterministically (was " a").
-* `LONG_GEN_REQUIRED=1` smoke-gate now correctly reads
-  `visible_words` instead of `completion_tokens` — the gate flips
-  red on the real bug instead of green-on-noise.
+`_v4_force_kv_caches_read` was folding `b + opaque_zero * kv` to force
+XLA to emit a real read of donated `kv_caches`. Compressor / indexer
+`score_state` init slots hold `-inf` (intended; softmax-zeros them).
+IEEE: `0.0 * -inf = NaN`. Every decode step poisoned its output buffer
+at every -inf slot. CPU localize probe (`/tmp/test_v4_decode_nan_localize.py`):
+prefill ratio>0 layers had 256/512 -inf slots (correct); after decode
+step 0 those flipped to 256/512 NaN slots; by step 3 NaN reached `h`.
 
-**What's still red:** decode after token 1 emits NaN-ish logits
-that argmax to pad token 0. Greedy path produces visible token
-1 correctly, then 60+ invisible tokens until max_tokens. Logprobs
-return HTTP 400 "Out of range float values are not JSON compliant:
-nan" — direct evidence of NaN in the logit path.
+Fix: replace `b + opaque_zero * kv` with `where(opaque_false, b + kv, b)`.
+The where reads `kv` (HLO retains it; donation alias marker preserved
+per `/tmp/test_v4_force_read_alt_hlo.py`) but `b + (-inf) = -inf`
+(finite, never NaN) and runtime selects `b`. Pinned by
+`test_run_with_decode_state_does_not_propagate_nan_through_kv_caches`
+(13/13 in `TestPackedDecodeStateBuffer`).
 
-Four hypotheses to chase next, in decreasing order of likelihood:
-1. **Compressor / indexer state init from `transformer_body_init_state_to_buffer`
-   produces silent NaN/Inf at slots decode reads.** `_compressor_state_from_prefill`
-   leaves "init" slots at `-inf`; if a decode step's softmax
-   numerator hits a slot that's been overwritten with garbage
-   instead of a real -inf placeholder, NaN propagates.
-   Quickest probe: log h at decode step 0 and check for NaN.
-2. **`_v4_force_kv_caches_read` + `_v4_constrain_packed_replicated`
-   are insufficient for prefill→decode aliasing.** The donated
-   `kv_caches` buffer may carry stale junk from prefill's
-   transient compute that the barrier doesn't seal off.
-3. **Compressor `lax.cond` / `jnp.where` divergence on real V4
-   SPMD.** Tiny-config CPU tests pass; SPMD partitioner may
-   produce non-identical state at the compress-event boundary.
+**Real-V4 smoke after fix:** basic Paris R1==R2 green; `LONG_GEN_REQUIRED=1`
+still red with the same symptom (`completion_tokens=64 visible_words=1`).
+`logprobs` at `max_tokens=1` is finite (-1.066 for " Paris"); at
+`max_tokens=2+` HTTP 400 "nan". So **decode step 0** is still producing
+NaN h on real V4 — separate from the kv_caches contamination my fix
+addressed. Tiny CPU does NOT reproduce (orchestrator over 6 layers /
+random bf16 weights / 4 decode steps stays NaN-free).
+
+Remaining hypotheses, in order of likelihood:
+1. **Quantization-specific NaN at decode step 0.** Real V4 uses FP4
+   experts and FP8 attention; tiny config uses bf16 throughout. A
+   dequant kernel may produce NaN on a path decode hits but prefill
+   doesn't (e.g. single-token dequant tile vs multi-token, or zero
+   activation tiles). Probe: read smoke logs for FP8/FP4 dequant warnings,
+   or instrument a `jax.debug.print(jnp.any(jnp.isnan(...)))` at the
+   block-output boundary inside `block_decode_step`.
+2. **SPMD partitioner divergence in `attention_decode_step` or
+   `compressor_decode_step`.** Real V4 runs with
+   `attention_data_parallelism=32`; tiny CPU is fully replicated.
+   `lax.dynamic_update_slice` semantics under sharded `start_pos`,
+   or `top_k` over a -inf-padded `index_score`, may differ.
+3. **HC head / sigmoid saturation on real-V4 weights.** `head_hc`
+   does `sigmoid(mixes * hc_scale + hc_base) + hc_eps`; if `mixes`
+   has extreme values, sigmoid grad overflows / underflows. Decode-
+   only because decode's `x_step` shape is `[B, 1, hc, D]` vs prefill's
+   `[B, T, hc, D]` — accumulation order differs.
 4. **SWA wraparound under traced `start_pos`:** off-by-one in
    `lax.dynamic_update_slice` for slot `start_pos % win`.
 
