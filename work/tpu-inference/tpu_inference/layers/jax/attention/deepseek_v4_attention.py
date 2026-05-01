@@ -38,17 +38,23 @@ _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
 
 
 def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
-    """Per-call NaN/+inf/-inf counts + `max_abs(x)` to the runtime log.
-    No-op unless `V4_DECODE_NAN_TRIPWIRE=1` (gated at module import,
-    HLO byte-identical when off). Used to localize NaN sites for S1
-    diagnostics."""
-    if not _V4_DECODE_NAN_TRIPWIRE:
-        return
+    """Always-on silent barrier: reductions + host callback at every site
+    so XLA cannot elide donated kv_cache writes (S1 heisenbug — only
+    effectful ops fix this; SSA barriers don't). Prints reductions when
+    `V4_DECODE_NAN_TRIPWIRE=1` (set at process start); otherwise the
+    callback is silent.
+
+    Trade-off: ~600 callbacks/decode_step perturb SPMD floating-point
+    reduction order, breaking per-call determinism (different
+    completions across runs at temperature=0). NaN-suppression is the
+    primary correctness goal; sustained-generation determinism is a
+    known follow-on (S1.1)."""
     if x.size == 0:
-        jax.debug.print(
-            "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
-            l=layer_idx, p=position, n=name,
-        )
+        if _V4_DECODE_NAN_TRIPWIRE:
+            jax.debug.print(
+                "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
+                l=layer_idx, p=position, n=name,
+            )
         return
     xf = x.astype(jnp.float32)
     nans = jnp.sum(jnp.isnan(xf))
@@ -56,10 +62,13 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
     ninfs = jnp.sum(jnp.isneginf(xf))
     finite = jnp.where(jnp.isfinite(xf), jnp.abs(xf), jnp.float32(0.0))
     max_abs = jnp.max(finite)
-    jax.debug.print(
-        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
-        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
-    )
+    if _V4_DECODE_NAN_TRIPWIRE:
+        jax.debug.print(
+            "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
+            l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
+        )
+    else:
+        jax.debug.callback(lambda *_: None, nans, pinfs, ninfs, max_abs)
 
 
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:

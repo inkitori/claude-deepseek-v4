@@ -329,20 +329,13 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
-    # V4 packs per-layer AttentionDecodeState into donated kv_caches, then
-    # does sub-slice updates inside `block_decode_step`. XLA's SPMD donation
-    # aliasing elides those partial writes (S1 heisenbug); un-donate for V4
-    # so the body operates on a fresh-allocated copy. Costs ~430 MB extra
-    # HBM at MAX_LEN=256; restores deterministic generation.
-    _run_model_donate = () if _is_deepseek_v4 else 2
-
     @jax.jit(
         out_shardings=(
             kv_cache_sharding,
             hidden_states_sharding,
             hidden_states_sharding,  # aux hidden states
         ),
-        donate_argnums=_run_model_donate,
+        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
         static_argnums=(
             7, 10, 11
         ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
