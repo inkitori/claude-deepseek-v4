@@ -2324,7 +2324,10 @@ class TestPackedDecodeStateBuffer:
         out = capfd.readouterr().out
         assert "[v4nan]" in out, "tripwire log lines must appear when gate is on"
         decode_probes = {
-            "kv_cache_at_entry", "qr_postnorm", "q_postrsqrt", "q_postrope",
+            "kv_cache_at_entry", "compressor_kv_at_entry",
+            "compressor_score_at_entry", "indexer_kv_at_entry",
+            "indexer_score_at_entry", "indexer_kv_cache_at_entry",
+            "qr_postnorm", "q_postrsqrt", "q_postrope",
             "kv_postrope", "kv_cache_post_write", "sparse_attn_o",
             "o_post_inv_rope", "wo_b_y",
         }

@@ -163,64 +163,82 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01 v5): kv_cache NaN bug FIXED, LONG_GEN STILL FAILS.**
-The concat-not-`zeros + at[].set` construction in
-`attention_init_state_from_prefill` (smoke `20260501T080237Z` with
-TRIPWIRE=1) cleared the L5+ NaN at every layer × every decode position.
-Tripwire-OFF rerun (`20260501T081341Z`): Paris deterministic, LONG_GEN
-visible_words=1/64. Same end-user symptom as pre-fix. Conclusion: the
-L5+ NaN was a real bug but NOT the proximate cause of pad-token decode.
-There's a second, independent bug.
+**Status (2026-05-01 v6): NaN/Inf RULED OUT. The bug is logic-level,
+not numerical.** Smoke `20260501T083332Z` (TRIPWIRE=1, all 6
+AttentionDecodeState fields probed at decode entry) emitted 13,583
+`[v4nan]` lines and EXACTLY ZERO of them have `nan>0`. Every input
+field to every decode step at every layer at every position is
+finite. kv_cache_at_entry max_abs grows monotonically over decode
+positions (5.16 → 5.34 → 5.38 ...), confirming new tokens ARE being
+written. Yet LONG_GEN still produces 1 visible word of 64 tokens.
 
-`V4_DECODE_NAN_TRIPWIRE=1` runs 9 decode probes inside
-`attention_decode_step` (`kv_cache_at_entry`, `qr_postnorm`,
-`q_postrsqrt`, `q_postrope`, `kv_postrope`, `kv_cache_post_write`,
-`sparse_attn_o`, `o_post_inv_rope`, `wo_b_y`) PLUS 3 prefill→buffer
-probes (`prefill_state_kv_cache`, `packed_buffer_post_pack`,
-`packed_buffer_post_force_read`) PLUS 8 inner probes inside
-`attention_init_state_from_prefill` (`init_x_in`, `init_kv_postlinear`,
-`init_kv_postnorm`, `init_kv_postrope`, `init_swa`,
-`init_kv_cache_post_swa_set`, `init_kv_compressed`,
-`init_kv_cache_post_comp_set`). All share the same gate; HLO unchanged
-when off. Pinned by `test_decode_nan_tripwire_when_enabled_runs_clean`.
+So the next iter must move PAST NaN debugging entirely.
 
-**What's ruled out:**
+`V4_DECODE_NAN_TRIPWIRE=1` runs:
+* 9 decode-step inner probes (`kv_cache_at_entry`, `qr_postnorm`,
+  `q_postrsqrt`, `q_postrope`, `kv_postrope`, `kv_cache_post_write`,
+  `sparse_attn_o`, `o_post_inv_rope`, `wo_b_y`)
+* 5 decode-entry probes for the OTHER state fields
+  (`compressor_kv_at_entry`, `compressor_score_at_entry`,
+  `indexer_kv_at_entry`, `indexer_score_at_entry`,
+  `indexer_kv_cache_at_entry`)
+* 3 prefill→buffer probes (`prefill_state_kv_cache`,
+  `packed_buffer_post_pack`, `packed_buffer_post_force_read`)
+* 8 inner prefill-init probes inside `attention_init_state_from_prefill`
+
+All share the same `V4_DECODE_NAN_TRIPWIRE` gate; HLO unchanged when
+off. Pinned by `test_decode_nan_tripwire_when_enabled_runs_clean`.
+**Tripwire-on breaks Paris determinism** (callback side effects
+prevent some XLA optimizations); use ONLY for NaN localization, not
+for end-to-end gate validation.
+
+**What's ruled out (cumulative):**
 * Bad weights (`V4_WEIGHT_NAN_AUDIT`).
 * rsqrt / sparse_attn / inverse-RoPE numerics.
-* `attention_init_state_from_prefill` math (inner probes nan=0 at L5+).
-* `_pack_layer_state` / `_v4_force_kv_caches_read` (NaN was upstream).
-* kv_cache aliasing on partial-write `zeros + at[].set` (the v5 fix).
+* `attention_init_state_from_prefill` math (inner probes clean).
+* `_pack_layer_state` / `_v4_force_kv_caches_read` (no propagation).
+* kv_cache field aliasing (v5 concat fix).
+* ANY NaN/Inf anywhere in the decode pipeline (smoke 083332Z).
 
-**What's still suspect — next iter's hypotheses:**
-1. **Other state fields aliasing**: `_compressor_state_from_prefill`
-   still uses `zeros + at[].set` (kv_state) and `full(-inf) + at[].set`
-   (score_state). No probes on these fields. Apply same concat-not-
-   `at[].set` fix and verify. The score_state's `-inf` init is a
-   classic source of `0.0 * -inf = NaN` if a stale read leaks through.
-2. **`_swa_kv_cache_from_prefill` T<win path**: also `zeros +
-   at[:, :T, :].set(kv)`. The result feeds my v5 concat, so any
-   aliasing inside swa would propagate. Inner probe `init_swa`
-   reported nan=0 in tripwire-on smokes — so this field is clean
-   per-instance, but XLA may still alias post-return.
-3. **Decode-step math at pos>=1**: tripwire-on confirmed
-   `kv_cache_at_entry` is finite at every pos × every layer. So the
-   INPUT to decode-step is correct. Check the output (logits) and
-   the sampler — maybe argmax is hitting a control token slot due
-   to a dimension/offset bug. Quick probe: log `h` (post-attention)
-   and `lm_head_out` (logits) at every decode position.
-4. **start_pos plumbing**: `_maybe_set_v4_decode_start_pos` in
-   `runner/tpu_runner.py` derives start_pos from `seq_lens-1`. If
-   that's mis-incrementing for decode, the kv-cache reads at pos>=1
-   pull the wrong slot.
+**What's left — strictly logic-level hypotheses:**
+1. **Sampler / lm_head**: model emits finite logits, sampler picks
+   pad/EOS/control tokens. Add a probe on `hidden_TD` (output of
+   `__call__`) and on the post-`compute_logits` array — measure
+   argmax id and top-3 logit values per decode step. The
+   `completions text` shows real first token then pad; the logit
+   trajectory will show whether the first decode genuinely picks
+   the right token via argmax and subsequent ones converge to a
+   pad-token-favoring fixed point.
+2. **Stale residual stream**: if the per-decode-step h doesn't
+   actually advance (the kv_cache write happens but the attention
+   READ of new positions is wrong), the residual stream stays
+   essentially fixed and logits collapse to a vocabulary-prior
+   fixed point that often favors special tokens. Probe `h` (the
+   per-layer post-MoE output) at decode pos 5 and pos 11; it should
+   be substantively different. If max_abs(h_pos11 - h_pos5) ≈ 0,
+   the bug is in attention READS not writes.
+3. **start_pos plumbing**: observed positions in smoke 083332Z were
+   5,6,7,...11 (correct: prompt has ~5 tokens, max_tokens=8 → 7
+   decodes). So start_pos is incrementing. But maybe the WRITE
+   slot is wrong: SWA writes go to `start_pos % win`, compressor
+   writes at `start_pos // ratio`. If those are off-by-one, attention
+   reads stale slots. Add a probe that prints `start_pos`, `start_pos
+   % win`, and `(start_pos+1) // ratio` per layer per step.
+4. **vLLM-side cache management**: `_initialize_kv_cache_deepseek_v4`
+   creates one `kv_caches` list at engine init and never resets per
+   request. If two unrelated requests collide on the same buffer
+   (which they shouldn't — vLLM's scheduler runs one request at a
+   time on V4 due to MAX_SEQS=1), there's no issue. But verify the
+   donation chain: after a request completes, what holds the
+   `kv_caches[i]` reference, and does the next request's prefill
+   actually overwrite it? `runner/kv_cache_manager.py` line 884.
 
-**Real-V4 verification commands:**
-* Force NaN diagnostics: `V4_DECODE_NAN_TRIPWIRE=1` (NOTE: tripwire
-  itself breaks determinism via callback side effects, so Paris
-  probe will fail. Use only for NaN localization.)
-* Real gate (default): `LONG_GEN_REQUIRED=1
-  scripts/full_slice_v4_smoke_check.sh`. Pre-v5 fix, this produced
-  visible_words=1; post-v5, also visible_words=1 (NaN cleared but
-  symptom unchanged).
+**Real-V4 verification:**
+* Localize the bug: TRIPWIRE=1 + add a probe on `h` and on logits.
+* End-to-end gate (default-on): `LONG_GEN_REQUIRED=1
+  scripts/full_slice_v4_smoke_check.sh`. Pre-fix and post-fix both
+  produce `visible_words=1` of 64 tokens. The closed gate is
+  `visible_words >= 10`.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
