@@ -2281,14 +2281,19 @@ class TestPackedDecodeStateBuffer:
                     f"contaminated buffer via 0.0 * (-inf)")
 
     def test_decode_nan_tripwire_when_enabled_runs_clean(self, monkeypatch, capfd):
-        """`V4_DECODE_NAN_TRIPWIRE=1` adds `jax.debug.print` of NaN counts at
-        each decode-step sub-block boundary. Validate the tripwire-on path
-        still produces a NaN-free run (no degenerate input the tripwire
-        itself induces) and emits the expected per-layer log lines so a
-        smoke can grep for the first non-zero `nan=` value to localize the
-        bug from CLAUDE.md S1."""
-        from tpu_inference.models.jax import deepseek_v4 as v4mod
-        monkeypatch.setattr(v4mod, "_V4_DECODE_NAN_TRIPWIRE", True)
+        """`V4_DECODE_NAN_TRIPWIRE=1` adds `jax.debug.print` of NaN/+inf/-inf
+        counts and `max_abs(x)` at each decode-step sub-block boundary,
+        including 8 inner probes inside `attention_decode_step` (qr_postnorm,
+        q_postrsqrt, q_postrope, kv_postrope, kv_cache_post_write,
+        sparse_attn_o, o_post_inv_rope, wo_b_y). Validate the tripwire-on
+        path still produces a NaN-free run on tiny CPU and emits per-layer
+        log lines including the new `max_abs=` field so a real-V4 smoke can
+        grep for the first non-zero `nan=` to localize the bug AND read
+        `max_abs` to test fp32-overflow hypotheses (CLAUDE.md S1)."""
+        from tpu_inference.layers.jax.attention import (
+            deepseek_v4_attention as attn_mod,
+        )
+        monkeypatch.setattr(attn_mod, "_V4_DECODE_NAN_TRIPWIRE", True)
 
         model, params, cfg, swa, comp = self._build_pair(seed=7)
         L_real = 6
@@ -2318,14 +2323,27 @@ class TestPackedDecodeStateBuffer:
         assert not bool(jnp.any(jnp.isnan(h_step)))
         out = capfd.readouterr().out
         assert "[v4nan]" in out, "tripwire log lines must appear when gate is on"
-        # Every emitted line must end with a `nan=N` field that's 0 on tiny —
-        # tiny CPU is the canonical NaN-free baseline (see CLAUDE.md S1).
+        seen_inner = set()
         for line in out.splitlines():
             if "[v4nan]" not in line:
                 continue
+            # tiny CPU is the canonical NaN-free baseline (CLAUDE.md S1).
             assert " nan=0 " in line, (
                 f"tiny CPU baseline emitted NaN at {line!r} — tripwire is "
                 f"reporting NaN where there should be none")
+            assert "max_abs=" in line, (
+                f"tripwire must emit `max_abs=` for fp32-overflow detection: "
+                f"{line!r}")
+            for name in ("qr_postnorm", "q_postrsqrt", "q_postrope",
+                         "kv_postrope", "kv_cache_post_write",
+                         "sparse_attn_o", "o_post_inv_rope", "wo_b_y"):
+                if f" {name}:" in line:
+                    seen_inner.add(name)
+        missing = {"qr_postnorm", "q_postrsqrt", "q_postrope", "kv_postrope",
+                   "kv_cache_post_write", "sparse_attn_o", "o_post_inv_rope",
+                   "wo_b_y"} - seen_inner
+        assert not missing, (
+            f"attention_decode_step inner probes missing: {missing}")
 
     def test_weight_nan_audit_localizes_bad_leaves(self, capfd):
         """`_v4_weight_nan_audit` walks a loaded param tree and emits one

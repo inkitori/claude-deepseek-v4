@@ -24,6 +24,7 @@ See V3_TO_V4_DIFF.md and INVARIANTS.md (I5–I12) for shape conventions.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -31,6 +32,30 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as P
+
+
+_V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
+
+
+def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
+    """Emit per-call NaN/+inf/-inf counts and `max_abs(x)` to the runtime
+    log. No-op unless `V4_DECODE_NAN_TRIPWIRE=1` was set at process start
+    (gated at module import; production HLO unchanged when disabled).
+    Used to localize which decode-step sub-block first produces NaN on
+    real V4, and to spot pre-NaN magnitude blow-up that points at fp32
+    overflow inside `jnp.square` / rsqrt — see CLAUDE.md S1."""
+    if not _V4_DECODE_NAN_TRIPWIRE:
+        return
+    xf = x.astype(jnp.float32)
+    nans = jnp.sum(jnp.isnan(xf))
+    pinfs = jnp.sum(jnp.isposinf(xf))
+    ninfs = jnp.sum(jnp.isneginf(xf))
+    finite = jnp.where(jnp.isfinite(xf), jnp.abs(xf), jnp.float32(0.0))
+    max_abs = jnp.max(finite)
+    jax.debug.print(
+        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
+        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
+    )
 
 
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:
@@ -666,6 +691,7 @@ def attention_decode_step(
     params: AttentionParams,
     freqs_cis_full: jnp.ndarray,
     state: AttentionDecodeState,
+    layer_idx: int = -1,
 ) -> Tuple[AttentionDecodeState, jnp.ndarray]:
     """One decode step of full attention.
 
@@ -692,15 +718,19 @@ def attention_decode_step(
     # q
     qr = _linear(x_step, params.wq_a)
     qr = rms_norm(qr, params.q_norm_w, eps)
+    _v4_nan_tripwire("qr_postnorm", qr, layer_idx, start_pos)
     q = _linear(qr, params.wq_b).reshape(B, 1, H, Dh)
     q_f = q.astype(jnp.float32)
     q = (q_f * lax.rsqrt(jnp.square(q_f).mean(-1, keepdims=True) + eps)).astype(q.dtype)
+    _v4_nan_tripwire("q_postrsqrt", q, layer_idx, start_pos)
     q = splice_rope(q, rd, fc, inverse=False)
+    _v4_nan_tripwire("q_postrope", q, layer_idx, start_pos)
 
     # kv (single shared head)
     kv = _linear(x_step, params.wkv)
     kv = rms_norm(kv, params.kv_norm_w, eps)
     kv = splice_rope(kv, rd, fc, inverse=False)
+    _v4_nan_tripwire("kv_postrope", kv, layer_idx, start_pos)
 
     new_kv_cache = state.kv_cache.at[:, start_pos % win].set(kv.squeeze(1))
 
@@ -741,9 +771,12 @@ def attention_decode_step(
         i_kvcache = state.indexer_kv_cache
 
     topk_idxs = topk_idxs.astype(jnp.int32)
+    _v4_nan_tripwire("kv_cache_post_write", new_kv_cache, layer_idx, start_pos)
 
     o = sparse_attn(q, new_kv_cache, params.attn_sink, topk_idxs, params.softmax_scale)
+    _v4_nan_tripwire("sparse_attn_o", o, layer_idx, start_pos)
     o = splice_rope(o, rd, fc, inverse=True)
+    _v4_nan_tripwire("o_post_inv_rope", o, layer_idx, start_pos)
 
     G = params.n_groups
     R = params.o_lora_rank
@@ -753,6 +786,7 @@ def attention_decode_step(
     o_proj = jnp.einsum("bsgd,grd->bsgr", o_grouped.astype(jnp.float32), wo_a_view)
     o_flat = o_proj.reshape(B, 1, G * R).astype(x_step.dtype)
     y = _linear(o_flat, params.wo_b)
+    _v4_nan_tripwire("wo_b_y", y, layer_idx, start_pos)
 
     new_state = AttentionDecodeState(
         kv_cache=new_kv_cache,

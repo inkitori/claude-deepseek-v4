@@ -42,7 +42,7 @@ from jax import lax
 
 from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     AttentionDecodeState, AttentionParams, CompressorParams, IndexerParams,
-    attention_decode_step, attention_init_state_from_prefill,
+    _v4_nan_tripwire, attention_decode_step, attention_init_state_from_prefill,
     attention_prefill, hc_split_sinkhorn, precompute_freqs_cis, rms_norm,
     splice_rope,
 )
@@ -330,27 +330,6 @@ def block_init_state_and_forward(
     return decode_state, hc_post(y, residual, post, comb)
 
 
-_V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
-
-
-def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx: int, position) -> None:
-    """Emit per-call NaN/+inf/-inf counts of `x` to the runtime log.
-    No-op unless `V4_DECODE_NAN_TRIPWIRE=1` was set at process start
-    (gated at module import; production HLO unchanged when disabled).
-    Used to localize which decode-step sub-block first produces NaN on
-    real V4 — see CLAUDE.md S1."""
-    if not _V4_DECODE_NAN_TRIPWIRE:
-        return
-    xf = x.astype(jnp.float32)
-    nans = jnp.sum(jnp.isnan(xf))
-    pinfs = jnp.sum(jnp.isposinf(xf))
-    ninfs = jnp.sum(jnp.isneginf(xf))
-    jax.debug.print(
-        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z}",
-        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs,
-    )
-
-
 def _v4_weight_nan_audit(tree) -> None:
     """One-shot finiteness audit of a loaded V4 param tree. For each array
     leaf, emits a `[weight_nan] {path}` line if the tensor contains any NaN
@@ -434,7 +413,7 @@ def block_decode_step(
     _v4_nan_tripwire("attn_hcpre_y", y, layer_idx, start_pos)
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
     new_state, y = attention_decode_step(
-        y, start_pos, params.attn, freqs_cis_full, prev_state)
+        y, start_pos, params.attn, freqs_cis_full, prev_state, layer_idx)
     _v4_nan_tripwire("attn_decode_y", y, layer_idx, start_pos)
     x_step = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("attn_block_out", x_step, layer_idx, start_pos)

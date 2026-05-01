@@ -163,49 +163,71 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01): hypothesis 1 (bad weights) RULED OUT. NaN
-originates inside `attention_decode_step` itself at L5.**
+**Status (2026-05-01): localized to L5's `state.kv_cache` at decode
+entry — the contamination is in PREFILL output, not the decode-step
+math.**
 
-The decode-step NaN tripwire (`V4_DECODE_NAN_TRIPWIRE=1`, gated at
-module import; production HLO unchanged when off) localized the first
-non-finite tensor to L5's `attn_decode_y` — the OUTPUT of
-`attention_decode_step`. Inputs (`attn_in`, `attn_hcpre_y`) are clean.
-L5 is the SECOND `compress_ratio=128` layer (V4-Flash `compress_ratios`
-= `[0,0,4,128,4,128,...]`); L3 is the FIRST and runs clean. NOT a
-structural ratio=128 bug — L5-specific.
+Tripwire now also reports `max_abs(x)` and probes 8 inner sub-blocks
+inside `attention_decode_step` (`qr_postnorm`, `q_postrsqrt`,
+`q_postrope`, `kv_postrope`, `kv_cache_post_write`, `sparse_attn_o`,
+`o_post_inv_rope`, `wo_b_y`) — single source of truth in
+`layers/jax/attention/deepseek_v4_attention.py`, pinned by an
+extended `test_decode_nan_tripwire_when_enabled_runs_clean`. Helper
+re-imported into `models/jax/deepseek_v4.py` so all 16 probes share
+gating.
 
-The weight-finiteness audit (`V4_WEIGHT_NAN_AUDIT=1`, one-shot walk
-of the loaded tree at end of `load_weights_from_dir`, pinned by
-`test_weight_nan_audit_localizes_bad_leaves`) examined 1360 array
-leaves on each of 8 hosts and reported `nan_leaves=0 inf_leaves=0`
-across the entire param tree (smoke
-`logs/full-slice-v4-smoke-20260501T030626Z.log`). FP4/FP8 dequant is
-clean; L5's `attn_norm_w` is finite; the bug is purely runtime.
+Smoke `logs/full-slice-v4-smoke-20260501T041227Z.log` at L5 pos=5:
 
-Surviving hypotheses (next-iter order):
-1. **Runtime overflow inside `attention_decode_step` at L5's input
-   magnitude.** Site to suspect first:
-   `q_f * lax.rsqrt(jnp.square(q_f).mean(-1) + eps)` — if `q_f`
-   overflows `jnp.square` to `+inf` despite the fp32 cast, `inf *
-   rsqrt(inf) = NaN`. Less plausible in fp32 (max ~3.4e38) than bf16,
-   but L5 is the second pass through the residual stream so depth-
-   cumulative hidden magnitudes are highest there.
-2. **A reduction in `sparse_attn` overflows on L5's tensor scale.**
-   Top-k softmax over a NaN-tainted score row, attention sink
-   denominator, or kv-cache lookup at a stale slot.
-3. **Inverse-RoPE on `o` produces NaN** when freqs at
-   `start_pos=5` interact with a degenerate RoPE-tail in the
-   ratio=128 code path.
+  qr_postnorm:        nan=0  max_abs=0.10
+  q_postrsqrt:        nan=0  max_abs=15.3
+  q_postrope:         nan=0  max_abs=14.9
+  kv_postrope:        nan=0  max_abs=6.7      ← fresh kv finite
+  kv_cache_post_write:nan=28672 max_abs=6.7   ← buffer has 28672 NaN
+  sparse_attn_o:      nan=32768 max_abs=0.0   ← downstream
+  o_post_inv_rope:    nan=32768 max_abs=0.0
+  wo_b_y / attn_decode_y / ... all NaN
 
-**Next-iter first move:** extend `_v4_nan_tripwire` to also report
-`max_abs(x)` and add inner probes inside `attention_decode_step`
-between every numeric step (`qr_postnorm`, `q_postrope`,
-`kv_postrope`, `kv_cache_post_write`, `sparse_attn_o`,
-`o_post_inv_rope`, `wo_b_y`). Run a real-V4 smoke; the FIRST sub-block
-inside L5's `attention_decode_step` to flip from finite-with-bounded-
-max-abs to NaN/inf points at the bug. Hypothesis-3 (rsqrt overflow)
-falsified if `q_f` `max_abs` is < 1e15 on entry. Hypothesis on
-`sparse_attn` confirmed if `o` is the first NaN.
+L0–L4 `kv_cache_post_write` all `nan=0`. The freshly computed kv at
+L5 is finite (`kv_postrope: nan=0`); after writing it into one slot,
+the cache STILL contains 28672 NaNs in OTHER slots. So the
+contamination existed BEFORE this decode step's write — the buffer
+came in dirty.
+
+What this rules out:
+* **rsqrt overflow** — `q_postrsqrt: max_abs=15.3` (fp32 limit ~3.4e38).
+* **`sparse_attn` numeric overflow** — its NaN is downstream of an
+  already-NaN `kv_cache`.
+* **Inverse-RoPE on `o`** — same, downstream of pre-poisoned cache.
+* **Bad weights** — `V4_WEIGHT_NAN_AUDIT=1` smoke
+  `logs/full-slice-v4-smoke-20260501T030626Z.log` reported
+  `examined=1360 nan_leaves=0 inf_leaves=0` (pinned by
+  `test_weight_nan_audit_localizes_bad_leaves`).
+
+New leading hypothesis: **`state.kv_cache` enters L5's first
+`attention_decode_step` already NaN-poisoned.** The `state` is built
+once by `attention_init_state_from_prefill` from the prefill
+artifacts. L5 is the second `compress_ratio=128` layer (compress_ratios
+= `[0,0,4,128,4,128,...]`); L3 is the first and runs clean — so it's
+NOT a structural ratio=128 init bug, but L5-specific within the
+prefill pack.
+
+Sub-hypotheses (next-iter order):
+1. `attention_prefill` produces NaN tail-slots on L5 (e.g.
+   uninitialized HCA compressor slots past the real prefill length
+   that get packed into the cache).
+2. `attention_init_state_from_prefill` mispacks L5's compressor
+   buffer (off-by-one or dim-stride mismatch only triggered on the
+   second ratio=128 layer).
+3. Loader sharding for L5's prefill output races with cache buffer
+   allocation.
+
+**Next-iter first move:** add a `kv_cache_at_entry` probe at the very
+start of `attention_decode_step` (before any write), gated by the
+same `V4_DECODE_NAN_TRIPWIRE`. If L5's `kv_cache_at_entry` is already
+NaN at pos=5, the bug is upstream in prefill init — at which point
+add `attention_init_state_from_prefill_*` probes. If L5's
+`kv_cache_at_entry` is clean but `kv_cache_post_write` is dirty,
+the SWA/compressed write itself is corrupting the buffer.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
