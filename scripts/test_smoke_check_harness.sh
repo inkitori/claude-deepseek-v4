@@ -200,10 +200,15 @@ run_scenario long_gen_required_loop        18118 13 \
     --long-gen-text "robot robot robot robot robot robot wandered the plain steadily"
 run_scenario long_gen_required_dirty_end   18119 13 \
     --long-gen-text "The robot rolled across the rust-red plain ...."
+# Real-V4 decode-state corruption emits pad/control tokens that decode to
+# empty strings: completion_tokens=64 (from usage) looks healthy but visible
+# text is just one word. Pin the gate against this exact pattern.
+run_scenario long_gen_required_invisible   18120 13 \
+    --long-gen-tokens 64 --long-gen-text " This"
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "OK: 28/28 harness scenarios pass"
+    echo "OK: 29/29 harness scenarios pass"
     exit 0
 fi
 echo "FAIL: ${fails} scenario(s) failed"

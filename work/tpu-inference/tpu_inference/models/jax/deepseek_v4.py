@@ -776,6 +776,7 @@ def deepseek_v4_run_with_decode_state(
     state_max_seq_len: int,
     is_decode_step: bool,
     start_pos,
+    state_init_ids: "jnp.ndarray | None" = None,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
     """Run one prefill or one decode step, threading per-layer
     `AttentionDecodeState` through `kv_caches` (each entry a 1D fp32 buffer
@@ -785,6 +786,15 @@ def deepseek_v4_run_with_decode_state(
     state from `kv_caches`, advances one position at traced `start_pos`,
     and returns updated buffers. Returns `(updated_kv_caches, h)` so the
     caller can pass `kv_caches` as a donated JIT argument.
+
+    `state_init_ids` (prefill only): when set, state is seeded from this
+    sliced-to-real-length tensor while `h` is still computed on the
+    padded `input_ids`. Required because state init is positional (padding
+    tokens encoded into SWA / compressor / indexer slots produce wrong
+    decode reads), but `transformer_body_forward` on the padded shape
+    is what the runtime's logits path reads — running the body on a
+    sliced shape changes the SPMD compile and the prefill `h` argmax
+    no longer matches the real-V4 reference.
 
     Donation-safety scaffolding (`optimization_barrier(h)`,
     `_v4_force_kv_caches_read`, `_v4_constrain_packed_replicated`) blocks
@@ -802,8 +812,9 @@ def deepseek_v4_run_with_decode_state(
     h = transformer_body_forward(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
     h = lax.optimization_barrier(h)
+    state_ids = state_init_ids if state_init_ids is not None else input_ids
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
-        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+        state_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
     packed_buffers = _v4_force_kv_caches_read(packed_buffers, kv_caches)
@@ -1798,16 +1809,22 @@ def _build_class():
                 T = int(ids_2d.shape[-1])
                 state_max_seq_len = (
                     v4_state_max_seq_len_from_vllm_config(self.vllm_config))
-                L_real = T
                 if is_decode:
                     start_pos = (
                         attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
                     ids_for_orchestrator = ids_2d[:, 0:1]
+                    state_init_ids = None
                 else:
                     start_pos = jnp.int32(0)
-                    # vLLM pads prefill ids to a token bucket; SWA / compressor
-                    # / indexer state init is positional, so feeding T_pad ids
-                    # encodes padding tokens into kv slots. Slice to real len.
+                    # Prefill `h` runs on the padded ids — slicing the body's
+                    # input shape changes the SPMD compile and the argmax at
+                    # L_real-1 drifts from the real-V4 reference. State init
+                    # runs on ids sliced to the real prompt length: SWA /
+                    # compressor / indexer state construction is positional,
+                    # so feeding T_pad ids encodes padding tokens into kv
+                    # slots that decode steps then attend to.
+                    ids_for_orchestrator = ids_2d
+                    L_real = T
                     qsl_cpu = getattr(
                         attention_metadata, "query_start_loc_cpu", None)
                     if qsl_cpu is not None:
@@ -1817,7 +1834,8 @@ def _build_class():
                         except Exception:  # noqa: BLE001
                             L_real = T
                     L_real = max(1, min(L_real, T))
-                    ids_for_orchestrator = ids_2d[:, :L_real]
+                    state_init_ids = (
+                        ids_2d[:, :L_real] if L_real < T else None)
                 kv_caches, h = deepseek_v4_run_with_decode_state(
                     kv_caches, ids_for_orchestrator, params,
                     freqs_swa, freqs_comp,
@@ -1825,13 +1843,10 @@ def _build_class():
                     state_max_seq_len=state_max_seq_len,
                     is_decode_step=is_decode,
                     start_pos=start_pos,
+                    state_init_ids=state_init_ids,
                 )
                 if is_decode and T > 1:
                     pad_shape = (h.shape[0], T - 1, *h.shape[2:])
-                    pad = jnp.zeros(pad_shape, h.dtype)
-                    h = jnp.concatenate([h, pad], axis=1)
-                elif (not is_decode) and T > L_real:
-                    pad_shape = (h.shape[0], T - L_real, *h.shape[2:])
                     pad = jnp.zeros(pad_shape, h.dtype)
                     h = jnp.concatenate([h, pad], axis=1)
                 h_BSD = head_hc(

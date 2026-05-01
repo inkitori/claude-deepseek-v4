@@ -309,8 +309,10 @@ print(ne)
 "
 }
 
-# Print three lines: completion_tokens (from usage), max-word-run (longest
-# streak of identical adjacent space-split words; 1 = no repetition), and
+# Print four lines: completion_tokens (from usage), visible_word_count
+# (len(text.strip().split()), needed because completion_tokens lies when
+# the engine emits pad/control tokens that decode to empty strings),
+# max-word-run (longest streak of identical adjacent words; 1 = none), and
 # ends_clean (1 if the last 5 chars of the stripped text contain >= 2
 # alphanumerics, 0 otherwise — rejects `....` / pure-whitespace endings).
 extract_long_gen_metrics() {
@@ -335,6 +337,7 @@ for i in range(1, len(words)):
 tail = stripped[-5:] if len(stripped) >= 5 else stripped
 alnum = sum(1 for ch in tail if ch.isalnum())
 print(ct)
+print(len(words))
 print(max_run)
 print(1 if alnum >= 2 else 0)
 "
@@ -596,15 +599,27 @@ main() {
         if RLG="$(fire_completion_long_gen 2>/dev/null)"; then
             LG_T1=$(date +%s%N)
             LG_ELAPSED_MS=$(( (LG_T1 - LG_T0) / 1000000 ))
-            mapfile -t LGM < <(printf '%s' "$RLG" | extract_long_gen_metrics 2>/dev/null || printf '0\n0\n0\n')
+            mapfile -t LGM < <(printf '%s' "$RLG" | extract_long_gen_metrics 2>/dev/null || printf '0\n0\n0\n0\n')
             LG_TOK="${LGM[0]:-0}"
-            LG_RUN="${LGM[1]:-0}"
-            LG_CLEAN="${LGM[2]:-0}"
+            LG_WORDS="${LGM[1]:-0}"
+            LG_RUN="${LGM[2]:-0}"
+            LG_CLEAN="${LGM[3]:-0}"
             LG_TPS=$(awk "BEGIN { printf \"%.2f\", ${LG_TOK:-0} * 1000 / (${LG_ELAPSED_MS:-1} > 0 ? ${LG_ELAPSED_MS:-1} : 1) }")
-            echo "[smoke-check] long-gen completion_tokens=$LG_TOK wall_ms=$LG_ELAPSED_MS observed_tps=$LG_TPS max_word_run=$LG_RUN ends_clean=$LG_CLEAN"
+            echo "[smoke-check] long-gen completion_tokens=$LG_TOK visible_words=$LG_WORDS wall_ms=$LG_ELAPSED_MS observed_tps=$LG_TPS max_word_run=$LG_RUN ends_clean=$LG_CLEAN"
             if [ "${LG_TOK:-0}" -lt 30 ]; then
                 echo "[smoke-check] FAIL: long-gen probe produced only $LG_TOK tokens, expected >=30 (LONG_GEN_REQUIRED=1)" >&2
                 echo "[smoke-check]       sustained generation under-produced — possible premature stop / flat-logits regime." >&2
+                exit 13
+            fi
+            # Visible-word floor: completion_tokens lies when the engine
+            # emits pad/control tokens that decode to empty strings (real-V4
+            # decode-state corruption produces NaN logits → argmax 0 → pad
+            # token). 10 visible words at 64 tokens is a generous floor:
+            # English averages ~3 tokens/word so a healthy gen would hit
+            # ~20+ words; below 10 means the engine is degenerating.
+            if [ "${LG_WORDS:-0}" -lt 10 ]; then
+                echo "[smoke-check] FAIL: long-gen probe produced $LG_TOK tokens but only $LG_WORDS visible words (LONG_GEN_REQUIRED=1)" >&2
+                echo "[smoke-check]       most generated tokens decoded to empty — decode produced pad/control tokens." >&2
                 exit 13
             fi
             if [ "${LG_RUN:-0}" -ge 5 ]; then

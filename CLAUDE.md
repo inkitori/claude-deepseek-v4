@@ -142,46 +142,64 @@ blocked on this.
 `kv_caches`). Tiny-config tests pass; real-V4 generation
 fails the moment a real decode step runs.
 
-**Reproducer (real V4, fresh engine, V4_DECODE_STATE knob is gone):**
+**Reproducer (real V4, fresh engine):**
 ```
 prompt: "Tell me a short story about a robot exploring Mars:"
 max_tokens=64, temperature=0, seed=0
-→ completion_tokens=64, finish_reason=length
-→ visible text: 1-2 chars (' "' or '#')
+→ completion_tokens=64, finish_reason=length, visible_words=1
+→ visible text: ' This' (1 word; 63 tokens decode to empty)
 ```
 
 The basic Paris probe (`max_tokens=8` on
-`"The capital of France is"`) hits natural EOS at token 1, so
-**no decode steps actually run** — that's why it "passes" while
-sustained generation is broken. `LONG_GEN_REQUIRED=1` (default-on)
-forces real decode and exposes the bug.
+`"The capital of France is"`) returns " Paris" — the FIRST decoded
+token is correct. But `usage.completion_tokens=8` while visible
+text is just " Paris": the trailing 7 decode steps emit pad/control
+tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
+(default-on) catches this via the `visible_words >= 10` floor.
+**Don't trust `usage.completion_tokens` and don't trust
+`max_word_run`/`ends_clean`** — those metrics all read healthy
+on the corrupted output (pinned by `long_gen_required_invisible`
+in the harness self-test).
 
-**Fix landed 2026-04-30 (commit 2ac33061):** `__call__` now
-slices padded prefill ids to `query_start_loc_cpu[1]` before
-seeding state. SWA / compressor / indexer state init is
-positional, so feeding T_pad ids encoded padding tokens into
-kv slots — decode then attended to padding-token kvs at SWA
-slots. Pinned by `test_padded_prefill_must_be_sliced_to_real_seq_len`.
-**Untested on real V4 as of writing.** The next iter must:
-1. Run a fresh smoke (cluster reset → sync → smoke → check).
-2. Confirm `LONG_GEN_REQUIRED=1` PASSes on a fresh engine.
-3. Re-fire the long-gen probe after 5 unrelated requests
-   (catches state-pollution bugs the single-shot gate misses).
-   Don't trust `usage.completion_tokens` — engine reports 64
-   even when visible text is 1 char. Read response `text`.
+**Iter 2026-05-01 (HEAD):** prefill `h` is now correct. The S1
+diagnosis was partly wrong — slicing ids before
+`transformer_body_forward` changed the SPMD compile and broke
+the prefill argmax (basic Paris dropped to " a" on real V4).
+Fix landed: split prefill input — `h` runs on the full padded
+ids (preserves SPMD compile), state init runs on ids sliced to
+`query_start_loc_cpu[1]` (no padding tokens encoded into SWA /
+compressor / indexer slots). Pinned by
+`test_run_with_decode_state_state_init_ids_does_not_affect_h`
+(L_real=6, T_pad=32).
 
-If the padded-ids fix didn't close it, four hypotheses to chase:
-1. **Compressor `lax.cond` divergence:** the compress-event
-   branch (Python-static on tiny CPU, traced on real V4 SPMD)
-   may produce non-identical state.
-2. **SWA wraparound under traced `start_pos`:** off-by-one in
-   `lax.dynamic_update_slice` index computation.
-3. **Indexer top-k mask under traced `start_pos`:** picks
-   wrong positions; downstream attention reads corrupted slots.
-4. **Cross-request state pollution:** kv_caches buffer state
-   from request N leaks into request N+1's decode (the
-   `_v4_force_kv_caches_read` + `_v4_constrain_packed_replicated`
-   donation-aliasing scaffolding may not be sufficient).
+**What this iter unlocks:**
+* Basic Paris probe returns " Paris" deterministically (was " a").
+* `LONG_GEN_REQUIRED=1` smoke-gate now correctly reads
+  `visible_words` instead of `completion_tokens` — the gate flips
+  red on the real bug instead of green-on-noise.
+
+**What's still red:** decode after token 1 emits NaN-ish logits
+that argmax to pad token 0. Greedy path produces visible token
+1 correctly, then 60+ invisible tokens until max_tokens. Logprobs
+return HTTP 400 "Out of range float values are not JSON compliant:
+nan" — direct evidence of NaN in the logit path.
+
+Four hypotheses to chase next, in decreasing order of likelihood:
+1. **Compressor / indexer state init from `transformer_body_init_state_to_buffer`
+   produces silent NaN/Inf at slots decode reads.** `_compressor_state_from_prefill`
+   leaves "init" slots at `-inf`; if a decode step's softmax
+   numerator hits a slot that's been overwritten with garbage
+   instead of a real -inf placeholder, NaN propagates.
+   Quickest probe: log h at decode step 0 and check for NaN.
+2. **`_v4_force_kv_caches_read` + `_v4_constrain_packed_replicated`
+   are insufficient for prefill→decode aliasing.** The donated
+   `kv_caches` buffer may carry stale junk from prefill's
+   transient compute that the barrier doesn't seal off.
+3. **Compressor `lax.cond` / `jnp.where` divergence on real V4
+   SPMD.** Tiny-config CPU tests pass; SPMD partitioner may
+   produce non-identical state at the compress-event boundary.
+4. **SWA wraparound under traced `start_pos`:** off-by-one in
+   `lax.dynamic_update_slice` for slot `start_pos % win`.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.

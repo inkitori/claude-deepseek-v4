@@ -2172,6 +2172,63 @@ class TestPackedDecodeStateBuffer:
                 f"run_with_decode_state diverged from full prefill "
                 f"(max abs {d})")
 
+    def test_run_with_decode_state_state_init_ids_does_not_affect_h(self):
+        """`state_init_ids` (prefill only) controls state seeding without
+        changing the forward shape. Required because slicing the
+        orchestrator's input_ids changes the SPMD compile and the prefill
+        argmax at the last real position drifts from the padded-shape
+        reference (real-V4 regression). Pin: with `input_ids=padded`
+        and `state_init_ids=padded[:L_real]`, the returned `h` matches
+        a full prefill on the padded ids while the state buffers match
+        a state init on the sliced ids."""
+        L_real, T_pad = 6, 32
+        model, params, cfg, swa, comp = self._build_pair(seed=L_real)
+        torch.manual_seed(L_real + T_pad + 313)
+        ids_real = torch.randint(
+            0, model.args.vocab_size, (1, L_real), dtype=torch.int64)
+        torch.manual_seed(L_real + T_pad + 717)
+        pad_tail = torch.randint(
+            0, model.args.vocab_size,
+            (1, T_pad - L_real), dtype=torch.int64)
+        ids_padded = torch.cat([ids_real, pad_tail], dim=1)
+        ids_padded_j = t2j(ids_padded).astype(jnp.int32)
+        ids_real_j = ids_padded_j[:, :L_real]
+        state_max = model.args.max_seq_len
+
+        layouts = transformer_body_layout(
+            params, cfg, state_max, batch_size=1)
+        kv_caches = [
+            jnp.zeros((_layer_packed_size(lo),), dtype=jnp.float32)
+            for lo in layouts
+        ]
+
+        kv_caches_out, h_out = deepseek_v4_run_with_decode_state(
+            kv_caches, ids_padded_j, params, swa, comp, cfg,
+            state_max_seq_len=state_max,
+            is_decode_step=False, start_pos=jnp.int32(0),
+            state_init_ids=ids_real_j,
+        )
+
+        h_padded_ref = transformer_body_forward(
+            ids_padded_j, params, swa, comp, cfg)
+        d_h = float(jnp.max(jnp.abs(
+            h_out.astype(jnp.float32)
+            - h_padded_ref.astype(jnp.float32))))
+        assert d_h <= 5e-3, (
+            f"h computed by run_with_decode_state with state_init_ids "
+            f"override drifted from transformer_body_forward(padded) "
+            f"(max abs {d_h}); the override must NOT change h's path")
+
+        _h_state_ref, buffers_ref = transformer_body_init_state_to_buffer(
+            ids_real_j, params, swa, comp, cfg, state_max_seq_len=state_max)
+        for i, (got, ref) in enumerate(zip(kv_caches_out, buffers_ref)):
+            # score_state slots hold -inf at the same positions in both,
+            # so use array_equal_nan-style comparison (NaN==NaN treated equal)
+            # rather than max-abs-diff (which yields NaN on -inf - -inf).
+            assert bool(jnp.array_equal(got, ref, equal_nan=True)), (
+                f"layer {i} packed state diverged from "
+                f"init_state_to_buffer(state_init_ids)")
+
 
 # =============================================================
 # Tier 6 — Real-TPU compile + tiny forward
