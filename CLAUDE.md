@@ -163,12 +163,14 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01 v4): HEISENBUG — adding `jax.debug.print` inside
-`attention_init_state_from_prefill` makes the L5+ NaN disappear.
-`lax.optimization_barrier` (no I/O effect) does NOT. The bug is
-suppressed only by ops with side effects (callbacks). Strongly
-suggests a donation-aliasing or buffer-reuse bug in XLA SPMD that
-the next iter has to characterize and fix.**
+**Status (2026-05-01 v5): kv_cache NaN bug FIXED, LONG_GEN STILL FAILS.**
+The concat-not-`zeros + at[].set` construction in
+`attention_init_state_from_prefill` (smoke `20260501T080237Z` with
+TRIPWIRE=1) cleared the L5+ NaN at every layer × every decode position.
+Tripwire-OFF rerun (`20260501T081341Z`): Paris deterministic, LONG_GEN
+visible_words=1/64. Same end-user symptom as pre-fix. Conclusion: the
+L5+ NaN was a real bug but NOT the proximate cause of pad-token decode.
+There's a second, independent bug.
 
 `V4_DECODE_NAN_TRIPWIRE=1` runs 9 decode probes inside
 `attention_decode_step` (`kv_cache_at_entry`, `qr_postnorm`,
@@ -181,90 +183,44 @@ probes (`prefill_state_kv_cache`, `packed_buffer_post_pack`,
 `init_kv_cache_post_swa_set`, `init_kv_compressed`,
 `init_kv_cache_post_comp_set`). All share the same gate; HLO unchanged
 when off. Pinned by `test_decode_nan_tripwire_when_enabled_runs_clean`.
-Helper is zero-size-safe (compressor output `[B, T//ratio, ...]` is
-empty when T < ratio).
 
-Smoke `logs/full-slice-v4-smoke-20260501T045527Z.log`,
-`prefill_state_kv_cache` (= `state.kv_cache` returned by
-`attention_init_state_from_prefill` BEFORE any pack/force-read step):
+**What's ruled out:**
+* Bad weights (`V4_WEIGHT_NAN_AUDIT`).
+* rsqrt / sparse_attn / inverse-RoPE numerics.
+* `attention_init_state_from_prefill` math (inner probes nan=0 at L5+).
+* `_pack_layer_state` / `_v4_force_kv_caches_read` (NaN was upstream).
+* kv_cache aliasing on partial-write `zeros + at[].set` (the v5 fix).
 
-  L0–L4:        nan=0       max_abs=4.7–6.7   ← clean
-  L5  (HCA):    nan=29696   max_abs=2.18      ← partial NaN
-  L6  (CSA):    nan=90112   max_abs=3.40      ← partial NaN
-  L7  (HCA):    nan=66560   max_abs=0.0      ← entire buffer NaN
-  L8+:          alternating CSA/HCA, all NaN
+**What's still suspect — next iter's hypotheses:**
+1. **Other state fields aliasing**: `_compressor_state_from_prefill`
+   still uses `zeros + at[].set` (kv_state) and `full(-inf) + at[].set`
+   (score_state). No probes on these fields. Apply same concat-not-
+   `at[].set` fix and verify. The score_state's `-inf` init is a
+   classic source of `0.0 * -inf = NaN` if a stale read leaks through.
+2. **`_swa_kv_cache_from_prefill` T<win path**: also `zeros +
+   at[:, :T, :].set(kv)`. The result feeds my v5 concat, so any
+   aliasing inside swa would propagate. Inner probe `init_swa`
+   reported nan=0 in tripwire-on smokes — so this field is clean
+   per-instance, but XLA may still alias post-return.
+3. **Decode-step math at pos>=1**: tripwire-on confirmed
+   `kv_cache_at_entry` is finite at every pos × every layer. So the
+   INPUT to decode-step is correct. Check the output (logits) and
+   the sampler — maybe argmax is hitting a control token slot due
+   to a dimension/offset bug. Quick probe: log `h` (post-attention)
+   and `lm_head_out` (logits) at every decode position.
+4. **start_pos plumbing**: `_maybe_set_v4_decode_start_pos` in
+   `runner/tpu_runner.py` derives start_pos from `seq_lens-1`. If
+   that's mis-incrementing for decode, the kv-cache reads at pos>=1
+   pull the wrong slot.
 
-`packed_buffer_post_pack` and `packed_buffer_post_force_read` faithfully
-propagate the same NaN counts (with extra -inf and NaN from
-compressor/indexer score_state slots). The pack and force-read steps
-are NOT introducing NaN; they read it from the prefill output.
-
-**Heisenbug evidence chain:**
-
-* Smoke `20260501T045527Z` (3 outer probes only, no inner): 
-  `prefill_state_kv_cache` L5+ has NaN. Paris OK, LONG_GEN FAIL.
-* Smoke `20260501T051140Z` (3 outer + 8 inner probes inside
-  `attention_init_state_from_prefill`): `prefill_state_kv_cache`
-  L0–L42 ALL clean (`nan=0`). Paris probe FAILS — completion 1
-  ≠ completion 2 (`" the same time, the same time,"` vs `" the
-  first time. The first time."`), neither contains "Paris". Adding
-  probes both fixes the NaN AND breaks determinism.
-* Smoke `20260501T052433Z` (no inner probes; `lax.optimization_barrier`
-  on each returned `AttentionDecodeState` field at the end of
-  `attention_init_state_from_prefill`): Paris probe PASS deterministic.
-  LONG_GEN FAIL with 1 visible word. `lax.optimization_barrier`
-  preserves determinism but is INSUFFICIENT to fix the NaN — the
-  fix needs side-effect ops (callbacks), not just an SSA barrier.
-
-So:
-* sub-hyp 1 (alloc/force-read pipeline) RULED OUT — the data is
-  already corrupt before pack.
-* sub-hyp 2 (jit-cache aliasing in alloc) RULED OUT — same reason.
-* sub-hyp 3 (prefill math producing NaN) RULED OUT — every
-  intermediate inside `attention_init_state_from_prefill`
-  (`init_x_in`, `init_kv_postlinear`, `init_kv_postnorm`,
-  `init_kv_postrope`, `init_swa`, `init_kv_cache_post_swa_set`,
-  `init_kv_compressed`, `init_kv_cache_post_comp_set`) reports
-  `nan=0` at L5 in the inner-probe smoke. The math is correct.
-* sub-hyp 4 (XLA donation aliasing / SPMD buffer reuse): NEW
-  LEADING. The donated `kv_caches` buffer slots that aren't fully
-  written by `kv_cache.at[:, :win, :].set(swa)` retain garbage
-  (NaN) from previous calls or uninitialized pages. Side-effect
-  ops (callbacks) prevent the offending optimization;
-  `optimization_barrier` does not.
-
-Already ruled out by prior iters:
-* rsqrt overflow / sparse_attn / inverse-RoPE numerics (downstream).
-* Bad weights — `V4_WEIGHT_NAN_AUDIT` reported all leaves finite
-  (pinned by `test_weight_nan_audit_localizes_bad_leaves`).
-
-**Next-iter first move (sub-hyp 4 attack plan):**
-
-The fix needs an HLO-level side-effect that prevents donation
-aliasing on the kv_cache field. Try (in order):
-
-1. **`lax.with_sharding_constraint(kv_cache, P())`** at the end of
-   `attention_init_state_from_prefill`. Has effects in HLO under
-   SPMD; doesn't do device→host I/O. If this fixes determinism +
-   long_gen, this is the production fix.
-2. **Replace `jnp.zeros((B, win + extra, Dh))` with explicit fill
-   under SPMD**: `lax.full((B, win + extra, Dh), 0., dtype=dtype)`
-   constrained to `P()`. Forces XLA to emit a fresh allocation
-   instead of aliasing a donated buffer.
-3. **Disable donation for state-init path**: in
-   `deepseek_v4_run_with_decode_state`'s prefill branch, force
-   `kv_caches` to be donated only for the decode-step path.
-   Requires JIT signature changes — bigger touch.
-4. **Audit `_v4_force_kv_caches_read`'s where logic**: maybe the
-   `where(false, b + kv, b)` IS being optimized away despite the
-   opaque_false barrier on this libtpu build, and the bug is
-   actually output aliasing to `kv` (donated, with garbage)
-   rather than `b` (computed).
-
-Discriminator for hypothesis 4: temporarily replace
-`_v4_force_kv_caches_read` with the identity function in the
-prefill path. If the bug pattern changes / disappears, the
-where-discarded-branch trick is the load-bearing piece.
+**Real-V4 verification commands:**
+* Force NaN diagnostics: `V4_DECODE_NAN_TRIPWIRE=1` (NOTE: tripwire
+  itself breaks determinism via callback side effects, so Paris
+  probe will fail. Use only for NaN localization.)
+* Real gate (default): `LONG_GEN_REQUIRED=1
+  scripts/full_slice_v4_smoke_check.sh`. Pre-v5 fix, this produced
+  visible_words=1; post-v5, also visible_words=1 (NaN cleared but
+  symptom unchanged).
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.

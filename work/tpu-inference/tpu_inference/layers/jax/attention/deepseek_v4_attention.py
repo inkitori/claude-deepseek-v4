@@ -1025,24 +1025,31 @@ def attention_init_state_from_prefill(
     kv = kv.astype(dtype)
 
     extra = (cfg_max_seq_len // ratio) if ratio else 0
-    kv_cache = jnp.zeros((B, win + extra, Dh), dtype=dtype)
     swa = _swa_kv_cache_from_prefill(kv, win)
     _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
-    kv_cache = kv_cache.at[:, :win, :].set(swa)
-    _v4_nan_tripwire("init_kv_cache_post_swa_set", kv_cache, layer_idx, -1)
 
+    # Concatenate, not zeros + at[].set(): the partial-write pattern lets
+    # XLA alias the buffer to a donated `kv_caches[i]` slot and elide the
+    # zero broadcast, leaving `[win + Tcomp:]` holding stale data.
     if ratio > 0:
-        # Compressed positions [win, win + T//ratio) come from compressor_prefill.
         kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full).astype(dtype)
         _v4_nan_tripwire("init_kv_compressed", kv_compressed, layer_idx, -1)
         Tcomp = kv_compressed.shape[1]  # = T // ratio
-        if Tcomp > 0:
-            kv_cache = kv_cache.at[:, win:win + Tcomp, :].set(kv_compressed)
+        if Tcomp >= extra:
+            comp_full = kv_compressed[:, :extra, :]
+        elif Tcomp > 0:
+            pad = jnp.zeros((B, extra - Tcomp, Dh), dtype=dtype)
+            comp_full = jnp.concatenate([kv_compressed, pad], axis=1)
+        else:
+            comp_full = jnp.zeros((B, extra, Dh), dtype=dtype)
+        kv_cache = jnp.concatenate([swa, comp_full], axis=1)
         _v4_nan_tripwire("init_kv_cache_post_comp_set", kv_cache, layer_idx, -1)
         c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor)
     else:
+        kv_cache = swa  # extra==0; the pure-SWA layer
         c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
         c_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
+    _v4_nan_tripwire("init_kv_cache_post_swa_set", kv_cache, layer_idx, -1)
 
     if ratio == 4 and params.indexer is not None:
         # Indexer state: same compressor logic on params.indexer.compressor.
@@ -1050,12 +1057,19 @@ def attention_init_state_from_prefill(
         # indexer_kv_cache: [B, max/ratio, index_head_dim] with [:T//ratio]
         # populated from the indexer's compressor_prefill output.
         max_iidx = cfg_max_seq_len // ratio
-        i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
         if T >= ratio:
             idx_kv_compressed = compressor_prefill(
                 x, params.indexer.compressor, freqs_cis_full).astype(dtype)
             Ti = idx_kv_compressed.shape[1]
-            i_cache = i_cache.at[:, :Ti, :].set(idx_kv_compressed)
+            if Ti >= max_iidx:
+                i_cache = idx_kv_compressed[:, :max_iidx, :]
+            elif Ti > 0:
+                pad = jnp.zeros((B, max_iidx - Ti, cfg_index_head_dim), dtype=dtype)
+                i_cache = jnp.concatenate([idx_kv_compressed, pad], axis=1)
+            else:
+                i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
+        else:
+            i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
     else:
         i_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
         i_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
