@@ -888,7 +888,7 @@ def _v4_force_h_kv_dependence(
     that's tracked separately as a follow-on to S1."""
     if not kv_caches:
         return h
-    jax.debug.callback(lambda *_: None, h, kv_caches[0], ordered=True)
+    jax.debug.callback(lambda *_: None, h, kv_caches[0])
     return h
 
 
