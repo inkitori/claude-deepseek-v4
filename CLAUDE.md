@@ -163,81 +163,80 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01): bug is structurally before the first decode
-step — kv_cache buffer enters `attention_decode_step` already NaN
-for every layer index >= 5; L0–L4 enter clean.**
+**Status (2026-05-01 v3): bug is in `attention_init_state_from_prefill`'s
+math at layer indices ≥ 5. Sub-hyp 3 confirmed; sub-hyps 1 and 2
+RULED OUT.**
 
-`V4_DECODE_NAN_TRIPWIRE=1` runs 9 probes inside `attention_decode_step`
-(`kv_cache_at_entry`, `qr_postnorm`, `q_postrsqrt`, `q_postrope`,
-`kv_postrope`, `kv_cache_post_write`, `sparse_attn_o`, `o_post_inv_rope`,
-`wo_b_y`). Single source of truth in
-`layers/jax/attention/deepseek_v4_attention.py`, pinned by
-`test_decode_nan_tripwire_when_enabled_runs_clean`. Helper re-imported
-into `models/jax/deepseek_v4.py` so module-level probes share gating.
+`V4_DECODE_NAN_TRIPWIRE=1` runs 9 decode probes inside
+`attention_decode_step` (`kv_cache_at_entry`, `qr_postnorm`,
+`q_postrsqrt`, `q_postrope`, `kv_postrope`, `kv_cache_post_write`,
+`sparse_attn_o`, `o_post_inv_rope`, `wo_b_y`) PLUS 3 prefill→buffer
+probes (`prefill_state_kv_cache`, `packed_buffer_post_pack`,
+`packed_buffer_post_force_read`) PLUS 8 inner probes inside
+`attention_init_state_from_prefill` (`init_x_in`, `init_kv_postlinear`,
+`init_kv_postnorm`, `init_kv_postrope`, `init_swa`,
+`init_kv_cache_post_swa_set`, `init_kv_compressed`,
+`init_kv_cache_post_comp_set`). All share the same gate; HLO unchanged
+when off. Pinned by `test_decode_nan_tripwire_when_enabled_runs_clean`.
+Helper is zero-size-safe (compressor output `[B, T//ratio, ...]` is
+empty when T < ratio).
 
-Smoke `logs/full-slice-v4-smoke-20260501T043040Z.log`,
-`kv_cache_at_entry` at pos=5 (stable across all later positions):
+Smoke `logs/full-slice-v4-smoke-20260501T045527Z.log`,
+`prefill_state_kv_cache` (= `state.kv_cache` returned by
+`attention_init_state_from_prefill` BEFORE any pack/force-read step):
 
   L0–L4:        nan=0       max_abs=4.7–6.7   ← clean
-  L5  (HCA):    nan=29696   max_abs=2.16      ← partial NaN
-  L6, L8,...   (CSA):  nan=90112  max_abs=2.5–10  ← partial NaN
-  L7, L9,...   (HCA):  nan=66560  max_abs=0.0    ← fully NaN
+  L5  (HCA):    nan=29696   max_abs=2.18      ← partial NaN
+  L6  (CSA):    nan=90112   max_abs=3.40      ← partial NaN
+  L7  (HCA):    nan=66560   max_abs=0.0      ← entire buffer NaN
+  L8+:          alternating CSA/HCA, all NaN
 
-So the bug:
-* is NOT in the decode-step math — input cache is already poisoned.
-* is NOT L5-specific — it hits every layer index ≥ 5.
-* is NOT pure ratio=128 vs ratio=4 — both flavors are poisoned past
-  L5, and L3 (first HCA) stays clean. The cutoff is by absolute
-  layer index.
-* HCA layers from L7 onward show `max_abs=0.0` — the entire
-  `state.kv_cache` field is NaN, no finite values at all. Implies
-  the underlying packed-fp32 buffer at decode entry was never written
-  to a valid value for those layers; `_unpack_layer_state`'s slice
-  produces NaN.
+`packed_buffer_post_pack` and `packed_buffer_post_force_read` faithfully
+propagate the same NaN counts (with extra -inf and NaN from
+compressor/indexer score_state slots). The pack and force-read steps
+are NOT introducing NaN; they read it from the prefill output.
+
+So the bug is in the prefill state-init MATH at layer indices ≥ 5:
+* sub-hyp 1 (alloc/force-read pipeline) RULED OUT — the data is
+  already corrupt before pack.
+* sub-hyp 2 (jit-cache aliasing in alloc) RULED OUT — same reason.
+* sub-hyp 3 (prefill math producing NaN at higher layers) CONFIRMED.
+
+The fact that L5 has only ~45% NaN (max_abs=2.18) but L7 onwards is
+fully NaN (max_abs=0.0) means: the residual stream cascades to NaN
+across blocks once the first NaN appears. L5 is the FIRST place NaN
+is introduced. By L7 the input residual `x` is already all-NaN so
+the entire kv_cache becomes NaN.
 
 Already ruled out by prior iters:
 * rsqrt overflow / sparse_attn / inverse-RoPE numerics (downstream).
 * Bad weights — `V4_WEIGHT_NAN_AUDIT` reported all leaves finite
   (pinned by `test_weight_nan_audit_localizes_bad_leaves`).
 
-Leading hypothesis: **`_initialize_kv_cache_deepseek_v4` allocates
-fp32 zero buffers; `transformer_body_init_state_to_buffer` runs
-prefill and packs each layer's `AttentionDecodeState` into those
-buffers via `_pack_layer_state` → `_v4_force_kv_caches_read` →
-`_v4_constrain_packed_replicated`. Somewhere in that chain, layers
-≥ 5 either (a) never receive their pack write, (b) receive a write
-of garbage memory, or (c) get the write but then have it overwritten
-by a stale buffer reuse.**
+**Next-iter first move:** read the 8 inner probes for L5 (the first
+NaN-introducing layer) in the next smoke log:
 
-Sub-hypotheses (next-iter order, sharpest first):
-1. `_pack_layer_state` writes finite values for L5+, but
-   `_v4_force_kv_caches_read` / `_v4_constrain_packed_replicated`
-   discards / re-reads stale uninitialized memory for layer indices
-   past some sharding boundary.
-2. The per-layer `jax.jit(_alloc_fn, out_shardings=sharding)` jit
-   in `_initialize_kv_cache_deepseek_v4` (kv_cache_manager.py:887)
-   silently shares one compiled program across layers and the
-   buffer alias backs onto uninitialized memory for layers past the
-   first jit-cache hit.
-3. `attention_init_state_from_prefill` itself writes NaN into
-   L5+ states (prefill compressor producing NaN at higher layers).
+```
+grep "v4nan.*L5 pos=-1 init_" logs/full-slice-v4-smoke-*.log | sort -u
+```
 
-**Next-iter first move:** add probes at the prefill→buffer interface.
-Inside `transformer_body_init_state_to_buffer`
-(`models/jax/deepseek_v4.py`, around line 771–778), gate on
-`V4_DECODE_NAN_TRIPWIRE` and emit per-layer:
-* `[v4nan] L{i} prefill_state_kv_cache: nan=… max_abs=…` on each
-  `state` returned by `attention_init_state_from_prefill`.
-* `[v4nan] L{i} packed_buffer_post_pack: nan=… max_abs=…` on each
-  `_pack_layer_state(s, lo)` output.
-* `[v4nan] L{i} packed_buffer_post_force_read: nan=… max_abs=…`
-  inside `_v4_force_kv_caches_read` (or wrapping its return).
-
-If `prefill_state_kv_cache` is already NaN at L5+ → sub-hyp 3 (math).
-If `prefill_state_kv_cache` is clean but `packed_buffer_post_pack`
-is NaN → bug is in `_pack_layer_state` (unlikely; it's a reshape +
-concatenate). If `post_pack` is clean but `post_force_read` is NaN
-→ sub-hyp 1 / sub-hyp 2 (alloc / sharding pipeline).
+* If `init_x_in` is NaN at L5 → bug is in L4's block output (residual
+  stream from previous layer's `hc_post`/`moe`/`hc_pre`). Add probes
+  in `block_init_state_and_forward` between residual writes.
+* If `init_x_in` is finite but `init_kv_postlinear` is NaN → wkv
+  weight or fp4/fp8 dequant of `params.wkv` for L5 produces NaN.
+  Audit weights with finer-grained per-layer checks.
+* If `init_kv_postlinear` is finite but `init_kv_postnorm` is NaN →
+  rms_norm produces NaN (zero variance? unusual `kv_norm_w`?).
+* If `init_kv_postnorm` is finite but `init_kv_postrope` is NaN →
+  `splice_rope` math; check `freqs_cis_compressed[:T]` slice.
+* If everything inside `attention_init_state_from_prefill` is finite
+  but `prefill_state_kv_cache` (just `state.kv_cache`) is NaN → the
+  `kv_cache.at[:, :win, :].set(swa)` or `.at[:, win:win+Tcomp, :].set`
+  scatter is producing NaN under SPMD on certain shapes.
+* Compare L3 (first HCA, clean) vs L5 (second HCA, NaN) at each
+  probe. Same params layout; difference must be either the residual-
+  stream input or a layer-specific weight artifact.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
