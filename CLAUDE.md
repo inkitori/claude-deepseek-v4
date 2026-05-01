@@ -163,9 +163,12 @@ tokens that decode to empty strings. `LONG_GEN_REQUIRED=1`
 on the corrupted output (pinned by `long_gen_required_invisible`
 in the harness self-test).
 
-**Status (2026-05-01 v3): bug is in `attention_init_state_from_prefill`'s
-math at layer indices ≥ 5. Sub-hyp 3 confirmed; sub-hyps 1 and 2
-RULED OUT.**
+**Status (2026-05-01 v4): HEISENBUG — adding `jax.debug.print` inside
+`attention_init_state_from_prefill` makes the L5+ NaN disappear.
+`lax.optimization_barrier` (no I/O effect) does NOT. The bug is
+suppressed only by ops with side effects (callbacks). Strongly
+suggests a donation-aliasing or buffer-reuse bug in XLA SPMD that
+the next iter has to characterize and fix.**
 
 `V4_DECODE_NAN_TRIPWIRE=1` runs 9 decode probes inside
 `attention_decode_step` (`kv_cache_at_entry`, `qr_postnorm`,
@@ -196,47 +199,72 @@ propagate the same NaN counts (with extra -inf and NaN from
 compressor/indexer score_state slots). The pack and force-read steps
 are NOT introducing NaN; they read it from the prefill output.
 
-So the bug is in the prefill state-init MATH at layer indices ≥ 5:
+**Heisenbug evidence chain:**
+
+* Smoke `20260501T045527Z` (3 outer probes only, no inner): 
+  `prefill_state_kv_cache` L5+ has NaN. Paris OK, LONG_GEN FAIL.
+* Smoke `20260501T051140Z` (3 outer + 8 inner probes inside
+  `attention_init_state_from_prefill`): `prefill_state_kv_cache`
+  L0–L42 ALL clean (`nan=0`). Paris probe FAILS — completion 1
+  ≠ completion 2 (`" the same time, the same time,"` vs `" the
+  first time. The first time."`), neither contains "Paris". Adding
+  probes both fixes the NaN AND breaks determinism.
+* Smoke `20260501T052433Z` (no inner probes; `lax.optimization_barrier`
+  on each returned `AttentionDecodeState` field at the end of
+  `attention_init_state_from_prefill`): Paris probe PASS deterministic.
+  LONG_GEN FAIL with 1 visible word. `lax.optimization_barrier`
+  preserves determinism but is INSUFFICIENT to fix the NaN — the
+  fix needs side-effect ops (callbacks), not just an SSA barrier.
+
+So:
 * sub-hyp 1 (alloc/force-read pipeline) RULED OUT — the data is
   already corrupt before pack.
 * sub-hyp 2 (jit-cache aliasing in alloc) RULED OUT — same reason.
-* sub-hyp 3 (prefill math producing NaN at higher layers) CONFIRMED.
-
-The fact that L5 has only ~45% NaN (max_abs=2.18) but L7 onwards is
-fully NaN (max_abs=0.0) means: the residual stream cascades to NaN
-across blocks once the first NaN appears. L5 is the FIRST place NaN
-is introduced. By L7 the input residual `x` is already all-NaN so
-the entire kv_cache becomes NaN.
+* sub-hyp 3 (prefill math producing NaN) RULED OUT — every
+  intermediate inside `attention_init_state_from_prefill`
+  (`init_x_in`, `init_kv_postlinear`, `init_kv_postnorm`,
+  `init_kv_postrope`, `init_swa`, `init_kv_cache_post_swa_set`,
+  `init_kv_compressed`, `init_kv_cache_post_comp_set`) reports
+  `nan=0` at L5 in the inner-probe smoke. The math is correct.
+* sub-hyp 4 (XLA donation aliasing / SPMD buffer reuse): NEW
+  LEADING. The donated `kv_caches` buffer slots that aren't fully
+  written by `kv_cache.at[:, :win, :].set(swa)` retain garbage
+  (NaN) from previous calls or uninitialized pages. Side-effect
+  ops (callbacks) prevent the offending optimization;
+  `optimization_barrier` does not.
 
 Already ruled out by prior iters:
 * rsqrt overflow / sparse_attn / inverse-RoPE numerics (downstream).
 * Bad weights — `V4_WEIGHT_NAN_AUDIT` reported all leaves finite
   (pinned by `test_weight_nan_audit_localizes_bad_leaves`).
 
-**Next-iter first move:** read the 8 inner probes for L5 (the first
-NaN-introducing layer) in the next smoke log:
+**Next-iter first move (sub-hyp 4 attack plan):**
 
-```
-grep "v4nan.*L5 pos=-1 init_" logs/full-slice-v4-smoke-*.log | sort -u
-```
+The fix needs an HLO-level side-effect that prevents donation
+aliasing on the kv_cache field. Try (in order):
 
-* If `init_x_in` is NaN at L5 → bug is in L4's block output (residual
-  stream from previous layer's `hc_post`/`moe`/`hc_pre`). Add probes
-  in `block_init_state_and_forward` between residual writes.
-* If `init_x_in` is finite but `init_kv_postlinear` is NaN → wkv
-  weight or fp4/fp8 dequant of `params.wkv` for L5 produces NaN.
-  Audit weights with finer-grained per-layer checks.
-* If `init_kv_postlinear` is finite but `init_kv_postnorm` is NaN →
-  rms_norm produces NaN (zero variance? unusual `kv_norm_w`?).
-* If `init_kv_postnorm` is finite but `init_kv_postrope` is NaN →
-  `splice_rope` math; check `freqs_cis_compressed[:T]` slice.
-* If everything inside `attention_init_state_from_prefill` is finite
-  but `prefill_state_kv_cache` (just `state.kv_cache`) is NaN → the
-  `kv_cache.at[:, :win, :].set(swa)` or `.at[:, win:win+Tcomp, :].set`
-  scatter is producing NaN under SPMD on certain shapes.
-* Compare L3 (first HCA, clean) vs L5 (second HCA, NaN) at each
-  probe. Same params layout; difference must be either the residual-
-  stream input or a layer-specific weight artifact.
+1. **`lax.with_sharding_constraint(kv_cache, P())`** at the end of
+   `attention_init_state_from_prefill`. Has effects in HLO under
+   SPMD; doesn't do device→host I/O. If this fixes determinism +
+   long_gen, this is the production fix.
+2. **Replace `jnp.zeros((B, win + extra, Dh))` with explicit fill
+   under SPMD**: `lax.full((B, win + extra, Dh), 0., dtype=dtype)`
+   constrained to `P()`. Forces XLA to emit a fresh allocation
+   instead of aliasing a donated buffer.
+3. **Disable donation for state-init path**: in
+   `deepseek_v4_run_with_decode_state`'s prefill branch, force
+   `kv_caches` to be donated only for the decode-step path.
+   Requires JIT signature changes — bigger touch.
+4. **Audit `_v4_force_kv_caches_read`'s where logic**: maybe the
+   `where(false, b + kv, b)` IS being optimized away despite the
+   opaque_false barrier on this libtpu build, and the bug is
+   actually output aliasing to `kv` (donated, with garbage)
+   rather than `b` (computed).
+
+Discriminator for hypothesis 4: temporarily replace
+`_v4_force_kv_caches_read` with the identity function in the
+prefill path. If the bug pattern changes / disappears, the
+where-discarded-branch trick is the load-bearing piece.
 
 **Runtime-hook locations** (read before touching plumbing):
 * `models/common/model_loader.py` — V4 `kv_cache_sharding=P()`.
