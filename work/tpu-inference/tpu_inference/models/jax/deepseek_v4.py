@@ -856,17 +856,11 @@ def _v4_force_kv_caches_read(
     buffers: List[jnp.ndarray],
     kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Force XLA to read the donated `kv_caches` and write the output
-    buffer (preventing donation-aliased write elision). Output equals
-    `b` byte-for-byte at runtime.
-
-    `where(opaque_false, b + kv, b)` keeps the read-of-kv branch in HLO
-    (XLA cannot constant-fold `opaque_false` past the barrier) while
-    selecting `b` at runtime. NaN-safe: compressor / indexer
-    `score_state` init slots hold -inf, and `0.0 * -inf = NaN` would
-    contaminate the buffer at every decode step. The where-discarded
-    branch holds `b + (-inf) = -inf`, never NaN; selection drops it.
-    """
+    """Force XLA to read donated `kv_caches` (prevents aliased write
+    elision under SPMD donation). Output equals `b` at runtime; the
+    `where(opaque_false, b + kv, b)` shape keeps the kv-read branch
+    in HLO. NaN-safe: discarded branch holds `b + (-inf) = -inf`,
+    never NaN, so compressor `score_state` -inf init slots are fine."""
     opaque_false = lax.optimization_barrier(jnp.bool_(False))
     return [
         jnp.where(opaque_false, b + kv.astype(jnp.float32), b)
@@ -1786,22 +1780,6 @@ def _build_class():
                     f"not present in checkpoint (e.g. {still_abstract[:3]})",
                     file=_sys.stderr, flush=True,
                 )
-
-            # NOTE: a post-load `_consolidate_moe_after_load` pass was
-            # tried here (jnp.stack(per-leaf experts) + device_put to
-            # P('attn_dp', None, None)) to eliminate the per-forward
-            # all-to-all storm. It fails with TPU
-            # `RuntimeProgramAllocationFailure: reserve 256 MB at the
-            # bottom of memory` because HBM is heavily fragmented after
-            # 33 000 small per-leaf allocations and there's no
-            # contiguous 256 MB free buffer for the device_put's
-            # transient. The right fix is to stack at LOAD time (so the
-            # per-leaf leaves never exist on TPU) — i.e. change
-            # `make_abstract_moe_params` to carry stacked
-            # `[E, inter, dim]` tensors and have the loader fill them
-            # via host-side accumulation. That's a bigger change and is
-            # the next-iter target; this iter ships the moe_forward
-            # branch + freqs cap so the change isn't wasted.
 
             if _os.environ.get("V4_WEIGHT_NAN_AUDIT", "0") == "1":
                 _v4_weight_nan_audit(current)
