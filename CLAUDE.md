@@ -200,21 +200,30 @@ argmax ties.
 visible_words but max_word_run hits 5+ on degenerate attractors.
 
 **Open follow-on (S1.1 — determinism + degenerate attractors):**
-Two paths to investigate:
+Path investigated and ruled out:
+* **Un-donate kv_caches for V4** (commit `5c9d9213`, reverted in
+  `c32fe431`): made `donate_argnums` conditional on `_is_deepseek_v4`
+  in `model_loader.py:332`. Engine compiled fine but TPU UserFatal'd
+  on the first inference call (`learning/45eac/tpu/runtime/hal/internal/
+  tpu_program_termination_validation.cc:186`, `core location: 2x6x0_SC0
+  ... error type: UserFatal`). Likely incompatibility between
+  un-donation and V4's specific kv_caches sharding (`P()` replicated)
+  or a downstream kernel (sparse_attn / Pallas) that assumed donated
+  buffer behavior. Don't retry without first understanding which
+  kernel asserts donation.
+
+Remaining paths:
 1. **Reduce callback count** while preserving NaN suppression.
    Bisect *which* tripwire sites are load-bearing. Fix #5/5b
    ruled out single-site / 6-field-input-only. Try
    {at_entry × 6} ∪ {kv_cache_post_write} ∪ {sparse_attn_o} ∪
    {wo_b_y} (~9 sites/layer) — hypothesis: q/qr/kv intermediate
    sites aren't load-bearing, only state-touching sites are.
-2. **Break donation aliasing for V4 specifically.** Either
-   un-donate kv_cache in `model_loader.py::run_model` (broad
-   blast radius — affects all models), or insert a per-call
-   "uncoupling" step in V4's `__call__` (`kv_caches = jax.tree.map(
-   lax.full_like_then_add_zero, kv_caches)`-style dance to force
-   a fresh-buffer copy). The latter sacrifices the donation perf
-   benefit but should restore determinism since XLA can't elide
-   what it can't alias.
+2. **In-body opaque copy.** Insert `k = k + lax.optimization_barrier(
+   jnp.float32(0.0))` at the start of V4's `__call__` to force a
+   fresh kv_caches buffer without changing the JIT donation contract.
+   Less invasive than fix #6; may or may not break aliasing
+   (XLA could still alias `k + 0` in-place).
 
 Determinism diagnostic: run 3+ Paris probes with `temperature=0,
 seed=0`. Healthy = byte-equal. Current state = different completions
