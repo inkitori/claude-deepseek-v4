@@ -200,17 +200,22 @@ argmax ties.
 visible_words but max_word_run hits 5+ on degenerate attractors.
 
 **Open follow-on (S1.1 — determinism + degenerate attractors):**
-Path investigated and ruled out:
-* **Un-donate kv_caches for V4** (commit `5c9d9213`, reverted in
-  `c32fe431`): made `donate_argnums` conditional on `_is_deepseek_v4`
-  in `model_loader.py:332`. Engine compiled fine but TPU UserFatal'd
-  on the first inference call (`learning/45eac/tpu/runtime/hal/internal/
-  tpu_program_termination_validation.cc:186`, `core location: 2x6x0_SC0
-  ... error type: UserFatal`). Likely incompatibility between
-  un-donation and V4's specific kv_caches sharding (`P()` replicated)
-  or a downstream kernel (sparse_attn / Pallas) that assumed donated
-  buffer behavior. Don't retry without first understanding which
-  kernel asserts donation.
+Paths investigated and ruled out:
+* **Un-donate kv_caches for V4** (fix #6, commit `5c9d9213`, reverted
+  in `c32fe431`): conditional `donate_argnums=() if _is_deepseek_v4
+  else 2` in `model_loader.py:332`. Engine compiled but TPU UserFatal'd
+  on the first inference call (`tpu_program_termination_validation.cc:186`,
+  `core location: 2x6x0_SC0 ... error type: UserFatal`). Likely
+  incompatibility between un-donation and V4's `P()` replicated
+  kv_cache sharding or a downstream kernel that assumed donated
+  buffer behavior. Don't retry without understanding which kernel
+  asserts donation.
+* **In-body opaque copy + single entry callback** (fix #7, commit
+  `75b92f4b`, reverted in `9d2f15ec`): added `kv_caches = [k +
+  lax.optimization_barrier(0.)]` + 1 callback at start of V4 __call__.
+  Engine compiled, ran, but NaN returned (`visible_words=1`). XLA
+  optimized the opaque-zero add in-place against the donated buffer,
+  so no fresh allocation actually happened.
 
 Remaining paths:
 1. **Reduce callback count** while preserving NaN suppression.
@@ -219,11 +224,14 @@ Remaining paths:
    {at_entry × 6} ∪ {kv_cache_post_write} ∪ {sparse_attn_o} ∪
    {wo_b_y} (~9 sites/layer) — hypothesis: q/qr/kv intermediate
    sites aren't load-bearing, only state-touching sites are.
-2. **In-body opaque copy.** Insert `k = k + lax.optimization_barrier(
-   jnp.float32(0.0))` at the start of V4's `__call__` to force a
-   fresh kv_caches buffer without changing the JIT donation contract.
-   Less invasive than fix #6; may or may not break aliasing
-   (XLA could still alias `k + 0` in-place).
+2. **Force a fresh allocation that XLA can't elide.** Try
+   `jax.tree.map(lax.full_like, kv_caches, fill_value=0.) + kv_caches`
+   or shard-then-reshard via `with_sharding_constraint` to a
+   different mesh axis — these may allocate fresh memory.
+3. **Investigate WHY un-donation crashed.** Determine if a
+   specific kernel (sparse_attn, megablox/gmm) requires donation
+   semantics. If so, gate that kernel only — V4 may need a
+   different attention path.
 
 Determinism diagnostic: run 3+ Paris probes with `temperature=0,
 seed=0`. Healthy = byte-equal. Current state = different completions
