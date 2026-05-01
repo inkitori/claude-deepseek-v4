@@ -1061,17 +1061,11 @@ def attention_init_state_from_prefill(
         i_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
         i_cache = jnp.zeros((B, 0, 0), dtype=dtype)
 
-    # Barrier each returned field so XLA cannot CSE / fuse / alias the
-    # state-init kv writes against the parallel `attention_prefill` path
-    # in `block_init_state_and_forward`. Without these, donation-aware
-    # buffer aliasing produces NaN in the L5+ kv_cache field on real V4
-    # (CLAUDE.md S1: Heisenbug confirmed when 8 inner debug-prints made
-    # the bug disappear; barrier is the side-effect-free equivalent).
     return AttentionDecodeState(
-        kv_cache=lax.optimization_barrier(kv_cache),
-        compressor_kv_state=lax.optimization_barrier(c_kv),
-        compressor_score_state=lax.optimization_barrier(c_sc),
-        indexer_kv_state=lax.optimization_barrier(i_kv),
-        indexer_score_state=lax.optimization_barrier(i_sc),
-        indexer_kv_cache=lax.optimization_barrier(i_cache),
+        kv_cache=kv_cache,
+        compressor_kv_state=c_kv,
+        compressor_score_state=c_sc,
+        indexer_kv_state=i_kv,
+        indexer_score_state=i_sc,
+        indexer_kv_cache=i_cache,
     )
