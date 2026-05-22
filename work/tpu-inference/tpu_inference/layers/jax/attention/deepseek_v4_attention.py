@@ -38,17 +38,22 @@ _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
 
 
 def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
-    """Anchors per-field SSA values via host callback so XLA cannot elide
-    the writes flowing into the packed-state output buffer. Effectful
-    callback (not `lax.optimization_barrier`) is required — SSA barriers
-    are insufficient. Prints reductions when `V4_DECODE_NAN_TRIPWIRE=1`;
-    otherwise the callback is silent."""
+    """Diagnostic print of nan/inf/max_abs over `x`. NO-OP unless
+    `V4_DECODE_NAN_TRIPWIRE=1` is set in the environment.
+
+    Earlier iterations of this function emitted a silent `jax.debug.callback`
+    even when disabled, to anchor per-field SSA values and block XLA from
+    eliding writes into the packed decode-state buffer. That role is now
+    held by `_v4_anchor_output_buffers` in `models/jax/deepseek_v4.py`
+    (output-side `lax.optimization_barrier`), which is deterministic and
+    doesn't perturb SPMD reduction order."""
+    if not _V4_DECODE_NAN_TRIPWIRE:
+        return
     if x.size == 0:
-        if _V4_DECODE_NAN_TRIPWIRE:
-            jax.debug.print(
-                "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
-                l=layer_idx, p=position, n=name,
-            )
+        jax.debug.print(
+            "[v4nan] L{l} pos={p} {n}: nan=0 +inf=0 -inf=0 max_abs=empty",
+            l=layer_idx, p=position, n=name,
+        )
         return
     xf = x.astype(jnp.float32)
     nans = jnp.sum(jnp.isnan(xf))
@@ -56,13 +61,10 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
     ninfs = jnp.sum(jnp.isneginf(xf))
     finite = jnp.where(jnp.isfinite(xf), jnp.abs(xf), jnp.float32(0.0))
     max_abs = jnp.max(finite)
-    if _V4_DECODE_NAN_TRIPWIRE:
-        jax.debug.print(
-            "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
-            l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
-        )
-    else:
-        jax.debug.callback(lambda *_: None, nans, pinfs, ninfs, max_abs)
+    jax.debug.print(
+        "[v4nan] L{l} pos={p} {n}: nan={x} +inf={y} -inf={z} max_abs={m}",
+        l=layer_idx, p=position, n=name, x=nans, y=pinfs, z=ninfs, m=max_abs,
+    )
 
 
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:

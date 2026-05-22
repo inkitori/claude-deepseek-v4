@@ -120,7 +120,7 @@ via `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`.
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | `0` | Cache fast-to-compile modules. |
 | `RAY_CGRAPH_get_timeout` | `3600` | Ray compiled-graph timeout. Default 300 trips on first inference. |
 | `V4_XLA_FLAGS` | unset | Opt-in custom `XLA_FLAGS` (smoke.sh does NOT inherit parent-shell `XLA_FLAGS`; pitfall #4). |
-| `V4_DECODE_NAN_TRIPWIRE` | `0` | When `1`, `_v4_nan_tripwire` prints reductions; when `0`, the silent callback still runs (the side-effect is what anchors SSA values to block XLA elision — see S1). HLO is **not** byte-identical between `0` and `1`, but the silent path is the load-bearing one. |
+| `V4_DECODE_NAN_TRIPWIRE` | `0` | When `1`, `_v4_nan_tripwire` prints per-field nan/inf/max_abs reductions for diagnostics. When `0` (default), the function is a no-op — anti-elision is held by `_v4_anchor_output_buffers` (`lax.optimization_barrier` on each output packed buffer), see S1. |
 
 `*_REQUIRED` smoke-check knobs (exit code in parens): `CHAT_REQUIRED` (4),
 `REASONING_REQUIRED` (5), `STREAMING_REQUIRED` (6), `SAMPLING_REQUIRED` (7),
@@ -144,7 +144,7 @@ blocked on this. `__call__` routes through
 `AttentionDecodeState` through `kv_caches`. Tiny-config tests pass;
 real-V4 generation falls off the prose manifold within 2-3 tokens.
 
-**Reproducer (real V4, fresh engine, fix #4 active):**
+**Symptom (real V4-Flash on v6e-32, pre-fix):**
 ```
 prompt: "Tell me a short story about a robot exploring Mars:"
 max_tokens=64, temperature=0
@@ -164,45 +164,77 @@ also non-deterministic from byte-identical input at temperature=0.
 `ends_clean`** — all read healthy on corrupted output (pinned by
 `long_gen_required_invisible` in the harness self-test). Closure
 gate is `LONG_GEN_REQUIRED=1`: `visible_words >= 10` AND
-`max_word_run < 5`. Today: visible_words can pass; max_word_run
-fails on every prompt.
+`max_word_run < 5`.
 
 **Root cause (audited 2026-05-01):** V4 writes its KV-cache via
 pure JAX `at[].set` partial writes on a manually-packed fp32
-buffer (sites in `attention_decode_step` and
+buffer (sites in `attention_decode_step`,`compressor_decode_step`,
+`indexer_decode_step`, and the prefill seed
 `_compressor_state_from_prefill`), then re-packs through
 `_pack_layer_state`. V3 and Qwen3 work fine under the same
 `donate_argnums=2` because their kv_caches are written by Pallas
 kernels whose outputs are consumed and returned (opaque to XLA's
 alias analysis). V4's pack/unpack indirection gives XLA a long
-sequence of pure functional ops where alias analysis can elide
-writes whose only consumer is the JIT output tuple. Replicated
-`P()` sharding silently masks per-chip elision.
+sequence of pure functional ops where alias analysis can rewrite
+the partial writes as in-place updates of the donation slot and
+drop ones whose result it can statically prove isn't observed
+elsewhere — typically the compressor / indexer state slots, whose
+only consumer is the *next* decode call.
 
-The prefill seed in `attention_init_state_from_prefill` is the
-likely first-corruption site — `_compressor_state_from_prefill`
-uses `zeros + at[].set`; the produced state is the JIT output that
-gets aliased into the donated buffer.
+Earlier band-aids anchored some fields via host callbacks
+(commit `f1ec28f8`, fix #4: ~14 callbacks per attention layer ×
+~43 layers ≈ 600/decode_step). Those anchored the inputs and the
+SWA post-write, but NOT the compressor/indexer outputs — so
+NaN→pad was suppressed (the SWA write was preserved) but the
+compressor state still drifted, producing the degenerate
+attractors above. The callback count also perturbed SPMD
+floating-point reduction order, breaking determinism at
+temperature=0.
 
-**Current band-aid (commit `f1ec28f8` — fix #4):**
-`_v4_nan_tripwire` runs ~14 silent host-callbacks per attention
-layer (~600/decode_step). Each callback anchors one field's SSA
-value as a side-effect, blocking the elision. **This suppresses
-the NaN→pad pathway but does NOT produce coherent prose** — output
-is real-vocab tokens that still fall into degenerate attractors.
-The callback count perturbs SPMD floating-point reduction order,
-breaking determinism at temperature=0.
+**Current fix — Option C (output-side `lax.optimization_barrier`):**
+`_v4_anchor_output_buffers` in `models/jax/deepseek_v4.py:772`
+wraps each output packed buffer in `lax.optimization_barrier`
+before they're returned from `deepseek_v4_run_with_decode_state`.
+That forces XLA to materialise every `at[].set` and concatenate
+upstream of the barrier — including the compressor/indexer fields
+the old callback set missed. Host callbacks are removed (deferred
+behind `V4_DECODE_NAN_TRIPWIRE=1` for diagnostics), restoring
+deterministic float reduction order.
 
-**Cleanest untried path (Option C, recommended next):**
-Replace the 600 callbacks with a single `lax.optimization_barrier`
-on the *output* packed buffer per layer (~43 ops/decode_step,
-deterministic, no host callbacks). Fix #7 applied a barrier on the
-*input* before `at[].set` — XLA could see through that
-algebraically. Output-side barrier is structurally different.
-Implementation site: between `_pack_layer_state` and the return in
-`deepseek_v4_run_with_decode_state`.
+Why a barrier on the *output* and not on the input (as fix #7
+tried): `optimization_barrier(b)` on an output forces every upstream
+op contributing to `b` to compute the intended value, because the
+barrier's output is observed via the JIT return. Fix #7's
+input-side `k + optimization_barrier(0.0)` was algebraically
+identity (`k + 0 = k`) — XLA's algebraic simplifier could fold
+through the constant barrier and proceed to in-place rewrite.
 
-**Other untried paths:**
+**Validation matrix:**
+* CPU tiny-config (7 layers) + JIT + `donate_argnums=0`: passes,
+  byte-equal to fresh-prefill argmax across N=8 decode steps.
+* CPU V4-Flash-truncated (4 layers, 8 experts, full V4-Flash
+  dims) + JIT + `donate_argnums=0`: passes, byte-equal to
+  fresh-prefill argmax across N=6 decode steps. (~85s prefill /
+  ~80s decode on CPU.)
+* CPU lowered HLO contains 6 `stablehlo.optimization_barrier` ops
+  (one per layer); compiled HLO retains all 132 dynamic-update-
+  slice writes. CPU XLA strips the barriers in compile but the
+  writes are kept regardless — CPU never had the elision bug.
+* TPU verification (real V4-Flash, v6e-32, 43 layers, 256
+  experts): **NOT YET RUN**. Needs `scripts/full_slice_v4_smoke.sh`
+  + `scripts/full_slice_v4_smoke_check.sh` with
+  `LONG_GEN_REQUIRED=1`. Other code in the project
+  (`offload/utils.py`, `layers/common/fused_moe_gmm.py`) uses
+  `lax.optimization_barrier` on TPU as the standard anti-
+  optimization primitive.
+
+**Fallback if Option C is insufficient on TPU:**
+Set `V4_DECODE_NAN_TRIPWIRE=1` to re-enable the per-field host
+callbacks AND get visible prints of nan/inf/max_abs per layer.
+That re-introduces non-determinism but restores the old NaN-
+suppression behaviour and produces a diagnostic trace.
+
+**Other untried paths (if Option C also fails):**
 1. Fold `at[].set` writes into a `pl.pallas_call` whose output is
    the new state (matches V3/Qwen3 pattern; merges naturally with
    B1's sparse-attention Pallas kernel).

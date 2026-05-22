@@ -769,19 +769,36 @@ def _v4_constrain_packed_replicated(
         return buffers
 
 
-def _v4_force_kv_caches_read(
+def _v4_anchor_output_buffers(
     buffers: List[jnp.ndarray],
-    kv_caches: List[jnp.ndarray],
 ) -> List[jnp.ndarray]:
-    """Anchor donated `kv_caches` as a live read in HLO via
-    `where(opaque_false, b + kv, b)`. Output equals `b` at runtime; the
-    discarded branch holds `b + (-inf) = -inf`, never NaN, so compressor
-    `score_state` -inf init slots are unaffected."""
-    opaque_false = lax.optimization_barrier(jnp.bool_(False))
-    return [
-        jnp.where(opaque_false, b + kv.astype(jnp.float32), b)
-        for b, kv in zip(buffers, kv_caches)
-    ]
+    """Wrap each output packed buffer in `lax.optimization_barrier` so XLA
+    cannot elide the `at[].set` writes that produced it.
+
+    Why: V3/Qwen3 KV caches are written by a Pallas kernel whose update is
+    consumed and returned, opaque to XLA's alias analysis. V4 writes its KV
+    cache via pure JAX `at[].set` partial writes (in `attention_decode_step`,
+    `compressor_decode_step`, `indexer_decode_step`, and the prefill seed
+    `_compressor_state_from_prefill`), then concatenates the fields through
+    `_pack_layer_state`. Under `donate_argnums=2` with replicated `P()`
+    sharding on TPU, XLA can recognise that the only consumer of those
+    writes is the JIT output tuple aliased to the donated input slot, and
+    rewrite the partial writes as in-place updates of the donation slot.
+    The rewrite can drop individual writes whose result it can statically
+    prove isn't observed elsewhere — typically the compressor / indexer
+    state slots, whose only consumer is the *next* decode call. The stale
+    state is what produces the degenerate-attractor output (repetition /
+    numeric runs) described in S1.
+
+    `optimization_barrier(b)` produces a new SSA value equal to `b` at
+    runtime that XLA must preserve verbatim. Every op that contributes to
+    `b` — every `at[].set`, every `jnp.concatenate` field flatten — lives
+    upstream of the barrier and must be materialised for the barrier's
+    input to be well-defined. Used in place of the prior 14-callback /
+    layer host-side anchor (fix #4) which suppressed NaN but perturbed
+    SPMD reduction order at temperature=0 and missed the compressor /
+    indexer outputs whose only consumer is the packed buffer."""
+    return [lax.optimization_barrier(b) for b in buffers]
 
 
 def deepseek_v4_run_with_decode_state(
@@ -818,7 +835,7 @@ def deepseek_v4_run_with_decode_state(
             kv_caches, start_pos=start_pos,
             state_max_seq_len=state_max_seq_len,
         )
-        new_buffers = _v4_force_kv_caches_read(new_buffers, kv_caches)
+        new_buffers = _v4_anchor_output_buffers(new_buffers)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
         return new_buffers, h
     h = transformer_body_forward(
@@ -828,9 +845,7 @@ def deepseek_v4_run_with_decode_state(
         state_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
     )
-    packed_buffers = _v4_force_kv_caches_read(packed_buffers, kv_caches)
-    for i, b in enumerate(packed_buffers):
-        _v4_nan_tripwire("packed_buffer_post_force_read", b, i, -1)
+    packed_buffers = _v4_anchor_output_buffers(packed_buffers)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
     return packed_buffers, h
 
