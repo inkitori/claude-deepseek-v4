@@ -11,47 +11,78 @@ inference with the real V4-Flash weights**, served via the
 OpenAI-compatible HTTP endpoint to many concurrent users.
 
 **State of the system (read before claiming progress):**
-Commit `1f212036` implements S1 Option C — `lax.optimization_barrier`
-on each output packed buffer in `deepseek_v4_run_with_decode_state` —
-and removes the prior 14-callback-per-layer band-aid (it was
-deterministic-breaking AND incomplete; missed the compressor/
-indexer state outputs). The fix is **CPU-validated** at tiny
-config and V4-Flash-truncated dims under `jit + donate_argnums=0`
-but **NOT yet TPU-validated** on real V4-Flash. See S1 below for
-the full picture.
+HEAD `b3e44530` keeps S1 Option C in place — `lax.optimization_barrier`
+on each output packed buffer in `deepseek_v4_run_with_decode_state`
+— with the prior 14-callback-per-layer band-aid removed. CPU repros
+pass at tiny + V4-Flash-truncated dims. **TPU XLA strips
+`optimization_barrier` in compile** (verified empirically:
+`s1_cpu_hlo_check.py` with `JAX_PLATFORMS=tpu` shows lowered HLO has
+6 barriers, compiled HLO has **0**; the with-anchor vs no-anchor
+compiled HLO is byte-identical at 0 barriers / 174 dynamic-update-
+slice ops). But TPU jit+donate decode at V4-Flash-truncated dims
+*still passes* (8/8 byte-equal to eager fresh-prefill argmax),
+which means **donation aliasing alone preserves the writes at this
+scale** — the anchor is a JIT no-op, not the safety net it was
+believed to be.
+
+Real V4-Flash on v6e-32 has **NOT** been re-verified post-fix at the
+correct gate. The one post-fix smoke (mark's contested slice) gave
+empty output + `SLICE_FAILURE_SW_INJECT_ERROR`; that was attributed
+to the barrier being stripped, but the TPU validation above contradicts
+that story — at truncated scale the JIT path is correct without the
+anchor. The real failure is likely something else (numerical instability
+at real weight values, sharding-specific interaction, or vLLM/Ray
+multi-host glue). v6e-16 cannot fit V4-Flash (math: 256 experts × 43
+layers × bf16 / 16 chips ≈ 34.6 GB/chip > 31.25 GB available; verified
+by SIGSEGV-without-OOM-msg at "placed 2200 tensors, layer 10/43").
+v6e-32 is the minimum.
 
 **To pick this up cold:**
-1. `git log --oneline -5` — current head should be `1f212036` "S1
-   fix: optimization_barrier on output packed buffers, remove host
-   callbacks".
-2. CPU repros that prove the fix doesn't regress:
-   * `scripts/s1_cpu_repro_tiny.py` — tiny config, ~30s eager / ~5s jit.
-   * `scripts/s1_cpu_repro_v4flash.py` — V4-Flash truncated to 4
-     layers with 8 experts (full V4-Flash hidden_size / 64 heads /
-     1024 q_lora_rank / 512 index_topk), ~30s param init / ~85s
-     jit prefill / ~80s jit decode on CPU.
-   * `scripts/s1_cpu_hlo_check.py` — dumps lowered + compiled HLO
-     of one decode step, counts `stablehlo.optimization_barrier`
-     ops. Lowered HLO should contain 6 barriers (one per layer);
-     CPU XLA strips them in compile, TPU XLA should keep them.
+1. `git log --oneline -5` — current head should be `b3e44530` "ray_restart.sh:
+   parameterize SLICE_SIZE for v6e-16" on branch `s1-v6e-16-bring-up`
+   (pushed to origin).
+2. CPU + TPU repros confirming the JIT path works at truncated scale:
+   * `scripts/s1_cpu_repro_tiny.py` — tiny config, ~30s eager / ~5s jit on CPU.
+   * `scripts/s1_cpu_repro_v4flash.py` — V4-Flash truncated to 4 layers
+     with 8 experts (full V4-Flash hidden_size / 64 heads / 1024 q_lora_rank
+     / 512 index_topk). **CPU**: ~30s param init / ~85s jit prefill / ~80s
+     jit decode. **TPU** (single-host 4-chip, `JAX_PLATFORMS=tpu`): ~45s
+     param init / ~17s eager prefill / ~77s jit prefill / ~80s jit decode,
+     8/8 byte-equal.
+   * `scripts/s1_cpu_hlo_check.py` — dumps lowered + compiled HLO of one
+     decode step. **CPU**: lowered=6 barriers, compiled=0, 132 dynamic-
+     update-slice. **TPU**: lowered=6 barriers, compiled=**0**, 174
+     dynamic-update-slice. TPU XLA strips the barrier — but compiled
+     HLO still has all the writes via donation aliasing.
+   * `scripts/s1_tpu_anchor_compare.py` (TPU-only) — proves the anchor is
+     a JIT no-op on TPU. With-anchor vs no-anchor compiled HLO is byte-
+     identical at 0 barriers / 174 DUS / 147 copy / 21 scatter / 254
+     concatenate.
+   * `scripts/s1_tpu_sharded.py` (TPU-only) — runs the V4-Flash-truncated
+     decode parity on a sharded mesh (`attn_dp=local_chip_count`,
+     `kv_caches` replicated with `P()`). Diagnoses sharding-axis
+     interaction with `at[].set` writes.
 
-   Run via:
+   Run TPU variant:
    ```
-   PYTHONPATH=work/tpu-inference:work/vllm \
-     <venv>/bin/python3.11 scripts/s1_cpu_repro_tiny.py both 8 8
+   ssh <head> 'cd ~/claude-deepseek-v4 && \
+     TPU_HOST_BOUNDS=1,1,1 TPU_CHIPS_PER_HOST_BOUNDS=2,2,1 \
+     TPU_PROCESS_BOUNDS=1,1,1 TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 \
+     PYTHONPATH=work/vllm:work/tpu-inference JAX_PLATFORMS=tpu \
+     work/vllm_env/bin/python3.12 scripts/s1_cpu_repro_v4flash.py both 8 8 4'
    ```
-   Both repros should end in "OK: both eager and jit match
-   fresh-prefill argmax". Needs `jax==0.9.2`, `numpy`, `torch`
-   (CPU); the on-host venv at `work/vllm_env/` works but a
-   minimal CPU venv with just those works too.
-3. Real-V4 verification requires bootstrap of the slice; see
-   "Slice bootstrap" section below. After bootstrap, the iterate
-   loop in this file is the validation gate.
-4. If output is still degenerate on TPU after this fix, set
-   `V4_DECODE_NAN_TRIPWIRE=1` to re-enable callback-based anchoring
-   (non-deterministic but suppresses NaN) and gather per-field
-   diagnostics. See S1's "Fallback if Option C is insufficient
-   on TPU" paragraph.
+   Both repros end in "OK: both eager and jit match fresh-prefill argmax".
+   Needs `jax==0.9.2`, `numpy`, `torch`; the on-host venv at
+   `work/vllm_env/` works.
+3. Real V4 verification needs a v6e-32 slice — v6e-16 doesn't fit (above).
+   See "Slice bootstrap" section below.
+4. If real-V4 output is broken on v6e-32, set `V4_DECODE_NAN_TRIPWIRE=1` to
+   emit per-field nan/inf/max_abs diagnostics. **Note**: as of HEAD,
+   `_v4_nan_tripwire` is a hard early-return when this flag is 0 — the prior
+   "silent callback even when disabled" anchoring behaviour is GONE. If
+   the v6e-32 failure was actually being masked by those silent callbacks
+   (a possibility worth exploring), partially reverting to the pre-fix
+   callback emission may be the right move.
 
 ## Discipline
 
@@ -269,57 +300,77 @@ attractors above. The callback count also perturbed SPMD
 floating-point reduction order, breaking determinism at
 temperature=0.
 
-**Current fix — Option C (output-side `lax.optimization_barrier`):**
+**Current fix — Option C (output-side `lax.optimization_barrier`),
+but it's a JIT no-op on TPU:**
 `_v4_anchor_output_buffers` in `models/jax/deepseek_v4.py:772`
 wraps each output packed buffer in `lax.optimization_barrier`
 before they're returned from `deepseek_v4_run_with_decode_state`.
-That forces XLA to materialise every `at[].set` and concatenate
-upstream of the barrier — including the compressor/indexer fields
-the old callback set missed. Host callbacks are removed (deferred
-behind `V4_DECODE_NAN_TRIPWIRE=1` for diagnostics), restoring
-deterministic float reduction order.
+The intent was to force XLA to materialise every `at[].set` and
+concatenate upstream of the barrier. Host callbacks were removed
+(deferred behind `V4_DECODE_NAN_TRIPWIRE=1`).
 
-Why a barrier on the *output* and not on the input (as fix #7
-tried): `optimization_barrier(b)` on an output forces every upstream
-op contributing to `b` to compute the intended value, because the
-barrier's output is observed via the JIT return. Fix #7's
-input-side `k + optimization_barrier(0.0)` was algebraically
-identity (`k + 0 = k`) — XLA's algebraic simplifier could fold
-through the constant barrier and proceed to in-place rewrite.
+**What TPU validation actually showed (2026-05-23):**
+* TPU XLA strips `lax.optimization_barrier` in compile — same as CPU.
+  Verified by `s1_cpu_hlo_check.py` with `JAX_PLATFORMS=tpu`:
+  lowered HLO has 6 barriers, compiled HLO has **0**.
+* With-anchor vs no-anchor compiled HLO is byte-identical at 0
+  barriers / 174 dynamic-update-slice / 147 copy / 21 scatter /
+  254 concatenate ops. The anchor is a complete JIT no-op on TPU.
+* `scripts/s1_cpu_repro_v4flash.py` run via `JAX_PLATFORMS=tpu`
+  (single-host, 4 chips, no mesh): **PASS** — 8/8 decode steps
+  byte-equal to eager fresh-prefill argmax under jit+donate. The
+  V4-Flash-truncated JIT decode is correct on TPU **without any
+  effective anchor**.
+
+This means the original S1 hypothesis ("XLA elides at[].set writes
+under donation aliasing") is **false at this scale**. Donation
+aliasing alone preserves the writes — XLA materialises them as
+dynamic-update-slice ops that operate in-place on the donated buffer.
+The 14-callback band-aid wasn't fixing an elision bug; whatever it
+was masking on real V4-Flash v6e-32 is something else (numerical
+instability at real weights, sharding-specific interaction, multi-
+host SPMD glue).
+
+**The big unknown:** real V4-Flash on v6e-32 has not been
+re-verified with the current head. The one attempt after committing
+the fix (mark's contested slice) produced empty completion +
+`SLICE_FAILURE_SW_INJECT_ERROR`. That was attributed to the barrier
+being stripped, but per the above the barrier is irrelevant —
+removing it changes nothing in the compiled HLO. The real cause
+needs a fresh v6e-32 run with `V4_DECODE_NAN_TRIPWIRE=1` to localize
+the first field that NaNs/Infs.
 
 **Validation matrix:**
-* CPU tiny-config (7 layers) + JIT + `donate_argnums=0`: passes,
-  byte-equal to fresh-prefill argmax across N=8 decode steps.
-* CPU V4-Flash-truncated (4 layers, 8 experts, full V4-Flash
-  dims) + JIT + `donate_argnums=0`: passes, byte-equal to
-  fresh-prefill argmax across N=6 decode steps. (~85s prefill /
-  ~80s decode on CPU.)
-* CPU lowered HLO contains 6 `stablehlo.optimization_barrier` ops
-  (one per layer); compiled HLO retains all 132 dynamic-update-
-  slice writes. CPU XLA strips the barriers in compile but the
-  writes are kept regardless — CPU never had the elision bug.
-* TPU verification (real V4-Flash, v6e-32, 43 layers, 256
-  experts): **NOT YET RUN**. Needs `scripts/full_slice_v4_smoke.sh`
-  + `scripts/full_slice_v4_smoke_check.sh` with
-  `LONG_GEN_REQUIRED=1`. Other code in the project
-  (`offload/utils.py`, `layers/common/fused_moe_gmm.py`) uses
-  `lax.optimization_barrier` on TPU as the standard anti-
-  optimization primitive.
+* CPU tiny-config (7 layers) + JIT + `donate_argnums=0`: passes.
+* CPU V4-Flash-truncated (4 layers, 8 experts) + JIT + donate: passes.
+* TPU V4-Flash-truncated (single-host, 4 chips, no mesh) + JIT +
+  donate: passes (8/8 byte-equal). Run via
+  `JAX_PLATFORMS=tpu scripts/s1_cpu_repro_v4flash.py both 8 8 4`.
+* TPU V4-Flash-truncated, single-host with `attn_dp=4` sharded mesh
+  + `P()`-replicated kv_caches + JIT + donate: passes (8/8 byte-
+  equal). Run via `scripts/s1_tpu_sharded.py`. ~24s eager / ~151s
+  jit prefill / ~158s jit decode.
+* TPU HLO: anchor stripped in compile, writes preserved via donation
+  (174 dynamic-update-slice in compiled HLO, identical with vs without
+  anchor). Run via `scripts/s1_tpu_anchor_compare.py`.
+* Real V4-Flash on v6e-32 with current head: **NOT YET RE-RUN**.
+  v6e-16 cannot fit (34.6 GB/chip > 31.25 GB).
 
-**Fallback if Option C is insufficient on TPU:**
-Set `V4_DECODE_NAN_TRIPWIRE=1` to re-enable the per-field host
-callbacks AND get visible prints of nan/inf/max_abs per layer.
-That re-introduces non-determinism but restores the old NaN-
-suppression behaviour and produces a diagnostic trace.
-
-**Other untried paths (if Option C also fails):**
-1. Fold `at[].set` writes into a `pl.pallas_call` whose output is
-   the new state (matches V3/Qwen3 pattern; merges naturally with
-   B1's sparse-attention Pallas kernel).
-2. Special-case `donate_argnums` for V4 prefill JIT only (decode
-   keeps donation). The prefill path doesn't actually use arg2;
-   fix #6 attempted full un-donation and crashed, so partial
-   un-donation needs diagnosis of which kernel asserted donation.
+**If real-V4 on v6e-32 fails:** the right first move is
+`V4_DECODE_NAN_TRIPWIRE=1` to localize the corruption. Then,
+plausible structural fixes:
+1. Restore the pre-fix unconditional silent callbacks in
+   `_v4_nan_tripwire` (read-only `jax.debug.callback(lambda *_: None,
+   ...)`). They may have been doing more than anchoring — host
+   round-trips of bf16 values are bit-preserving for NaN/Inf, but
+   ordered effects can prevent some XLA fusions whose rounding
+   differs. Try this BEFORE concluding the bug is elsewhere.
+2. Fold `at[].set` writes into a `pl.pallas_call` whose output is
+   the new state (matches V3/Qwen3 pattern; merges with B1's
+   sparse-attention Pallas kernel).
+3. Audit numerical stability of the compressor / indexer paths
+   under real weights — bf16 accumulation can saturate at real
+   scale where 0.02-stddev random params don't.
 
 **Don't repeat (full traces in `git log`):**
 - `ac8d2077` — single per-layer callback in transformer body. Insufficient.
@@ -327,6 +378,10 @@ suppression behaviour and produces a diagnostic trace.
 - `14e11136` — callbacks at at_entry × 6 fields. NaN returns.
 - `5c9d9213` (rev `c32fe431`) — full un-donate kv_caches for V4. TPU UserFatal.
 - `75b92f4b` (rev `9d2f15ec`) — input-side opaque copy. XLA optimized in-place.
+- `1f212036` (current HEAD ancestor) — output-side `optimization_barrier`
+  + removal of all silent callbacks. Stripped by TPU XLA in compile;
+  v6e-32 smoke produced empty + SLICE_FAILURE. Possibly because the
+  removed callbacks were masking a separate (non-elision) bug.
 
 **Real-V4 verification:**
 * Diagnostics: `V4_DECODE_NAN_TRIPWIRE=1 scripts/full_slice_v4_smoke{,_check}.sh`.
