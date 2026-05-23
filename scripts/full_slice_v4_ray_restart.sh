@@ -20,6 +20,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${VENV:-$REPO/work/vllm_env}"
 HEAD_IP="${HEAD_IP:-10.164.0.41}"
 WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+# Slice-size knobs. Defaults are v6e-32; override SLICE_SIZE for other
+# topologies (e.g. SLICE_SIZE=16 for v6e-16).
+SLICE_SIZE="${SLICE_SIZE:-32}"
 SSH="ssh -i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 ray_bin="$VENV/bin/ray"
@@ -47,11 +50,11 @@ done
 # Settle: give raylets a moment to fully exit before restart
 sleep 4
 
-log "starting ray head on $HEAD_IP"
+log "starting ray head on $HEAD_IP (slice=v6e-$SLICE_SIZE)"
 "$ray_bin" start --head \
     --node-ip-address="$HEAD_IP" \
     --port=6379 \
-    --resources='{"TPU":4,"TPU-v6e-32-head":1}' \
+    --resources="{\"TPU\":4,\"TPU-v6e-${SLICE_SIZE}-head\":1}" \
     --temp-dir=/tmp/ray-vllm \
     2>&1 | tail -8 | sed 's/^/  /'
 
@@ -75,10 +78,12 @@ sleep 5
 log "verifying cluster"
 RAY_ADDRESS="$HEAD_IP:6379" "$ray_bin" status 2>&1 | grep -E "node_|TPU|nodes" | sed 's/^/  /'
 
-# Pass criterion: 32.0/32.0 TPU available
+# Pass criterion: $SLICE_SIZE.0/$SLICE_SIZE.0 TPU available
 got=$(RAY_ADDRESS="$HEAD_IP:6379" "$ray_bin" status 2>&1 | grep -oE '0\.0/[0-9]+\.0 TPU\b' | head -1)
 log "TPU line: $got"
-case "$got" in
-    "0.0/32.0 TPU") log "OK: cluster up with 32 TPU"; exit 0 ;;
-    *) log "FAIL: expected '0.0/32.0 TPU'"; exit 1 ;;
-esac
+expected="0.0/${SLICE_SIZE}.0 TPU"
+if [ "$got" = "$expected" ]; then
+    log "OK: cluster up with $SLICE_SIZE TPU"; exit 0
+else
+    log "FAIL: expected '$expected'"; exit 1
+fi
