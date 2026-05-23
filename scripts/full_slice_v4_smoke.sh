@@ -21,14 +21,17 @@ export PATH="$VENV/bin:$PATH"
 export VIRTUAL_ENV="$VENV"
 export PYTHONPATH="$REPO_ROOT/work/vllm:$REPO_ROOT/work/tpu-inference:$VENV/lib/python3.12/site-packages"
 
-# Multi-host TPU bounds: form the 32-chip distributed mesh.
+# Multi-host TPU bounds. Defaults form a 32-chip distributed mesh
+# (v6e-32, 8 hosts × 4 chips); override the TPU_* and TP env vars for
+# other slice sizes (e.g. v6e-16 → TPU_HOST_BOUNDS=2,2,1 TP=16).
 export TPU_MULTIHOST_BACKEND=ray
-export RAY_ADDRESS=10.164.0.41:6379
+export RAY_ADDRESS="${RAY_ADDRESS:-10.164.0.41:6379}"
 export JAX_PLATFORMS=
-export TPU_HOST_BOUNDS=2,4,1
-export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
-export TPU_PROCESS_BOUNDS=2,4,1
-export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
+export TPU_HOST_BOUNDS="${TPU_HOST_BOUNDS:-2,4,1}"
+export TPU_CHIPS_PER_HOST_BOUNDS="${TPU_CHIPS_PER_HOST_BOUNDS:-2,2,1}"
+export TPU_PROCESS_BOUNDS="${TPU_PROCESS_BOUNDS:-2,4,1}"
+export TPU_CHIPS_PER_PROCESS_BOUNDS="${TPU_CHIPS_PER_PROCESS_BOUNDS:-2,2,1}"
+TP="${TP:-32}"
 
 # HF offline — checkpoint is mounted via gcsfuse, no internet.
 export HF_HUB_OFFLINE=1
@@ -82,7 +85,7 @@ echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLAC
 echo "[smoke]   xla_flags=$XLA_FLAGS  ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
-    --tensor-parallel-size 32 \
+    --tensor-parallel-size "$TP" \
     --max-model-len "$MAX_LEN" \
     --max-num-seqs "$MAX_SEQS" \
     --port "$PORT" \
