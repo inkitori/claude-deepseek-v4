@@ -10,13 +10,48 @@ The non-negotiable goal is **fast, mathematically correct
 inference with the real V4-Flash weights**, served via the
 OpenAI-compatible HTTP endpoint to many concurrent users.
 
-**State of the system (read before claiming progress):** the
-basic ` Paris` smoke probe passes on a fresh engine. **Anything
-past 1 generated token is broken** — the `LONG_GEN_REQUIRED=1`
-gate has never passed end-to-end. The current S1 partial fix
-suppresses NaN but the model still emits degenerate attractors
-(repetition / numeric runs / date-format lists) instead of prose
-on any multi-token completion. See S1 below.
+**State of the system (read before claiming progress):**
+Commit `1f212036` implements S1 Option C — `lax.optimization_barrier`
+on each output packed buffer in `deepseek_v4_run_with_decode_state` —
+and removes the prior 14-callback-per-layer band-aid (it was
+deterministic-breaking AND incomplete; missed the compressor/
+indexer state outputs). The fix is **CPU-validated** at tiny
+config and V4-Flash-truncated dims under `jit + donate_argnums=0`
+but **NOT yet TPU-validated** on real V4-Flash. See S1 below for
+the full picture.
+
+**To pick this up cold:**
+1. `git log --oneline -5` — current head should be `1f212036` "S1
+   fix: optimization_barrier on output packed buffers, remove host
+   callbacks".
+2. CPU repros that prove the fix doesn't regress:
+   * `scripts/s1_cpu_repro_tiny.py` — tiny config, ~30s eager / ~5s jit.
+   * `scripts/s1_cpu_repro_v4flash.py` — V4-Flash truncated to 4
+     layers with 8 experts (full V4-Flash hidden_size / 64 heads /
+     1024 q_lora_rank / 512 index_topk), ~30s param init / ~85s
+     jit prefill / ~80s jit decode on CPU.
+   * `scripts/s1_cpu_hlo_check.py` — dumps lowered + compiled HLO
+     of one decode step, counts `stablehlo.optimization_barrier`
+     ops. Lowered HLO should contain 6 barriers (one per layer);
+     CPU XLA strips them in compile, TPU XLA should keep them.
+
+   Run via:
+   ```
+   PYTHONPATH=work/tpu-inference:work/vllm \
+     <venv>/bin/python3.11 scripts/s1_cpu_repro_tiny.py both 8 8
+   ```
+   Both repros should end in "OK: both eager and jit match
+   fresh-prefill argmax". Needs `jax==0.9.2`, `numpy`, `torch`
+   (CPU); the on-host venv at `work/vllm_env/` works but a
+   minimal CPU venv with just those works too.
+3. Real-V4 verification requires bootstrap of the slice; see
+   "Slice bootstrap" section below. After bootstrap, the iterate
+   loop in this file is the validation gate.
+4. If output is still degenerate on TPU after this fix, set
+   `V4_DECODE_NAN_TRIPWIRE=1` to re-enable callback-based anchoring
+   (non-deterministic but suppresses NaN) and gather per-field
+   diagnostics. See S1's "Fallback if Option C is insufficient
+   on TPU" paragraph.
 
 ## Discipline
 
@@ -59,6 +94,49 @@ read **indistinguishable from `qwen3.py` / `deepseek_v3.py`**.
 * No backwards-compat shims for never-shipped code.
 
 30-second diff against `qwen3.py` before declaring "done".
+
+## Slice bootstrap
+
+The `.env` and venv aren't checked in; a fresh slice needs:
+
+1. **gcloud auth** must reach this project (`prm-research`). Check
+   with `gcloud config get project` + `gcloud compute tpus tpu-vm
+   list --zone=<your-zone>`. The slice's hostname will look like
+   `t1v-n-<id>-w-<worker_num>`; verify with `hostname`.
+2. **Discover worker IPs**:
+   ```bash
+   curl -s -H "Metadata-Flavor: Google" \
+     http://metadata.google.internal/computeMetadata/v1/instance/attributes/worker-network-endpoints \
+     | tr ',' '\n' | awk -F: '{print $3}'
+   ```
+   Order in that list is worker 0 → worker N. Worker 0 is the head.
+3. **Cross-worker SSH**: `gcloud compute tpus tpu-vm ssh
+   <user>@<tpu-name> --zone=<zone> --worker=0 --command=true` once
+   to auto-generate `~/.ssh/google_compute_engine` and propagate
+   it to all workers. After that, plain `ssh -i
+   ~/.ssh/google_compute_engine <user>@<worker_ip>` works.
+4. **`.env`** (copy from `.env.example`):
+   ```
+   HF_TOKEN=hf_...    # only needed for tokenizer/config download fallback
+   MOUNT_GCS=1
+   GCS_BUCKET=<bucket with V4-Flash hub layout>
+   GCS_ONLY_DIR=<path/under/bucket>
+   ```
+   `mark`'s slice had V4-Flash staged at `gs://personal-mark-eu/vllm/hub/`
+   readable by the project's default compute service account — useful
+   if you have read access. Otherwise stage it yourself or fall back
+   to HF download (slow, 543 GiB).
+5. **Override slice IPs**: `scripts/full_slice_v4_bootstrap.sh` and
+   `scripts/full_slice_v4_smoke.sh` hard-code `HEAD_IP=10.164.0.41`
+   and a specific 7-worker list. Either edit those constants or run
+   the bootstrap with `HEAD_IP=<head> WORKERS="<7 space-separated
+   IPs>"` env vars. The smoke launcher hard-codes `RAY_ADDRESS`
+   too — patch that or export `RAY_ADDRESS=<head_ip>:6379`.
+6. From the head (worker 0): `./scripts/setup.sh` (builds local
+   venv) then `./scripts/full_slice_v4_bootstrap.sh` (fans setup
+   to other 7 workers + starts Ray cluster). First run takes
+   ~10-15 min (parallel venv builds).
+7. Then the normal iterate loop in this file works.
 
 ## Cluster topology
 
