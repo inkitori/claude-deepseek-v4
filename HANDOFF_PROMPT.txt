@@ -1,0 +1,99 @@
+Your one and only goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash`
+produce coherent, deterministic decode output on this v6e-32 TPU slice,
+instead of the degenerate attractor it collapses into today (bug S1).
+Getting it working is the entire job — no other deliverable. Make every
+call yourself; never wait for approval. Keep going until DONE.
+
+READ CLAUDE.md FIRST — it is the runbook (success gate, reproducer, how
+to run, what's already failed, plumbing, and the shared-slice pitfalls).
+This is a continuation: a prior session did PHASE 0 + PHASE 1 and the
+infra recovery. Do NOT re-tread that. Current state below.
+
+=== ALREADY DONE (do not repeat) ===
+- PHASE 0 bootstrap: COMPLETE. Ray cluster is UP (8 nodes / 0.0/32.0 TPU).
+  Verify with `work/vllm_env/bin/ray status`.
+- INFRA / shared-slice contention RESOLVED + documented in CLAUDE.md
+  (First-action STEP 0/0b, Pitfall 0). The contender was mark's
+  tpu-manager `node` DOCKER container (a ray worker joining ray at
+  10.164.0.192:6379 — our head — restart=unless-stopped, restart_count=32),
+  NOT `~/agent.py` (that's harmless observability; ignore it). Those
+  `node` containers are stopped (--restart=no) on all 8 hosts. Their
+  thrashing had WEDGED the TPU launch-group state
+  (SLICE_FAILURE_SW_INJECT_ERROR / "unexpected peer ... different launch
+  id"); cleared by rebooting the 7 workers + remounting GCS + ray restart.
+  >>> BEFORE ANY SMOKE: re-check no `node` container is running
+  (`sudo docker ps --filter name=^/node$` on each host) and keep a guardian
+  that re-stops it; a remote controller may redeploy it. We have sudo.
+- PHASE 1: the in-tree candidate fix (1f212036, output-side
+  `optimization_barrier` in deepseek_v4.py) was TESTED ON TPU and FAILED.
+  The engine reached "Application startup complete", served, and decode
+  still collapsed: Mars prompt @ temp=0 ->
+  ' "The first step is to be the best." "The best is to be the best." ...'
+  (the S1 attractor). XLA elides the barriers (CPU-HLO confirmed 6->0).
+  Root cause is OPEN. Do not retry the barrier.
+
+=== SLICE CAVEAT ===
+The slice is only MARGINALLY stable post-recovery: it served one decode
+then a worker hit SLICE_FAILURE again with NO contention present. So
+prefer SMALL configs (few chips) over repeated full 32-chip smokes, which
+are both expensive (~9 min to serve) and exposed to the flaky collective.
+API port is 18081. Smoke logs: logs/full-slice-v4-smoke-*.log.
+
+=== PHASE 2 — YOUR JOB: diagnose BEFORE patching ===
+Per CLAUDE.md "How to validate", the inner loop is a small-config-on-TPU
+repro (CPU cannot reproduce S1). Start here:
+
+1) Establish whether S1 reproduces at small scale on TPU. Run on a WORKER
+   (rebootable if it wedges — do NOT run heavy TPU on the head, your
+   session lives there):
+     ssh <worker> 'cd ~/claude-deepseek-v4 && JAX_PLATFORMS=tpu \
+       PYTHONPATH=work/tpu-inference:work/vllm \
+       work/vllm_env/bin/python scripts/s1_cpu_repro_v4flash.py both 8 12 4'
+   (workers: `scripts/full_slice_v4_discover.sh workers`). Exit 2 = S1
+   reproduced (eager OK, jit+donate diverges); 0 = no S1; 3 = regression.
+   NOTE this repro uses donate_argnums=0 + single-device; production S1 is
+   donate_argnums=2 + TP=32 + replicated P() sharding. If it does NOT
+   reproduce, S1 likely needs that multi-host/sharding context -> build a
+   sharded multi-chip repro, or instrument a full smoke with
+   V4_DECODE_NAN_TRIPWIRE=1 (wired at deepseek_v4_attention.py:37-67).
+
+2) If it reproduces: localize WHICH state field the donation drops. The
+   nan-tripwire only catches non-finite values, but S1 corruption is
+   plausible-but-wrong FINITE values, so do a per-field eager-vs-jit STATE
+   DIFF: record per-step packed buffers in both paths, unpack via
+   _unpack_layer_state (deepseek_v4.py), and find the first (step, layer,
+   field) where they diverge. Fields: kv_cache, compressor_kv_state,
+   compressor_score_state, indexer_kv_state, indexer_score_state,
+   indexer_kv_cache. Gate behind an env flag so default behavior is
+   unchanged. Write the corrupted-field finding into CLAUDE.md.
+
+3) Only AFTER diagnosis confirms a dropped/corrupted write, fix it. Leading
+   untried direction: fold V4's decode state writes into a pl.pallas_call
+   whose OUTPUT is the new packed state (opaque to XLA alias analysis, the
+   way V3/Qwen3 KV writes are). Alternative: prefill-only un-donation.
+   The write sites are in deepseek_v4_attention.py (attention_decode_step
+   L751/765, compressor_decode_step L515/516/539/540, indexer_decode_step
+   L585). See CLAUDE.md "already tried" list — don't re-tread dead-ends;
+   if a variant resembles one, state how it differs.
+
+4) Validate any fix on the small TPU repro first, THEN confirm on a full
+   smoke. Reserve full smokes (at most 1-2/session).
+
+=== DONE (the only definition) — verify TWICE on a fresh engine ===
+- LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh exits 0
+  (visible_words>=10, max_word_run<5).
+- 3 Paris probes @ temp=0 are byte-identical (determinism).
+- Survives 5 unrelated requests.
+The smoke_check only does 2 determinism probes + no 5-request test, so run
+the 3-probe byte-identity and 5-request checks MANUALLY. "Contains 'Paris'"
+alone is a known false positive — READ the actual decode text, not metrics.
+
+=== WORKING STYLE ===
+Keep context LEAN: delegate bounded investigations to subagents that
+return ONLY conclusions. Commit a checkpoint after every validated step
+and keep CLAUDE.md's S1 section current — your context WILL reset; the
+commit log + CLAUDE.md are your only handoff. After EVERY code edit run
+scripts/full_slice_v4_sync.sh (7/8 workers run stale code otherwise).
+Clean up ONLY via scripts/full_slice_v4_reset.sh, never broad pkill.
+Spawn subagents/parallel work aggressively; tokens are abundant; only
+never re-run a 25-45 min full smoke on a hypothesis killable more cheaply.
