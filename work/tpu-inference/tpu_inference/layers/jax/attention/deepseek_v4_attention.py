@@ -1035,6 +1035,11 @@ def attention_init_state_from_prefill(
 
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     # SWA kv (matches attention_prefill's kv computation).
+    # NB: replicating wkv here (fix "d") did NOT stop the L1 overflow -> NaN — the
+    # garbage comes from x's EMPTY token shards (short single-seq prefill leaves
+    # ~31/32 attn_dp token shards empty) entering the matmul's cross-rank reshard,
+    # not from the weight. The real fix is to eliminate empty token shards (pad the
+    # seed token axis to >= dp_size before sharding). See HANDOFF_S1.md PHASE 9.
     kv = _linear(x, params.wkv)
     _v4_nan_tripwire("init_kv_postlinear", kv, layer_idx, -1)
     kv = rms_norm(kv, params.kv_norm_w, eps)

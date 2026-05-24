@@ -73,16 +73,45 @@ The `V4_DECODE_NAN_TRIPWIRE=1` smoke (132710Z, "Count to 8" decode) localized S1
   replicated decode state (`P()`) then takes the garbage ranks' values. But full
   replication breaks the forward (empty + halt), so that's not the cure.
 
-## NEXT — fix the seed kv overflow at its source
-Compare `attention_prefill` (forward kv = finite) vs `attention_init_state_from_prefill`
-(seed kv = overflows) to see why they diverge under sharding: likely the seed matmul/x
-reduces over or reads a sharded axis that includes idle/garbage shards, or an fp8
-dequant/scale differs, or the seed processes padding/garbage token positions the forward
-masks. Candidate fixes (NO full-replication, NO degenerate empty-shard `with_sharding_
-constraint(P())`): (a) zero/mask idle-rank & padding token activations before the seed kv;
-(b) constrain only the seed kv's *output* to take the data-rank value; (c) match the
-forward's exact (working) kv sharding/dequant in the seeding. Tripwire smoke 132710Z still
-up for live probing.
+## ROOT WALL (deepened) — EMPTY token shards on a short single-seq prefill
+The seed kv `_linear(x, params.wkv)` (`deepseek_v4_attention.py:1038`) is the IDENTICAL op
+to the forward kv (`:855`); `wkv` is plain bf16 (dequant at load). The divergence is pure
+sharding: the seed's output is forced **replicated P()** (`kv_cache_manager._initialize_
+kv_cache_deepseek_v4:865`, `_v4_constrain_packed_replicated`, `model_loader kv_cache_sharding=P()`),
+and that requirement propagates back so XLA reshards `x` for the matmul. For `max_num_seqs=1`
+the single sequence is on ~1 attn_dp rank and **~31/32 token shards are EMPTY/uninitialized**
+(`donate_argnums=2` recycles HBM; never zeroed). The reshard/all-gather over those empty
+shards injects garbage → 1.8e37 → NaN. The forward stays token-sharded end-to-end (idle
+lanes masked by causal/topk) so it's finite.
+
+## FIXES TRIED → ALL FAILED (don't repeat)
+- **FIX v2** `with_sharding_constraint(x,P())` in seed: Core-halt (degenerate empty-shard gather of x).
+- **Option A** runtime: replicate prefill input_ids from host: decode EMPTY (no NaN seen, but not
+  tripwire-checked) + Core-halt at req ~6. NOTE: replicating the input AVOIDED the NaN.
+- **fix (d)** replicate `wkv` in seed (`_linear(x, _replicate(params.wkv))`): L1 STILL overflows
+  (1.8e37→3.4e37, +inf/-inf appeared) ⇒ garbage is from x's EMPTY shards, not the weight. Reverted.
+
+## NEXT — candidate fixes (ranked); RUN OPTION-A-WITH-TRIPWIRE FIRST (cheap, decisive)
+1. **FIRST, cheap & decisive:** re-apply Option A (replicate V4 prefill input_ids from host,
+   `tpu_runner._prepare_inputs_dp`, see commit f1598b82's diff) AND smoke with
+   `V4_DECODE_NAN_TRIPWIRE=1`. Grep `[v4nan]` for L1 `init_kv_postlinear`. If it's **FINITE**
+   under Option A, then replicating the input FIXES THE SEED — the empty output + halt were a
+   SEPARATE decode-side issue (decode input/`q0==1` path, or prefix-cache/EOS), and S1 is much
+   closer than it looks. Then split Option A: replicate the SEED's input ONLY (`state_init_ids`
+   in `deepseek_v4.py:1849`) and keep the forward token-sharded, and replicate the DECODE input
+   too (q0==1) — so seed+decode are consistent without breaking the forward.
+2. **PAD the seed token axis to ≥ dp_size (32) before sharding** so NO shard is empty: pad
+   `state_init_ids` (`deepseek_v4.py:1849`) to a multiple of 32 with a pad token; thread the
+   REAL length `L_real` into `attention_init_state_from_prefill` + `_swa_kv_cache_from_prefill`/
+   `_compressor_state_from_prefill` so the cross-token roll/slice use `L_real` (ignore padding).
+   Most robust (kills empty shards = the root) but invasive + must not re-introduce an
+   empty-shard slice. NO degenerate `with_sharding_constraint(x,P())`.
+3. Shard the decode state (not replicated P()) to match the activation so the seed write is
+   local — big change (kv_cache_manager + decode reads); last resort.
+
+DIAGNOSTIC TOOL: `V4_DECODE_NAN_TRIPWIRE=1` prints `[v4nan] L{l} pos={p} {tag}: nan/inf/max_abs`
+(seed=pos -1 `init_*`; decode=pos≥T). `grep '\[v4nan\]' LOG | grep -vE 'nan=0 .inf=0 -inf=0'`
+shows the first non-finite field/layer. Only one rank (.202) prints — that's enough.
 
 ## DONE (verify TWICE on a fresh engine) — READ THE TEXT
 `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` exits 0 (visible_words≥10,
