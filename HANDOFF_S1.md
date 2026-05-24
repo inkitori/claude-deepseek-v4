@@ -44,23 +44,32 @@ still run (`node_guardian` + `meta_guardian`) as belt-and-suspenders. Reverse wi
   had the *right idea* (let every rank see the sequence) but the *wrong impl* (in-jit
   gather over empty shards halts).
 
-## FIX UNDER TEST — "Option A" (runtime replicated prefill input)
-Committed-pending-verify in `runner/tpu_runner.py` (`_prepare_inputs_dp` + non-dp twin,
-right after the metadata unpack): **for V4 + prefill only (`q0 = query_start_loc_view[1]
-> 1`), re-place `input_ids` REPLICATED from the HOST buffer** (`device_array(self.mesh,
-input_ids_view, sharding=NamedSharding(self.mesh, P()))`). This is a host→device
-**broadcast, NOT a device all-gather**, so it avoids FIX v2's faulting collective; every
-rank then sees the full token sequence and seeds the **same** replicated state. No model
-change (V4 is GSPMD global-array; it already slices `state_init_ids` from host lengths).
-Decode (`q0==1`) keeps `P(ATTN_DATA)`.
+## TWO replication fixes FAILED ⇒ seed-replication hypothesis is INSUFFICIENT
+Both attempts to "make every rank see the sequence" failed — STOP guessing, DIAGNOSE.
+- **FIX v2** (model-level `_replicate(x)` in `attention_init_state_from_prefill`):
+  Core-halt at prefill step 1 (degenerate empty-shard all-gather). Reverted.
+- **Option A** (runtime: re-place V4 prefill `input_ids` REPLICATED from host buffer in
+  `tpu_runner._prepare_inputs_dp`): decode returned **EMPTY** (not coherent, not even the
+  collapse attractor) for ~5 requests, then **Core-halted** at the 6th (tpu2:pe2:0/.198,
+  node PROVABLY absent). So a replicated prefill input neither fixes S1 nor is halt-free.
+  **Reverted** (working tree = clean pre-fix baseline). Note: replicated-input changed the
+  symptom collapse→EMPTY, so the seed/forward IS sharding-sensitive — but consistency alone
+  isn't the cure (the replicated forward may compute a *different wrong* seed, or the bug is
+  in the DECODE step, not the seed).
 
-**Smoke in flight: `logs/full-slice-v4-smoke-20260524T130642Z.log`.** Outcomes:
-- **COHERENT** (e.g. "Count to 8: ... 5, 6, 7, 8") ⇒ verify TWICE ⇒ **DONE**.
-- **STILL COLLAPSES (no halt)** ⇒ seed fix insufficient; the DECODE step also needs a
-  consistent input. Companion: replicate the V4 decode input too (q0==1 path) the same
-  host-broadcast way, and/or diagnose with `V4_DECODE_NAN_TRIPWIRE=1` (per-field drift).
-- **Core-halts at prefill** ⇒ surprising (a host broadcast shouldn't gather); the
-  `P()`→expert scatter would be implicated — diagnose, don't re-add a `with_sharding_constraint(P())`.
+## NEXT — DIAGNOSE with the tripwire (don't patch blind)
+Run a smoke on the clean **pre-fix** baseline with **`V4_DECODE_NAN_TRIPWIRE=1`** (smoke.sh
+forwards it). It prints `[v4nan] L{layer} pos={pos} {tag}: nan=.. +inf=.. -inf=.. max_abs=..`
+for the SEED (`init_*` tags, pos=-1) and every decode-step state field (`*_at_entry`,
+`q_postrope`, `kv_postrope`, …). Send a short decode curl (max_tokens~3 to limit volume),
+then grep `[v4nan]`:
+- If the SEED (`init_*` / first `*_at_entry`) already shows nan/inf or anomalous max_abs ⇒
+  the prefill→decode SEED is corrupt (which field/layer).
+- If the seed is clean but a DECODE step's fields drift at step 1 (pos=T) ⇒ the bug is in
+  the sharded **decode step**, not the seed (the handoff's "decode math fp32-exact" was an
+  isolated test, NOT the full 32-way sharded decode with idle ranks).
+Localize the field/layer/step FIRST, then design a fix that targets it without a degenerate
+empty-shard collective.
 
 ## DONE (verify TWICE on a fresh engine) — READ THE TEXT
 `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` exits 0 (visible_words≥10,
