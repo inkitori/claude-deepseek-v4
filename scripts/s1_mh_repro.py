@@ -65,8 +65,8 @@ def main():
     n_experts = int(sys.argv[6]) if len(sys.argv) > 6 else 8
     if mode not in ("replicated", "sharded"):
         raise SystemExit(f"mode '{mode}' not in (replicated, sharded)")
-    if action not in ("repro", "diff"):
-        raise SystemExit(f"action '{action}' not in (repro, diff)")
+    if action not in ("repro", "diff", "seeddiff"):
+        raise SystemExit(f"action '{action}' not in (repro, diff, seeddiff)")
 
     log(f"[s1-mh] mode={mode} action={action} T={T} N={N} n_layers={n_layers} "
         f"n_experts={n_experts} devices={jax.device_count()} procs={jax.process_count()}")
@@ -79,6 +79,73 @@ def main():
 
     rng = np.random.default_rng(seed=1234)
     ids_full = rng.integers(0, cfg.vocab_size, size=(1, T + N)).astype(np.int32)
+
+    AXES = ("data", "attn_dp", "attn_dp_expert", "expert", "model")
+    nd = jax.device_count()
+
+    def build_mesh(m):
+        if m == "replicated":
+            shape = (1, 1, 1, 1, nd)
+        else:
+            adp = nd
+            while adp > 1 and (n_experts % adp or nd % adp):
+                adp //= 2
+            shape = (1, adp, 1, 1, nd // adp)
+        devices = np.array(jax.devices()).reshape(shape)
+        return jax.sharding.Mesh(devices, AXES), shape
+
+    if action == "seeddiff":
+        # Weight-agnostic test: does SHARDED prefill-seeding match REPLICATED
+        # prefill-seeding (same weights+inputs)? Seeding should be mode-invariant
+        # up to ~1e-3 bf16 reduction noise; a large per-field relErr means the
+        # attn_dp-sharded compute CORRUPTS the seeded packed state — the prime
+        # real-S1 suspect (decode reads corrupted state => step-1 collapse). The
+        # MH repro never tested this (it only compared same-mode oracle/decode).
+        def seed_buffers(m):
+            mesh, shape = build_mesh(m)
+            log(f"[s1-mh] seeddiff mode={m} mesh={dict(zip(AXES, shape))}")
+            repl = jax.sharding.NamedSharding(mesh, P())
+            def put(x):
+                x = np.asarray(x)
+                return jax.make_array_from_callback(
+                    x.shape, repl, lambda idx, _x=x: _x[idx])
+            with jax.set_mesh(mesh):
+                pr = jax.tree_util.tree_map(put, params)
+                sw, co = put(swa), put(comp)
+                def _pf(kv, ids):
+                    nk, _ = deepseek_v4_run_with_decode_state(
+                        kv, ids, pr, sw, co, cfg, state_max_seq_len=max_seq,
+                        is_decode_step=False, start_pos=jnp.int32(0))
+                    return nk
+                jp = jax.jit(_pf)
+                kv = [put(np.zeros((s,), np.float32)) for s in sizes]
+                kv = jp(kv, put(ids_full[:, :T]))
+                return [np.asarray(b) for b in kv]
+
+        rep_buf = seed_buffers("replicated")
+        shd_buf = seed_buffers("sharded")
+        layouts = transformer_body_layout(params, cfg, max_seq, 1)
+        worst = (0.0, None)
+        for layer in range(n_layers):
+            off = 0
+            for name, fshape, _dt in layouts[layer]:
+                n = int(np.prod(fshape)) if len(fshape) else 1
+                if n == 0:
+                    continue
+                r = rep_buf[layer][off:off + n]
+                s = shd_buf[layer][off:off + n]
+                rel = float(np.linalg.norm(r - s) / (np.linalg.norm(r) + 1e-9))
+                mad = float(np.max(np.abs(r - s)))
+                if rel > worst[0]:
+                    worst = (rel, (layer, name))
+                flag = "**" if rel > 0.02 else "  "
+                log(f"  {flag} layer={layer} ratio={cfg.compress_ratios[layer]} "
+                    f"field={name:<22} relErr={rel:.5f} max|d|={mad:.4g}")
+                off += n
+        log(f"[s1-mh] seeddiff WORST relErr={worst[0]:.5f} at {worst[1]} "
+            f"(T={T} attn_dp idle-ranks={'yes' if T < nd else 'no'})")
+        print(f"[p{PID}] SEEDDIFF_DONE worst={worst[0]:.5f}@{worst[1]}", flush=True)
+        return
 
     # Mesh carries production's named axes (the functional fwd references
     # 'attn_dp' for MoE expert sharding). 'replicated': everything size-1 except
