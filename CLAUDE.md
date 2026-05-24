@@ -500,21 +500,28 @@ the top of `attention_init_state_from_prefill` (seeding) AND `attention_decode_s
   independent slice flakiness — the runbook says this slice SLICE_FAILUREs
   spontaneously. A FRESH-slice retest is needed to be sure.)
 
-**RECOVERY DONE:** the wedge was cleared by **rebooting the 7 workers** (STEP 0b).
+**CONFIRMED on a FRESH slice → reverted to seeding-only (FIX v2):** rebooted the 7
+workers (clean slice, 0 failures), relaunched the c5f245c7 fix smoke — decode Core-halted
+*again* at the FIRST step (`SLICE_FAILURE_SW_INJECT_ERROR`). That's **3x including a
+freshly-rebooted slice ⇒ NOT slice flakiness; the decode-step `_replicate(x_step)` is the
+halt cause.** Root: a single decode token has a **size-1 token axis** — `with_sharding_
+constraint` to `P()` emits a degenerate all-gather the TPU faults on; and a size-1 axis
+can't shard 32 ways anyway (already effectively replicated), so the op was unnecessary AND
+fatal. **FIX v2 (committed, seeding-only):** removed `_replicate(x_step)` from
+`attention_decode_step`; KEPT `_replicate(x)` in `attention_init_state_from_prefill`
+(prefill seeds over T>1 token-sharded tokens — the real S1 cause — and that gather is
+normal/non-degenerate, prefill never halted). Pre-fix decode ran without halting and
+collapsed from the bad SEED, so seeding-only should make decode coherent.
 
-**NEXT (in priority order):**
-1. On the fresh slice, TEST the fix cheaply FIRST with a **token-sharded MH repro**
-   (place input on `P(None,'attn_dp')`, NOT replicated) BEFORE a full smoke — it
-   reveals (a) does the fix's reshard Core-halt at truncated scale, and (b) does decode
-   match the oracle. Faster than a 10-min smoke. (Enhance `s1_mh_repro.py`: the existing
-   `put` places replicated — add a token-sharded input placement.)
-2. If the fix Core-halts on a FRESH slice ⇒ confirmed cause ⇒ switch to a **TPU-safe
-   variant**: prefer a RUNTIME fix — make V4 *decode* use a **replicated input sharding**
-   instead of `P(ShardingAxisName.ATTN_DATA)` (`tpu_runner.py:~1560`,
-   `data_parallel_attn_sharding`), so the activation is replicated from entry and NO
-   mid-forward reshard is inserted. That directly addresses the PHASE-7 diagnosis
-   (token-axis sharding of the single decode token) at the source.
-3. If the fix is clean+correct on the MH repro ⇒ ONE full smoke for closure (verify TWICE).
+**RECOVERY procedure (each bad-fix smoke wedges the slice → STEP 0b reboot):** reboot 7
+workers → wait for SSH → remount GCS each (`mount_gcs.sh`) → `full_slice_v4_ray_restart.sh`.
+~6-7 min. The seeding-only fix should NOT wedge (no degenerate reshard).
+
+**NEXT:** smoke FIX v2 on the fresh slice; read decode text. Coherent ⇒ verify TWICE ⇒ DONE.
+If still COLLAPSES (no halt) ⇒ seed fix insufficient ⇒ the decode-step ALSO needs correct
+sharding but via a NON-halting route: a RUNTIME fix (give V4 decode a replicated input at
+`tpu_runner.py` `data_parallel_attn_sharding`, so no mid-forward reshard) — NOT another
+model-level `with_sharding_constraint` on the size-1 decode activation.
 
 ## How to validate (fastest signal first)
 
