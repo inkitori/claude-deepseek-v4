@@ -715,6 +715,12 @@ def attention_decode_step(
 
     Returns (new_state, y_step) with y_step shape [B, 1, dim].
     """
+    # S1 FIX: the runtime token-shards activations on ATTN_DATA, so a single
+    # decode token lands on one dp shard with the rest idle. The decode math is
+    # built around the REPLICATED P() kv-state, so pin the activation replicated
+    # here — otherwise the idle/uneven token-axis shards corrupt the sparse_attn
+    # gather + write-sites against the replicated cache. No-op on CPU / no mesh.
+    x_step = _replicate(x_step)
     B = x_step.shape[0]
     H = params.n_heads
     Dh = params.head_dim
@@ -1010,6 +1016,15 @@ def attention_init_state_from_prefill(
     Dh = params.head_dim
     rd = params.rope_head_dim
     eps = params.norm_eps
+
+    # S1 FIX: prefill SEEDING runs cross-token ops (_swa_kv_cache_from_prefill
+    # jnp.roll, _compressor_state_from_prefill slice) over the token axis. The
+    # runtime token-shards this activation on ATTN_DATA; for a short prompt the
+    # axis is sharded UNEVENLY (idle ranks), which corrupts the rolled/sliced
+    # seeded state while the forward `h` stays correct -> decode reads a bad
+    # seed and collapses at step 1. Pin the seeding activation replicated so the
+    # cross-token ops see the full sequence. No-op on CPU / no mesh.
+    x = _replicate(x)
 
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     # SWA kv (matches attention_prefill's kv computation).
