@@ -272,6 +272,48 @@ at the collapse step; is `pos=` correct each step.
 (Production V4 runs attn_dp=32: num_kv_heads=1 + bf16 ⇒ TP folds entirely into
 attn_dp, model=expert=1, KV `P()`. The repro used attn_dp=8 / 8 experts.)
 
+## PHASE 3 — S1 IS A DECODE-PATH BUG (real-weight smoke, 2026-05-24)
+
+The instrumented smoke (`V4_DECODE_NAN_TRIPWIRE=1`) ran clean on real weights and
+**localized S1 to the decode path.** Decisive findings:
+
+* **PREFILL IS HEALTHY.** Pure single-token probes (`max_tokens=1`, ZERO decode
+  steps) are all correct: France→`Paris`, Japan→`Tokyo`, hot→`cold`,
+  hydrogen→`oxygen`, George→`Washington`, violets→`blue`. So the weights, config,
+  embedding, MoE routing, sparse-attention SELECTION and the whole forward are
+  correct **in the prefill path**.
+* **DECODE COLLAPSES.** With `max_tokens≥2` the output degenerates by token 2-3
+  into a repeating attractor (Mars→`' "The first thing that is a good and the
+  first thing'`; Paris→`' Paris, 2000, 2000, 2000'`). The collapse appears the
+  moment decode steps (which reuse the threaded KV + compressor/indexer/SWA
+  decode-state) run instead of recomputing over the full sequence.
+* **Tripwire trace is BENIGN at the field level:** finite everywhere (NO nan/inf
+  in decode), `pos=` correct each step (11,12,…), all 6 state fields + per-layer
+  activations finite and varying with reasonable magnitude. The `-inf` in
+  `compressor_score`/`indexer_score` is by-design masking that correctly
+  *decreases* as positions fill. So S1 is **wrong FINITE values from attending to
+  the wrong context / mis-threaded state**, not a blowup — exactly why the
+  nan-tripwire alone never caught it.
+* **Non-determinism is a DOWNSTREAM symptom, not the bug.** It survives the
+  tripwire host-callbacks (so it's not merely debug-perturbable reduction order)
+  and only appears at LATE tokens (first ~6 tokens identical across temp=0 runs,
+  then split) — i.e. once decode is already in a flat-logit degenerate regime,
+  32-way reduction noise flips near-ties. The PRIMARY bug is the **collapse**.
+
+**This OVERTURNS the PHASE-2 "decode math is correct" conclusion** — that was
+proven only on the truncated random-weight repro (4 layers, ratios (0,0,4,128),
+8 experts, short seq, attn_dp=8). The real-config decode path (61 layers, real
+per-layer `compress_ratio`/`window_size`, real `state_max_seq_len`, attn_dp=32)
+IS broken. So S1 is a **real-config-only decode bug**: prime suspects are the
+sparse-attention index selection at decode (`get_window_topk_idxs_decode` /
+`get_compress_topk_idxs_decode` / indexer `compress_topk` in
+`deepseek_v4_attention.py:~750-790`), the SWA ring-buffer wrap
+(`kv_cache.at[:, start_pos % win]`) when `win < seq_len`, or a prefill→decode
+seed slot-layout mismatch (`attention_init_state_from_prefill` /
+`_compressor_state_from_prefill`) that the short-seq/ratio-0 repro never exercised.
+Confirm with a teacher-forcing comparison (decode trajectory vs re-prefill every
+token) — re-prefill-every-token should generate COHERENTLY since prefill is healthy.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
