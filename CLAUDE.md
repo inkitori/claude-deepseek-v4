@@ -314,6 +314,33 @@ seed slot-layout mismatch (`attention_init_state_from_prefill` /
 Confirm with a teacher-forcing comparison (decode trajectory vs re-prefill every
 token) — re-prefill-every-token should generate COHERENTLY since prefill is healthy.
 
+## PHASE 4 — S1 REPRODUCED ON CPU (peaked weights) — fast iteration unlocked
+
+**The runbook's "CPU can never reproduce S1" was WRONG** — it was an artifact of
+the repro's `normal*0.02` weights, which make the compressor/indexer internal
+softmaxes ~UNIFORM and average out the decode-vs-prefill discrepancy. With
+**peaked** weights the bug surfaces on CPU, eager, single-device (NO sharding /
+NO reduction noise → a genuine deterministic decode-math discrepancy):
+
+* `scripts/s1_cpu_repro_peaked.py <scale> <n_layers> <T> <N> <seed>` — same
+  truncated cfg as `s1_cpu_repro_v4flash.py` but weights `normal*scale`, eager
+  only, compares decode argmax vs the fresh-prefill (`transformer_body_forward`)
+  reference. `scale=0.02`→bad=0/12 (matches old runbook); **`scale=0.5`→bad=3/12**
+  (S1). `scale=1.0`→0 (logits saturate). ~23s/run.
+* Structural confirmation (`/tmp/s1_structural_check.py` logic): at scale=0.5,
+  worst decode steps have **||h_dec−h_pre||/||h_pre|| = 0.20–0.41** (vs 0.004 at
+  scale=0.02) — a LARGE hidden-state divergence, not a near-tie float flip. This
+  IS S1's class of bug.
+
+**Localization so far:** the bug is NOT in `deepseek_v4_attention.py` — an
+isolated single-layer attention parity test (prefill seed+decode_step vs
+reference) stays at relErr ~3e-3 even under peaked weights. The structural error
+only appears in the FULL decode path `deepseek_v4_run_with_decode_state`
+(`deepseek_v4.py`): `_pack_layer_state`/`_unpack_layer_state`, the MoE decode,
+and/or multi-layer state threading. **USE THE CPU REPRO to bisect which
+layer/component first diverges** (compare per-layer decode h vs prefill h) — no
+smoke needed until final closure.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
