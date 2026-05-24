@@ -107,23 +107,39 @@ ONE chip = .202). The NaN almost certainly ORIGINATES earlier/elsewhere (a non-.
 embed or L0 forward, or the weight on some rank) and the L1 matmul's cross-rank contraction
 surfaces it on .202.
 
-## NEXT — get ALL-RANK visibility (single-chip tripwire is the blind spot)
-1. **Instrument all ranks.** Modify `_v4_nan_tripwire` (deepseek_v4_attention.py:40) to report a
-   GLOBAL reduction so one chip's print reflects every rank: e.g. wrap the nan/inf/max_abs in a
-   collective — `jax.lax.psum`/`pmax` over the mesh axes ('data','attn_dp','attn_dp_expert',
-   'expert','model') — OR add `jax.debug.print` of per-chip values keyed by a device id. Also try
-   collecting the OTHER 7 workers' EngineCore logs (per-host ray session logs under
-   `/tmp/ray-vllm/session_*/logs/`), not just the head smoke log, to see non-.202 ranks.
-2. **Find where the NaN FIRST appears** across ranks: instrument the EMBED output
-   (`deepseek_v4.py` `embed_w[input_ids]`) and L0 forward `h`, per rank. Is some rank NaN at the
-   embed already (bad input_ids / OOB gather on idle ranks)? Or at L0 forward? That's the true
-   origin; L1's matmul just surfaces it.
-3. Reconsider the WEIGHT: is `params.wkv` finite on ALL ranks in the SEED's jit (vs the forward)?
-   Donation/aliasing (`donate_argnums=2`) could corrupt a buffer the seed reads. (Earlier
-   "donation DISPROVEN" was for the decode math, not this seed-context cross-rank read.)
-Only after locating the true origin should the next fix be designed.
+## CORRECTED DIAGNOSIS — it's the MATMUL's OUTPUT-SHARDING, not empty x shards
+KEY: `_v4_nan_tripwire`'s `jnp.sum(isnan(x))` / `jnp.max(|x|)` are WHOLE-ARRAY reductions ⇒
+XLA all-reduces them ⇒ **the printed nan/max are GLOBAL across all 32 ranks** (the single
+".202 prints" is irrelevant — its numbers are already global; other ranks' ray logs have ZERO
+`[v4nan]`, confirmed). So at the seed L1: `init_x_in nan=0 max_abs=0.18` ⇒ **x is finite & small
+on EVERY rank**; `wkv` is the SAME finite weight the forward uses fine; yet `init_kv_postlinear`
+is NaN. **Same `_linear(x, params.wkv)` op, same finite inputs, but the SEED's call (line 1038)
+→ NaN while the FORWARD's (line 855) → finite.** The ONLY difference is the OUTPUT sharding: the
+seed's kv flows into the REPLICATED-`P()` decode state; the forward's stays token-sharded
+(`P(ATTN_DATA)`). ⇒ This is an **XLA sharded-matmul corruption driven by the replicated-output
+requirement** — NOT empty-shard x garbage. That's why input-replicate (Option A), weight-replicate
+(fix d), AND token-pad all failed: none change the output-sharding-driven plan.
 
-## (OBSOLETE) earlier pad-fix plan — kept for context
+## NEXT — redirected fix: compute the seed matmul TOKEN-SHARDED (like the forward), reshard AFTER
+1. **Cheap confirm (1 line + smoke):** add `_v4_nan_tripwire("init_wkv", params.wkv, layer_idx, -1)`
+   before line 1038. Expect FINITE (forward uses same wkv) ⇒ confirms it's the matmul's sharded
+   execution, not a corrupt weight. (If wkv is huge ⇒ donation/aliasing corrupts the seed's weight
+   buffer — different fix.)
+2. **Leading fix:** force the seed's kv matmul to compute in the FORWARD's finite token-sharded
+   layout, e.g. `kv = with_sharding_constraint(_linear(x, params.wkv), P(None, ATTN_DATA, None))`
+   (ATTN_DATA = `('data','attn_dp','attn_dp_expert')`) so XLA uses the forward's (finite) plan;
+   the reshard to the replicated state then happens AFTER, on the finite kv. RISK: that later
+   token-sharded→replicated state reshard all-gathers empty token shards (short prefill) → may
+   halt/garbage; so likely COMBINE with the pad (zero-pad token axis to ≥32 so no empty shards) —
+   i.e. pad + pin-output-token-sharded together. Apply the same to the compressor/indexer seed
+   matmuls. Validate each step with `V4_DECODE_NAN_TRIPWIRE=1` (watch init_kv_postlinear finite,
+   then the state fields finite) + read decode text.
+3. If XLA still corrupts it: the seed may need to mirror the forward's FULL kv computation (reuse
+   attention_prefill's kv) rather than recompute under the replicated-output context.
+NOTE: the pad fix (commit c731f592, reverted in fefddcb3) is CPU-parity-correct and may be a
+NECESSARY companion to (2) — re-apply it together with the output-sharding pin.
+
+## (OBSOLETE) earlier empty-shard / pad-fix plan — kept for context
 Both input- and weight-replication left the seed NaN, so the fix must make the seed's token
 axis have NO empty shards. The runtime already ZEROES the global token buffer beyond the real
 tokens (`tpu_runner.py:1813` `input_ids_view[total:] = 0`), but the seed SLICES to L_real
