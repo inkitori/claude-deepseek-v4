@@ -55,19 +55,36 @@ There is an **untested candidate fix already in the tree** (commit
 returns. It is CPU-validated but **never run on TPU**.
 
 **STEP 0 — this is a SHARED slice; evict the other tenant first**
-(see Pitfall 0). User `mark` runs a `tpu-manager` agent (`~/agent.py`)
-in a tmux `while true` restart loop on **all 7 workers**; it grabs the
-TPU and SIGKILLs our vllm workers mid-`load_model` (the smoke dies
-~80 s in with `Worker exit type: SYSTEM_ERROR ... connection error
-code 2`, NOT an S1 symptom). Kill it and keep it dead before any smoke:
+(see Pitfall 0). The slice is mark's `tpu-manager` prod box, only
+half-decommissioned. The real contender is a **Docker container named
+`node`** (`vllm/vllm-tpu:nightly`, `restart_policy=unless-stopped`) on
+all 8 hosts: it runs `ray start --address=10.164.0.192:6379` — the SAME
+ray head our cluster uses — so two ray/vllm stacks fight over one
+exclusive TPU slice. (`~/agent.py` under user `mark` is a RED HERRING:
+pure observability on :8999, never touches the TPU. Don't waste time on
+it.) Evict on every host (we have sudo; `unless-stopped` means an
+explicit stop sticks):
 ```bash
-for h in $(scripts/full_slice_v4_discover.sh workers); do
+for h in $(scripts/full_slice_v4_discover.sh head) $(scripts/full_slice_v4_discover.sh workers); do
   ssh -i ~/.ssh/google_compute_engine -o StrictHostKeyChecking=no enyouki@$h \
-    'sudo -u mark -H tmux kill-session -t agent 2>/dev/null; sudo pkill -9 -u mark -f agent.py'
-done
+    'sudo docker update --restart=no node; sudo docker stop -t3 node' 2>/dev/null
+done   # head runs docker locally; loop form shown for clarity
 ```
-A redeployer may restart it, so run a guardian loop that re-kills any
-`agent.py` every ~25 s for the duration of your smokes.
+Leave the GCP platform containers alone (`tpu-runtime`/fake_tensorflow,
+healthagent, google-runtime-monitor, …). Run a guardian that re-stops
+any reappearing `node` container every ~25 s during smokes (a remote
+controller may redeploy it).
+
+**STEP 0b — if smokes still halt with `SLICE_FAILURE_SW_INJECT_ERROR` /
+`Core halted` / `unexpected peer ... different launch id`**, the TPU
+launch-group state is WEDGED (legacy of `node`'s 32 thrash-restarts);
+ray-restart does NOT clear it. Recovery (verified): **`sudo reboot` the
+7 workers** (NOT the head — your session lives there; spot VMs survive
+reboot), wait for them, then on each worker
+`cd ~/claude-deepseek-v4 && set -a && source .env && set +a && ./scripts/mount_gcs.sh`
+(reboot drops the gcsfuse mount), then `scripts/full_slice_v4_ray_restart.sh`.
+After that a smoke loads+compiles cleanly (~9 min to `Application
+startup complete`).
 
 So the cheapest possible win is to just run the TPU smoke as-is and
 see if it already passes:
@@ -79,9 +96,21 @@ scripts/full_slice_v4_smoke.sh        # launch vllm serve (background)
 LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh
 ```
 
-If it passes the success gate → done. If not → the root cause is
-**open** (see below); this fix becomes another tried-and-failed data
-point, and you diagnose from scratch.
+**RESULT (2026-05-24, smoke after infra recovery): FAILED.** The
+barrier fix (`1f212036`) is now a **confirmed TPU dead-end**, not just
+untested. With it live at HEAD the engine reached `Application startup
+complete`, served, and decode still collapsed:
+`"Tell me a short story about a robot exploring Mars:"` (max_tokens=64,
+temp=0) → `' "The first step is to be the best." "The best is to be the
+best." "The best is to be the best." …'` — the S1 repeating attractor.
+(Matches the CPU-HLO finding that XLA elides the 6 `optimization_barrier`
+ops, 6→0 in compiled HLO — same folding fate as `75b92f4b`.) So: root
+cause is **OPEN**; diagnose from scratch (next section). NOTE the slice
+is marginally stable post-recovery — it served one decode then a worker
+hit `SLICE_FAILURE` again with no contention present; prefer the
+small-config-on-TPU repro (4 layers / few chips) as the PHASE-2 inner
+loop over repeated full smokes (it's also less exposed to the flaky
+32-chip collective).
 
 ## If it fails — root cause is OPEN
 
@@ -175,17 +204,20 @@ log activity during load.
 
 ## Pitfalls (these cost real time)
 
-0. **SHARED SLICE — the `tpu-manager` tenant will kill your smoke.**
-   User `mark` runs `~/agent.py` (open-inf/tpu-manager) in a tmux
-   `while true; do python3 ~/agent.py; sleep 2; done` loop on all 7
-   workers (none on the head). It contends for the TPU and crashes our
-   vllm workers during `collective_rpc("load_model")` ~80 s in
-   (`ActorDiedError` / `SYSTEM_ERROR` / `connection error code 2` — a
-   silent OS-level kill, no Python traceback, NOT OOM, NOT S1). We have
-   `sudo`. Evict before every smoke (see First-action STEP 0) and keep
-   a guardian re-killing it. Symptom-vs-S1 tell: if the smoke dies
-   *before* `Application startup complete` / before any decode token,
-   it's the tenant, not S1 — re-check `pgrep -u mark -f agent.py`.
+0. **SHARED SLICE — mark's `tpu-manager` `node` container will kill
+   your smoke; a wedged slice needs a worker reboot.** See First-action
+   STEP 0 / 0b for the full eviction + un-wedge procedure. The contender
+   is the Docker container `node` (mark's ray worker joining ray at
+   `10.164.0.192:6379`, `restart=unless-stopped`, was thrash-looping
+   restart_count=32) — NOT `~/agent.py` (that's harmless observability).
+   Failure signatures, all BEFORE `Application startup complete` / before
+   any decode token (so NOT S1): `ActorDiedError` / `Worker exit type:
+   SYSTEM_ERROR` / `connection error code 2` (live contention), then once
+   wedged `SLICE_FAILURE_SW_INJECT_ERROR` / `Core halted unexpectedly` /
+   `unexpected peer shows up ... different launch id`. Tell-vs-S1: S1 is a
+   *decode-output* bug — it only exists once the server reaches
+   `Application startup complete` and curls return text. Any crash during
+   load/compile is infra, not S1.
 1. **`scripts/full_slice_v4_sync.sh` after EVERY code edit** — each of
    the 8 hosts has its own clone; `git push` does NOT sync them. Skip
    it and 7/8 workers run stale code (30+ min lost). Syncs
