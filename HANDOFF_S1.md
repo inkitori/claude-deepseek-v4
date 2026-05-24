@@ -45,19 +45,34 @@ freely; use the TPU; make every call yourself; commit+push checkpoints; never wa
   ./scripts/mount_gcs.sh`) → `scripts/full_slice_v4_ray_restart.sh`. ~6 min. With `node`
   removed first, reboot won't auto-start it.
 
-## IN FLIGHT (check this FIRST)
-A clean-slice FIX v2 smoke is loading: `logs/full-slice-v4-smoke-20260524T105632Z.log`
-(port 18081, tripwire OFF). When it logs `Application startup complete`, run the decode
-test: **`/tmp/s1_verify.sh`** (reads ACTUAL decode text on count/paris/mars + 3-Paris
-byte-identity + 5-request survival; first probe absorbs the cold decode compile, ~min).
-- COHERENT decode (e.g. "Count to 8: 1,2,3,4," → " 5, 6, 7, 8,...") ⇒ FIX v2 WORKS ⇒
-  verify TWICE for closure (DONE gate below).
-- Still COLLAPSES (no halt) ⇒ seed fix insufficient ⇒ the decode path also needs correct
-  sharding via a NON-halting route: a RUNTIME fix (give V4 *decode* a replicated input at
-  `tpu_runner.py` `data_parallel_attn_sharding`, so no mid-forward reshard). NOT another
-  model-level `with_sharding_constraint` on the size-1 decode activation.
-- Core-halts AGAIN ⇒ check `node` slipped in (node_guardian log) / slice degraded; reboot
-  recovery + retry.
+## VERIFICATION IS BLOCKED BY `node` CONTENTION — fix this FIRST (PHASE 8, 11:15)
+FIX v2 could NOT be verified: the FIX v2 smoke (`105632Z`) reached startup but Core-halted
+at decode (`tpu6:pe4:0`). Across 5 halts the chip DIFFERS every time (tpu1:pe2:0,
+tpu2:pe2:1, tpu6:pe4:0) ⇒ **NOT one bad chip** ⇒ `node`-contention / launch-group
+corruption. `node` reappeared at 11:03 during this smoke (guardian removed it in 3s).
+**The 3s guardian is INSUFFICIENT: ANY `node` touch during the smoke's lifetime corrupts
+the launch group and the next decode collective halts.** FIX v2's DECODE graph is byte-
+identical to the pre-fix graph that ran clean for 93 requests at 06:48, so **the fix is
+very likely CORRECT — the blocker is infra, not the fix.**
+
+**STEP 1 — ELIMINATE `node` entirely (not just mitigate) so a smoke gets a clean window:**
+- Find what redeploys it: it auto-starts on worker reboot AND a controller redeploys it
+  every few min. Check `sudo docker events --since 10m` / `docker inspect node` (labels) /
+  systemd / GCP VM metadata (`curl -H 'Metadata-Flavor: Google' metadata/.../attributes/`)
+  on a worker right after it reappears. If the controller is LOCAL, disable it.
+- If remote/unreachable: **occupy the name** — `sudo docker create --name node busybox`
+  (a stopped dummy holding the name) on all 8 hosts, so the controller's
+  `docker run --name node <real>` fails (name conflict). Update node_guardian to remove
+  only the REAL node (image `vllm/vllm-tpu*`) and re-create the dummy. Verify `node` stays
+  absent for ≥10 min before smoking.
+**STEP 2 — clean reboot recovery (slice is wedged from the 11:15 halt; see recovery above).**
+**STEP 3 — relaunch smoke + `/tmp/s1_verify.sh`. Watch outcomes:**
+- COHERENT (e.g. "Count to 8: 1,2,3,4," → " 5, 6, 7, 8,...") ⇒ FIX v2 WORKS ⇒ verify TWICE.
+- COLLAPSES (no halt) ⇒ seed fix insufficient ⇒ RUNTIME fix: give V4 *decode* a replicated
+  input at `tpu_runner.py` `data_parallel_attn_sharding` (no mid-forward reshard). NOT a
+  model-level `with_sharding_constraint` on the size-1 decode activation (that Core-halts).
+- Core-halts AGAIN with `node` confirmed absent the whole smoke ⇒ slice genuinely degraded
+  ⇒ consider re-creating the TPU slice (GCP) or escalate to the user.
 
 ## DONE (verify TWICE on a fresh engine) — READ THE TEXT
 `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` exits 0 (visible_words≥10,
