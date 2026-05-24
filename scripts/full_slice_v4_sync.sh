@@ -13,12 +13,14 @@
 # Usage: scripts/full_slice_v4_sync.sh
 #
 # Reads:
-#   WORKERS  — space-separated worker IPs
+#   WORKERS  — space-separated worker IPs (default: auto-discovered)
+#   HEAD_IP  — head IP (default: auto-discovered)
 
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+HEAD_IP="${HEAD_IP:-$("$REPO/scripts/full_slice_v4_discover.sh" head)}"
+WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
 SSH_OPTS="-i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 log() { echo "[sync] $*"; }
@@ -39,8 +41,8 @@ for h in $WORKERS; do
 done
 
 log "verification: slice-aware code present on every host?"
-for h in 10.164.0.41 $WORKERS; do
-    if [ "$h" = "10.164.0.41" ]; then
+for h in "$HEAD_IP" $WORKERS; do
+    if [ "$h" = "$HEAD_IP" ]; then
         n=$(grep -c "iter_v4_safetensors_specs\|place_spec_as_jax_sharded\|slice_aware" \
             "$REPO/work/tpu-inference/tpu_inference/models/jax/deepseek_v4_loader.py" \
             "$REPO/work/tpu-inference/tpu_inference/models/jax/deepseek_v4.py" 2>/dev/null \

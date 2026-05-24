@@ -44,8 +44,10 @@
 
 set -u
 
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/vllm/xla_cache}"
-WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+HEAD_IP="${HEAD_IP:-$("$REPO/scripts/full_slice_v4_discover.sh" head)}"
+WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
 SSH_OPTS="-i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 fp_local() {
@@ -73,7 +75,7 @@ fp_remote() {
     " 2>&1 | grep -v "^Warning:"
 }
 
-echo "=== 10.164.0.41 (head) ==="
+echo "=== $HEAD_IP (head) ==="
 fp_local
 for h in $WORKERS; do
     echo "=== $h ==="

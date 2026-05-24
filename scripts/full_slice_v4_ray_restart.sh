@@ -10,7 +10,7 @@
 #   scripts/full_slice_v4_ray_restart.sh
 #
 # Reads:
-#   HEAD_IP   — head node ip (default 10.164.0.41)
+#   HEAD_IP   — head node ip (default: auto-discovered)
 #   WORKERS   — space-separated worker ips
 #   VENV      — path to vllm venv
 
@@ -18,8 +18,8 @@ set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${VENV:-$REPO/work/vllm_env}"
-HEAD_IP="${HEAD_IP:-10.164.0.41}"
-WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+HEAD_IP="${HEAD_IP:-$("$REPO/scripts/full_slice_v4_discover.sh" head)}"
+WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
 SSH="ssh -i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 ray_bin="$VENV/bin/ray"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch vllm serve DeepSeek-V4-Flash on the full v6e-32 slice. Run on
-# worker 0 (10.164.0.41). Assumes Ray is up + repo/venv synced to all 8
+# worker 0 (the head). Assumes Ray is up + repo/venv synced to all 8
 # workers + GCS-mounted V4-Flash checkpoint visible on every host.
 
 set -euo pipefail
@@ -23,7 +23,7 @@ export PYTHONPATH="$REPO_ROOT/work/vllm:$REPO_ROOT/work/tpu-inference:$VENV/lib/
 
 # Multi-host TPU bounds: form the 32-chip distributed mesh.
 export TPU_MULTIHOST_BACKEND=ray
-export RAY_ADDRESS=10.164.0.41:6379
+export RAY_ADDRESS="${RAY_ADDRESS:-$("$REPO_ROOT/scripts/full_slice_v4_discover.sh" head):6379}"
 export JAX_PLATFORMS=
 export TPU_HOST_BOUNDS=2,4,1
 export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1

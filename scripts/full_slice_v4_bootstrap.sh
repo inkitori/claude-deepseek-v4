@@ -22,15 +22,15 @@
 #   scripts/full_slice_v4_bootstrap.sh
 #
 # Environment:
-#   HEAD_IP   default 10.164.0.41
-#   WORKERS   default the 7 known v6e-32 worker IPs
+#   HEAD_IP   default: auto-discovered from GCP metadata (worker 0)
+#   WORKERS   default: auto-discovered from GCP metadata (workers 1..N)
 
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO/.env"
-HEAD_IP="${HEAD_IP:-10.164.0.41}"
-WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+HEAD_IP="${HEAD_IP:-$("$REPO/scripts/full_slice_v4_discover.sh" head)}"
+WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
 SSH_OPTS="-i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 log() { echo "[bootstrap $(date -u +%H:%M:%SZ)] $*"; }

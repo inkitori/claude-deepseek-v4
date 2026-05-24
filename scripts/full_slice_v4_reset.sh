@@ -14,8 +14,8 @@
 #   4. Leaked Ray placement groups in the CREATED state.
 #
 # Does NOT touch raylet daemons or the Ray cluster itself. Assumes Ray
-# is already running and reachable at $RAY_ADDRESS (default
-# 10.164.0.41:6379) and that ssh ~/.ssh/google_compute_engine works
+# is already running and reachable at $RAY_ADDRESS (default:
+# auto-discovered) and that ssh ~/.ssh/google_compute_engine works
 # host-to-host as the current user.
 #
 # Usage:
@@ -24,15 +24,15 @@
 #
 # Env vars (override defaults):
 #   WORKERS  — space-separated worker IPs
-#   RAY_ADDRESS — Ray head address (default 10.164.0.41:6379)
+#   RAY_ADDRESS — Ray head address (default: auto-discovered)
 #   VENV     — path to vllm venv (default $REPO/work/vllm_env)
 
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${VENV:-$REPO/work/vllm_env}"
-RAY_ADDRESS="${RAY_ADDRESS:-10.164.0.41:6379}"
-WORKERS="${WORKERS:-10.164.0.22 10.164.0.35 10.164.0.36 10.164.0.39 10.164.0.45 10.164.0.18 10.164.0.30}"
+RAY_ADDRESS="${RAY_ADDRESS:-$("$REPO/scripts/full_slice_v4_discover.sh" head):6379}"
+WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
 PIDFILE="$REPO/logs/full-slice-v4-smoke.pid"
 QUIET="${QUIET:-0}"
 
