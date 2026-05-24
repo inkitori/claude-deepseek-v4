@@ -225,10 +225,36 @@ shown if it were in the decode math — it isn't). **Remaining suspects:**
    uninitialized HBM read / non-det collective / cross-request buffer reuse.
 
 **NEXT: an INSTRUMENTED smoke (real weights) — the only thing left that can
-show S1.** Log per decode call: `is_decode`, `start_pos`, and cheap reductions
-of kv_caches in/out (env-gated in the `__call__` decode branch). Watch the
-start_pos trajectory (must be P, P+1, P+2…), enable `V4_DECODE_NAN_TRIPWIRE=1`,
-and run the 3× determinism probe to find WHERE/WHEN real decode first diverges.
+show S1.** Good news: `V4_DECODE_NAN_TRIPWIRE=1` is ALREADY plumbed to workers
+(smoke.sh copies it) and wired at ~30 sites incl. all 6 state fields
+`_at_entry`/`_post_write` per layer, each printing `pos={start_pos}` + nan/inf/
+`max_abs`. So enabling it gives the start_pos trajectory (must be P, P+1, P+2…)
+AND the per-field magnitude trace with ZERO code change. Run a SHORT gen
+(max_tokens~8, S1 collapses in 2-3 tokens) to keep the trace small; read the
+actual decode text (attractor vs coherent); + 3× Paris determinism probe.
+CAVEAT: the tripwire uses jax.debug.print host callbacks, which prior history
+says can perturb SPMD reduction order — if S1 *vanishes* under it, that's itself
+a clue (callback-sensitive). Localize: which (layer, field) `max_abs` blows up
+at the collapse step; is `pos=` correct each step.
+
+> **INFRA BLOCKER (2026-05-24, hit while launching the smoke):** the running
+> ray cluster reports version **2.54.1** but the venv ray is **2.55.1**
+> (uniform across all 8 hosts, binary+python both 2.55.1, installed 02:46), so
+> `vllm`'s `ray.init()` dies with "Version mismatch" at engine init — BEFORE
+> any model work (NOT S1). `ray_restart.sh` does NOT fix it: stale cluster
+> state in `/tmp/ray-vllm` (orig bootstrap cluster was 2.54.1 pre-upgrade) is
+> carried forward (its `usage_stats.json` still says 2.54.1). FIX (needs a
+> teardown that the auto-mode classifier blocks — run by hand / add a perm
+> rule): on ALL 8 hosts `ray stop --force; pkill -9 -f gcs_server; pkill -9 -f
+> 'ray/core/src/ray/raylet'; rm -rf /tmp/ray-vllm /tmp/ray /tmp/libtpu_lockfile`
+> then `scripts/full_slice_v4_ray_restart.sh`, then verify with
+> `RAY_ADDRESS=<head>:6379 work/vllm_env/bin/python -c "import ray;
+> ray.init(address='auto'); print(ray.cluster_resources())"` (should connect,
+> no version error). If it STILL reports 2.54.1 after a clean /tmp wipe, the
+> venv ray is the problem → `uv pip install --reinstall ray==2.55.1` on all 8.
+> A node-container guardian (`scripts/full_slice_v4_node_guardian.sh`) may be
+> left running in the background (re-stops mark's redeployed `node`); kill via
+> `pkill -f "[f]ull_slice_v4_node_guardian"`.
 
 (Production V4 runs attn_dp=32: num_kv_heads=1 + bf16 ⇒ TP folds entirely into
 attn_dp, model=expert=1, KV `P()`. The repro used attn_dp=8 / 8 experts.)
