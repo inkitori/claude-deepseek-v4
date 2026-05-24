@@ -715,12 +715,13 @@ def attention_decode_step(
 
     Returns (new_state, y_step) with y_step shape [B, 1, dim].
     """
-    # S1 FIX: the runtime token-shards activations on ATTN_DATA, so a single
-    # decode token lands on one dp shard with the rest idle. The decode math is
-    # built around the REPLICATED P() kv-state, so pin the activation replicated
-    # here — otherwise the idle/uneven token-axis shards corrupt the sparse_attn
-    # gather + write-sites against the replicated cache. No-op on CPU / no mesh.
-    x_step = _replicate(x_step)
+    # NOTE: do NOT _replicate(x_step) here. A single decode token has a size-1
+    # token axis; resharding it (ATTN_DATA token-shard -> replicated P()) emits
+    # a degenerate all-gather that Core-halts the TPU at the first decode step
+    # (confirmed 3x incl. on a freshly-rebooted slice; PHASE 8). The S1 seed
+    # corruption is fixed in attention_init_state_from_prefill (prefill, T>1
+    # tokens, a normal gather). Pre-fix decode ran without halting; the collapse
+    # came from the corrupted SEED, which the seeding-side _replicate addresses.
     B = x_step.shape[0]
     H = params.n_heads
     Dh = params.head_dim
