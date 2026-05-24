@@ -1621,6 +1621,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
 
+        # S1 FIX: V4 seeds a REPLICATED P() decode-state (see
+        # kv_cache_manager._initialize_kv_cache_deepseek_v4) from cross-token
+        # prefill ops. Under attn_dp a short single-seq prefill lands on ~1 dp
+        # rank with ~31 EMPTY ranks, so the seeding + replicated-state write are
+        # inconsistent across ranks -> decode collapses (S1). Re-place input_ids
+        # REPLICATED from the host buffer (host->device broadcast, NOT a device
+        # all-gather: a with_sharding_constraint(x,P()) gather over empty shards
+        # Core-halts the TPU). Every rank then sees the full sequence and seeds
+        # the same state. V4 + prefill only (q0>1); decode (q0==1) keeps ATTN_DATA.
+        if self._is_deepseek_v4 and int(query_start_loc_view[1]) > 1:
+            input_ids = device_array(
+                self.mesh, input_ids_view,
+                sharding=NamedSharding(self.mesh, PartitionSpec()))
+
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
                 input_positions=positions,
@@ -1894,6 +1908,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
+
+        # S1 FIX: V4 seeds a REPLICATED P() decode-state (see
+        # kv_cache_manager._initialize_kv_cache_deepseek_v4) from cross-token
+        # prefill ops. Under attn_dp a short single-seq prefill lands on ~1 dp
+        # rank with ~31 EMPTY ranks, so the seeding + replicated-state write are
+        # inconsistent across ranks -> decode collapses (S1). Re-place input_ids
+        # REPLICATED from the host buffer (host->device broadcast, NOT a device
+        # all-gather: a with_sharding_constraint(x,P()) gather over empty shards
+        # Core-halts the TPU). Every rank then sees the full sequence and seeds
+        # the same state. V4 + prefill only (q0>1); decode (q0==1) keeps ATTN_DATA.
+        if self._is_deepseek_v4 and int(query_start_loc_view[1]) > 1:
+            input_ids = device_array(
+                self.mesh, input_ids_view,
+                sharding=NamedSharding(self.mesh, PartitionSpec()))
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(

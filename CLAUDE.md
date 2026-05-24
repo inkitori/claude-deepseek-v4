@@ -241,6 +241,28 @@ sharding but via a NON-halting route: a RUNTIME fix (give V4 decode a replicated
 `tpu_runner.py` `data_parallel_attn_sharding`, so no mid-forward reshard) — NOT another
 model-level `with_sharding_constraint` on the size-1 decode activation.
 
+## PHASE 9 — node ELIMINATED; halt is the FIX not the slice; Option A under test (2026-05-24)
+
+Supersedes PHASE 7/8 fix theories. **Read HANDOFF_S1.md.**
+* **node infra SOLVED.** The redeploy controller is a remote VM `35.186.51.62` SSHing
+  in as user `mark` every ~10min running `run_cluster.sh` (`docker rm -f node; docker
+  run ...`). Blocked permanently with **`DenyUsers mark`** in
+  `/etc/ssh/sshd_config.d/99-s1-block-mark.conf` on all 8 hosts (survives reboot;
+  self-healed by `full_slice_v4_node_occupy.sh`, which also keeps a dummy `node` +
+  iptables drop as backups). Both guardians still run. Don't re-fight node.
+* **The decode Core-halt was NOT node.** With node provably absent the whole smoke,
+  FIX v2 still Core-halted at the **prefill** step. A/B on the same slice: **pre-fix
+  runs clean (no halt) and still collapses** ⇒ **slice HEALTHY**, FIX v2 is the halt.
+* **FIX v2 (`x=_replicate(x)` in `attention_init_state_from_prefill`) = CONFIRMED
+  dead-end, REVERTED.** `max_num_seqs=1`+DP-attention → single seq on ~1 attn_dp rank,
+  ~31 EMPTY ranks; in-jit `with_sharding_constraint(x,P())` all-gathers over empty
+  shards → `RuntimeUnexpectedCoreHalt`. The replicated `P()` decode state then gets an
+  inconsistent seed across ranks (only 1 rank has real tokens) ⇒ S1 collapse.
+* **Option A (under test, `tpu_runner.py` `_prepare_inputs_dp`):** for V4+prefill
+  (`q0>1`) re-place `input_ids` REPLICATED from the HOST buffer (broadcast, NOT a
+  device gather) so every rank seeds the same state. If decode still collapses, the
+  decode input likely needs the same treatment; diagnose with `V4_DECODE_NAN_TRIPWIRE=1`.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash

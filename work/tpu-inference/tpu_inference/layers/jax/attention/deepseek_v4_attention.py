@@ -1025,7 +1025,13 @@ def attention_init_state_from_prefill(
     # seeded state while the forward `h` stays correct -> decode reads a bad
     # seed and collapses at step 1. Pin the seeding activation replicated so the
     # cross-token ops see the full sequence. No-op on CPU / no mesh.
-    x = _replicate(x)
+    # NB: FIX v2 `x = _replicate(x)` HERE is a CONFIRMED TPU dead-end (reverted).
+    # On a short prefill the activation is DP-sharded with the single sequence on
+    # ~1 rank and ~31 EMPTY ranks; with_sharding_constraint(x, P()) then all-gathers
+    # over empty shards -> RuntimeUnexpectedCoreHalt at the PREFILL step (proven
+    # 2026-05-24 with node fully absent; pre-fix runs clean & still collapses =>
+    # slice healthy, S1 still OPEN). A correct fix must seed the short-prefill
+    # state WITHOUT a degenerate empty-shard all-gather.
 
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     # SWA kv (matches attention_prefill's kv computation).
