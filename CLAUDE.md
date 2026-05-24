@@ -147,6 +147,40 @@ fold the state writes into a `pl.pallas_call` whose output *is* the
 new state (matches V3/Qwen3); or partial un-donation for prefill JIT
 only.
 
+## PHASE 2 — S1 REPRODUCED at small scale (2026-05-24)
+
+There is now a **cheap multi-host reproducer.** The single-host small-TPU
+loop the prior runbook assumed DOES NOT EXIST: a lone worker can't boot a
+v6e-32 (libtpu `CreateTpuSystemState` waits forever for the other 7 hosts);
+all TPU work needs all 8 hosts. New tooling (committed):
+* `scripts/full_slice_v4_mh_run.sh <script.py> [args]` — fan a script out
+  across all 8 hosts as ONE `jax.distributed` job (no-arg metadata
+  auto-detect; head may land as any proc index), cleans the libtpu lock,
+  per-proc logs in `logs/mh-*`.
+* `scripts/s1_mh_repro.py <mode> <T> <N> <n_layers> <action> <n_experts>` —
+  truncated V4 (random weights, no 543 GiB load) on the 32-chip mesh with
+  production's named axes (layers/common/sharding.py); KV state replicated
+  `P()`, kv_caches donated. `mode`∈{replicated,sharded}. `action=repro`
+  prints VERDICT; `action=diff` localizes the corrupted packed-state field
+  (donate vs non-donate buffer diff). Must build replicated arrays via
+  `make_array_from_callback` (device_put-reshard of process-local arrays to
+  global `P()` tile-allgathers the embed/head weight 8× and OOMs HBM).
+* `scripts/full_slice_v4_node_guardian.sh` — background loop re-stopping the
+  redeployed `node` container (it CAME BACK 2026-05-24 — run during TPU work).
+
+**Result — the bug needs SHARDING + donation, not just TPU + donation:**
+* `replicated` (all `P()`, 32 chips, no reshard) → **NO_S1** (bad=0/12), as CPU.
+* `sharded` (attn_dp=8, production-style: experts+attn parallel, KV `P()`)
+  → **S1_REPRODUCED** (bad=1/12).
+
+So the root cause is the **reshard between attn_dp-sharded compute and the
+replicated `P()` *donated* KV buffers** under XLA SPMD — exactly what
+`_v4_constrain_packed_replicated`'s docstring ("JIT-boundary reshard
+interacts with donated kv_caches") gestures at. Production V4 runs
+attn_dp=32 (num_kv_heads=1 + bf16 ⇒ TP folds entirely into attn_dp),
+model=expert=1, KV `P()`. NEXT: `action=diff` to name the corrupted field,
+then fix (leading: Pallas-output state, or prefill-only un-donation).
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
@@ -171,17 +205,18 @@ survives a smaller TPU repro (at most 1-2 full smokes per session).
    argmax". **Caveat: CPU already passes — it cannot reproduce S1.**
    Use CPU only to rule out regressions / inspect HLO, never as proof a
    fix works.
-2. **Small configs ON TPU — cheap (no full weights), and the only cheap
-   thing that can show S1.** Run the truncated-V4 repro (4 layers, full
-   dims) and the tiny-fixture pytest classes on the TPU backend
-   (`JAX_PLATFORMS=tpu`, 1-or-few chips; these scripts default to CPU, so
-   adapt the platform). This exercises the real TPU XLA compiler —
-   donation, alias analysis, the exact machinery S1 lives in — in
-   seconds-to-minutes. **First establish whether any small config
-   reproduces S1 on TPU:** if one does, it's your inner loop and you
-   rarely need the full smoke; if none does, that minimal-reproducer
-   search is itself diagnosis. (Helpers to check: `scripts/v4_tp1_test.py`,
-   `scripts/v4_serial_correctness.py`.)
+2. **Small config ON TPU = MULTI-HOST sharded repro — THE inner loop
+   (~3-6 min, no full weights). CONFIRMED to reproduce S1 (2026-05-24).**
+   A lone host CANNOT boot a v6e-32 (`CreateTpuSystemState` hangs forever
+   waiting for the other 7 hosts), so the old "run a 1-/few-chip script
+   directly" advice is WRONG — it just hangs. Use:
+   ```
+   scripts/full_slice_v4_mh_run.sh scripts/s1_mh_repro.py sharded 8 12 4
+   ```
+   This fans a truncated-V4 (random weights, 4 layers) `jax.distributed`
+   job across all 8 hosts / 32 chips, sharded exactly like production.
+   `replicated` mode → NO_S1; `sharded` (attn_dp) → S1_REPRODUCED. See the
+   "PHASE 2" section. Reserve the full smoke for final closure only.
 3. Tiny-fixture pytest classes in `tests/models/jax/test_deepseek_v4.py` (~30s-2min, CPU or TPU).
 4. `eval_shape` / `lower(...).compile()` on real config under virtual
    mesh: `XLA_FLAGS=--xla_force_host_platform_device_count=32 JAX_PLATFORMS=cpu`.
