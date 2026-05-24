@@ -134,7 +134,11 @@ def main():
             new_kv, h = deepseek_v4_run_with_decode_state(
                 kv_caches, ids_step, params_r, swa_r, comp_r, cfg,
                 state_max_seq_len=max_seq, is_decode_step=True, start_pos=start_pos)
-            return new_kv, jnp.argmax(_head(h)[0, 0])
+            logits = _head(h)[0, 0]
+            top2 = jax.lax.top_k(logits, 2)[0]
+            # gap = top1-top2 logit: tiny gap at a mismatch => benign near-tie
+            # (reduction-order noise); large gap => real state divergence.
+            return new_kv, jnp.argmax(logits), top2[0] - top2[1]
 
         def make_jits(donate):
             da = (0,) if donate else ()
@@ -144,14 +148,15 @@ def main():
         def run_inc(jit_prefill, jit_decode, snapshot):
             kv = [put(np.zeros((s,), dtype=np.float32)) for s in sizes]
             kv = jit_prefill(kv, put(ids_full[:, :T]))
-            ams, snaps = [], []
+            ams, gaps, snaps = [], [], []
             for step in range(N):
                 pos = T + step
-                kv, am = jit_decode(kv, put(ids_full[:, pos:pos + 1]), put(np.int32(pos)))
+                kv, am, gap = jit_decode(kv, put(ids_full[:, pos:pos + 1]), put(np.int32(pos)))
                 ams.append(int(am))
+                gaps.append(float(gap))
                 if snapshot:
                     snaps.append([np.asarray(b) for b in kv])
-            return ams, snaps
+            return ams, gaps, snaps
 
         t0 = time.time()
         argmax_full = jit_oracle(put(ids_full))
@@ -162,12 +167,13 @@ def main():
         if action == "repro":
             t0 = time.time()
             jp, jd = make_jits(donate=True)
-            ams, _ = run_inc(jp, jd, snapshot=False)
+            ams, gaps, _ = run_inc(jp, jd, snapshot=False)
             n_bad = sum(a != o for a, o in zip(ams, oracle))
             log(f"[s1-mh] donated decode ran in {time.time()-t0:.1f}s, bad={n_bad}/{N}")
-            for s, (a, o) in enumerate(zip(ams, oracle)):
+            for s, (a, o, g) in enumerate(zip(ams, oracle, gaps)):
                 log(f"  {'  ' if a == o else '**'} step={s:>2} pos={T+s:>2} "
-                    f"decode={a:>6} oracle={o:>6} {'OK' if a == o else 'MISMATCH'}")
+                    f"decode={a:>6} oracle={o:>6} gap={g:>9.3g} "
+                    f"{'OK' if a == o else 'MISMATCH'}")
             verdict = "NO_S1" if n_bad == 0 else "S1_REPRODUCED"
             print(f"[p{PID}] VERDICT: {verdict} (bad={n_bad}/{N})", flush=True)
             return
@@ -175,8 +181,8 @@ def main():
         # action == diff: donated vs non-donated, localize corrupted field.
         jp_d, jd_d = make_jits(donate=True)
         jp_n, jd_n = make_jits(donate=False)
-        ams_d, snaps_d = run_inc(jp_d, jd_d, snapshot=True)
-        ams_n, snaps_n = run_inc(jp_n, jd_n, snapshot=True)
+        ams_d, _, snaps_d = run_inc(jp_d, jd_d, snapshot=True)
+        ams_n, _, snaps_n = run_inc(jp_n, jd_n, snapshot=True)
         bad_d = sum(a != o for a, o in zip(ams_d, oracle))
         bad_n = sum(a != o for a, o in zip(ams_n, oracle))
         log(f"[s1-mh] DONATE bad={bad_d}/{N}  NON-DONATE bad={bad_n}/{N}")

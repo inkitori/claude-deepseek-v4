@@ -119,6 +119,12 @@ patching.** Set `V4_DECODE_NAN_TRIPWIRE=1` on the smoke to print
 per-field nan/inf/max_abs reductions per layer and find *which*
 state field actually drifts and *when*, before changing code.
 
+> **DISPROVEN 2026-05-24 (see "PHASE 2" below).** The donation /
+> dropped-write hypothesis here is FALSE: a sharded MH repro shows donate
+> vs non-donate decode-state buffers are byte-identical, and the decode
+> math matches teacher-forcing. S1 is NOT in the model decode math / not a
+> donation bug. The text below is kept for history; jump to PHASE 2.
+
 **Leading hypothesis (UNCONFIRMED — challenge it):** V4 writes its
 KV-cache via pure JAX `at[].set` partial writes on a manually-packed
 fp32 buffer (sites in `attention_decode_step`,
@@ -173,13 +179,47 @@ all TPU work needs all 8 hosts. New tooling (committed):
 * `sharded` (attn_dp=8, production-style: experts+attn parallel, KV `P()`)
   → **S1_REPRODUCED** (bad=1/12).
 
-So the root cause is the **reshard between attn_dp-sharded compute and the
-replicated `P()` *donated* KV buffers** under XLA SPMD — exactly what
-`_v4_constrain_packed_replicated`'s docstring ("JIT-boundary reshard
-interacts with donated kv_caches") gestures at. Production V4 runs
-attn_dp=32 (num_kv_heads=1 + bf16 ⇒ TP folds entirely into attn_dp),
-model=expert=1, KV `P()`. NEXT: `action=diff` to name the corrupted field,
-then fix (leading: Pallas-output state, or prefill-only un-donation).
+**DONATION IS EXONERATED — and the decode MATH is correct.** `action=diff`
+(donate vs NON-donate, both sharded) → packed buffers **byte-identical** at
+every (step,layer,field) (`first=None`) AND identical argmax (bad_d=bad_n=1).
+So donation drops NOTHING — overturning the hypothesis the entire prior
+effort (barrier `1f212036`, un-donation `5c9d9213`, callbacks) rested on;
+that's why they ALL failed. The lone sharded divergence is a **benign
+near-tie flip**: the 1/12 mismatch is at step 4 then RECOVERS (steps 5-11
+OK), oscillating among the same token-ids the oracle emits (random *0.02
+weights ⇒ flat near-tie logits + attn_dp reduction-order noise). It does NOT
+compound. So `deepseek_v4_run_with_decode_state` (compressor/indexer/SWA
+state threading) is CORRECT under replicated AND sharded, donated or not.
+
+**S1 IS NOT IN THE MODEL DECODE MATH.** Both the CPU repros and this MH repro
+test that core and pass. Stop patching the write sites / donation.
+
+**Where S1 must live next (none tested yet — pick up here):**
+1. **Cross-mode forward** (cheapest, do first): the oracle is teacher-forcing
+   under the SAME code+sharding, so a bug corrupting the *forward pass itself*
+   equally in decode and oracle is invisible here. Compare replicated-forward
+   vs sharded-forward argmax/logits on identical weights (add a crossmode
+   action to `s1_mh_repro.py`). Large diff ⇒ sharding corrupts the forward.
+2. **Real-weight amplification**: random weights give near-tie logits; a small
+   sharded state error invisible here could push *trained* logits off-manifold
+   into the attractor. Hard to test without real weights.
+3. **Runner integration the repro BYPASSES** (CPU repros bypass it too):
+   `runner/kv_cache_manager.py::_initialize_kv_cache_deepseek_v4` (buffers
+   `batch_size=1`, zero-init, replicated `P()`), `tpu_runner.py::
+   _maybe_set_v4_decode_start_pos` (`start_pos=seq_lens[0]-1`), and the model
+   `__call__` wrapper `deepseek_v4.py:1778-1910`. The single-seq decode branch
+   MIRRORS the repro (looks correct). The MULTI-seq branch (>1 query segment,
+   L1887) runs PREFILL-only — ignores kv_caches/decode-state — a real bug, but
+   single-prompt decode (`query_start_loc=[0,1]`) takes the single-seq branch,
+   so probably not the single-prompt cause. Check whether the runner pads
+   decode to batch>1 (would hit multi-seq → prefill → garbage).
+4. **Non-determinism source**: S1 is non-deterministic at temp=0; this repro is
+   fully deterministic. So S1's non-determinism (uninitialized HBM read /
+   non-deterministic collective / cross-request buffer reuse) is NOT in the
+   math path — it points at the runner buffer lifecycle or real-weight numerics.
+
+(Production V4 runs attn_dp=32: num_kv_heads=1 + bf16 ⇒ TP folds entirely into
+attn_dp, model=expert=1, KV `P()`. The repro used attn_dp=8 / 8 experts.)
 
 ## How to validate (fastest signal first)
 
