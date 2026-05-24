@@ -81,9 +81,27 @@ worker_setup_one() {
     log "[$h] OK"
 }
 
+# Parallel fan-out: each worker_setup_one is independent (own clone + venv),
+# so run all 7 concurrently with per-worker logs instead of serially (~5 min
+# total instead of ~35). Collect exit codes via wait.
+BLOG_DIR="$REPO/logs"
+mkdir -p "$BLOG_DIR"
+declare -A worker_pid
+declare -A worker_log
+for h in $WORKERS; do
+    lg="$BLOG_DIR/bootstrap-worker-$h.log"
+    worker_setup_one "$h" > "$lg" 2>&1 &
+    worker_pid["$h"]=$!
+    worker_log["$h"]="$lg"
+    log "[$h] setup launched (pid ${worker_pid[$h]}, log $lg)"
+done
+
 failed_workers=()
 for h in $WORKERS; do
-    if ! worker_setup_one "$h"; then
+    if wait "${worker_pid[$h]}"; then
+        log "[$h] setup OK (log ${worker_log[$h]})"
+    else
+        log "[$h] setup FAILED (see ${worker_log[$h]})"
         failed_workers+=("$h")
     fi
 done
