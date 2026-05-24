@@ -57,19 +57,32 @@ Both attempts to "make every rank see the sequence" failed — STOP guessing, DI
   isn't the cure (the replicated forward may compute a *different wrong* seed, or the bug is
   in the DECODE step, not the seed).
 
-## NEXT — DIAGNOSE with the tripwire (don't patch blind)
-Run a smoke on the clean **pre-fix** baseline with **`V4_DECODE_NAN_TRIPWIRE=1`** (smoke.sh
-forwards it). It prints `[v4nan] L{layer} pos={pos} {tag}: nan=.. +inf=.. -inf=.. max_abs=..`
-for the SEED (`init_*` tags, pos=-1) and every decode-step state field (`*_at_entry`,
-`q_postrope`, `kv_postrope`, …). Send a short decode curl (max_tokens~3 to limit volume),
-then grep `[v4nan]`:
-- If the SEED (`init_*` / first `*_at_entry`) already shows nan/inf or anomalous max_abs ⇒
-  the prefill→decode SEED is corrupt (which field/layer).
-- If the seed is clean but a DECODE step's fields drift at step 1 (pos=T) ⇒ the bug is in
-  the sharded **decode step**, not the seed (the handoff's "decode math fp32-exact" was an
-  isolated test, NOT the full 32-way sharded decode with idle ranks).
-Localize the field/layer/step FIRST, then design a fix that targets it without a degenerate
-empty-shard collective.
+## DIAGNOSED (tripwire) — S1 = seed kv-linear OVERFLOWS at L1 → NaN cascade
+The `V4_DECODE_NAN_TRIPWIRE=1` smoke (132710Z, "Count to 8" decode) localized S1:
+- SEED (pos=-1): **L0 fully finite**. **L1 `init_kv_postlinear` = `_linear(x, params.wkv)`
+  EXPLODES to max_abs 1.847e37 with nan=5984** — from a finite, SMALL input (`init_x_in`
+  max_abs 0.18). NaN then cascades through every later layer/field of the seed; the decode
+  steps (pos 17/18/19) inherit it → NaN logits → collapse/EOS (decode text was `' '`).
+- `_linear(x,w) = (x.fp32 @ w.fp32.T)` — a small x → 1.8e37 ⇒ the **matmul/weight is wrong
+  under 32-way sharding** (CPU passes; isolated decode math was fp32-exact).
+- The forward's first token is fine, so the seed kv DIVERGES from the forward kv (the
+  seeding comment claims they "match" — they don't under sharding).
+- **Option A (replicated input) AVOIDED the NaN** (gave empty, not NaN-collapse) ⇒ the NaN
+  comes from the DP-sharded input — likely **idle-rank garbage** entering the seed's kv
+  matmul (single seq on ~1 rank, ~31 ranks have uninitialized/garbage activations); the
+  replicated decode state (`P()`) then takes the garbage ranks' values. But full
+  replication breaks the forward (empty + halt), so that's not the cure.
+
+## NEXT — fix the seed kv overflow at its source
+Compare `attention_prefill` (forward kv = finite) vs `attention_init_state_from_prefill`
+(seed kv = overflows) to see why they diverge under sharding: likely the seed matmul/x
+reduces over or reads a sharded axis that includes idle/garbage shards, or an fp8
+dequant/scale differs, or the seed processes padding/garbage token positions the forward
+masks. Candidate fixes (NO full-replication, NO degenerate empty-shard `with_sharding_
+constraint(P())`): (a) zero/mask idle-rank & padding token activations before the seed kv;
+(b) constrain only the seed kv's *output* to take the data-rank value; (c) match the
+forward's exact (working) kv sharding/dequant in the seeding. Tripwire smoke 132710Z still
+up for live probing.
 
 ## DONE (verify TWICE on a fresh engine) — READ THE TEXT
 `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` exits 0 (visible_words≥10,
