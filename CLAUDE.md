@@ -105,8 +105,12 @@ only.
 
 ## How to validate (fastest signal first)
 
-The full smoke is 25-45 min — **do not use it as your inner loop.**
-Vet each hypothesis cheaply, then spend at most 1-2 smokes per session.
+**The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
+smoke** (543 GiB weight load + 10-30 min cold compile = 25-45 min). TPU
+time on *small* configs is cheap (seconds-to-minutes), and it's the only
+thing that can reproduce S1 — **CPU passes, so it never will.** Iterate
+on small-on-TPU; reserve the full smoke for confirming a fix that already
+survives a smaller TPU repro (at most 1-2 full smokes per session).
 
 1. **CPU repros (~seconds-minutes, no TPU):**
    ```
@@ -120,13 +124,25 @@ Vet each hypothesis cheaply, then spend at most 1-2 smokes per session.
      dynamic-update-slice writes survive in compiled HLO.
 
    Both repros should end "OK: both eager and jit match fresh-prefill
-   argmax". **Caveat: CPU already passes — it can't reproduce the
-   bug.** Use CPU only to rule out regressions / inspect HLO, not as
-   proof a fix works.
-2. Tiny-fixture pytest classes in `tests/models/jax/test_deepseek_v4.py` (~30s-2min).
-3. `eval_shape` / `lower(...).compile()` on real config under virtual
+   argmax". **Caveat: CPU already passes — it cannot reproduce S1.**
+   Use CPU only to rule out regressions / inspect HLO, never as proof a
+   fix works.
+2. **Small configs ON TPU — cheap (no full weights), and the only cheap
+   thing that can show S1.** Run the truncated-V4 repro (4 layers, full
+   dims) and the tiny-fixture pytest classes on the TPU backend
+   (`JAX_PLATFORMS=tpu`, 1-or-few chips; these scripts default to CPU, so
+   adapt the platform). This exercises the real TPU XLA compiler —
+   donation, alias analysis, the exact machinery S1 lives in — in
+   seconds-to-minutes. **First establish whether any small config
+   reproduces S1 on TPU:** if one does, it's your inner loop and you
+   rarely need the full smoke; if none does, that minimal-reproducer
+   search is itself diagnosis. (Helpers to check: `scripts/v4_tp1_test.py`,
+   `scripts/v4_serial_correctness.py`.)
+3. Tiny-fixture pytest classes in `tests/models/jax/test_deepseek_v4.py` (~30s-2min, CPU or TPU).
+4. `eval_shape` / `lower(...).compile()` on real config under virtual
    mesh: `XLA_FLAGS=--xla_force_host_platform_device_count=32 JAX_PLATFORMS=cpu`.
-4. Real TPU smoke — the only test that actually reproduces S1.
+5. Full V4-Flash smoke — the closure gate, but the slow one; the only
+   test that reproduces S1 end-to-end.
 
 **Smoke phase budgets (silence is expected, don't bail early):**
 weight load ~4 min; `jit_run_model` cold compile **10-30 min** (warm
