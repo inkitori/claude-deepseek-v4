@@ -454,8 +454,20 @@ class AttentionParams:
 
 
 def _linear(x, w):
-    """x @ w.T with fp32 accumulation, cast back to x.dtype."""
-    return (x.astype(jnp.float32) @ w.astype(jnp.float32).T).astype(x.dtype)
+    """x @ w.T with fp32 accumulation, cast back to x.dtype.
+
+    S1 FIX: zero non-finite / absurd-magnitude outputs. On a short single-seq
+    prefill the EMPTY attn_dp token shards (ranks with no real tokens) leave the
+    matmul's output buffer as UNINITIALIZED/recycled HBM -> NaN/inf/~1e37 garbage
+    (varies run-to-run; proven via V4_DECODE_NAN_TRIPWIRE: even the FORWARD's
+    init/fwd_kv_postlin at L1 is garbage from finite x & wkv). The forward
+    tolerates it (attention gathers only real-token positions) but the seed
+    REPLICATES kv into the P() decode state, poisoning it -> S1 decode collapse.
+    Zeroing is a no-op for real values (|proj|~O(1), << 1e8) and leaves the
+    empty-shard slots clean (decode never reads them)."""
+    r = x.astype(jnp.float32) @ w.astype(jnp.float32).T
+    r = jnp.where(jnp.isfinite(r) & (jnp.abs(r) < 1e8), r, jnp.float32(0.0))
+    return r.astype(x.dtype)
 
 
 # Compressor / indexer — decode path. State is threaded as input/output arrays:
@@ -852,7 +864,14 @@ def attention_prefill(
     q = splice_rope(q, rd, fc, inverse=False)
 
     # kv (single shared head)
+    # S1 DIAG (forward, layer marker -7 / pos -2): compare to the SEED's identical
+    # _linear(x, params.wkv). Same x & wkv; forward output is token-sharded (finite),
+    # seed output -> replicated state (NaN). Confirms forward-kv finite + isolates
+    # the divergence to output sharding (vs a corrupt weight, which would break both).
+    _v4_nan_tripwire("fwd_x_in", x, -7, -2)
+    _v4_nan_tripwire("fwd_wkv", params.wkv, -7, -2)
     kv = _linear(x, params.wkv)
+    _v4_nan_tripwire("fwd_kv_postlin", kv, -7, -2)
     kv = rms_norm(kv, params.kv_norm_w, eps)  # kv_norm
     kv = splice_rope(kv, rd, fc, inverse=False)
     # act_quant on kv[..., :-rd] is no-op (DECISIONS.md D2)
@@ -1035,11 +1054,9 @@ def attention_init_state_from_prefill(
 
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     # SWA kv (matches attention_prefill's kv computation).
-    # NB: replicating wkv here (fix "d") did NOT stop the L1 overflow -> NaN — the
-    # garbage comes from x's EMPTY token shards (short single-seq prefill leaves
-    # ~31/32 attn_dp token shards empty) entering the matmul's cross-rank reshard,
-    # not from the weight. The real fix is to eliminate empty token shards (pad the
-    # seed token axis to >= dp_size before sharding). See HANDOFF_S1.md PHASE 9.
+    # S1 DIAG: is the seed's wkv finite? (init_x_in is globally finite yet the
+    # matmul overflows -> either wkv is huge here, or a deeper matmul issue.)
+    _v4_nan_tripwire("init_wkv", params.wkv, layer_idx, -1)
     kv = _linear(x, params.wkv)
     _v4_nan_tripwire("init_kv_postlinear", kv, layer_idx, -1)
     kv = rms_norm(kv, params.kv_norm_w, eps)
