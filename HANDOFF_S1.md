@@ -97,7 +97,33 @@ lanes masked by causal/topk) so it's finite.
   empty-token-shard reshard (donate_argnums recycles the buffer; the ~31 idle token shards are never
   written). The fix MUST eliminate empty token shards.
 
-## NEXT — THE PAD FIX (replication is ruled out; eliminate empty token shards)
+## PAD FIX FAILED TOO — the L1 NaN is ROBUST to ALL x-side fixes
+4th failed fix. Zero-padding the seed token axis to 32 (full shards, CPU-parity OK) did NOT
+make L1 `init_kv_postlinear` finite (still 4.25e37 NaN; decode still `' '`). So the overflow
+is NOT (only) x's empty token shards: it survived input-replicate (Option A), weight-replicate
+(fix d), AND token-pad. KEY: `.202`'s own `init_x_in` is FINITE but its matmul output is NaN ⇒
+the NaN is pulled CROSS-RANK from ranks the tripwire CAN'T SEE (jax.debug.print emits from only
+ONE chip = .202). The NaN almost certainly ORIGINATES earlier/elsewhere (a non-.202 rank's
+embed or L0 forward, or the weight on some rank) and the L1 matmul's cross-rank contraction
+surfaces it on .202.
+
+## NEXT — get ALL-RANK visibility (single-chip tripwire is the blind spot)
+1. **Instrument all ranks.** Modify `_v4_nan_tripwire` (deepseek_v4_attention.py:40) to report a
+   GLOBAL reduction so one chip's print reflects every rank: e.g. wrap the nan/inf/max_abs in a
+   collective — `jax.lax.psum`/`pmax` over the mesh axes ('data','attn_dp','attn_dp_expert',
+   'expert','model') — OR add `jax.debug.print` of per-chip values keyed by a device id. Also try
+   collecting the OTHER 7 workers' EngineCore logs (per-host ray session logs under
+   `/tmp/ray-vllm/session_*/logs/`), not just the head smoke log, to see non-.202 ranks.
+2. **Find where the NaN FIRST appears** across ranks: instrument the EMBED output
+   (`deepseek_v4.py` `embed_w[input_ids]`) and L0 forward `h`, per rank. Is some rank NaN at the
+   embed already (bad input_ids / OOB gather on idle ranks)? Or at L0 forward? That's the true
+   origin; L1's matmul just surfaces it.
+3. Reconsider the WEIGHT: is `params.wkv` finite on ALL ranks in the SEED's jit (vs the forward)?
+   Donation/aliasing (`donate_argnums=2`) could corrupt a buffer the seed reads. (Earlier
+   "donation DISPROVEN" was for the decode math, not this seed-context cross-rank read.)
+Only after locating the true origin should the next fix be designed.
+
+## (OBSOLETE) earlier pad-fix plan — kept for context
 Both input- and weight-replication left the seed NaN, so the fix must make the seed's token
 axis have NO empty shards. The runtime already ZEROES the global token buffer beyond the real
 tokens (`tpu_runner.py:1813` `input_ids_view[total:] = 0`), but the seed SLICES to L_real

@@ -263,10 +263,9 @@ def _overlap_transform(t: jnp.ndarray, ratio: int, d: int, fill_value: float) ->
 
 
 def compressor_prefill(
-    x: jnp.ndarray,            # [B, S, dim] (may be zero-padded past T_real)
+    x: jnp.ndarray,            # [B, S, dim]
     params: CompressorParams,
     freqs_cis_full: jnp.ndarray,  # [max_seq_len, rope_head_dim/2] complex64
-    T_real: "int | None" = None,
 ) -> jnp.ndarray:
     """Prefill-only compressor forward.
 
@@ -285,8 +284,7 @@ def compressor_prefill(
       RMSNorm(head_dim), then RoPE on last rope_head_dim slots (using the
       *first* position of each ratio-group's freqs).
     """
-    B, _Sp, _ = x.shape
-    S = _Sp if T_real is None else T_real  # cross-token cutoff uses real len
+    B, S, _ = x.shape
     ratio = params.compress_ratio
     overlap = (ratio == 4)
     coff = 2 if overlap else 1
@@ -909,9 +907,8 @@ def attention_prefill(
 # materialized in a single pass. Pinned by `TestPrefillToDecodeStateParity`.
 
 def _compressor_state_from_prefill(
-    x: jnp.ndarray,             # [B, Tp, dim] (may be zero-padded past T_real)
+    x: jnp.ndarray,             # [B, T, dim]
     params: CompressorParams,
-    T_real: "int | None" = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Return (kv_state, score_state) matching torch reference's
     `Compressor.forward(start_pos=0)` post-state at end of T prefill steps.
@@ -935,8 +932,7 @@ def _compressor_state_from_prefill(
     boundary because those slots are fully overwritten before then.
     Pin via `TestPrefillToDecodeStateParity::test_field_parity`.
     """
-    B, Tp, _ = x.shape
-    T = Tp if T_real is None else T_real  # cross-token slices use the real len
+    B, T, _ = x.shape
     ratio = params.compress_ratio
     overlap = (ratio == 4)
     coff = 2 if overlap else 1
@@ -946,8 +942,8 @@ def _compressor_state_from_prefill(
         return compressor_init_state(B, d, ratio)
 
     xf = x.astype(jnp.float32)
-    kv_full = xf @ params.wkv.T          # [B, Tp, coff*d]
-    score_full = xf @ params.wgate.T     # [B, Tp, coff*d]
+    kv_full = xf @ params.wkv.T          # [B, T, coff*d]
+    score_full = xf @ params.wgate.T     # [B, T, coff*d]
 
     full_d = coff * d
     n_slots = 2 * ratio if overlap else ratio
@@ -978,25 +974,21 @@ def _compressor_state_from_prefill(
 
 
 def _swa_kv_cache_from_prefill(
-    kv: jnp.ndarray,             # [B, Tp, head_dim] — already rms_normed + RoPE'd
+    kv: jnp.ndarray,             # [B, T, head_dim] — already rms_normed + RoPE'd
     win: int,
-    T: "int | None" = None,      # real token count; kv may be zero-padded past T
 ) -> jnp.ndarray:
     """Build the SWA portion of attention's kv_cache after T prefill steps.
 
     Mirrors what `attention_decode_step.kv_cache[:, :win]` holds after T
     decode calls from zero state. Slot i holds the most recent kv at position
     p with `p % win == i`. Returns shape [B, win, head_dim]. dtype matches kv.
-    `kv` may be zero-padded on the token axis past `T` (S1 PHASE-9 seed pad);
-    pass the real length so the roll/slice ignore padding. Defaults to kv width.
     """
-    B, Tp, D = kv.shape
-    T = Tp if T is None else T
+    B, T, D = kv.shape
     if T == 0:
         return jnp.zeros((B, win, D), dtype=kv.dtype)
     if T < win:
         out = jnp.zeros((B, win, D), dtype=kv.dtype)
-        return out.at[:, :T, :].set(kv[:, :T, :])
+        return out.at[:, :T, :].set(kv)
     # T >= win: cache[i] = kv[T-1 - ((T-1-i) % win)].
     # Equivalent: take the last win positions and roll by T % win so slot
     # (T-win+k) % win = (k + T) % win lands at index (k + T) % win.
@@ -1019,33 +1011,12 @@ def attention_init_state_from_prefill(
 
     The decode state can then drive `attention_decode_step` at start_pos=T
     without re-running prefill."""
-    B, T_real, _ = x.shape
+    B, T, _ = x.shape
     win = params.window_size
     ratio = params.compress_ratio
     Dh = params.head_dim
     rd = params.rope_head_dim
     eps = params.norm_eps
-
-    # S1 FIX (PHASE 9): pad the seed token axis up to a multiple of the
-    # ATTN_DATA (attn_dp) mesh size so NO token shard is empty. The decode
-    # state is forced replicated P(); for a short single-seq prefill x is
-    # token-sharded on attn_dp=32 with T_real<32, leaving ~31/32 shards
-    # uninitialized. The replicating reshard before `_linear(x, wkv)` then
-    # reads recycled HBM (overflow -> NaN at L1). Zero-padding is partition-
-    # preserving (does NOT read empty shards) and fills idle shards with 0 so
-    # the reshard reads 0. ALL cross-token arithmetic below uses T_real (the
-    # real length); arrays stay at T_pad through the matmuls — never slice
-    # back to T_real or empty shards reappear. Padding lands in unused state
-    # slots only (decode reads real positions). No-op on CPU / no mesh.
-    dp = 1
-    if not jax.sharding.get_abstract_mesh().empty:
-        sh = jax.sharding.get_abstract_mesh().shape
-        for _ax in ('data', 'attn_dp', 'attn_dp_expert'):
-            dp *= sh.get(_ax, 1)
-    dp = max(dp, 32)  # also covers no-mesh: pad >=32 so a real-mesh smoke is safe
-    T_pad = -(-T_real // dp) * dp
-    if T_pad > T_real:
-        x = jnp.pad(x, ((0, 0), (0, T_pad - T_real), (0, 0)))
 
     # S1 FIX: prefill SEEDING runs cross-token ops (_swa_kv_cache_from_prefill
     # jnp.roll, _compressor_state_from_prefill slice) over the token axis. The
@@ -1073,25 +1044,23 @@ def attention_init_state_from_prefill(
     _v4_nan_tripwire("init_kv_postlinear", kv, layer_idx, -1)
     kv = rms_norm(kv, params.kv_norm_w, eps)
     _v4_nan_tripwire("init_kv_postnorm", kv, layer_idx, -1)
-    # kv is T_pad wide; rope the full width (padded rows get rope on zero kv =>
-    # finite, and are never read since SWA below uses T_real).
-    fc = freqs_cis_full[:T_pad] if T_pad > 0 else freqs_cis_full[:0]
-    if T_pad > 0:
+    fc = freqs_cis_full[:T] if T > 0 else freqs_cis_full[:0]
+    if T > 0:
         kv = splice_rope(kv, rd, fc, inverse=False)
     _v4_nan_tripwire("init_kv_postrope", kv, layer_idx, -1)
     kv = kv.astype(dtype)
 
     extra = (cfg_max_seq_len // ratio) if ratio else 0
-    swa = _swa_kv_cache_from_prefill(kv, win, T_real)
+    swa = _swa_kv_cache_from_prefill(kv, win)
     _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
 
     # Concatenate, not zeros + at[].set(): the partial-write pattern lets
     # XLA alias the buffer to a donated kv_caches[i] slot and elide the
     # zero broadcast.
     if ratio > 0:
-        kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full, T_real).astype(dtype)
+        kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full).astype(dtype)
         _v4_nan_tripwire("init_kv_compressed", kv_compressed, layer_idx, -1)
-        Tcomp = kv_compressed.shape[1]  # = T_real // ratio
+        Tcomp = kv_compressed.shape[1]  # = T // ratio
         if Tcomp >= extra:
             comp_full = kv_compressed[:, :extra, :]
         elif Tcomp > 0:
@@ -1101,7 +1070,7 @@ def attention_init_state_from_prefill(
             comp_full = jnp.zeros((B, extra, Dh), dtype=dtype)
         kv_cache = jnp.concatenate([swa, comp_full], axis=1)
         _v4_nan_tripwire("init_kv_cache_post_comp_set", kv_cache, layer_idx, -1)
-        c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor, T_real)
+        c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor)
     else:
         kv_cache = swa  # extra==0; the pure-SWA layer
         c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
@@ -1110,13 +1079,13 @@ def attention_init_state_from_prefill(
 
     if ratio == 4 and params.indexer is not None:
         # Indexer state: same compressor logic on params.indexer.compressor.
-        i_kv, i_sc = _compressor_state_from_prefill(x, params.indexer.compressor, T_real)
-        # indexer_kv_cache: [B, max/ratio, index_head_dim] with [:T_real//ratio]
+        i_kv, i_sc = _compressor_state_from_prefill(x, params.indexer.compressor)
+        # indexer_kv_cache: [B, max/ratio, index_head_dim] with [:T//ratio]
         # populated from the indexer's compressor_prefill output.
         max_iidx = cfg_max_seq_len // ratio
-        if T_real >= ratio:
+        if T >= ratio:
             idx_kv_compressed = compressor_prefill(
-                x, params.indexer.compressor, freqs_cis_full, T_real).astype(dtype)
+                x, params.indexer.compressor, freqs_cis_full).astype(dtype)
             Ti = idx_kv_compressed.shape[1]
             if Ti >= max_iidx:
                 i_cache = idx_kv_compressed[:, :max_iidx, :]
