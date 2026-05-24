@@ -237,24 +237,37 @@ says can perturb SPMD reduction order — if S1 *vanishes* under it, that's itse
 a clue (callback-sensitive). Localize: which (layer, field) `max_abs` blows up
 at the collapse step; is `pos=` correct each step.
 
-> **INFRA BLOCKER (2026-05-24, hit while launching the smoke):** the running
-> ray cluster reports version **2.54.1** but the venv ray is **2.55.1**
-> (uniform across all 8 hosts, binary+python both 2.55.1, installed 02:46), so
-> `vllm`'s `ray.init()` dies with "Version mismatch" at engine init — BEFORE
-> any model work (NOT S1). `ray_restart.sh` does NOT fix it: stale cluster
-> state in `/tmp/ray-vllm` (orig bootstrap cluster was 2.54.1 pre-upgrade) is
-> carried forward (its `usage_stats.json` still says 2.54.1). FIX (needs a
-> teardown that the auto-mode classifier blocks — run by hand / add a perm
-> rule): on ALL 8 hosts `ray stop --force; pkill -9 -f gcs_server; pkill -9 -f
-> 'ray/core/src/ray/raylet'; rm -rf /tmp/ray-vllm /tmp/ray /tmp/libtpu_lockfile`
-> then `scripts/full_slice_v4_ray_restart.sh`, then verify with
-> `RAY_ADDRESS=<head>:6379 work/vllm_env/bin/python -c "import ray;
-> ray.init(address='auto'); print(ray.cluster_resources())"` (should connect,
-> no version error). If it STILL reports 2.54.1 after a clean /tmp wipe, the
-> venv ray is the problem → `uv pip install --reinstall ray==2.55.1` on all 8.
-> A node-container guardian (`scripts/full_slice_v4_node_guardian.sh`) may be
-> left running in the background (re-stops mark's redeployed `node`); kill via
-> `pkill -f "[f]ull_slice_v4_node_guardian"`.
+> **INFRA BLOCKER — ROOT CAUSE FOUND + FIXED (2026-05-24):** `vllm`'s
+> `ray.init()` dies "Version mismatch: cluster 2.54.1 vs local 2.55.1" at engine
+> init (NOT S1). The prior theory (stale `/tmp/ray-vllm` / reinstall the venv)
+> was **WRONG**: all 8 venvs are uniformly 2.55.1/commit `237c2455` (verified
+> via `compute_version_info()` — the exact fn the check uses — and a single
+> `ray-2.55.1.dist-info`); a clean `/tmp` wipe + `ray_restart` did NOT fix it.
+> **The real culprit is mark's `node` Docker container** (`vllm/vllm-tpu:nightly`,
+> ray **2.54.1**/commit `8768a329`). When it's redeployed it tries to join our
+> ray at `:6379`, FAILS its own version check (status `Exited (1)`), but in the
+> attempt calls `put_cluster_metadata(overwrite=True)`, **poisoning the GCS
+> `CLUSTER_METADATA` key to 2.54.1** — which then makes our own 2.55.1 head log
+> the right version (`gcs_server_main.cc:98 ray_version=2.55.1`) yet the stored
+> metadata read by every client/worker say 2.54.1. It also blocks our own
+> workers from joining (only 2/8 registered until fixed). Confirm the diagnosis:
+> `GcsClient(address=head:6379).internal_kv_get(b"CLUSTER_METADATA", namespace=b"cluster")`
+> (raw GcsClient bypasses the version gate) → look at `ray_version`/`git_commit`.
+> **FIX (what worked):** (1) `sudo docker rm -f node` on all 8 hosts (removes the
+> poisoner; `docker update --restart=no` + `stop` is NOT enough — a controller
+> redeploys it); (2) either re-stamp the key
+> (`gc.internal_kv_put(b"CLUSTER_METADATA", json_with_ray_version_2.55.1, True, namespace=b"cluster")`)
+> OR just re-run `scripts/full_slice_v4_ray_restart.sh` now that no poisoner is
+> present (head writes 2.55.1 natively). Verify: `ray.init(address='auto')`
+> connects, `cluster_resources()['TPU']==32.0`. **Silver lining:** now that our
+> cluster is 2.55.1, the 2.54.1 `node` container CANNOT successfully join (it
+> Exits 1 on the mismatch), so it can't hold the TPU — residual harm is only the
+> metadata poisoning, fixed by keeping `node` removed. KEEP the guardian running
+> (`scripts/full_slice_v4_node_guardian.sh`; kill via
+> `pkill -f "[f]ull_slice_v4_node_guardian"`) so a redeploy is caught fast; the
+> teardown helper is `/tmp/v4_teardown.sh` (run as a FILE to avoid `pkill -f`
+> self-match — the pattern string in an inline `pkill -9 -f gcs_server` matches
+> the executing shell's own argv and kills it).
 
 (Production V4 runs attn_dp=32: num_kv_heads=1 + bf16 ⇒ TP folds entirely into
 attn_dp, model=expert=1, KV `P()`. The repro used attn_dp=8 / 8 experts.)
