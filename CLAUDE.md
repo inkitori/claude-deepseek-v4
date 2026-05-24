@@ -481,6 +481,41 @@ idle ranks can't corrupt the rolled/sliced state. Localize the exact field with 
 > this session preserved). It had usefully enhanced `s1_mh_repro.py`'s `seeddiff` action
 > (full-trajectory replicated-vs-sharded) — that enhancement is KEPT.
 
+## PHASE 8 — candidate fix `c5f245c7` is SUSPECT (correlates with TPU Core-halts) (2026-05-24)
+
+The fix `c5f245c7` adds `_replicate(x)` (= `with_sharding_constraint(x, P())`) at
+the top of `attention_init_state_from_prefill` (seeding) AND `attention_decode_step`
+(decode). **It has NOT been shown to work and is a PRIME SUSPECT for crashing decode:**
+* **PRE-fix** smoke `064842`: served **93 completions, 0 Core-halts** (decode ran,
+  just collapsed — the S1 symptom).
+* **POST-fix** smokes `093046` (48443) and `094655` (this session): **Core-halt at the
+  FIRST decode step**, both times — `real_program_continuator.cc: Core halted
+  unexpectedly` then cluster-wide `SLICE_FAILURE_SW_INJECT_ERROR`. Different workers
+  each time (.202, then .198) — i.e. NOT one bad chip.
+* The fix's ONLY new op in the decode path is an **all-gather of the activation**
+  (token-sharded ATTN_DATA → replicated P()). The pre-existing
+  `_v4_constrain_packed_replicated` (P()→P(), no reshard) ran fine for 93 requests;
+  resharding a **degenerate size-1 token axis** (1 decode token over 32 ways) is the
+  new thing and is the leading Core-halt suspect. (Caveat: can't fully rule out
+  independent slice flakiness — the runbook says this slice SLICE_FAILUREs
+  spontaneously. A FRESH-slice retest is needed to be sure.)
+
+**RECOVERY DONE:** the wedge was cleared by **rebooting the 7 workers** (STEP 0b).
+
+**NEXT (in priority order):**
+1. On the fresh slice, TEST the fix cheaply FIRST with a **token-sharded MH repro**
+   (place input on `P(None,'attn_dp')`, NOT replicated) BEFORE a full smoke — it
+   reveals (a) does the fix's reshard Core-halt at truncated scale, and (b) does decode
+   match the oracle. Faster than a 10-min smoke. (Enhance `s1_mh_repro.py`: the existing
+   `put` places replicated — add a token-sharded input placement.)
+2. If the fix Core-halts on a FRESH slice ⇒ confirmed cause ⇒ switch to a **TPU-safe
+   variant**: prefer a RUNTIME fix — make V4 *decode* use a **replicated input sharding**
+   instead of `P(ShardingAxisName.ATTN_DATA)` (`tpu_runner.py:~1560`,
+   `data_parallel_attn_sharding`), so the activation is replicated from entry and NO
+   mid-forward reshard is inserted. That directly addresses the PHASE-7 diagnosis
+   (token-axis sharding of the single decode token) at the source.
+3. If the fix is clean+correct on the MH repro ⇒ ONE full smoke for closure (verify TWICE).
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
