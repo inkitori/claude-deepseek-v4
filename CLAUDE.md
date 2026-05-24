@@ -341,6 +341,55 @@ and/or multi-layer state threading. **USE THE CPU REPRO to bisect which
 layer/component first diverges** (compare per-layer decode h vs prefill h) — no
 smoke needed until final closure.
 
+## PHASE 5 — bug is in the COMPRESSION-LAYER decode INTEGRATION (2026-05-24)
+
+Airtight: decode is broken even on UNAMBIGUOUS factual prompts (no greedy-loop
+confound) while prefill is perfect:
+* prefill `max_tokens=1`: France→Paris, Japan→Tokyo, hot→cold, hydrogen→oxygen,
+  George→Washington, violets→blue — all correct.
+* decode `max_tokens≥2`: `"first six primes are 2,3,5,"`→`' 0 0 0 0 0 0'`;
+  `"Count from 1 to 20: 1,2,3,"`→`' '`; `"Days: Monday, Tuesday,"`→
+  `' Wednesday, 2012-12-19 12:'` (note: `Wednesday` = correct 1st decode token,
+  THEN collapses). So decode collapse is real and immediate; prefill is healthy.
+  (The earlier "story prompt pure-prefill loops too" was a weak greedy-raw-
+  completion artifact, NOT the bug — disregard it.)
+
+**CPU bisection (scripts/s1_cpu_repro_peaked.py, scale=0.5, ~10-23s each):**
+* n_layers 1,2 (ratios (0)/(0,0), pure SWA) → bad=0. SWA + MoE decode are FINE.
+* n_layers 3 (adds ratio=4 layer) → bad=1; n_layers 4 (adds ratio=128) → bad=3,
+  with worst-step hidden-state ||h_dec−h_pre||/||h_pre|| = **0.20–0.41** (vs
+  0.004 baseline) = structural, not a near-tie flip.
+⇒ **The bug is introduced by the ratio=4 / compression layer's decode.**
+
+**RULED OUT (isolated CPU tests, peaked weights, all relErr≈0.000):**
+* Main compressor: `compressor_prefill` vs zero-state incremental
+  `compressor_decode_step` → byte-identical (`/tmp/comp_parity.py`).
+* Prefill→decode SEED: `_compressor_state_from_prefill`+decode vs prefill →
+  byte-identical, incl. in-progress-window remainder (`/tmp/seed_parity.py`).
+* pack/unpack: every field's actual shape == `_layer_decode_state_layout` shape
+  (`/tmp/s1_shape_check.py`, no mismatch).
+* Isolated single-layer attention parity (subagent): relErr ~3e-3 even peaked.
+* Window/SWA (n_layers 1,2 clean), donation (PHASE 2), runner KV threading.
+
+**THEREFORE** the error is in the FULL-LAYER decode INTEGRATION that the
+component tests don't exercise — i.e. inside `attention_decode_step` for ratio>0
+layers: how window-topk ∪ indexer `compress_topk` feed `sparse_attn` over the
+combined ring-buffer+compressed `new_kv_cache`, OR the indexer's own
+state/score path, OR a freqs (swa vs `compress_rope_theta` `comp`) dispatch
+difference between the prefill and decode call sites.
+
+**NEXT (do this first, on CPU, ~seconds):** write the decisive INTEGRATION test
+— for the truncated cfg's ratio=4 layer (`params.layers[2].attn`), compare
+`attention_prefill(x[:M])[:,P]` vs `attention_init_state_from_prefill(x[:T])` +
+`attention_decode_step` stepped to position P, at peaked weights (scale 0.5).
+Mind which freqs each call site receives (swa vs comp) — `transformer_body_forward`
+is the source of truth for per-layer freqs dispatch. If `y` diverges → bug is in
+`attention_decode_step` integration (likely the topk/sparse_attn assembly or the
+indexer `compress_topk`, esp. the prefill `K=min(index_topk, S//ratio)` vs decode
+`K=index_topk` asymmetry at L412 vs L600); if `y` matches → look at MoE/residual
+across the multi-layer stack. Then fix, confirm on `s1_cpu_repro_peaked.py 0.5`
+(bad→0) AND `s1_cpu_repro_v4flash.py both 8 12 4` (no regression), THEN one smoke.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
