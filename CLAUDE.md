@@ -435,6 +435,52 @@ instrumented smoke on :18081 for the real collapse + start_pos trajectory.** A f
 repro needs REAL WEIGHTS (random weights are proven inadequate) — consider loading a few
 real V4-Flash layers on CPU (~9 GiB/layer) if the runtime audit doesn't pin it.
 
+## PHASE 7 — runtime audit done; PRIME suspect = TOKEN-AXIS sharding of SHORT prefills (2026-05-24)
+
+Live-engine ground truth (instrumented smoke :18081) + runtime audit:
+* **Collapse is at the FIRST decode step and DETERMINISTIC.** `"Count to 5: 1,2,3,"`→`" 0 0"`
+  (token1 `" "`=prefill OK; token2 `"0"`=first decode step, WRONG). 6 identical probes
+  byte-identical ⇒ deterministic; the 2010-vs-2012 non-det was cross-request contamination
+  (`enable_prefix_caching=True`). Collapsed decode sometimes yields **NaN logits** (engine
+  `ValueError: Out of range float ... nan` on logprobs).
+* **Runtime is correct:** decode `start_pos = seq_lens[0]-1` INCREMENTS by 1 in the live
+  trace (17..27, 9..14); runner captures+rethreads `self.kv_caches` each step
+  (`tpu_runner.py:869`). So start_pos / kv-threading are NOT the bug.
+* **Real cfg:** 43 layers, ratios `[0,0,4,128,4,128,...,4,0]`, 256 experts, index_topk=512,
+  `state_max_seq_len=8192` (=256 max_model_len × 32 dp) ⇒ ratio4 cache=2048 slots ≫512;
+  NO size mismatch, NO new flavor. Decode math fp32-exact for all 3 flavors (PHASE 6).
+
+**PRIME HYPOTHESIS (untested by any repro so far):** the real engine **token-shards
+`input_ids`/activations on `ATTN_DATA`** (`tpu_runner.py:1560`,
+`data_parallel_attn_sharding = P(ShardingAxisName.ATTN_DATA)`; ATTN_DATA=('data','attn_dp',
+'attn_dp_expert')). With attn_dp=32 and a SHORT prefill (T<32 tokens) the token axis is
+sharded UNEVENLY (empty/idle ranks). The cross-token state-SEEDING ops run on this
+token-sharded activation: `_swa_kv_cache_from_prefill` (jnp.roll over token axis) and
+`_compressor_state_from_prefill` (slice `[cutoff-ratio:cutoff]` over token axis) — a sharded
+roll/slice with idle ranks can produce a CORRUPTED seeded packed state, while the forward
+`h` (token-1 logits) stays correct ⇒ exactly "first token correct, then step-1 collapse".
+**The MH repro placed inputs REPLICATED `P()`** (`s1_mh_repro.py` `put`), so it NEVER tested
+token-axis sharding — that's why sharded-MH (attn_dp=8, replicated input) looked clean.
+
+**DECISIVE CHEAP TESTS (in priority order):**
+1. **Real-engine length sweep** (just curls, faithful): short prompt (T<32) should COLLAPSE,
+   long prompt (T≥32, fills all dp ranks) should stay COHERENT. If so ⇒ token-axis/short-
+   prefill sharding bug CONFIRMED. (Earlier attempt got contention; rerun on a clean engine.)
+2. **Token-sharded MH seeddiff**: place input on `P(None,'attn_dp')` (token-sharded) and diff
+   the seeded packed state vs replicated-input. NB the replicated-input `seeddiff` action
+   times out in its slow replicated half — make it sharded-vs-(token-sharded) and budget time.
+
+If confirmed, the FIX is in the prefill state-seeding under token sharding: constrain the
+seeding input/activation to replicated `P()` before `_swa_kv_cache_from_prefill` /
+`_compressor_state_from_prefill` (or compute seeding on a gathered/un-sharded token axis), so
+idle ranks can't corrupt the rolled/sliced state. Localize the exact field with test #2.
+
+> SESSION NOTE (2026-05-24): a STALE 2nd `claude` session (old prompt) was running
+> concurrently — co-editing scripts + running competing TPU jobs (tore down the smoke, ran
+> a seeddiff that timed out). Consolidated to a single driver (SIGKILLed it; guardians +
+> this session preserved). It had usefully enhanced `s1_mh_repro.py`'s `seeddiff` action
+> (full-trajectory replicated-vs-sharded) — that enhancement is KEPT.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash

@@ -95,13 +95,15 @@ def main():
         return jax.sharding.Mesh(devices, AXES), shape
 
     if action == "seeddiff":
-        # Weight-agnostic test: does SHARDED prefill-seeding match REPLICATED
-        # prefill-seeding (same weights+inputs)? Seeding should be mode-invariant
-        # up to ~1e-3 bf16 reduction noise; a large per-field relErr means the
-        # attn_dp-sharded compute CORRUPTS the seeded packed state — the prime
-        # real-S1 suspect (decode reads corrupted state => step-1 collapse). The
-        # MH repro never tested this (it only compared same-mode oracle/decode).
-        def seed_buffers(m):
+        # Weight-agnostic decisive test: REPLICATED decode is ground truth
+        # (proven == prefill, fp32-exact). Run the FULL trajectory (prefill seed
+        # + N decode steps) in BOTH replicated and sharded modes with identical
+        # weights/inputs, and compare (a) the seeded packed state per field and
+        # (b) per-decode-step packed state + argmax. Any LARGE structural
+        # divergence is the SHARDING bug; localizes seed (step -1) vs decode-step
+        # (which step/layer/field). The MH repro never did cross-mode comparison
+        # (it only compared same-mode oracle/decode).
+        def run_mode(m):
             mesh, shape = build_mesh(m)
             log(f"[s1-mh] seeddiff mode={m} mesh={dict(zip(AXES, shape))}")
             repl = jax.sharding.NamedSharding(mesh, P())
@@ -112,39 +114,67 @@ def main():
             with jax.set_mesh(mesh):
                 pr = jax.tree_util.tree_map(put, params)
                 sw, co = put(swa), put(comp)
+                def _head(h):
+                    return head_forward(
+                        h, pr.head_w, pr.final_norm_w, pr.hc_head_fn,
+                        pr.hc_head_scale, pr.hc_head_base, cfg.rms_norm_eps, cfg.hc_eps)
                 def _pf(kv, ids):
                     nk, _ = deepseek_v4_run_with_decode_state(
                         kv, ids, pr, sw, co, cfg, state_max_seq_len=max_seq,
                         is_decode_step=False, start_pos=jnp.int32(0))
                     return nk
-                jp = jax.jit(_pf)
+                def _dec(kv, ids, sp):
+                    nk, h = deepseek_v4_run_with_decode_state(
+                        kv, ids, pr, sw, co, cfg, state_max_seq_len=max_seq,
+                        is_decode_step=True, start_pos=sp)
+                    return nk, jnp.argmax(_head(h)[0, 0])
+                jp, jd = jax.jit(_pf), jax.jit(_dec)
                 kv = [put(np.zeros((s,), np.float32)) for s in sizes]
                 kv = jp(kv, put(ids_full[:, :T]))
-                return [np.asarray(b) for b in kv]
+                seed = [np.asarray(b) for b in kv]
+                step_buf, ams = [], []
+                for step in range(N):
+                    pos = T + step
+                    kv, am = jd(kv, put(ids_full[:, pos:pos + 1]), put(np.int32(pos)))
+                    step_buf.append([np.asarray(b) for b in kv])
+                    ams.append(int(am))
+                return seed, step_buf, ams
 
-        rep_buf = seed_buffers("replicated")
-        shd_buf = seed_buffers("sharded")
+        rep_seed, rep_steps, rep_am = run_mode("replicated")
+        shd_seed, shd_steps, shd_am = run_mode("sharded")
         layouts = transformer_body_layout(params, cfg, max_seq, 1)
-        worst = (0.0, None)
-        for layer in range(n_layers):
-            off = 0
-            for name, fshape, _dt in layouts[layer]:
-                n = int(np.prod(fshape)) if len(fshape) else 1
-                if n == 0:
-                    continue
-                r = rep_buf[layer][off:off + n]
-                s = shd_buf[layer][off:off + n]
-                rel = float(np.linalg.norm(r - s) / (np.linalg.norm(r) + 1e-9))
-                mad = float(np.max(np.abs(r - s)))
-                if rel > worst[0]:
-                    worst = (rel, (layer, name))
-                flag = "**" if rel > 0.02 else "  "
-                log(f"  {flag} layer={layer} ratio={cfg.compress_ratios[layer]} "
-                    f"field={name:<22} relErr={rel:.5f} max|d|={mad:.4g}")
-                off += n
-        log(f"[s1-mh] seeddiff WORST relErr={worst[0]:.5f} at {worst[1]} "
-            f"(T={T} attn_dp idle-ranks={'yes' if T < nd else 'no'})")
-        print(f"[p{PID}] SEEDDIFF_DONE worst={worst[0]:.5f}@{worst[1]}", flush=True)
+
+        def field_diffs(rep_bufs, shd_bufs, tag):
+            worst = (0.0, None)
+            for layer in range(n_layers):
+                off = 0
+                for name, fshape, _dt in layouts[layer]:
+                    nfe = int(np.prod(fshape)) if len(fshape) else 1
+                    if nfe == 0:
+                        continue
+                    r = rep_bufs[layer][off:off + nfe]
+                    s = shd_bufs[layer][off:off + nfe]
+                    rel = float(np.linalg.norm(r - s) / (np.linalg.norm(r) + 1e-9))
+                    if rel > worst[0]:
+                        worst = (rel, (layer, cfg.compress_ratios[layer], name))
+                    off += nfe
+            log(f"  [{tag}] worst field relErr={worst[0]:.5f} at {worst[1]}")
+            return worst
+
+        log(f"[s1-mh] === SEED (prefill) replicated-vs-sharded ===")
+        field_diffs(rep_seed, shd_seed, "seed")
+        log(f"[s1-mh] === per-decode-step replicated-vs-sharded ===")
+        nbad = 0
+        for step in range(N):
+            w = field_diffs(rep_steps[step], shd_steps[step], f"step{step} pos{T+step}")
+            am_ok = rep_am[step] == shd_am[step]
+            if not am_ok:
+                nbad += 1
+            log(f"     step{step} pos{T+step}: rep_argmax={rep_am[step]} "
+                f"shd_argmax={shd_am[step]} {'OK' if am_ok else '** ARGMAX DIFF'}")
+        log(f"[s1-mh] argmax replicated-vs-sharded mismatches: {nbad}/{N}")
+        print(f"[p{PID}] SEEDDIFF_DONE T={T} idle={'yes' if T < nd else 'no'} "
+              f"argmax_mismatch={nbad}/{N}", flush=True)
         return
 
     # Mesh carries production's named axes (the functional fwd references
