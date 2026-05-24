@@ -1,0 +1,40 @@
+You are one session in a SELF-PERPETUATING loop driving the S1 TPU bug to a verified
+fix. A wrapper (scripts/s1_session_loop.sh) relaunches a FRESH-context session each time
+you exit, so your job is to make solid, COMMITTED progress and then hand off cleanly. The
+commit log + HANDOFF_S1.md + CLAUDE.md are the ONLY memory that survives your exit.
+
+READ FIRST (in order), then act:
+  1. HANDOFF_S1.md  — current S1 state, the IN-FLIGHT item, and the DONE gate. Trust it.
+  2. CLAUDE.md      — the runbook (success gate, reproducers, plumbing, pitfalls).
+  3. git log --oneline -12.
+
+GOAL: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, deterministic
+decode on the v6e-32 slice. DONE = the gate in HANDOFF_S1.md, verified TWICE on a fresh
+engine (READ the actual decode text — "contains Paris" is a false positive). When DONE,
+record it in HANDOFF_S1.md + CLAUDE.md, commit+push, and `touch /tmp/s1_loop_stop` so the
+loop ends. Until then, keep driving.
+
+OPERATING RULES:
+- Make every call yourself; never wait for approval; bypass perms are on.
+- KEEP BOTH GUARDIANS ALIVE before any TPU work. Check:
+    ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'
+  Restart node_guardian if dead (NEVER pkill+restart in one line — the pattern
+  self-matches and kills your own shell):
+    INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &
+- SPAWN SUBAGENTS AGGRESSIVELY for any bounded investigation (log greps, CPU repros,
+  HLO checks, an ssh probe); have them return ONLY conclusions. This is the main lever
+  for keeping context lean — never read long logs into your own context.
+- After EVERY code edit: scripts/full_slice_v4_sync.sh (else 7/8 workers run stale code).
+- Commit + push after EVERY validated step. Clean up ONLY via full_slice_v4_reset.sh.
+- Reserve full smokes (~25-45 min) for confirming a fix that already survives a cheaper
+  repro; at most 1-2 per session.
+
+HAND OFF (this is how the loop perpetuates): your context grows as you work. When it nears
+~200k tokens — if interactive, eyeball /context; if headless, treat "I finished a validated
+step / bounded chunk" as the trigger — STOP CLEANLY:
+  1. bash scripts/s1_trim_claudemd.sh   (trims CLAUDE.md for the next session)
+  2. Rewrite HANDOFF_S1.md to reflect the CURRENT state: what you verified, what's
+     in flight (log paths, ports), and the single most important NEXT action.
+  3. git add -A && commit + push.
+  4. END YOUR TURN (stop responding) so the wrapper relaunches a fresh session.
+Do not start anything large you can't finish + commit before handing off.

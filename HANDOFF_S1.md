@@ -64,3 +64,26 @@ byte-identity + 5-request survival; first probe absorbs the cold decode compile,
 max_word_run<5); 3 Paris probes byte-identical at temp=0; survives 5 unrelated requests.
 "Contains Paris" alone is a false positive. After EVERY code edit: `scripts/full_slice_v4_sync.sh`.
 CPU repros only confirm NO-REGRESSION (the fix is a CPU no-op): `s1_cpu_repro_v4flash.py both 8 12 4` → exit 0.
+
+## Session continuity (self-perpetuating loop)
+S1 outlives a single Claude Code context. A relaunch loop keeps a FRESH session always
+working on it: each session starts with empty context (auto-loads CLAUDE.md), works a
+bounded chunk, hands off (trims CLAUDE.md, refreshes this file, commits+pushes), and
+exits; the wrapper then launches the next fresh session. This keeps context lean while
+progress accumulates in git + this file + CLAUDE.md.
+
+- **START:**
+  ```
+  tmux new-window -n s1loop        # detachable; survives SSH logout
+  scripts/s1_session_loop.sh       # runs `claude --print --effort max --dangerously-skip-permissions`
+  ```
+  (detach: Ctrl-b d · reattach: `tmux attach`). Or headless: `nohup scripts/s1_session_loop.sh >logs/s1_session_loop.log 2>&1 &`.
+- **STOP:** `touch /tmp/s1_loop_stop` — the loop checks it before each relaunch and exits
+  cleanly without killing an in-flight session (a session also touches it when S1 is DONE).
+  Do **not** `pkill -f s1_session_loop` from a shell whose own command line contains that
+  string — it self-matches and kills the wrong process. Use the stop file.
+- **Per-session prompt:** `scripts/s1_loop_prompt.txt`. **Trim helper:** `scripts/s1_trim_claudemd.sh`
+  (archives old PHASE sections to `CLAUDE.full.md`, keeps the 2 newest). Session logs: `logs/s1_session_*.log`.
+- **Note:** `claude --print` is agentic but cannot read `/context`; sessions hand off after a
+  validated chunk instead. Run one session interactively to literally watch `/context`:
+  `claude --effort max --dangerously-skip-permissions "$(cat scripts/s1_loop_prompt.txt)"`.
