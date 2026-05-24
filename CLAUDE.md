@@ -390,6 +390,51 @@ indexer `compress_topk`, esp. the prefill `K=min(index_topk, S//ratio)` vs decod
 across the multi-layer stack. Then fix, confirm on `s1_cpu_repro_peaked.py 0.5`
 (bad→0) AND `s1_cpu_repro_v4flash.py both 8 12 4` (no regression), THEN one smoke.
 
+## PHASE 6 — the CPU PEAKED repro is a RED HERRING; decode math is fp32-EXACT (2026-05-24)
+
+**PHASE 4/5 are OVERTURNED.** Three new CPU diagnostics (committed) settle it:
+* `scripts/s1_cpu_integration_test.py` — isolated SINGLE-LAYER attention decode vs
+  prefill, ratio=4 layer, peaked scale 0.5, bf16. **MATCHES** (relErr ~1e-3, bf16
+  noise). So the bug is NOT an isolated `attention_decode_step` integration bug —
+  directly refutes the PHASE-5 "ratio=4 attention integration is broken" claim.
+* `scripts/s1_cpu_layer_bisect.py` — per-layer teacher-forcing (real threaded
+  activations, `block_forward` vs `block_init_state_and_forward`+`block_decode_step`).
+  Divergence is **SCATTERED across ALL layer types** incl pure-SWA L1 (0.194 @pos14);
+  "first diverging layer" VARIES by position (L3@9, L2@11, L1@14). With win=128 and
+  positions<128 there is NO ring wrap and ratio=128 has ZERO compressed tokens in
+  range, so L3 is effectively pure-SWA too. Pure-SWA L1 diverging CONTRADICTS the
+  PHASE-5 "n_layers 1,2 clean" claim (that was argmax-level only; hidden h DOES
+  diverge there).
+* `scripts/s1_cpu_dtype_disambig.py` — reruns the bisect in pure fp32 vs bf16.
+  **DECISIVE: fp32 worst relErr = 0.00026 (0/12 positions); bf16 worst = 0.227
+  (5/12).** In fp32 decode is bit-exact equal to prefill.
+
+**CONCLUSION: the peaked-repro divergence is bf16 ROUNDING amplified by RANDOM-weight
+near-ties** — non-hash MoE top-k routing flips (`top_k` over near-tie expert scores,
+`deepseek_v4_moe.py:98`) and the swiglu `±10` clip boundary (`expert_forward:128-129`),
+both random-weight artifacts. The decode ALGORITHM is correct (fp32-exact == prefill,
+confirming PHASE-2's sharded byte-identical finding from another angle). **`s1_cpu_repro_peaked.py`
+does NOT capture real S1** and `bad>0` there is NOT a valid fix target. Real trained
+weights give CONFIDENT logits, so symmetric bf16 rounding-order noise CANNOT produce
+the real HARD collapse ("0 0 0 0"). **STOP iterating on the random-weight CPU repro.**
+
+**Therefore real S1 lives in what the standalone repro does NOT exercise:**
+1. **The vLLM RUNTIME integration** (PRIME suspect — the repro hand-feeds the correct
+   `start_pos`, so a runtime start_pos / attention_metadata / kv-threading bug is
+   INVISIBLE to every CPU/MH repro done so far). Audit `_maybe_set_v4_decode_start_pos`
+   (`runner/tpu_runner.py`) and `_initialize_kv_cache_deepseek_v4`
+   (`runner/kv_cache_manager.py`): is `start_pos` the right absolute position each
+   decode step? does prefill→decode hand off the right position? is `state_max_seq_len`
+   what the buffers were sized for?
+2. **Real config**: 61 layers, 256 experts, full per-layer `compress_ratios` pattern,
+   real `state_max_seq_len` / `index_topk` vs seq_len — a combo the 4-layer truncation
+   never hits.
+
+**NEXT: audit the runtime start_pos/metadata path (free, no smoke), and probe the live
+instrumented smoke on :18081 for the real collapse + start_pos trajectory.** A faithful
+repro needs REAL WEIGHTS (random weights are proven inadequate) — consider loading a few
+real V4-Flash layers on CPU (~9 GiB/layer) if the runtime audit doesn't pin it.
+
 ## How to validate (fastest signal first)
 
 **The expensive thing is NOT TPU — it's the full DeepSeek-V4-Flash
