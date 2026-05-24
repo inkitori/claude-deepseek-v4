@@ -86,28 +86,38 @@ lanes masked by causal/topk) so it's finite.
 
 ## FIXES TRIED → ALL FAILED (don't repeat)
 - **FIX v2** `with_sharding_constraint(x,P())` in seed: Core-halt (degenerate empty-shard gather of x).
-- **Option A** runtime: replicate prefill input_ids from host: decode EMPTY (no NaN seen, but not
-  tripwire-checked) + Core-halt at req ~6. NOTE: replicating the input AVOIDED the NaN.
-- **fix (d)** replicate `wkv` in seed (`_linear(x, _replicate(params.wkv))`): L1 STILL overflows
-  (1.8e37→3.4e37, +inf/-inf appeared) ⇒ garbage is from x's EMPTY shards, not the weight. Reverted.
+- **Option A** runtime replicate prefill input_ids from host: decode EMPTY + Core-halt at req ~6.
+  **Re-tested WITH tripwire (smoke 141625Z): seed L1 init_kv_postlinear STILL NaN (2.64e37).** So
+  replicating the INPUT does NOT fix the seed — the forward reshards x back to token-sharded by L1.
+- **fix (d)** replicate `wkv` in seed: L1 STILL overflows (3.44e37). Replicating the WEIGHT doesn't
+  fix it either. Reverted.
+- **CONCLUSION:** neither input- nor weight-replication stops the overflow — XLA reshards x for the
+  matmul regardless (driven by the replicated-P() state output). The overflow VARIES run-to-run
+  (1.8e37/3.4e37/2.6e37; inf counts 0/160/256) ⇒ it's reading **uninitialized/recycled HBM** via the
+  empty-token-shard reshard (donate_argnums recycles the buffer; the ~31 idle token shards are never
+  written). The fix MUST eliminate empty token shards.
 
-## NEXT — candidate fixes (ranked); RUN OPTION-A-WITH-TRIPWIRE FIRST (cheap, decisive)
-1. **FIRST, cheap & decisive:** re-apply Option A (replicate V4 prefill input_ids from host,
-   `tpu_runner._prepare_inputs_dp`, see commit f1598b82's diff) AND smoke with
-   `V4_DECODE_NAN_TRIPWIRE=1`. Grep `[v4nan]` for L1 `init_kv_postlinear`. If it's **FINITE**
-   under Option A, then replicating the input FIXES THE SEED — the empty output + halt were a
-   SEPARATE decode-side issue (decode input/`q0==1` path, or prefix-cache/EOS), and S1 is much
-   closer than it looks. Then split Option A: replicate the SEED's input ONLY (`state_init_ids`
-   in `deepseek_v4.py:1849`) and keep the forward token-sharded, and replicate the DECODE input
-   too (q0==1) — so seed+decode are consistent without breaking the forward.
-2. **PAD the seed token axis to ≥ dp_size (32) before sharding** so NO shard is empty: pad
-   `state_init_ids` (`deepseek_v4.py:1849`) to a multiple of 32 with a pad token; thread the
-   REAL length `L_real` into `attention_init_state_from_prefill` + `_swa_kv_cache_from_prefill`/
-   `_compressor_state_from_prefill` so the cross-token roll/slice use `L_real` (ignore padding).
-   Most robust (kills empty shards = the root) but invasive + must not re-introduce an
-   empty-shard slice. NO degenerate `with_sharding_constraint(x,P())`.
-3. Shard the decode state (not replicated P()) to match the activation so the seed write is
-   local — big change (kv_cache_manager + decode reads); last resort.
+## NEXT — THE PAD FIX (replication is ruled out; eliminate empty token shards)
+Both input- and weight-replication left the seed NaN, so the fix must make the seed's token
+axis have NO empty shards. The runtime already ZEROES the global token buffer beyond the real
+tokens (`tpu_runner.py:1813` `input_ids_view[total:] = 0`), but the seed SLICES to L_real
+(`deepseek_v4.py:1849` `state_init_ids = ids_2d[:, :L_real]`), which RE-creates the empty
+shards (L_real<32 over attn_dp=32). PLAN:
+- **Zero-pad the seed token axis to a multiple of dp_size (≥32)** so every attn_dp shard is
+  non-empty (padding = 0 → reshards read 0, not recycled HBM). Do it at the seed-input level
+  (don't slice to L_real; pad to T_pad), OR `jnp.pad(x, ((0,0),(0,T_pad-L_real),(0,0)))` at the
+  top of `attention_init_state_from_prefill` (a partition-preserving op — does NOT read the
+  empty shards, unlike `with_sharding_constraint(P())`).
+- **Thread the REAL length `L_real` through the cross-token ops** so padding can't corrupt the
+  seeded state: `_swa_kv_cache_from_prefill` (jnp.roll by `T%win`, `:996`) and
+  `_compressor_state_from_prefill` (slice `[cutoff-ratio:cutoff]`, `:961,:968`) must use L_real,
+  not x.shape[1]=T_pad. CRUCIAL: keep the FULL T_pad array through these ops (mask/index with
+  L_real); do NOT slice back to `[:, :L_real]` (that re-creates empty shards). Padding positions
+  ≥L_real land in unused state slots that decode never reads.
+- Validate with `V4_DECODE_NAN_TRIPWIRE=1`: L1 `init_kv_postlinear` should be FINITE, the whole
+  seed finite, decode text coherent. Then verify TWICE → DONE.
+LAST RESORT: shard the decode state (not replicated P()) to match the activation so the seed
+write is local — big change (kv_cache_manager + decode reads).
 
 DIAGNOSTIC TOOL: `V4_DECODE_NAN_TRIPWIRE=1` prints `[v4nan] L{l} pos={p} {tag}: nan/inf/max_abs`
 (seed=pos -1 `init_*`; decode=pos≥T). `grep '\[v4nan\]' LOG | grep -vE 'nan=0 .inf=0 -inf=0'`
