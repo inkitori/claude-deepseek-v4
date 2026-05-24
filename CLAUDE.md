@@ -194,29 +194,41 @@ state threading) is CORRECT under replicated AND sharded, donated or not.
 **S1 IS NOT IN THE MODEL DECODE MATH.** Both the CPU repros and this MH repro
 test that core and pass. Stop patching the write sites / donation.
 
-**Where S1 must live next (none tested yet — pick up here):**
-1. **Cross-mode forward** (cheapest, do first): the oracle is teacher-forcing
-   under the SAME code+sharding, so a bug corrupting the *forward pass itself*
-   equally in decode and oracle is invisible here. Compare replicated-forward
-   vs sharded-forward argmax/logits on identical weights (add a crossmode
-   action to `s1_mh_repro.py`). Large diff ⇒ sharding corrupts the forward.
-2. **Real-weight amplification**: random weights give near-tie logits; a small
-   sharded state error invisible here could push *trained* logits off-manifold
-   into the attractor. Hard to test without real weights.
-3. **Runner integration the repro BYPASSES** (CPU repros bypass it too):
-   `runner/kv_cache_manager.py::_initialize_kv_cache_deepseek_v4` (buffers
-   `batch_size=1`, zero-init, replicated `P()`), `tpu_runner.py::
-   _maybe_set_v4_decode_start_pos` (`start_pos=seq_lens[0]-1`), and the model
-   `__call__` wrapper `deepseek_v4.py:1778-1910`. The single-seq decode branch
-   MIRRORS the repro (looks correct). The MULTI-seq branch (>1 query segment,
-   L1887) runs PREFILL-only — ignores kv_caches/decode-state — a real bug, but
-   single-prompt decode (`query_start_loc=[0,1]`) takes the single-seq branch,
-   so probably not the single-prompt cause. Check whether the runner pads
-   decode to batch>1 (would hit multi-seq → prefill → garbage).
-4. **Non-determinism source**: S1 is non-deterministic at temp=0; this repro is
-   fully deterministic. So S1's non-determinism (uninitialized HBM read /
-   non-deterministic collective / cross-request buffer reuse) is NOT in the
-   math path — it points at the runner buffer lifecycle or real-weight numerics.
+**RULED OUT so far (don't re-tread):**
+- Donation (diff: byte-identical buffers).
+- Decode math: replicated bad=0; sharded bad=1/12 and 4/48 — but mismatches
+  are SCATTERED (steps 20/21/32/37 at N=48), never compound, and every one is a
+  near-tie (top1-top2 logit gap ~5e-4..4e-3, same as OK steps) ⇒ benign attn_dp
+  reduction noise on flat random-weight logits.
+- Cross-mode forward (free, from logs): replicated-forward vs sharded-forward
+  teacher-forced argmax differ at ONLY the same near-tie step ⇒ forward
+  sharding perturbation is benign, not structural.
+- Multi-seq prefill branch: single-prompt decode (`query_start_loc=[0,1]`,
+  n_active=1) takes the single-seq branch (correct); multi-seq is batch>1 only.
+- Single-seq wrapper `deepseek_v4.py:1812-1871`: mirrors the repro, looks right.
+- Runner KV threading: `tpu_runner.py:869` captures & stores the returned
+  `kv_caches` each step; prefill→decode handoff fine; donation aliasing correct.
+
+**Therefore S1 is NOT reproducible with random weights / the functional path,
+and is almost certainly REAL-CONFIG / REAL-WEIGHT specific or a runtime-input
+issue** (key point: with confident trained logits, ~1e-3 reduction noise can't
+flip argmax, so S1's collapse is a LARGE structural error the repro would have
+shown if it were in the decode math — it isn't). **Remaining suspects:**
+1. **Real-config-only paths**: real V4 = 61 layers, 256 experts, real
+   `compress_ratios` per layer (my repro: 4 layers, 8 experts, ratios
+   (0,0,4,128)), real `state_max_seq_len`. A bug in a compress_ratio/layer
+   combo or at scale won't show in the 4-layer truncation.
+2. **Runtime attention_metadata**: is `seq_lens[0]-1` (start_pos) actually the
+   right position each decode step at runtime? Is `state_max_seq_len`
+   (`v4_state_max_seq_len_from_vllm_config`) what the buffers were sized for?
+3. **Non-determinism source** (S1 is non-det at temp=0; repro is deterministic):
+   uninitialized HBM read / non-det collective / cross-request buffer reuse.
+
+**NEXT: an INSTRUMENTED smoke (real weights) — the only thing left that can
+show S1.** Log per decode call: `is_decode`, `start_pos`, and cheap reductions
+of kv_caches in/out (env-gated in the `__call__` decode branch). Watch the
+start_pos trajectory (must be P, P+1, P+2…), enable `V4_DECODE_NAN_TRIPWIRE=1`,
+and run the 3× determinism probe to find WHERE/WHEN real decode first diverges.
 
 (Production V4 runs attn_dp=32: num_kv_heads=1 + bf16 ⇒ TP folds entirely into
 attn_dp, model=expert=1, KV `P()`. The repro used attn_dp=8 / 8 experts.)
