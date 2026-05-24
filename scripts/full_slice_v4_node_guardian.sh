@@ -14,19 +14,25 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HEAD_IP="${HEAD_IP:-$("$REPO/scripts/full_slice_v4_discover.sh" head)}"
 WORKERS="${WORKERS:-$("$REPO/scripts/full_slice_v4_discover.sh" workers)}"
-INTERVAL="${INTERVAL:-25}"
-SSH_OPTS="-i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8"
+INTERVAL="${INTERVAL:-3}"
+SSH_OPTS="-i $HOME/.ssh/google_compute_engine -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=6"
 
-echo "[guardian] re-stopping 'node' on $HEAD_IP $WORKERS every ${INTERVAL}s (Ctrl-C to stop)"
+# AGGRESSIVE: force-REMOVE `node` (not just stop) on every host every INTERVAL secs,
+# in PARALLEL. The remote controller REDEPLOYS `node` (vllm/vllm-tpu:nightly, ray
+# 2.54.1); it thrashes (joins our ray -> version-mismatch Exit 1 -> restart loop),
+# touching the TPU and corrupting the launch group -> SLICE_FAILURE_SW_INJECT_ERROR
+# (the decode Core-halts traced to this). `rm -f` neutralizes any state
+# (created/running/restarting) and beats `docker run --name node` (name stays taken
+# only until removed). A reboot won't auto-start a removed container. Short interval
+# minimizes the TPU-touch window before a sensitive 32-way decode collective.
+echo "[guardian] rm -f 'node' on $HEAD_IP $WORKERS every ${INTERVAL}s (Ctrl-C to stop)"
 while true; do
-    stopped=0
     for h in $HEAD_IP $WORKERS; do
         ssh $SSH_OPTS enyouki@"$h" \
-            'if sudo docker ps --filter name=^/node$ --format "{{.Names}}" 2>/dev/null | grep -q node; then
-                 sudo docker update --restart=no node >/dev/null 2>&1
-                 sudo docker stop -t3 node >/dev/null 2>&1
-                 echo restopped
-             fi' 2>/dev/null | grep -q restopped && { echo "[guardian] re-stopped node on $h at $(date +%H:%M:%S)"; stopped=1; }
+            'if sudo docker ps -a --filter name=^/node$ --format "{{.Names}}" 2>/dev/null | grep -q node; then
+                 sudo docker rm -f node >/dev/null 2>&1; echo removed
+             fi' 2>/dev/null | grep -q removed && echo "[guardian] rm -f node on $h at $(date +%H:%M:%S)" &
     done
+    wait
     sleep "$INTERVAL"
 done
