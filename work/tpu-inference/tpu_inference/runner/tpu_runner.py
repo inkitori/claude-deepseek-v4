@@ -1356,8 +1356,29 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         assert num_reqs > 0
 
         dp_size = self.dp_size
-        data_parallel_attn_sharding = NamedSharding(
-            self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        # S1 FIX: for V4 single-sequence DECODE (1 req, 1 scheduled token), replicate
+        # the batch metadata instead of sharding it on ATTN_DATA. A single decode token
+        # shards to ~1 attn_dp rank, leaving ~31 IDLE ranks that read uninitialized HBM
+        # (often FINITE garbage the `_linear` |.|<1e8 clamp misses) and contaminate the
+        # real token via the MoE expert all-reduce -> non-deterministic decode collapse
+        # (S1). Replicating makes every rank compute the SAME real token (no idle ranks).
+        # This is a RUNTIME placement, not an in-jit with_sharding_constraint gather of
+        # the size-1 token axis (which Core-halts); attention_decode_step does not
+        # reshard x_step, so it stays replicated through the decode forward.
+        # DECODE-ONLY (total==1): it increases decode determinism (confirmed: 2/3 runs
+        # became byte-identical vs all-different) but does NOT by itself fix the
+        # collapse — the residual comes from the SEED built during prefill. Do NOT
+        # also replicate PREFILL (num_reqs==1, total>1): that makes the forward
+        # DETERMINISTICALLY NaN (all-BOS) — the per-rank metadata still describes the
+        # ATTN_DATA layout, so replicating the data alone is a layout mismatch
+        # (== the prior "Option A" failure). The seed fix needs a different approach.
+        _v4_decode_replicate = (self._is_deepseek_v4 and num_reqs == 1
+                                and total_num_scheduled_tokens == 1)
+        if _v4_decode_replicate:
+            data_parallel_attn_sharding = NamedSharding(self.mesh, PartitionSpec())
+        else:
+            data_parallel_attn_sharding = NamedSharding(
+                self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
 
         (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
          scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
