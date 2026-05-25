@@ -4,7 +4,26 @@ Goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, determin
 decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
 checkpoints; never wait. Operational details are in `CLAUDE.md`; this is live state.
 
-## ⇒⇒⇒ SESSION 5 (2026-05-25) — ROOT CAUSE FOUND + FIX IN VALIDATION
+## ⇒ STAY SKEPTICAL (read before acting on SESSION 5 below)
+
+This project has a HISTORY of confident-but-WRONG root causes (SESSION 3's "dead MoE"
+was a pad-token confound). SESSION 5's claims below are well-evidenced but you should
+INDEPENDENTLY RE-VERIFY them with cheap probes BEFORE investing in the comp_full/i_cache
+fix or a smoke — and do NOT hyperfocus on that one hypothesis:
+1. Re-confirm decode == prefill-everything on SHARP tokens (re-run `/tmp/s1_prefill_vs_decode.py
+   "PROMPT" N`). If this DOESN'T reproduce, the "decode is faithful" conclusion is wrong.
+2. The residual (soft-token drift) is HYPOTHESIZED to be comp_full/i_cache (compressed
+   caches not n_real-aware). VERIFY by LOCALIZING first: run decode-vs-prefill-everything
+   at N>20 to find the FIRST divergent token, and check whether the divergence coincides
+   with a compression boundary. Keep alternatives open (decode-step accumulation, indexer
+   topk selection, numerical replicate-vs-shard, a different cache). Don't assume.
+3. After ANY fix: the fix is only validated if (a) CPU unit test passes AND (b) on the
+   slice, decode==prefill-everything at N>20 AND prefill-at-drift(610)==decode. A passing
+   "gate" or "looks coherent" is NOT proof (greedy looping is the MODEL, see below).
+4. The model is SOUND (chat+sampling coherent) — so "incoherent greedy output" is NOT by
+   itself evidence of a decode bug. Only DECODE≠PREFILL-EVERYTHING is.
+
+## ⇒⇒⇒ SESSION 5 (2026-05-25) — PRIMARY S1 FIXED; minor residual remains
 
 **S1 = the decode KV seed is built over the PADDED prefill activation (T=1024 ≫
 win=128), so the SWA window (and compressor state) get seeded with PAD-token kv
