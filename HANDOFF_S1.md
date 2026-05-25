@@ -44,12 +44,26 @@ BOTH-FIXES SMOKE 132821Z RESULT (verified on slice, READ the text):
   deterministic (3× byte-identical); chat endpoint gives clean "Paris".
   ⇒ **PRIMARY S1 collapse is FIXED.**
 
-⚠️ RESIDUAL DECODE BUG STILL PRESENT (S1 NOT closed). Decode DRIFTS at term 8: it emits
-"…377, 666" but the FAITHFUL prefill path (prefill "…377, ") predicts **610** (argmax
-0.43; 666 is the #2 at 0.14). So decode's distribution DIVERGES from prefill on this
-SOFT token (3:1 gap, not float noise) → flips argmax → then degenerates to "999…". On
-SHARP tokens (early terms) the small error doesn't flip the argmax, so it only shows
-in long-gen. THE definitive test: prefill-at-drift predicts 610, decode picked 666.
+⇒⇒ KEY REFRAME (decode-vs-prefill-everything token compare, `/tmp/s1_prefill_vs_decode.py`):
+For prose "Once upon a time, there was a" N=10, decode and PREFILL-EVERYTHING are
+**BYTE-IDENTICAL** (' time, and the time was a time, and') ⇒ **decode is FAITHFUL** to
+the no-decode-cache path on sharp tokens. So the GROSS GREEDY LOOPING is the **MODEL**
+(both paths loop identically), NOT a decode bug. The original S1 (decode diverging from
+prefill into its OWN attractor) is FIXED. BUT note: even prefill-everything loops on
+open-ended prose — so the model's open-ended greedy output is degenerate via BOTH paths
+(likely base-model + greedy + 256 ctx; the model IS correct on structured prompts:
+Fibonacci 7 terms sharp, "Paris" correct, chat→clean "Paris"). OPEN: confirm model
+quality vs a deeper forward bug via chat+sampling / the GPU reference.
+
+⚠️ SEPARATE small RESIDUAL decode bug (only SOFT tokens, far into gen): decode drifts at
+Fibonacci term 8 ("…377, 666") while FAITHFUL prefill ("…377, ") predicts **610** (argmax
+0.43; 666=#2 at 0.14). On SHARP tokens the small error doesn't flip argmax (decode==prefill
+at N=10), so it only bites soft tokens after ~5 compressions. NOT the cause of the looping.
+
+IMPLICATION for "done": the success-gate's "coherent greedy long-gen" may be UNACHIEVABLE
+because the MODEL loops at greedy on open-ended prompts. The right decode-correctness
+criterion is **decode == prefill-everything** (faithfulness) — now true except the soft-
+token residual. Fix the residual (comp_full/i_cache below), then decode==prefill always.
 
 LEADING HYPOTHESIS for the residual (source-confirmed unfixed): the compressed CACHES
 `comp_full` and `i_cache` (attention_init_state_from_prefill ~1167/1193) =
