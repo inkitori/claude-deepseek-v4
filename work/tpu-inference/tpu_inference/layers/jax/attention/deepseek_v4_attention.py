@@ -959,6 +959,7 @@ def attention_prefill(
 def _compressor_state_from_prefill(
     x: jnp.ndarray,             # [B, T, dim]
     params: CompressorParams,
+    n_real=None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Return (kv_state, score_state) matching torch reference's
     `Compressor.forward(start_pos=0)` post-state at end of T prefill steps.
@@ -1000,26 +1001,56 @@ def _compressor_state_from_prefill(
     kv_state = jnp.zeros((B, n_slots, full_d), dtype=jnp.float32)
     score_state = jnp.full((B, n_slots, full_d), -jnp.inf, dtype=jnp.float32)
 
-    remainder = T % ratio
-    cutoff = T - remainder
     offset = ratio if overlap else 0
     ape = _replicate(params.ape)  # [ratio, coff*d]
 
-    # Most-recent completed window (overlap only): slots [:ratio] = kv at
-    # positions [cutoff-ratio, cutoff) + ape (full ratio slice).
-    if overlap and cutoff >= ratio:
-        kv_state = kv_state.at[:, :ratio, :].set(kv_full[:, cutoff - ratio:cutoff, :])
+    if n_real is None:
+        # ---- legacy static path (exact-length; CPU / parity tests) ----
+        remainder = T % ratio
+        cutoff = T - remainder
+        # Most-recent completed window (overlap only): slots [:ratio] = kv at
+        # positions [cutoff-ratio, cutoff) + ape (full ratio slice).
+        if overlap and cutoff >= ratio:
+            kv_state = kv_state.at[:, :ratio, :].set(kv_full[:, cutoff - ratio:cutoff, :])
+            score_state = score_state.at[:, :ratio, :].set(
+                score_full[:, cutoff - ratio:cutoff, :] + ape)
+        # In-progress window: slots [offset, offset+remainder) = kv at
+        # positions [cutoff, T) + ape[:remainder].
+        if remainder > 0:
+            kv_state = kv_state.at[:, offset:offset + remainder, :].set(
+                kv_full[:, cutoff:T, :])
+            score_state = score_state.at[:, offset:offset + remainder, :].set(
+                score_full[:, cutoff:T, :] + ape[:remainder])
+        return kv_state, score_state
+
+    # ---- S1 FIX (SESSION 5) traced path: build the state at the REAL prompt
+    # length so the compressor's "previous completed window" + in-progress
+    # window come from real tokens, not the padded bucket's pad tokens (which
+    # otherwise pollute every future decode-step compression via the overlap).
+    nr = jnp.asarray(n_real, dtype=jnp.int32)
+    remainder = nr % ratio                     # traced [0, ratio)
+    cutoff = nr - remainder                     # traced; window boundary
+    r_idx = jnp.arange(ratio, dtype=jnp.int32)
+
+    if overlap:
+        # slots [:ratio] = kv[cutoff-ratio:cutoff] + ape, only when cutoff>=ratio.
+        prev = lax.dynamic_slice_in_dim(kv_full, jnp.maximum(cutoff - ratio, 0), ratio, axis=1)
+        prev_sc = lax.dynamic_slice_in_dim(score_full, jnp.maximum(cutoff - ratio, 0), ratio, axis=1)
+        has_prev = cutoff >= ratio
+        kv_state = kv_state.at[:, :ratio, :].set(
+            jnp.where(has_prev, prev, kv_state[:, :ratio, :]))
         score_state = score_state.at[:, :ratio, :].set(
-            score_full[:, cutoff - ratio:cutoff, :] + ape)
+            jnp.where(has_prev, prev_sc + ape, score_state[:, :ratio, :]))
 
-    # In-progress window: slots [offset, offset+remainder) = kv at
-    # positions [cutoff, T) + ape[:remainder].
-    if remainder > 0:
-        kv_state = kv_state.at[:, offset:offset + remainder, :].set(
-            kv_full[:, cutoff:T, :])
-        score_state = score_state.at[:, offset:offset + remainder, :].set(
-            score_full[:, cutoff:T, :] + ape[:remainder])
-
+    # In-progress window: slots [offset, offset+remainder) = kv[cutoff:cutoff+remainder]
+    # + ape[:remainder]. Take a fixed ratio-size slice from cutoff, mask j<remainder.
+    inprog = lax.dynamic_slice_in_dim(kv_full, cutoff, ratio, axis=1)
+    inprog_sc = lax.dynamic_slice_in_dim(score_full, cutoff, ratio, axis=1)
+    valid = (r_idx < remainder).reshape(1, ratio, 1)
+    kv_state = kv_state.at[:, offset:offset + ratio, :].set(
+        jnp.where(valid, inprog, kv_state[:, offset:offset + ratio, :]))
+    score_state = score_state.at[:, offset:offset + ratio, :].set(
+        jnp.where(valid, inprog_sc + ape, score_state[:, offset:offset + ratio, :]))
     return kv_state, score_state
 
 
@@ -1145,7 +1176,7 @@ def attention_init_state_from_prefill(
             comp_full = jnp.zeros((B, extra, Dh), dtype=dtype)
         kv_cache = jnp.concatenate([swa, comp_full], axis=1)
         _v4_nan_tripwire("init_kv_cache_post_comp_set", kv_cache, layer_idx, -1)
-        c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor)
+        c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor, n_real=n_real)
     else:
         kv_cache = swa  # extra==0; the pure-SWA layer
         c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
@@ -1154,7 +1185,7 @@ def attention_init_state_from_prefill(
 
     if ratio == 4 and params.indexer is not None:
         # Indexer state: same compressor logic on params.indexer.compressor.
-        i_kv, i_sc = _compressor_state_from_prefill(x, params.indexer.compressor)
+        i_kv, i_sc = _compressor_state_from_prefill(x, params.indexer.compressor, n_real=n_real)
         # indexer_kv_cache: [B, max/ratio, index_head_dim] with [:T//ratio]
         # populated from the indexer's compressor_prefill output.
         max_iidx = cfg_max_seq_len // ratio
