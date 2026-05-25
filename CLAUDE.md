@@ -1,15 +1,16 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "SESSION 4 UPDATE" is
-> authoritative** (it corrects SESSION 3). This file holds only durable operational
-> knowledge (how to run the slice, validate, pitfalls) + the handoff protocol below.
-> Live debugging state + current lead live in the handoff. History: `CLAUDE.full.md`.
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "SESSION 5" is authoritative.**
+> This file holds only durable operational knowledge (how to run the slice, validate,
+> pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
+> History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25): S1 is the decode path. The "dead MoE" root cause is
-> DISPROVEN — it was a pad-token diagnostic confound; for the real token, MoE + embed
-> MATCH prefill. The real bug is a DIRECTIONAL error that compounds from L0 decode-step
-> attention → flat logits → attractor ⇒ the decode-state / KV-seed / decode-attention
-> path. See the handoff for the corrected data + next step.
+> One-line status (2026-05-25): **ROOT CAUSE FOUND** — the decode KV seed is built over
+> the PADDED prefill activation, so the SWA window + compressor state get seeded with
+> PAD-token kv (padding bug, not sharding; reference windows over real seqlen). Fix
+> (committed, CPU-validated, SWA half confirmed on slice via `[seedfp]` MATCH): thread
+> the traced real length `n_real=seq_lens[0]` into the seed builders. Both-fixes smoke
+> in flight; GATE not yet passed — see handoff for the next action + open skepticism.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
