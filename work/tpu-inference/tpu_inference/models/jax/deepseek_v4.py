@@ -305,7 +305,7 @@ def block_forward(
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
-    y = moe_forward(y, input_ids, params.moe)
+    y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx)
     if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
         _m, _a = _v4_lp(y)
         jax.debug.print("[fwdS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
@@ -397,7 +397,7 @@ def block_decode_step(
     )
     _v4_nan_tripwire("ffn_hcpre_y", y, layer_idx, start_pos)
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
-    y = moe_forward(y, input_ids_step, params.moe)
+    y = moe_forward(y, input_ids_step, params.moe, layer_idx=layer_idx)
     _v4_nan_tripwire("moe_y", y, layer_idx, start_pos)
     if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
         _m, _a = _v4_lp(y)

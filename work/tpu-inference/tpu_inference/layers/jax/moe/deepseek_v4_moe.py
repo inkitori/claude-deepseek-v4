@@ -154,6 +154,7 @@ def moe_forward(
     x: jnp.ndarray,           # [B, S, dim] or [N, dim]
     input_ids: jnp.ndarray,   # [B, S] int
     params: MoEParams,
+    layer_idx: int = -1,
 ) -> jnp.ndarray:
     """MoE forward = sum_i (route_weight_i * expert_i(x)) + shared_expert(x).
     Vectorized dense: per-expert weights stacked into `[E, ...]` and
@@ -217,5 +218,15 @@ def moe_forward(
     # `y` accumulator dtype, then add the always-on shared expert.
     y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32
     shared = expert_forward(flat_x, None, params.shared_expert)
+    if 0 <= layer_idx <= 2:
+        # S1 decomp: ROUTED-sum vs SHARED-expert magnitude (last token row).
+        # Hypothesis: under a REPLICATED decode activation the sum over the
+        # attn_dp-sharded E axis isn't all-reduced -> routed contribution dies
+        # (only ~local experts) while shared stays healthy. Always-on/race-proof.
+        import jax as _jax
+        _rR = jnp.abs(y[-1].astype(fp32)); _rS = jnp.abs(shared[-1].astype(fp32))
+        _jax.debug.print("[moeRS] L{i} routed_max={a} routed_mean={b} shared_max={c} shared_mean={d}",
+                         i=layer_idx, a=jnp.max(_rR), b=jnp.mean(_rR),
+                         c=jnp.max(_rS), d=jnp.mean(_rS))
     y = y + shared.astype(fp32)
     return y.astype(dtype).reshape(orig_shape)
