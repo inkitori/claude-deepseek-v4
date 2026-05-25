@@ -90,6 +90,7 @@ echo "[smoke]   xla_flags=$XLA_FLAGS  ray_cgraph_timeout=${RAY_CGRAPH_get_timeou
     --trust-remote-code \
     --dtype bfloat16 \
     --enforce-eager \
+    --no-enable-prefix-caching \
     --reasoning-parser deepseek_v4 \
     --enable-auto-tool-choice \
     --tool-call-parser deepseek_v4 \

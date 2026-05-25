@@ -1971,6 +1971,13 @@ def _build_class():
             )
             x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
             logits = x.astype(jnp.float32) @ params.head_w.T
+            # S1 DIAGNOSTIC SCAFFOLD: the decode collapse produces NaN/inf logits
+            # that fatally halt the TPU sampling kernel (jit_sample) -> the engine
+            # dies before the collapse can be observed. Sanitize so the engine
+            # survives any request: NaN -> very negative (never the argmax), inf
+            # clamped finite. No-op for healthy finite logits. (Does NOT fix S1 —
+            # it only makes the collapse observable instead of crash-on-NaN.)
+            logits = jnp.nan_to_num(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
             return logits
 
         def load_weights(self, rng=None, *args, **kwargs):
