@@ -262,11 +262,25 @@ def hc_post(
     return (a + b).astype(dtype)
 
 
+def _v4_lp(z):
+    """S1 SEED-vs-STEP localizer (always-on, race-proof — no env gate so all
+    ray workers compile identically). Returns (max_abs, mean_abs) of the LAST
+    token position only. Comparing the forward's last position over
+    "prompt+tok1" (the coherent prefill-everything reference, processing tok1 at
+    pos T) against the decode step's single position (tok1 at pos T) layer-by-
+    layer pinpoints the first layer/component where decode diverges from prefill.
+    Global-max prints ([fwdh]) can't do this — they're dominated by the BOS
+    massive-activation token. Remove when S1 closes."""
+    zf = z[:, -1].astype(jnp.float32)
+    return jnp.max(jnp.abs(zf)), jnp.mean(jnp.abs(zf))
+
+
 def block_forward(
     x: jnp.ndarray,           # [B, S, hc, D]
     input_ids: jnp.ndarray,
     params: BlockParams,
     freqs_cis_full: jnp.ndarray,
+    layer_idx: int = -1,
 ) -> jnp.ndarray:
     """Block forward, prefill only."""
     # attn sub-step
@@ -277,7 +291,12 @@ def block_forward(
     )
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
     y = attention_prefill(y, params.attn, freqs_cis_full)
+    if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
+        _m, _a = _v4_lp(y)
+        jax.debug.print("[fwdS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     x = hc_post(y, residual, post, comb)
+    _am, _aa = _v4_lp(x)
+    jax.debug.print("[fwdL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
 
     # ffn sub-step
     residual = x
@@ -287,7 +306,13 @@ def block_forward(
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids, params.moe)
-    return hc_post(y, residual, post, comb)
+    if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
+        _m, _a = _v4_lp(y)
+        jax.debug.print("[fwdS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
+    out = hc_post(y, residual, post, comb)
+    _bm, _ba = _v4_lp(out)
+    jax.debug.print("[fwdL] L{i} blk max={a} mean={b}", i=layer_idx, a=_bm, b=_ba)
+    return out
 
 
 def block_init_state_and_forward(
@@ -357,8 +382,13 @@ def block_decode_step(
     new_state, y = attention_decode_step(
         y, start_pos, params.attn, freqs_cis_full, prev_state, layer_idx)
     _v4_nan_tripwire("attn_decode_y", y, layer_idx, start_pos)
+    if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
+        _m, _a = _v4_lp(y)
+        jax.debug.print("[decS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     x_step = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("attn_block_out", x_step, layer_idx, start_pos)
+    _am, _aa = _v4_lp(x_step)
+    jax.debug.print("[decL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
 
     residual = x_step
     y, post, comb = hc_pre(
@@ -369,8 +399,13 @@ def block_decode_step(
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids_step, params.moe)
     _v4_nan_tripwire("moe_y", y, layer_idx, start_pos)
+    if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
+        _m, _a = _v4_lp(y)
+        jax.debug.print("[decS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     out = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("ffn_block_out", out, layer_idx, start_pos)
+    _bm, _ba = _v4_lp(out)
+    jax.debug.print("[decL] L{i} blk max={a} mean={b}", i=layer_idx, a=_bm, b=_ba)
     return new_state, out
 
 
@@ -440,10 +475,12 @@ def transformer_body_forward(
         return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
     _en, _em = _fin(h)
     jax.debug.print("[fwdh] embed nan={n} max={m}", n=_en, m=_em)
+    _elm, _ela = _v4_lp(h)  # S1 decomp: embed last-position (token tok1 @ pos T)
+    jax.debug.print("[fwdS] L-1 embed max={m} mean={a}", m=_elm, a=_ela)
     for _i, layer in enumerate(params.layers):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
-        h = block_forward(h, input_ids, layer, fc)
+        h = block_forward(h, input_ids, layer, fc, layer_idx=_i)
         _n, _m = _fin(h)
         jax.debug.print("[fwdh] L{i} cr={c} nan={n} max={m}", i=_i, c=cr, n=_n, m=_m)
     return h
@@ -518,6 +555,8 @@ def transformer_body_decode_step(
         return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
     _e_n, _e_m = _nf2(h)
     jax.debug.print("[dech] embed nan={n} max={m}", n=_e_n, m=_e_m)
+    _elm, _ela = _v4_lp(h)  # S1 decomp: embed last-position (token tok1 @ pos T)
+    jax.debug.print("[decS] L-1 embed max={m} mean={a}", m=_elm, a=_ela)
     new_states: List[AttentionDecodeState] = []
     for i, (layer, prev) in enumerate(zip(params.layers, prev_states)):
         cr = layer.attn.compress_ratio
