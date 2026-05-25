@@ -14,6 +14,18 @@ STEP-0b "reboot 7 workers" is the WRONG response. **FIRST ACTION every session: 
 `md5sum` of the key .py files matches head-vs-all-7-workers; sync if not.** (My MH
 seeddiff also wedged a worker the same way — avoid MH repros while you need the slice.)
 
+**⇒ DECISIVE ISOLATION (2026-05-25, this session): PREFILL-EVERYTHING IS COHERENT.**
+Generating token-by-token via chained `max_tokens=1` (each step re-prefills the WHOLE
+sequence; NO incremental decode/KV step) on the live engine gives CORRECT output:
+prompt "...1,1,2,3,5,8,13, " → "21, 34, 55, 89, 144" (5/5 correct). SAME prompt via the
+normal decode path (max_tokens=40) → "21. The first step is to consider the number of
+the number of..." — token1 "21" correct, then DIVERGES AT DECODE STEP 1, repeating
+attractor, NON-DETERMINISTIC (run2≠run0=run1). ⇒ weights + prefill/forward math SOUND;
+S1 is 100% in the incremental decode-state/KV path. (Not a fix: O(L)/tok, ~1 tok/2.5min.
+Probe: `/tmp/s1_prefill_gen.py PROMPT N` then `/tmp/s1_decode_only.py PROMPT N`.) NB the
+poem-prompt greedy repetition loop is a RED HERRING (decode loops too); use a strictly-
+increasing correct sequence to discriminate coherent-vs-attractor.
+
 **SLICE-SERVING PROTOCOL (marginal slice):** before EVERY smoke: confirm code synced →
 CLEAR `~/.cache/vllm/xla_cache/*` on all 8 hosts (a stale/mixed cache also gives
 "different launch id") → `full_slice_v4_reset.sh` → launch. Init is still a coin-flip
