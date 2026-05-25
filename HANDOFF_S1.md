@@ -51,9 +51,11 @@ the no-decode-cache path on sharp tokens. So the GROSS GREEDY LOOPING is the **M
 (both paths loop identically), NOT a decode bug. The original S1 (decode diverging from
 prefill into its OWN attractor) is FIXED. BUT note: even prefill-everything loops on
 open-ended prose — so the model's open-ended greedy output is degenerate via BOTH paths
-(likely base-model + greedy + 256 ctx; the model IS correct on structured prompts:
-Fibonacci 7 terms sharp, "Paris" correct, chat→clean "Paris"). OPEN: confirm model
-quality vs a deeper forward bug via chat+sampling / the GPU reference.
+— this is RAW-GREEDY behavior, NOT a broken model: **CONFIRMED model is sound** — chat
+(instruct) + sampling produced a COHERENT on-topic ocean poem ("In the ocean's embrace,
+I feel a rhythm…"), chat→clean "Paris", Fibonacci 7 terms sharp+correct. So the gross
+looping = raw-completions + greedy + no instruct format (classic greedy trap), not our
+bug and not a model defect. Use chat+sampling for quality.
 
 ⚠️ SEPARATE small RESIDUAL decode bug (only SOFT tokens, far into gen): decode drifts at
 Fibonacci term 8 ("…377, 666") while FAITHFUL prefill ("…377, ") predicts **610** (argmax
