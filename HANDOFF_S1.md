@@ -33,6 +33,21 @@ OUT OF S1's scope: rep_pen=1.3 didn't help; try min_p / higher temp / longer max
 accept that the Flash variant loops on open-ended greedy. (Short + structured prompts decode
 clean; this only hits flat open-ended generation.)
 
+**REFINEMENT (S7, later) — open-ended output is NON-REPRODUCIBLE ACROSS ENGINE INSTANCES.**
+Same prompt, temp=0 greedy, same endpoint/encoding/code: the heavily-used engine looped
+(`…I will teach you about topology. I will teach`) while a FRESH engine echoed (`You are a
+helpful assistant.`) — different *deterministic* outputs across two instances. And the user's
+`澳大利亚` (high-temp, NO system prompt) did NOT reproduce on the fresh engine (3 temp=1.0
+samples + greedy all gave coherent topology; decode==prefill faithful). So open-ended gen is
+FRAGILE: flat model distributions → near-tie argmaxes → flipped by sharded-TPU FP-reduction
+nondeterminism (and possibly engine-lifetime state drift — NOT isolated; needs a
+two-fresh-engines vs early-vs-late controlled test, ~15–20 min). decode==prefill still holds
+WITHIN an instance. NOT the S1 token-2 collapse (fixed). Practical: short/focused prompts are
+reliable + correct; open-ended chat is hit-or-miss; the "You are a helpful assistant" system
+prompt specifically induced an echo — try a better system prompt + moderate temp. OPEN LEAD:
+isolate FP-nondeterminism vs engine-lifetime degradation (the latter would be a real serving
+bug worth fixing).
+
 ## NEXT ACTION
 1. Re-run the decode-vs-prefill verdict above on the live engine (:18081). Read it.
 2. If MODEL: try better decoding (min_p / higher temp / longer max_tokens — serve caps
