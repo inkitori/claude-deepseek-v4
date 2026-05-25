@@ -5,16 +5,15 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25 S7): **S1 CLOSED ✅ — decode is COHERENT + DETERMINISTIC.**
-> On a fresh diagnostic-free engine, greedy decode produces clean CORRECT Fibonacci
-> (`21, 34, 55, 89, 144, 233, 377, 610`) and correct facts (Eiffel Tower / Notre Dame),
-> byte-identical across 3× repeats at temp=0 (Fibonacci AND Paris). Decode is faithful to
-> prefill-everything to within ~0.24 logprob — they agree through term 7 and differ only at
-> a benign 0.236-logprob near-tie at term 8 (where decode is the MORE correct one: 610 vs
-> prefill's 676). The S5/S6 "term-8 drift / 等等" was an ARTIFACT of the always-on
-> `jax.debug.print` diagnostics perturbing XLA fusion/reduction at near-ties — REMOVED this
-> session (commit 77c0c7be); clean output followed. CPU repro OK (no regression). Loop
-> ended (`/tmp/s1_loop_stop`). This file is now historical; ops knowledge retained below.
+> One-line status (2026-05-25 S7): **Original S1 collapse FIXED; open-ended LOOPING is a new
+> open question — see `HANDOFF_S1.md`.** The precise S1 bug (token-2 degenerate attractor) is
+> gone: greedy Fibonacci decodes correct (`21…377, 610`), 3× byte-identical (deterministic),
+> faithful to prefill (~0.24 logprob); short factual CHAT works (instruct model, native chat,
+> needs a system prompt). BUT open-ended gen ("teach me topology") LOOPS (coherent start →
+> "It is a kind of geometry" ×24); `vllm chat` w/o a system prompt gave garbage. Whether the
+> loop is the decode path or the MODEL is PENDING a decode-vs-prefill check (strong hypothesis:
+> MODEL / neural-text-degeneration, not the sharding bug — short+structured are clean). Loop
+> stopped (`/tmp/s1_loop_stop`); engine LIVE on :18081. NEXT: run the verdict (handoff §NEXT).
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
