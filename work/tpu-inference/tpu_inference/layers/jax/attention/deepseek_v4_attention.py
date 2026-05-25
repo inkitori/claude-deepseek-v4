@@ -887,6 +887,11 @@ def attention_prefill(
         else:
             compress_topk = get_compress_topk_idxs_prefill(ratio, B, S, offset)
         topk_idxs = jnp.concatenate([topk_idxs, compress_topk], axis=-1)
+        if ratio == 4:  # S1 DIAG: pinpoint ratio=4 forward NaN (first such layer=L2)
+            jax.debug.print("[pf4] xin_nan={a} kv_nan={b} ctk_min={c} ctk_max={d}",
+                a=jnp.sum(jnp.isnan(x.astype(jnp.float32))),
+                b=jnp.sum(jnp.isnan(kv.astype(jnp.float32))),
+                c=jnp.min(compress_topk), d=jnp.max(compress_topk))
     topk_idxs = topk_idxs.astype(jnp.int32)
 
     # build kv buffer: for prefill, kv_cache[:bsz, :S] = current kv; for compress,
@@ -895,12 +900,19 @@ def attention_prefill(
     # we just use the temp tensor directly since there is no decode follow-up.)
     if ratio > 0:
         kv_compressed = compressor_prefill(x, params.compressor, freqs_cis_full)
+        if ratio == 4:  # S1 DIAG
+            jax.debug.print("[pf4] kvc_nan={a} kvc_max={b}",
+                a=jnp.sum(jnp.isnan(kv_compressed.astype(jnp.float32))),
+                b=jnp.max(jnp.where(jnp.isfinite(kv_compressed.astype(jnp.float32)),
+                                    jnp.abs(kv_compressed.astype(jnp.float32)), jnp.float32(0.0))))
         # kv_compressed: [B, S//ratio, head_dim]. Append.
         kv_full = jnp.concatenate([kv, kv_compressed], axis=1)
     else:
         kv_full = kv
 
     o = sparse_attn(q, kv_full, params.attn_sink, topk_idxs, params.softmax_scale)
+    if ratio == 4:  # S1 DIAG
+        jax.debug.print("[pf4] o_nan={a}", a=jnp.sum(jnp.isnan(o.astype(jnp.float32))))
 
     # inverse RoPE on rope dims of o
     o = splice_rope(o, rd, fc, inverse=True)
