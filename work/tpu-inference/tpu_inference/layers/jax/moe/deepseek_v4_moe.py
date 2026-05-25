@@ -218,21 +218,5 @@ def moe_forward(
     # `y` accumulator dtype, then add the always-on shared expert.
     y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32 routed sum
     shared = expert_forward(flat_x, None, params.shared_expert)
-    if 0 <= layer_idx <= 2:
-        # S1 decomp: ROUTED-sum vs SHARED-expert magnitude at the last REAL token.
-        # SESSION-4 FIX: prefill right-pads flat_ids with 0, so the old `[-1]` row
-        # read a PAD token (id 0), NOT tok1 -- which made the SESSION-3 "57x dead
-        # routed" a confound (compared pad-in-prefill vs real-tok1-in-decode).
-        # Index the last non-pad row so prefill+decode measure the SAME token.
-        # pew_sum (Sum|per_expert_weight|) splits routing-weights-collapsed (decode
-        # << fwd) vs per-expert-outputs-wrong (decode ~= fwd).
-        import jax as _jax
-        _valid = flat_ids != 0
-        _ri = jnp.where(_valid, jnp.arange(flat_ids.shape[0]), -1).max()
-        _ri = jnp.where(_ri < 0, flat_ids.shape[0] - 1, _ri)
-        _rR = jnp.abs(y[_ri].astype(fp32)); _rS = jnp.abs(shared[_ri].astype(fp32))
-        _jax.debug.print("[moeRS] L{i} routed_mean={b} shared_mean={d} pew_sum={p}",
-                         i=layer_idx, b=jnp.mean(_rR), d=jnp.mean(_rS),
-                         p=jnp.sum(jnp.abs(per_expert_weight[_ri].astype(fp32))))
     y = y + shared.astype(fp32)
     return y.astype(dtype).reshape(orig_shape)

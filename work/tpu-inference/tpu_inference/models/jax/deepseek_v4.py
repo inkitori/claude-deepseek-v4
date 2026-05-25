@@ -262,49 +262,6 @@ def hc_post(
     return (a + b).astype(dtype)
 
 
-def _v4_lp(z, input_ids=None):
-    """S1 SEED-vs-STEP localizer (always-on, race-proof — no env gate so all
-    ray workers compile identically). Returns (max_abs, mean_abs) of the LAST
-    REAL (non-pad) token position. Comparing the forward's last real position
-    over "prompt+tok1" (the coherent prefill-everything reference, processing
-    tok1 at pos T) against the decode step's single position (tok1 at pos T)
-    layer-by-layer pinpoints the first layer/component where decode diverges.
-
-    CRITICAL (2026-05-25 SESSION 4): prefill right-pads input_ids with 0
-    (`tpu_runner._prepare_inputs` ...input_ids_cpu[n:] = 0), so a bare `z[:, -1]`
-    reads a PAD slot = embed_w[0], NOT the real last token — which silently made
-    the SESSION-3 "reference" the model processing a PAD token (id 0) instead of
-    tok1, confounding every ref-vs-decode ratio. Pass `input_ids` so prefill
-    measures the last non-pad position; omit it (decode = a single real token)
-    to use z[:, -1]. Remove when S1 closes."""
-    if input_ids is not None:
-        S = z.shape[1]
-        valid = input_ids[0] != 0                       # trailing pads are id 0
-        idx = jnp.where(valid, jnp.arange(S), -1).max()  # last real position
-        idx = jnp.where(idx < 0, S - 1, idx)
-        zf = z[:, idx].astype(jnp.float32)
-    else:
-        zf = z[:, -1].astype(jnp.float32)
-    return jnp.max(jnp.abs(zf)), jnp.mean(jnp.abs(zf))
-
-
-def _v4_dir(z, input_ids=None):
-    """S1 DIRECTIONAL fingerprint at the last-real position (sign/order-sensitive;
-    complements _v4_lp's magnitude). Lets a decode step's attn output be compared
-    by DIRECTION to the prefill-everything reference — the S1 error is directional,
-    not magnitude. Same last-non-pad indexing as _v4_lp. Remove at S1 close."""
-    if input_ids is not None:
-        S = z.shape[1]
-        valid = input_ids[0] != 0
-        idx = jnp.where(valid, jnp.arange(S), -1).max()
-        idx = jnp.where(idx < 0, S - 1, idx)
-        zf = z[:, idx].astype(jnp.float32)
-    else:
-        zf = z[:, -1].astype(jnp.float32)
-    w = jnp.cos(jnp.arange(zf.shape[-1], dtype=jnp.float32) * 0.1)
-    return jnp.sum(zf[0] * w)
-
-
 def block_forward(
     x: jnp.ndarray,           # [B, S, hc, D]
     input_ids: jnp.ndarray,
@@ -321,13 +278,7 @@ def block_forward(
     )
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
     y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
-    if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
-        _m, _a = _v4_lp(y, input_ids)
-        jax.debug.print("[fwdS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
-        jax.debug.print("[fwdSd] L{i} attnout dir={d}", i=layer_idx, d=_v4_dir(y, input_ids))
     x = hc_post(y, residual, post, comb)
-    _am, _aa = _v4_lp(x, input_ids)
-    jax.debug.print("[fwdL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
 
     # ffn sub-step
     residual = x
@@ -337,12 +288,7 @@ def block_forward(
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx)
-    if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
-        _m, _a = _v4_lp(y, input_ids)
-        jax.debug.print("[fwdS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     out = hc_post(y, residual, post, comb)
-    _bm, _ba = _v4_lp(out, input_ids)
-    jax.debug.print("[fwdL] L{i} blk max={a} mean={b}", i=layer_idx, a=_bm, b=_ba)
     return out
 
 
@@ -415,14 +361,8 @@ def block_decode_step(
     new_state, y = attention_decode_step(
         y, start_pos, params.attn, freqs_cis_full, prev_state, layer_idx)
     _v4_nan_tripwire("attn_decode_y", y, layer_idx, start_pos)
-    if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
-        _m, _a = _v4_lp(y)
-        jax.debug.print("[decS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
-        jax.debug.print("[decSd] L{i} attnout dir={d}", i=layer_idx, d=_v4_dir(y))
     x_step = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("attn_block_out", x_step, layer_idx, start_pos)
-    _am, _aa = _v4_lp(x_step)
-    jax.debug.print("[decL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
 
     residual = x_step
     y, post, comb = hc_pre(
@@ -433,13 +373,8 @@ def block_decode_step(
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids_step, params.moe, layer_idx=layer_idx)
     _v4_nan_tripwire("moe_y", y, layer_idx, start_pos)
-    if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
-        _m, _a = _v4_lp(y)
-        jax.debug.print("[decS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     out = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("ffn_block_out", out, layer_idx, start_pos)
-    _bm, _ba = _v4_lp(out)
-    jax.debug.print("[decL] L{i} blk max={a} mean={b}", i=layer_idx, a=_bm, b=_ba)
     return new_state, out
 
 
@@ -499,24 +434,10 @@ def transformer_body_forward(
     return hidden states from __call__ and apply the head in compute_logits."""
     h = params.embed_w[input_ids]  # [B, S, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
-    # S1 DIAG SCAFFOLD (always-on, race-proof): per-layer residual-stream finiteness.
-    # The forward produces NaN logits on the synced sharded slice; this localizes the
-    # first layer whose output h goes NaN / blows up. ALWAYS on (no env gate) so all
-    # ray workers compile identically (env-gated reads race -> launch-id halt). 44
-    # host prints/forward — remove when S1 is fixed.
-    def _fin(z):
-        zf = z.astype(jnp.float32)
-        return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
-    _en, _em = _fin(h)
-    jax.debug.print("[fwdh] embed nan={n} max={m}", n=_en, m=_em)
-    _elm, _ela = _v4_lp(h, input_ids)  # S1 decomp: embed last REAL token (tok1 @ pos T)
-    jax.debug.print("[fwdS] L-1 embed max={m} mean={a}", m=_elm, a=_ela)
     for _i, layer in enumerate(params.layers):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
         h = block_forward(h, input_ids, layer, fc, layer_idx=_i)
-        _n, _m = _fin(h)
-        jax.debug.print("[fwdh] L{i} cr={c} nan={n} max={m}", i=_i, c=cr, n=_n, m=_m)
     return h
 
 
@@ -583,27 +504,12 @@ def transformer_body_decode_step(
     h = params.embed_w[input_ids_step]  # [B, 1, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
     _v4_nan_tripwire("embed_h", h, -1, start_pos)
-    # S1 DIAG SCAFFOLD (always-on, race-proof): per-layer decode-h + seed-state-at-entry
-    # finiteness. Localizes whether the decode collapse comes from a corrupted SEED state
-    # (prev.* NaN at entry) or the decode-step compute (h goes NaN with finite prev).
-    def _nf2(z):
-        zf = z.astype(jnp.float32)
-        return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
-    _e_n, _e_m = _nf2(h)
-    jax.debug.print("[dech] embed nan={n} max={m}", n=_e_n, m=_e_m)
-    _elm, _ela = _v4_lp(h)  # S1 decomp: embed last-position (token tok1 @ pos T)
-    jax.debug.print("[decS] L-1 embed max={m} mean={a}", m=_elm, a=_ela)
     new_states: List[AttentionDecodeState] = []
     for i, (layer, prev) in enumerate(zip(params.layers, prev_states)):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
-        _pk_n, _pk_m = _nf2(prev.kv_cache)
-        _ck_n = jnp.sum(jnp.isnan(prev.compressor_kv_state.astype(jnp.float32))) if cr > 0 else jnp.int32(0)
         new_state, h = block_decode_step(
             h, input_ids_step, layer, fc, prev, start_pos, layer_idx=i)
-        _h_n, _h_m = _nf2(h)
-        jax.debug.print("[dech] L{i} cr={c} seedkv_nan={p} seedkv_max={q} seedck_nan={r} h_nan={n} h_max={m}",
-                        i=i, c=cr, p=_pk_n, q=_pk_m, r=_ck_n, n=_h_n, m=_h_m)
         new_states.append(new_state)
     return h, new_states
 
