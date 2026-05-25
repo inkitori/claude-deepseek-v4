@@ -510,12 +510,25 @@ def transformer_body_decode_step(
     h = params.embed_w[input_ids_step]  # [B, 1, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
     _v4_nan_tripwire("embed_h", h, -1, start_pos)
+    # S1 DIAG SCAFFOLD (always-on, race-proof): per-layer decode-h + seed-state-at-entry
+    # finiteness. Localizes whether the decode collapse comes from a corrupted SEED state
+    # (prev.* NaN at entry) or the decode-step compute (h goes NaN with finite prev).
+    def _nf2(z):
+        zf = z.astype(jnp.float32)
+        return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
+    _e_n, _e_m = _nf2(h)
+    jax.debug.print("[dech] embed nan={n} max={m}", n=_e_n, m=_e_m)
     new_states: List[AttentionDecodeState] = []
     for i, (layer, prev) in enumerate(zip(params.layers, prev_states)):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
+        _pk_n, _pk_m = _nf2(prev.kv_cache)
+        _ck_n = jnp.sum(jnp.isnan(prev.compressor_kv_state.astype(jnp.float32))) if cr > 0 else jnp.int32(0)
         new_state, h = block_decode_step(
             h, input_ids_step, layer, fc, prev, start_pos, layer_idx=i)
+        _h_n, _h_m = _nf2(h)
+        jax.debug.print("[dech] L{i} cr={c} seedkv_nan={p} seedkv_max={q} seedck_nan={r} h_nan={n} h_max={m}",
+                        i=i, c=cr, p=_pk_n, q=_pk_m, r=_ck_n, n=_h_n, m=_h_m)
         new_states.append(new_state)
     return h, new_states
 
