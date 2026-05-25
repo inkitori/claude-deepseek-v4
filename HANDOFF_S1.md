@@ -33,20 +33,24 @@ OUT OF S1's scope: rep_pen=1.3 didn't help; try min_p / higher temp / longer max
 accept that the Flash variant loops on open-ended greedy. (Short + structured prompts decode
 clean; this only hits flat open-ended generation.)
 
-**REFINEMENT (S7, later) — open-ended output is NON-REPRODUCIBLE ACROSS ENGINE INSTANCES.**
-Same prompt, temp=0 greedy, same endpoint/encoding/code: the heavily-used engine looped
-(`…I will teach you about topology. I will teach`) while a FRESH engine echoed (`You are a
-helpful assistant.`) — different *deterministic* outputs across two instances. And the user's
-`澳大利亚` (high-temp, NO system prompt) did NOT reproduce on the fresh engine (3 temp=1.0
-samples + greedy all gave coherent topology; decode==prefill faithful). So open-ended gen is
-FRAGILE: flat model distributions → near-tie argmaxes → flipped by sharded-TPU FP-reduction
-nondeterminism (and possibly engine-lifetime state drift — NOT isolated; needs a
-two-fresh-engines vs early-vs-late controlled test, ~15–20 min). decode==prefill still holds
-WITHIN an instance. NOT the S1 token-2 collapse (fixed). Practical: short/focused prompts are
-reliable + correct; open-ended chat is hit-or-miss; the "You are a helpful assistant" system
-prompt specifically induced an echo — try a better system prompt + moderate temp. OPEN LEAD:
-isolate FP-nondeterminism vs engine-lifetime degradation (the latter would be a real serving
-bug worth fixing).
+**REFINEMENT (S7) — temp=0 decode is RUN-TO-RUN NONDETERMINISTIC on FLAT/open-ended prompts
+(NOT degradation, NOT the collapse).** Firing the SAME no-system topology prompt at temp=0
+**14× on ONE engine** gave ~3 outputs CYCLING non-monotonically (variant A "…stretching and" /
+variant B "…but not necessarily under" / variant C "I'm doing great! Let me teach you…" / back
+to A). So it is NOT engine-lifetime degradation (cycles, doesn't worsen) and NOT the token-2
+collapse — it's **run-to-run nondeterminism**: flat model distribution → near-tie argmaxes →
+flipped by 32-way sharded-TPU FP-reduction-order variation across runs (OR a real
+nondeterminism source — e.g. idle-rank / uninitialized HBM, cf. `CLAUDE.full.md` PHASES 7-9 —
+NOT distinguished). **CONFIDENT prompts (Fibonacci, Paris) ARE deterministic (3× byte-identical)**
+— so the earlier "decode is deterministic at temp=0" holds ONLY for sharp distributions, not
+flat ones. This explains `澳大利亚` + the looping (unlucky draws, amplified by high temp / no
+system prompt). A GOOD system prompt gives correct coherent answers (verified: "Topology is a
+branch of mathematics that studies the properties of spaces under continuous transformations…
+homeomorphisms, and continuity…"). **OPEN LEAD (the real remaining question):** is this flat-prompt
+temp=0 nondeterminism *inherent* sharded-FP-reduction variation (mostly unavoidable on TPU) or a
+*fixable* bug (idle-rank/uninitialized memory)? To probe: fire the same flat prompt at temp=0
+with `max_num_seqs` filled (all ranks busy) vs idle, and/or check if a deterministic-reduction
+XLA flag removes it. The S1 token-2 collapse remains FIXED regardless.
 
 ## NEXT ACTION
 1. Re-run the decode-vs-prefill verdict above on the live engine (:18081). Read it.
