@@ -1,16 +1,17 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "SESSION 5" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 6)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25): **ROOT CAUSE FOUND** — the decode KV seed is built over
-> the PADDED prefill activation, so the SWA window + compressor state get seeded with
-> PAD-token kv (padding bug, not sharding; reference windows over real seqlen). Fix
-> (committed, CPU-validated, SWA half confirmed on slice via `[seedfp]` MATCH): thread
-> the traced real length `n_real=seq_lens[0]` into the seed builders. Both-fixes smoke
-> in flight; GATE not yet passed — see handoff for the next action + open skepticism.
+> One-line status (2026-05-25 S6): **PRIMARY collapse FIXED** (SWA + compressor STATE
+> seeded over real `n_real`, commits 6245ea84/90bf85c3) — greedy Fibonacci decodes
+> correctly through **term 7**; residual drift at **term 8** remains. The comp_full/i_cache
+> pad-zeroing fix was tried + **REVERTED** (b026d9ff): it was CPU-valid but REGRESSED
+> decode on the slice (term-7 loop) — decode READS the boundary slot before overwrite, so
+> zero is worse than pad. Next: seed the boundary slot with its CORRECT compressed value
+> (not zero/pad), verify by decode==prefill-everything ON THE SLICE. See handoff.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

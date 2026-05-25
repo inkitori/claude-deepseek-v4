@@ -2,148 +2,103 @@
 
 Goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, deterministic
 decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
-checkpoints; never wait. Operational details are in `CLAUDE.md`; this is live state.
+checkpoints; never wait. Ops details are in `CLAUDE.md`; this is live state.
 
-> **LIVE ENGINE RIGHT NOW:** smoke `logs/full-slice-v4-smoke-20260525T132821Z.log` is
-> serving on :18081 (both-fixes code). SLOW (~18s/tok — the always-on diagnostics) and
-> degrades after several requests (empty completions). Use it for the cheap re-verify
-> probes below BEFORE re-smoking; if it's dead, re-smoke per CLAUDE.md.
+## STATE (2026-05-25, SESSION 6)
 
-## ⇒ STAY SKEPTICAL (read before acting on SESSION 5 below)
+**PRIMARY collapse is FIXED** (commits `6245ea84` SWA seed + `90bf85c3` compressor/indexer
+STATE — both thread the traced `n_real`). Decode no longer collapses: greedy Fibonacci
+("…1,1,2,3,5,8,13, ") decodes CORRECTLY through **term 7** → `21, 34, 55, 89, 144, 233,
+377` (early tokens sharp, conf 0.9-0.99). A **residual drift remains at term 8**: decode
+diverges there from the faithful path.
 
-This project has a HISTORY of confident-but-WRONG root causes (SESSION 3's "dead MoE"
-was a pad-token confound). SESSION 5's claims below are well-evidenced but you should
-INDEPENDENTLY RE-VERIFY them with cheap probes BEFORE investing in the comp_full/i_cache
-fix or a smoke — and do NOT hyperfocus on that one hypothesis:
-1. Re-confirm decode == prefill-everything on SHARP tokens (re-run `/tmp/s1_prefill_vs_decode.py
-   "PROMPT" N`). If this DOESN'T reproduce, the "decode is faithful" conclusion is wrong.
-2. The residual (soft-token drift) is HYPOTHESIZED to be comp_full/i_cache (compressed
-   caches not n_real-aware). VERIFY by LOCALIZING first: run decode-vs-prefill-everything
-   at N>20 to find the FIRST divergent token, and check whether the divergence coincides
-   with a compression boundary. Keep alternatives open (decode-step accumulation, indexer
-   topk selection, numerical replicate-vs-shard, a different cache). Don't assume.
-3. After ANY fix: the fix is only validated if (a) CPU unit test passes AND (b) on the
-   slice, decode==prefill-everything at N>20 AND prefill-at-drift(610)==decode. A passing
-   "gate" or "looks coherent" is NOT proof (greedy looping is the MODEL, see below).
-4. The model is SOUND (chat+sampling coherent) — so "incoherent greedy output" is NOT by
-   itself evidence of a decode bug. Only DECODE≠PREFILL-EVERYTHING is.
+**comp_full/i_cache zeroing was TRIED → REVERTED this session** (`ab948e3d`, reverted by
+`b026d9ff`). Hypothesis: the two COMPRESSED CACHES decode reads — `comp_full`
+(=`kv_cache[:, win:]`) and `i_cache` (=`indexer_kv_cache`) in
+`attention_init_state_from_prefill` — are built via `compressor_prefill(x_PADDED)` and so
+hold pad-token kv in slots `[n_safe:]` (`n_safe = n_real//ratio`); fix = zero those slots.
+It was CPU-validated (made padded-traced == exact-static == torch-ref, which leaves
+unwritten slots ZERO) but **REGRESSED decode on the slice**:
 
-## ⇒⇒⇒ SESSION 5 (2026-05-25) — PRIMARY S1 FIXED; minor residual remains
+| | term7 (after "…144, 233, ") |
+|---|---|
+| faithful prefill-everything | **377** (conf 0.76) |
+| PRE-fix decode | 377 (correct; drift only at term 8) |
+| POST-zeroing decode | **144** (LOOPS 144,233,144…; conf 0.45) |
 
-**S1 = the decode KV seed is built over the PADDED prefill activation (T=1024 ≫
-win=128), so the SWA window (and compressor state) get seeded with PAD-token kv
-instead of the real prompt's kv.** Decode attends over pad-token kv → directional
-garbage → attractor. It's a **PADDING bug, not sharding** (reproduces on CPU with a
-padded input; the exact-length CPU parity test missed it). The GPU/torch **reference
-always windows over the real seqlen, never pads** — confirms the fix direction.
+⇒ **KEY FINDING: decode READS comp_full/i_cache slot `n_safe` BEFORE the decode_step
+overwrites it.** A ZERO there corrupts attention MORE than the pad value did → the
+"overwrite-before-read is safe" argument is FALSE on the sharded slice. **CPU parity did
+NOT predict slice behavior** ("CPU can't reproduce S1"). For any decode fix, trust only
+**decode-vs-prefill-everything ON THE SLICE**, never CPU parity, never "looks coherent".
 
-DECISIVE EVIDENCE (direction-sensitive `[seedfp]`/`[kvchk-pf]` fingerprints added
-this session; same-tensor pre/post-scatter compare in one pass — NOT a confoundable
-cross-token/cross-pass ratio like SESSION-3's debunked MoE):
-* Smoke 123908Z (pre-fix): L0/L1 seed `kv` (pre-scatter) MATCHES prefill truth, but
-  `swa` (post-scatter) = `[10.7,11.07,11.37]` (slowly varying = pad id-0 at rope
-  positions). T=1024 printed; roll branch read `kv[896:1024]` = all pad.
-* Smoke 131221Z (SWA fix only): `[seedfp]` L0/L1 `swa` FLIPPED to **MATCH** truth
-  (`[-13.45,…]`,`[22.03,…]`). ⇒ SWA seed fix verified ON THE SLICE; dynamic gather
-  did NOT halt (the take_along_axis over the sharded token axis is fine — the HARD
-  CONSTRAINT is specifically about wsc(activation,P()) gathering a size-1 axis).
+## NEXT ACTION — the residual at term 8 (do NOT re-try plain zeroing)
 
-FIXES (committed `6245ea84` SWA, `90bf85c3` compressor; CPU-validated):
-* Thread the **traced** real length `n_real = seq_lens[0]` (correct per-request; the
-  old static `state_init_ids`/`L_real` slice is a TRACE-TIME branch baked at warmup
-  ⇒ never fires) through run_with_decode_state → transformer_body_init_state_* →
-  block_init_state_and_forward → attention_init_state_from_prefill →
-  `_swa_kv_cache_from_prefill` (+ `_compressor_state_from_prefill`). `n_real=None`
-  preserves exact-length static path (CPU/parity tests still pass).
-* SWA: branchless `swa[i]=kv[i+((n_real-1-i)//win)*win]` masked `i<n_real`.
-* Compressor/indexer state: cutoff/remainder from n_real via dynamic_slice + masking.
-* CPU unit tests (PASS): `/tmp/s1_swa_fix_test.py`, `/tmp/s1_compressor_fix_test.py`
-  (traced-over-padded == static-over-exact). `s1_cpu_repro both` OK (no regression).
+The residual is NOT pad-zeroing. The boundary slot `n_safe` (window straddling `n_real`)
+IS read by decode before being overwritten, so it needs its CORRECT compressed value at
+seed time — not zero, not pad. Two leads (pick one, prove on the slice):
+1. **Seed slot `n_safe` from the n_real-aware compressor STATE.** `c_kv/c_sc` (and indexer
+   `i_kv/i_sc`) already hold the in-progress partial window `[cutoff, cutoff+remainder)`
+   correctly (the SESSION-5 state fix). Compute that boundary window's compressed kv and
+   write it into `comp_full[:, n_safe]` / `i_cache[:, n_safe]` at seed time. Leave slots
+   `> n_safe` as whatever decode reads only AFTER overwriting (check #2).
+2. **Check the JAX decode-step read/write ORDER vs torch ref**
+   (`tests/models/jax/_deepseek_v4_reference/model.py`): torch writes slot
+   `start_pos//ratio` THEN reads `[0,(start_pos+1)//ratio)`. If the JAX decode-step reads
+   the boundary slot before writing it, fix the order so the seed value never matters.
+VERIFY: on a fresh smoke, decode-vs-prefill-everything at N>20 — decode term7 must stay
+**377** AND term8 must become **610** (= faithful). Localize with `/tmp/s1_prefill_vs_decode.py`.
 
-BOTH-FIXES SMOKE 132821Z RESULT (verified on slice, READ the text):
-* `[seedfp]` L0/L1 swa flipped DIVERGE→**MATCH** (seed fix engaged; no halt).
-* Decode NO LONGER COLLAPSES: Fibonacci → "21, 34, 55, 89, 144, 233, 377, …" (7 CORRECT
-  terms; was immediate garbage). logprobs sharp+correct: 21=0.89, 34=0.76, 55=0.99,
-  89=0.87, 144=0.999 — model is confident/correct, NOT a flat-logit regime. Paris
-  deterministic (3× byte-identical); chat endpoint gives clean "Paris".
-  ⇒ **PRIMARY S1 collapse is FIXED.**
+## SLICE-PROBE OPS (learned this session — saves you hours)
 
-⇒⇒ KEY REFRAME (decode-vs-prefill-everything token compare, `/tmp/s1_prefill_vs_decode.py`):
-For prose "Once upon a time, there was a" N=10, decode and PREFILL-EVERYTHING are
-**BYTE-IDENTICAL** (' time, and the time was a time, and') ⇒ **decode is FAITHFUL** to
-the no-decode-cache path on sharp tokens. So the GROSS GREEDY LOOPING is the **MODEL**
-(both paths loop identically), NOT a decode bug. The original S1 (decode diverging from
-prefill into its OWN attractor) is FIXED. BUT note: even prefill-everything loops on
-open-ended prose — so the model's open-ended greedy output is degenerate via BOTH paths
-— this is RAW-GREEDY behavior, NOT a broken model: **CONFIRMED model is sound** — chat
-(instruct) + sampling produced a COHERENT on-topic ocean poem ("In the ocean's embrace,
-I feel a rhythm…"), chat→clean "Paris", Fibonacci 7 terms sharp+correct. So the gross
-looping = raw-completions + greedy + no instruct format (classic greedy trap), not our
-bug and not a model defect. Use chat+sampling for quality.
+* The engine is **not** fragile from "degradation" as the old handoff implied. The
+  apparent "wedge / empty completions" was the **first-inference-per-input-SHAPE JIT
+  compile (~5 min)** exceeding short curl timeouts. **Use `--max-time`/timeout ≥ 580s for
+  the FIRST request of each new prompt shape**; same-shape requests after that are fast.
+  The always-on diagnostics slow decode to ~9-18s/tok (a 64-tok gen ≈ exceeds 900s — so
+  the scripted `LONG_GEN` gate can't complete until diagnostics are removed).
+* Faithful reference = **prefill-everything** (chained `max_tokens=1`; does NOT use the
+  decode seed). DECODE BUG ⟺ decode ≠ prefill-everything. Helpers:
+  `/tmp/s1_prefill_vs_decode.py "PROMPT" N` (per-req timeout already 900),
+  `/tmp/s1_faithful_terms.py` (single-term prefills). CPU repro of the (reverted) seed
+  diff: `/tmp/s1_compfull_fix_test.py`.
+* **No live engine is left running** (reset at session end). Re-smoke per CLAUDE.md (warm
+  xla_cache ⇒ ~6 min): edit → sync → reset → smoke → wait "Application startup complete".
+  Don't clear xla_cache unless you changed code (clearing forces a cold compile).
 
-⚠️ SEPARATE small RESIDUAL decode bug (only SOFT tokens, far into gen): decode drifts at
-Fibonacci term 8 ("…377, 666") while FAITHFUL prefill ("…377, ") predicts **610** (argmax
-0.43; 666=#2 at 0.14). On SHARP tokens the small error doesn't flip argmax (decode==prefill
-at N=10), so it only bites soft tokens after ~5 compressions. NOT the cause of the looping.
+## ⚠️ The scripted success gate has a prompt problem
+`scripts/full_slice_v4_smoke_check.sh` `LONG_GEN` uses an OPEN-ENDED prompt ("Tell me a
+short story about a robot exploring Mars:") at greedy temp=0 — exactly the red herring
+CLAUDE.md warns about (a base model loops at greedy regardless of decode correctness).
+Plus at ~9-18s/tok a 64-tok decode exceeds the 900s curl cap. Once decode is correct,
+either (a) remove diagnostics so decode is fast AND swap the gate prompt to a
+discriminating one (strictly-increasing Fibonacci), or (b) define done as
+decode==prefill-everything at N>20 on a discriminating prompt + 3× Paris determinism.
 
-IMPLICATION for "done": the success-gate's "coherent greedy long-gen" may be UNACHIEVABLE
-because the MODEL loops at greedy on open-ended prompts. The right decode-correctness
-criterion is **decode == prefill-everything** (faithfulness) — now true except the soft-
-token residual. Fix the residual (comp_full/i_cache below), then decode==prefill always.
-
-LEADING HYPOTHESIS for the residual (source-confirmed unfixed): the compressed CACHES
-`comp_full` and `i_cache` (attention_init_state_from_prefill ~1167/1193) =
-`compressor_prefill(x_padded)[:extra]` — built over the PADDED x, NOT n_real. So the
-boundary window straddling n_real (e.g. window 7 = tokens [28,32) = 1 real + 3 pad) is
-pad-polluted; decode reads more compressed slots as it generates → small accumulating
-error → flips the term-8 soft argmax. (I fixed the STATE c_kv/c_sc/i_kv/i_sc with
-n_real, but NOT these caches.) Decode-step math itself is likely fine (decode runs
-replicated == CPU; matched faithful on the first 14 tokens).
-
-NEXT ACTION:
-1. Fix `comp_full` + `i_cache` to respect n_real: mask/zero compressed windows whose
-   source tokens are ≥ n_real (only keep fully-real windows; decode overwrites the rest
-   via compressor_decode_step as it generates). CPU-validate like the state fix
-   (traced-over-padded vs static-over-exact) then smoke.
-2. RE-RUN the drift test: prefill("…377, ")→610 AND decode(Fibonacci)→ must now also
-   give 610 (decode == faithful). Then the GATE twice.
-3. If drift persists after the cache fix → compare decode vs prefill-everything
-   token-by-token (`/tmp/s1_prefill_vs_decode.py`) to find the first divergent step,
-   and check the GPU reference `work/vllm/vllm/model_executor/layers/deepseek_v4_attention.py`.
-
-NOTES: decode is SLOW (~18s/tok) — that's the ALWAYS-ON diagnostics' per-layer
-jax.debug.print host callbacks, NOT the fix; perf returns when diagnostics are removed
-at close. Engine still degrades after several requests (empty completions) — fire
-critical probes first. The SWA-only-smoke reference-'' was engine flakiness (132821Z
-prefill argmax is fine).
-
-REFERENCE IMPLEMENTATIONS (cross-check resources — use these to avoid false root causes):
-* torch ref: `work/tpu-inference/tests/models/jax/_deepseek_v4_reference/model.py`
-  (windows SWA over exact seqlen; compressor cutoff=seqlen%ratio).
-* **vLLM GPU impl: `work/vllm/vllm/model_executor/layers/deepseek_v4_attention.py`**
-  (`DeepseekV4SWACache`) — a second reference for decode/seed behavior.
-
-DIAGNOSTICS still in code (REMOVE at S1 close): `_v4_fp`/`_v4_dir`, `[seedfp]`,
-`[kvchk-pf]`, `[fwdSd]`, `[decSd]`. Helpers `/tmp/s1_seed_analyze.py`,
-`/tmp/s1_swa_fix_test.py`, `/tmp/s1_compressor_fix_test.py`.
-
-## Durable lessons (kept; the rest of SESSION 3/4 narrative was the pad confound)
-
+## Durable lessons (kept)
 * **HARD CONSTRAINT (proven ~8x):** `with_sharding_constraint(ACTIVATION, P())` that
   GATHERS a size-1 decode token axis Core-halts. A wsc on a POST-reduction `[N,dim]`
-  quantity is safe. (NB: a plain `take_along_axis`/`dynamic_slice` gather over the
-  sharded token axis — as in the SESSION-5 seed fix — does NOT halt; it's the
-  wsc-to-replicated of the degenerate axis that does.)
+  quantity is safe. A plain `take_along_axis`/`dynamic_slice` gather over the sharded
+  token axis (as in the SESSION-5 seed fix) does NOT halt.
 * Collapse is DETERMINISTIC at temp=0 (metadata-replicate decode fix in
-  `tpu_runner._prepare_inputs_dp`). token1 (prefill argmax) is correct; decode collapses.
+  `tpu_runner._prepare_inputs_dp`). token1 (prefill argmax) is correct.
+* Model is SOUND: chat (instruct) + sampling give coherent output; gross greedy looping on
+  open-ended prompts is the MODEL, not a decode bug.
 * Diagnostics must be ALWAYS-ON (no env gate) — env-gated module reads race across ray
-  workers → launch-id halt.
+  workers → launch-id halt. (REMOVE all S1 diagnostics at close: `_v4_fp`/`_v4_dir`,
+  `[seedfp]`, `[kvchk-pf]`, `[fwd*]`/`[dec*]`/`[pf4]`/`[moeRS]`.)
 
 ## Recovery / loop
-
-* **Launch-id halt / SLICE_FAILURE before startup = CODE DESYNC** → `full_slice_v4_sync.sh`
-  + clear `~/.cache/vllm/xla_cache/*` on all 8 hosts; do NOT reboot. Clean engine → just
-  `full_slice_v4_reset.sh`. Escalate: `full_slice_v4_ray_restart.sh`.
-* Infra `node` contention SOLVED (`DenyUsers mark`; 2 guardians). Keep node_guardian +
-  meta_guardian alive before TPU work.
+* **`different launch id` / `Core halted` / `SLICE_FAILURE` before startup = CODE DESYNC
+  at the COMPILED level** → `full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on
+  all 8 hosts AND **verify each cache dir is actually empty** (a host that silently kept
+  stale cache caused a halt this session; re-clearing+verifying fixed it). Do NOT reboot.
+  Clean engine → just `full_slice_v4_reset.sh`. Escalate: `full_slice_v4_ray_restart.sh`.
+* Keep node_guardian + meta_guardian alive before TPU work.
 * **Loop:** `scripts/s1_session_loop.sh` (stop: `touch /tmp/s1_loop_stop`).
+
+## References (cross-check to avoid false root causes)
+* torch ref: `work/tpu-inference/tests/models/jax/_deepseek_v4_reference/model.py`
+  (compressed/indexer caches over real seqlen; cutoff=seqlen%ratio; unwritten slots=0).
+* vLLM GPU: `work/vllm/vllm/model_executor/layers/deepseek_v4_attention.py`
+  (`DeepseekV4SWACache`; paged compressed cache written at real slot_mapping only).
