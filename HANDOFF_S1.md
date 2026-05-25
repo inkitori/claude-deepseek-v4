@@ -1,4 +1,4 @@
-# S1 handoff — decode COLLAPSE fixed; open-ended LOOPING is a NEW open question
+# S1 handoff — decode COLLAPSE fixed + done; open lead = temp=0 nondeterminism on flat prompts
 
 Goal: coherent, deterministic decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the
 v6e-32 slice. Ops in `CLAUDE.md`; this is live state. **Read the nuance — earlier "S1
@@ -52,21 +52,30 @@ temp=0 nondeterminism *inherent* sharded-FP-reduction variation (mostly unavoida
 with `max_num_seqs` filled (all ranks busy) vs idle, and/or check if a deterministic-reduction
 XLA flag removes it. The S1 token-2 collapse remains FIXED regardless.
 
-## NEXT ACTION
-1. Re-run the decode-vs-prefill verdict above on the live engine (:18081). Read it.
-2. If MODEL: try better decoding (min_p / higher temp / longer max_tokens — serve caps
-   `max_total_tokens=256`, raise `--max-model-len`). Accept that Flash may just loop on
-   open-ended greedy. Document; S1 (sharding decode) stays fixed.
-3. If DECODE: reopen — localize with decode-vs-prefill; the flat-distribution / longer-gen
-   regime is what Fibonacci didn't exercise.
+## NEXT ACTION (the decode COLLAPSE is FIXED + done; this is the ONE optional open lead)
+The decode-vs-prefill verdict is DONE: the open-ended looping/garbage is the MODEL + temp=0
+RUN-TO-RUN NONDETERMINISM on flat prompts, NOT the decode path (STATE above). So:
+1. **S1 token-2 collapse = closed.** If that's all you care about, nothing to drive — confirm
+   via a quick smoke + Fibonacci/Paris if you want, else stop.
+2. **The one real open question:** is the temp=0 flat-prompt nondeterminism (same prompt → ~3
+   cycling outputs) *inherent* sharded-FP-reduction variation (mostly unavoidable) or a
+   *fixable* bug (idle-rank / uninitialized HBM, cf. `CLAUDE.full.md` PHASES 7-9)?
+   PROBE (re-smoke first — engine was reset): fire the SAME flat open-ended prompt at temp=0
+   ~10× under (a) single-seq default vs (b) `max_num_seqs` raised + concurrent requests so all
+   32 ranks are busy. If nondeterminism VANISHES when ranks are busy → idle-rank/uninit bug
+   (fixable). Also worth: a deterministic-reduction XLA flag (validate per CLAUDE.md pitfall 4).
+   Use Fibonacci/Paris as the deterministic control (they stay byte-stable).
+3. Inherent FP → document + accept (mitigate: good system prompt + focused prompts). Fixable
+   bug → fix, then verify same-prompt temp=0 is byte-stable across 10× on FLAT prompts.
 
 ## Model usage (verified this session)
 * INSTRUCT/reasoning model (post-trained SFT+RL; has `<think>`/`reasoning_content`), NOT
   base. Chat works NATIVELY (NO `--chat-template`): serve already passes
   `--reasoning-parser deepseek_v4` and a custom `DeepseekV4Tokenizer` applies
   `encoding/encoding_dsv4.py`. **ALWAYS pass a system message** or short queries misbehave.
-* Engine LIVE on :18081 (left up). `vllm chat --url http://localhost:18081/v1 --model
-  deepseek-ai/DeepSeek-V4-Flash`.
+* Engine was RESET (down) at handoff — re-smoke to continue (sync → reset → smoke → wait
+  "Application startup complete"). Then `vllm chat --url http://localhost:18081/v1 --model
+  deepseek-ai/DeepSeek-V4-Flash` (WITH a system prompt).
 
 ## Real fixes (committed, live)
 * metadata-replicate decode (`_v4_decode_replicate` in `tpu_runner._prepare_inputs_dp`) → determinism.
@@ -82,4 +91,6 @@ XLA flag removes it. The S1 token-2 collapse remains FIXED regardless.
 * `different launch id`/`Core halted` before startup = CODE DESYNC → `full_slice_v4_sync.sh`
   + clear+verify-empty `~/.cache/vllm/xla_cache/*` on all 8 hosts (ssh `-i
   ~/.ssh/google_compute_engine enyouki@HOST`). Don't reboot. Reset: `full_slice_v4_reset.sh`.
-  Keep node_guardian + meta_guardian alive. Loop currently STOPPED (`/tmp/s1_loop_stop`).
+  Keep node_guardian + meta_guardian alive. Stop sentinel `/tmp/s1_loop_stop` was REMOVED to
+  resume a fresh session on the nondeterminism OPEN LEAD — the decode collapse itself is DONE,
+  so `touch /tmp/s1_loop_stop` again once you conclude the lead is inherent / out-of-scope.
