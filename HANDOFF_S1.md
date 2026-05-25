@@ -4,6 +4,11 @@ Goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, determin
 decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
 checkpoints; never wait. Operational details are in `CLAUDE.md`; this is live state.
 
+> **LIVE ENGINE RIGHT NOW:** smoke `logs/full-slice-v4-smoke-20260525T132821Z.log` is
+> serving on :18081 (both-fixes code). SLOW (~18s/tok — the always-on diagnostics) and
+> degrades after several requests (empty completions). Use it for the cheap re-verify
+> probes below BEFORE re-smoking; if it's dead, re-smoke per CLAUDE.md.
+
 ## ⇒ STAY SKEPTICAL (read before acting on SESSION 5 below)
 
 This project has a HISTORY of confident-but-WRONG root causes (SESSION 3's "dead MoE"
