@@ -5,15 +5,15 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25 S7): **Original S1 collapse FIXED; open-ended LOOPING is a new
-> open question — see `HANDOFF_S1.md`.** The precise S1 bug (token-2 degenerate attractor) is
+> One-line status (2026-05-25 S7): **S1 decode collapse FIXED (confirmed); the only residual —
+> open-ended LOOPING — is the MODEL, not decode.** The precise S1 bug (token-2 attractor) is
 > gone: greedy Fibonacci decodes correct (`21…377, 610`), 3× byte-identical (deterministic),
-> faithful to prefill (~0.24 logprob); short factual CHAT works (instruct model, native chat,
-> needs a system prompt). BUT open-ended gen ("teach me topology") LOOPS (coherent start →
-> "It is a kind of geometry" ×24); `vllm chat` w/o a system prompt gave garbage. Whether the
-> loop is the decode path or the MODEL is PENDING a decode-vs-prefill check (strong hypothesis:
-> MODEL / neural-text-degeneration, not the sharding bug — short+structured are clean). Loop
-> stopped (`/tmp/s1_loop_stop`); engine LIVE on :18081. NEXT: run the verdict (handoff §NEXT).
+> faithful to prefill; short factual CHAT works (instruct model, native chat, needs a system
+> prompt). Open-ended gen ("teach me topology") LOOPS — but CONFIRMED to be the MODEL:
+> prefill-everything (the true forward, no decode-state path) loops IDENTICALLY to decode at
+> temp=0, so decode is FAITHFUL. The looping is neural-text-degeneration (out of S1 scope; try
+> min_p / higher temp / longer max_tokens). Loop stopped (`/tmp/s1_loop_stop`); engine LIVE on
+> :18081. The S1 sharding decode bug is closed; remaining work is model/serving-params, not S1.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

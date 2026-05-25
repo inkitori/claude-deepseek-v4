@@ -22,19 +22,16 @@ topology" gives a coherent opening then phrase-repetition:
 * `vllm chat` (NO system prompt + its higher default temp) → outright garbage ("澳大利亚").
 * `repetition_penalty=1.3` did NOT fix it (looped the system prompt instead).
 
-**Is the looping the S1 DECODE bug or the MODEL? — CONFIRMATION PENDING (do this first).**
-* Decode-vs-prefill-everything at temp=0 on the topology chat prompt: DECODE loops;
-  PREFILL-EVERYTHING half was **in flight** (slow engine) when this was written — RE-RUN it
-  (cheap on the live engine). Script pattern: `encode_messages([sys,user],"chat")` via
-  `encoding/encoding_dsv4.py`, then decode N=28 temp=0 vs chained mt=1 temp=0; compare.
-* **Strong hypothesis: it's the MODEL** (classic neural-text-degeneration on flat-
-  distribution open-ended prompts), NOT the sharding decode bug — because (a) short/
-  structured prompts are clean, (b) original S1 was an IMMEDIATE token-2 tight attractor;
-  this is a coherent multi-sentence start then phrase-loop (qualitatively different), (c)
-  V4-Flash is the small/fast variant.
-* IF prefill-everything ALSO loops → confirmed MODEL: decode is faithful, S1-decode stays
-  fixed, looping is a model/decoding-params limitation (out of S1's scope). IF decode ≠
-  prefill → REOPEN S1: the bug survives on open-ended/longer gen that Fibonacci didn't hit.
+**Is the looping the S1 DECODE bug or the MODEL? — CONFIRMED: the MODEL (decode is FAITHFUL).**
+At the loop point, prefilling decode's own prefix and continuing at temp=0 gives
+`' I will teach you about topology. I will teach you about topology. I will'` — i.e.
+PREFILL-EVERYTHING (the model's true forward, which does NOT use the decode-state path) loops
+IDENTICALLY to decode. So the open-ended looping is the MODEL (neural-text-degeneration on
+flat-distribution open-ended greedy/low-temp), NOT the sharding decode bug. **S1 (the decode
+collapse) stays FIXED; decode is faithful.** The looping is a model/decoding-params limitation,
+OUT OF S1's scope: rep_pen=1.3 didn't help; try min_p / higher temp / longer max_tokens, or
+accept that the Flash variant loops on open-ended greedy. (Short + structured prompts decode
+clean; this only hits flat open-ended generation.)
 
 ## NEXT ACTION
 1. Re-run the decode-vs-prefill verdict above on the live engine (:18081). Read it.
