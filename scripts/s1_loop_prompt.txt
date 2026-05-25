@@ -29,12 +29,19 @@ OPERATING RULES:
 - Reserve full smokes (~25-45 min) for confirming a fix that already survives a cheaper
   repro; at most 1-2 per session.
 
-HAND OFF (this is how the loop perpetuates): your context grows as you work. When it nears
-~200k tokens — if interactive, eyeball /context; if headless, treat "I finished a validated
-step / bounded chunk" as the trigger — STOP CLEANLY:
-  1. bash scripts/s1_trim_claudemd.sh   (trims CLAUDE.md for the next session)
-  2. Rewrite HANDOFF_S1.md to reflect the CURRENT state: what you verified, what's
-     in flight (log paths, ports), and the single most important NEXT action.
+HAND OFF (this is how the loop perpetuates; full protocol is in CLAUDE.md "CONTEXT HANDOFF
+PROTOCOL"): your context grows as you work. Trigger at ~100k-200k tokens — if interactive,
+eyeball /context and heed "context getting long" reminders; if headless (-p), treat "I
+finished a validated step / bounded chunk" as the trigger — UNLESS you're seriously
+mid-operation (e.g. waiting on a smoke whose result you must read). Then STOP CLEANLY:
+  1. KEEP THE MARKDOWN LEAN — trim CLAUDE.md + HANDOFF_S1.md (+ memory files): delete
+     superseded narrative, keep only durable ops + the CURRENT lead + the next action.
+     Every line rsyncs to 8 hosts / loads into every session. Lean > complete.
+     (scripts/s1_trim_claudemd.sh helps with CLAUDE.md.)
+  2. Rewrite HANDOFF_S1.md to the CURRENT state: what you verified, what's in flight
+     (log paths, ports, task ids), and the single most important NEXT action.
   3. git add -A && commit + push.
-  4. END YOUR TURN (stop responding) so the wrapper relaunches a fresh session.
+  4. HAND OFF THE WINDOW: if interactive in tmux, run `scripts/s1_handoff_window.sh`
+     (spawns a fresh max-thinking session in a NEW tmux window), then END YOUR TURN.
+     If headless under s1_session_loop.sh, just END YOUR TURN (the wrapper relaunches).
 Do not start anything large you can't finish + commit before handing off.

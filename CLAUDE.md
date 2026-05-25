@@ -1,14 +1,41 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its "SESSION 3 UPDATE" at the top is
-> authoritative.** This file holds only durable operational knowledge (how to run
-> the slice, validate, pitfalls). The live debugging state + root cause live in the
-> handoff. Full project history/backlog: `CLAUDE.full.md` (read only if needed).
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "SESSION 4 UPDATE" is
+> authoritative** (it corrects SESSION 3). This file holds only durable operational
+> knowledge (how to run the slice, validate, pitfalls) + the handoff protocol below.
+> Live debugging state + current lead live in the handoff. History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25): S1 is the decode path; root cause CONFIRMED = the
-> V4 routed-MoE experts are DEAD in decode (~57x attenuated) under the replicated
-> decode activation, so the residual never accumulates → collapse. NOT a seed/KV
-> bug (that whole theory is disproven). See the handoff for the next experiment.
+> One-line status (2026-05-25): S1 is the decode path. The "dead MoE" root cause is
+> DISPROVEN — it was a pad-token diagnostic confound; for the real token, MoE + embed
+> MATCH prefill. The real bug is a DIRECTIONAL error that compounds from L0 decode-step
+> attention → flat logits → attractor ⇒ the decode-state / KV-seed / decode-attention
+> path. See the handoff for the corrected data + next step.
+
+## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
+
+Sessions are disposable; the commit log + `HANDOFF_S1.md` + this file are the only
+memory that survives. When your context reaches **~100k–200k tokens** (interactive:
+check `/context`; also heed the harness's "context getting long" reminders) AND you
+are NOT seriously mid-operation (e.g. waiting on a smoke whose result you must read, or
+a few calls from finishing a committed step) — HAND OFF to a fresh session:
+
+1. **Keep the markdown LEAN** — trim `CLAUDE.md`, `HANDOFF_S1.md` (and your memory
+   files): delete superseded narrative, keep only durable ops + the CURRENT lead + the
+   single next action. Every line here rsyncs to 8 hosts / loads into every session;
+   bloat is a real cost. Lean > complete.
+2. Rewrite `HANDOFF_S1.md` to the CURRENT state: what you verified, what's in flight
+   (log paths, ports, task ids), and the ONE most important next action.
+3. `git add -A && git commit && git push`.
+4. Run **`scripts/s1_handoff_window.sh`** — opens a NEW tmux window in this session and
+   launches a fresh `claude --dangerously-skip-permissions --effort max` (empty context,
+   auto-loads this file + `scripts/s1_loop_prompt.txt`). Not in tmux → it prints the
+   exact command to run by hand.
+5. **END YOUR TURN** so the fresh session takes over. Don't start anything you can't
+   finish + commit before handing off.
+
+(Headless alternative: `scripts/s1_session_loop.sh` relaunches `claude -p` in-place; it
+can't read `/context` so it hands off per finished-chunk. The new-window protocol above
+is preferred — the fresh session CAN budget by `/context`.)
 
 ## Goal
 
