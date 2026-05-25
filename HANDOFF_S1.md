@@ -5,7 +5,44 @@ decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
 checkpoints; never wait. Operational details (slice-serving protocol, validation,
 pitfalls) are in `CLAUDE.md` — this file is the live debugging state.
 
-## ⇒⇒⇒ SESSION 4 UPDATE (2026-05-25) — READ THIS FIRST (corrects SESSION 3)
+## ⇒⇒⇒ SESSION 5 (2026-05-25) — ROOT CAUSE FOUND. READ THIS FIRST.
+
+**S1 = the decode SWA seed is built over the PADDED prefill activation, so the
+SWA window is seeded with PAD-token kv instead of the real prompt's kv.** Decode
+then attends over pad-token kv → directional garbage → attractor. This is a
+PADDING bug (NOT sharding) — reproduces on CPU with a padded input; the CPU
+parity test missed it because it uses exact-length inputs.
+
+DECISIVE EVIDENCE (smoke 123908Z, direction-sensitive `[seedfp]`/`[kvchk-pf]`
+fingerprints added this session): at L0/L1 (SWA, ratio=0) the seed's *pre-scatter*
+kv MATCHES prefill truth exactly (`[-13.45,-8.86,-2.30]`), but the *post-scatter*
+`swa` GROSSLY DIVERGES (`[10.70,11.07,11.37]` — slowly varying = pad token id-0 at
+different rope positions). The seed activation length printed **T=1024** (prompt is
+~20 tokens): `_swa_kv_cache_from_prefill` takes its roll branch (T≥win=128),
+`last = kv[:, 896:1024]` = ALL PAD, so the whole SWA cache holds pad-token kv.
+
+WHY the existing `state_init_ids` slice-to-real-length guard fails: `L_real` is
+read from `query_start_loc_cpu[1]` in a **trace-time Python branch**
+(`deepseek_v4.py` ~1935-1946). vLLM warmup traces with full-bucket dummy inputs ⇒
+`L_real==T` ⇒ `state_init_ids=None` gets BAKED into the compiled program ⇒ real
+requests never slice. Static-slice is fundamentally wrong for padded serving.
+
+THE FIX (in progress): thread the **traced** real length `n_real = seq_lens[0]`
+(a runtime value, correct per-request, already used for decode `start_pos`) into
+the seed builders; window over real tokens dynamically. Clean branchless SWA
+formula (reproduces old behavior at n_real=T): `swa[i]=kv[i+((n_real-1-i)//win)*win]`
+masked by `i<n_real`. Thread n_real through run_with_decode_state →
+transformer_body_init_state_* → block_init_state_and_forward →
+attention_init_state_from_prefill → `_swa_kv_cache_from_prefill` (default None→T
+keeps CPU/parity tests valid). ALSO LIKELY NEEDS the same n_real fix for
+`_compressor_state_from_prefill` cutoff/remainder (ratio=4/128 layers' compressor
+STATE positions at T not n_real → bites long-gen decode compressions); the
+compressed CACHE read-slots are probably fine (decode reads only [0,n_real/ratio)).
+NEXT: finish SWA fix + CPU unit-test (padded input) + smoke ([seedfp] L0/L1 should
+MATCH) → then compressor state if still collapses. Diagnostics `[seedfp]/[kvchk-pf]/
+[fwdSd]/[decSd]` + `_v4_fp`/`_v4_dir` are committed; REMOVE at S1 close.
+
+## SESSION 4 UPDATE (2026-05-25) — superseded by SESSION 5 (kept for the confound lesson)
 
 **The SESSION-3 ref-vs-decode comparison was CONFOUNDED by a diagnostic bug: the
 prefill "reference" measured a PAD token (id 0), NOT tok1.** So the headline

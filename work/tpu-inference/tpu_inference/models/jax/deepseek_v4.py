@@ -288,6 +288,23 @@ def _v4_lp(z, input_ids=None):
     return jnp.max(jnp.abs(zf)), jnp.mean(jnp.abs(zf))
 
 
+def _v4_dir(z, input_ids=None):
+    """S1 DIRECTIONAL fingerprint at the last-real position (sign/order-sensitive;
+    complements _v4_lp's magnitude). Lets a decode step's attn output be compared
+    by DIRECTION to the prefill-everything reference — the S1 error is directional,
+    not magnitude. Same last-non-pad indexing as _v4_lp. Remove at S1 close."""
+    if input_ids is not None:
+        S = z.shape[1]
+        valid = input_ids[0] != 0
+        idx = jnp.where(valid, jnp.arange(S), -1).max()
+        idx = jnp.where(idx < 0, S - 1, idx)
+        zf = z[:, idx].astype(jnp.float32)
+    else:
+        zf = z[:, -1].astype(jnp.float32)
+    w = jnp.cos(jnp.arange(zf.shape[-1], dtype=jnp.float32) * 0.1)
+    return jnp.sum(zf[0] * w)
+
+
 def block_forward(
     x: jnp.ndarray,           # [B, S, hc, D]
     input_ids: jnp.ndarray,
@@ -303,10 +320,11 @@ def block_forward(
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
-    y = attention_prefill(y, params.attn, freqs_cis_full)
+    y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
     if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
         _m, _a = _v4_lp(y, input_ids)
         jax.debug.print("[fwdS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
+        jax.debug.print("[fwdSd] L{i} attnout dir={d}", i=layer_idx, d=_v4_dir(y, input_ids))
     x = hc_post(y, residual, post, comb)
     _am, _aa = _v4_lp(x, input_ids)
     jax.debug.print("[fwdL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
@@ -357,7 +375,7 @@ def block_init_state_and_forward(
         dtype=jnp.bfloat16,
         layer_idx=layer_idx,
     )
-    y = attention_prefill(y, params.attn, freqs_cis_full)
+    y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
     x = hc_post(y, residual, post, comb)
 
     residual = x
@@ -398,6 +416,7 @@ def block_decode_step(
     if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
         _m, _a = _v4_lp(y)
         jax.debug.print("[decS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
+        jax.debug.print("[decSd] L{i} attnout dir={d}", i=layer_idx, d=_v4_dir(y))
     x_step = hc_post(y, residual, post, comb)
     _v4_nan_tripwire("attn_block_out", x_step, layer_idx, start_pos)
     _am, _aa = _v4_lp(x_step)

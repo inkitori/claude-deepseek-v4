@@ -75,6 +75,19 @@ def _replicate(x: jnp.ndarray) -> jnp.ndarray:
         return x
     return jax.lax.with_sharding_constraint(x, P())
 
+
+def _v4_fp(v: jnp.ndarray) -> jnp.ndarray:
+    """S1 SEED-vs-TRUTH directional fingerprint of one position's vector
+    (always-on, NO env gate so all ray workers compile identically). Returns a
+    fp32 scalar that changes if ANY component's value/sign/order changes (a
+    direction-sensitive hash, unlike magnitude diags). Used to test whether the
+    SHARDED seed build (swa scatter in attention_init_state_from_prefill)
+    preserves per-position kv values vs attention_prefill's truth. v: [B, D].
+    Remove at S1 close."""
+    vf = v.astype(jnp.float32)
+    w = jnp.cos(jnp.arange(vf.shape[-1], dtype=jnp.float32) * 0.1)
+    return jnp.sum(vf[0] * w)
+
 def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
     """RMSNorm with fp32 accumulation, cast back to x.dtype."""
     dtype = x.dtype
@@ -838,6 +851,7 @@ def attention_prefill(
     x: jnp.ndarray,                # [B, S, dim]
     params: AttentionParams,
     freqs_cis_full: jnp.ndarray,  # [max_seq_len, rope_head_dim/2] complex64 — for current layer's rope
+    layer_idx: int = -1,
 ) -> jnp.ndarray:
     """Full attention forward for prefill (start_pos=0). Returns [B, S, dim].
 
@@ -875,6 +889,11 @@ def attention_prefill(
     kv = rms_norm(kv, params.kv_norm_w, eps)  # kv_norm
     kv = splice_rope(kv, rd, fc, inverse=False)
     # act_quant on kv[..., :-rd] is no-op (DECISIONS.md D2)
+    if 0 <= layer_idx <= 1:  # S1 seed-vs-truth: prefill's TRUE per-position kv (SWA ratio-0)
+        _S = kv.shape[1]
+        jax.debug.print("[kvchk-pf] L{i} S={s} kv {a} {b} {c}", i=layer_idx, s=_S,
+                        a=_v4_fp(kv[:, 0]), b=_v4_fp(kv[:, min(1, _S - 1)]),
+                        c=_v4_fp(kv[:, min(2, _S - 1)]))
 
     # window topk indices
     topk_idxs = get_window_topk_idxs_prefill(win, B, S)
@@ -1082,6 +1101,13 @@ def attention_init_state_from_prefill(
     extra = (cfg_max_seq_len // ratio) if ratio else 0
     swa = _swa_kv_cache_from_prefill(kv, win)
     _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
+    if 0 <= layer_idx <= 1:  # S1 seed-vs-truth: does the SHARDED scatter preserve kv?
+        _T = kv.shape[1]                       # swa[:,p]==kv[:,p] for p<T iff scatter ok
+        jax.debug.print("[seedfp] L{i} T={t} kv {a} {b} {c} swa {d} {e} {f}",
+                        i=layer_idx, t=_T,
+                        a=_v4_fp(kv[:, 0]), b=_v4_fp(kv[:, min(1, _T - 1)]),
+                        c=_v4_fp(kv[:, min(2, _T - 1)]),
+                        d=_v4_fp(swa[:, 0]), e=_v4_fp(swa[:, 1]), f=_v4_fp(swa[:, 2]))
 
     # Concatenate, not zeros + at[].set(): the partial-write pattern lets
     # XLA alias the buffer to a donated kv_caches[i] slot and elide the
