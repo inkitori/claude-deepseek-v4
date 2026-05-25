@@ -354,6 +354,7 @@ def block_init_state_and_forward(
     cfg_max_seq_len: int,
     cfg_index_head_dim: int,
     layer_idx: int = -1,
+    n_real=None,
 ) -> Tuple[AttentionDecodeState, jnp.ndarray]:
     """Block forward (prefill) that ALSO captures the post-prefill
     `AttentionDecodeState` for this layer. Output `[B, T, hc, D]` is
@@ -374,6 +375,7 @@ def block_init_state_and_forward(
         cfg_index_head_dim=cfg_index_head_dim,
         dtype=jnp.bfloat16,
         layer_idx=layer_idx,
+        n_real=n_real,
     )
     y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
     x = hc_post(y, residual, post, comb)
@@ -525,6 +527,7 @@ def transformer_body_init_state_from_prefill(
     freqs_cis_compressed: jnp.ndarray,
     cfg: DeepseekV4Config,
     state_max_seq_len: int,
+    n_real=None,
 ) -> Tuple[jnp.ndarray, List[AttentionDecodeState]]:
     """Run a prefill of `input_ids` AND capture per-layer
     `AttentionDecodeState` for subsequent decode steps. Returns
@@ -557,6 +560,7 @@ def transformer_body_init_state_from_prefill(
             cfg_max_seq_len=state_max_seq_len,
             cfg_index_head_dim=idx_hd,
             layer_idx=i,
+            n_real=n_real,
         )
         states.append(st)
     return h, states
@@ -803,6 +807,7 @@ def transformer_body_init_state_to_buffer(
     freqs_cis_compressed: jnp.ndarray,
     cfg: DeepseekV4Config,
     state_max_seq_len: int,
+    n_real=None,
 ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
     """Run a prefill of `input_ids` and return `(h, packed_buffers)` where
     `packed_buffers[i]` is the 1D fp32 packed `AttentionDecodeState` for
@@ -810,6 +815,7 @@ def transformer_body_init_state_to_buffer(
     h, states = transformer_body_init_state_from_prefill(
         input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
+        n_real=n_real,
     )
     for i, st in enumerate(states):
         _v4_nan_tripwire("prefill_state_kv_cache", st.kv_cache, i, -1)
@@ -908,6 +914,7 @@ def deepseek_v4_run_with_decode_state(
     is_decode_step: bool,
     start_pos,
     state_init_ids: "jnp.ndarray | None" = None,
+    n_real=None,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
     """Run one prefill or one decode step, threading per-layer
     `AttentionDecodeState` through `kv_caches` (each entry a 1D fp32 buffer
@@ -940,6 +947,7 @@ def deepseek_v4_run_with_decode_state(
     _h_state, packed_buffers = transformer_body_init_state_to_buffer(
         state_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
+        n_real=n_real,
     )
     packed_buffers = _v4_anchor_output_buffers(packed_buffers)
     packed_buffers = _v4_constrain_packed_replicated(packed_buffers)
@@ -1922,6 +1930,7 @@ def _build_class():
                         attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
                     ids_for_orchestrator = ids_2d[:, 0:1]
                     state_init_ids = None
+                    n_real = None
                 else:
                     start_pos = jnp.int32(0)
                     # Prefill `h` runs on the padded ids — slicing the body's
@@ -1932,6 +1941,18 @@ def _build_class():
                     # so feeding T_pad ids encodes padding tokens into kv
                     # slots that decode steps then attend to.
                     ids_for_orchestrator = ids_2d
+                    # S1 FIX (SESSION 5): real prompt length as a TRACED value so
+                    # the SWA seed windows over REAL tokens, not the padded bucket.
+                    # The static state_init_ids slice below is decided at TRACE
+                    # time (warmup traces full-bucket dummy => L_real==T => it never
+                    # slices), so it cannot fix the pad-in-seed bug; n_real
+                    # (= seq_lens[0]) is correct per-request at runtime.
+                    n_real = (
+                        attention_metadata.seq_lens[0]
+                        if (attention_metadata is not None
+                            and getattr(attention_metadata, "seq_lens", None)
+                            is not None)
+                        else None)
                     L_real = T
                     qsl_cpu = getattr(
                         attention_metadata, "query_start_loc_cpu", None)
@@ -1952,6 +1973,7 @@ def _build_class():
                     is_decode_step=is_decode,
                     start_pos=start_pos,
                     state_init_ids=state_init_ids,
+                    n_real=n_real,
                 )
                 if is_decode and T > 1:
                     pad_shape = (h.shape[0], T - 1, *h.shape[2:])

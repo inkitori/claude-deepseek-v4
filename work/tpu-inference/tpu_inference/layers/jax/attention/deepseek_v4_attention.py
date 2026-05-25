@@ -1026,24 +1026,39 @@ def _compressor_state_from_prefill(
 def _swa_kv_cache_from_prefill(
     kv: jnp.ndarray,             # [B, T, head_dim] — already rms_normed + RoPE'd
     win: int,
+    n_real=None,                 # traced real prompt length; None -> static T
 ) -> jnp.ndarray:
-    """Build the SWA portion of attention's kv_cache after T prefill steps.
+    """Build the SWA portion of attention's kv_cache after `n_real` REAL
+    prefill steps. Slot i holds the most recent real kv at position p with
+    `p % win == i`. Returns [B, win, head_dim]; dtype matches kv.
 
-    Mirrors what `attention_decode_step.kv_cache[:, :win]` holds after T
-    decode calls from zero state. Slot i holds the most recent kv at position
-    p with `p % win == i`. Returns shape [B, win, head_dim]. dtype matches kv.
-    """
+    S1 FIX (SESSION 5): the serving path pads the prefill activation to a
+    bucket T >> real length, so the legacy static path below (keyed on the
+    buffer length T) rolled PAD-token kv into the window — decode then read
+    pad kv and collapsed. Passing the traced `n_real` (= seq_lens[0]) windows
+    over REAL tokens and excludes pad. `n_real is None` preserves the
+    exact-length static behavior (CPU / TestPrefillToDecodeStateParity)."""
     B, T, D = kv.shape
-    if T == 0:
-        return jnp.zeros((B, win, D), dtype=kv.dtype)
-    if T < win:
-        out = jnp.zeros((B, win, D), dtype=kv.dtype)
-        return out.at[:, :T, :].set(kv)
-    # T >= win: cache[i] = kv[T-1 - ((T-1-i) % win)].
-    # Equivalent: take the last win positions and roll by T % win so slot
-    # (T-win+k) % win = (k + T) % win lands at index (k + T) % win.
-    last = kv[:, T - win:T, :]                  # [B, win, D]
-    return jnp.roll(last, shift=T % win, axis=1)
+    if n_real is None:
+        if T == 0:
+            return jnp.zeros((B, win, D), dtype=kv.dtype)
+        if T < win:
+            out = jnp.zeros((B, win, D), dtype=kv.dtype)
+            return out.at[:, :T, :].set(kv)
+        # T >= win: cache[i] = kv[T-1 - ((T-1-i) % win)] = roll of last win.
+        last = kv[:, T - win:T, :]                  # [B, win, D]
+        return jnp.roll(last, shift=T % win, axis=1)
+    # Traced dynamic path. Unified branchless formula valid for all n_real
+    # (reproduces the static result at n_real==T):
+    #   slot i <- kv[ i + ((n_real-1-i)//win)*win ], zeroed when i >= n_real.
+    nr = jnp.asarray(n_real, dtype=jnp.int32)
+    i = jnp.arange(win, dtype=jnp.int32)
+    valid = i < nr                                          # [win]
+    k = jnp.maximum(nr - 1 - i, 0) // jnp.int32(win)        # [win]
+    p = jnp.clip(i + k * win, 0, T - 1)                     # source pos in [0,T)
+    gathered = jnp.take_along_axis(
+        kv, jnp.broadcast_to(p.reshape(1, win, 1), (B, win, D)), axis=1)
+    return jnp.where(valid.reshape(1, win, 1), gathered, jnp.zeros_like(gathered))
 
 
 def attention_init_state_from_prefill(
@@ -1054,10 +1069,15 @@ def attention_init_state_from_prefill(
     cfg_index_head_dim: int = 0,
     dtype=jnp.bfloat16,
     layer_idx: int = -1,
+    n_real=None,
 ) -> AttentionDecodeState:
     """Closed-form construction of `AttentionDecodeState` after a prefill of
     length T = x.shape[1]. Equivalent to running `attention_decode_step` T
     times from `attention_decode_init_state(...)` zero state.
+
+    `n_real` (traced, S1 SESSION-5 fix): real prompt length on the padded
+    serving path. Threaded into the SWA window build so pad-token positions
+    don't seed the cache. None -> use static T (exact-length callers/tests).
 
     The decode state can then drive `attention_decode_step` at start_pos=T
     without re-running prefill."""
@@ -1099,7 +1119,7 @@ def attention_init_state_from_prefill(
     kv = kv.astype(dtype)
 
     extra = (cfg_max_seq_len // ratio) if ratio else 0
-    swa = _swa_kv_cache_from_prefill(kv, win)
+    swa = _swa_kv_cache_from_prefill(kv, win, n_real=n_real)
     _v4_nan_tripwire("init_swa", swa, layer_idx, -1)
     if 0 <= layer_idx <= 1:  # S1 seed-vs-truth: does the SHARDED scatter preserve kv?
         _T = kv.shape[1]                       # swa[:,p]==kv[:,p] for p<T iff scatter ok
