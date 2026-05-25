@@ -62,6 +62,14 @@ SESSION="$(tmux display-message -p '#S')"
 # finished-but-idle windows (claude ended its turn and is waiting) are harmless and
 # useful for reference; close them by hand if they pile up.
 WIN="s1fresh-$(date -u +%H%M%SZ)"
-tmux new-window -t "$SESSION:" -n "$WIN" -c "$REPO_ROOT" "_S1_LAUNCH=1 '$SELF'"
-echo "[handoff] fresh max-thinking session launching in tmux session '$SESSION', window '$WIN'."
+# `-d` (create in background, don't steal focus) + redirect THIS invocation's std{in,out,err}
+# to /dev/null. Without the redirection a NON-INTERACTIVE caller HANGS: the detached interactive
+# `claude` in the new window inherits the caller's stdout pipe, so the caller (s1_session_loop,
+# or a Claude Code Bash tool performing the handoff) blocks until that claude exits. A bare
+# `tmux new-window` only works from a human's interactive terminal. Proven: the bare form hangs
+# a non-interactive caller and never returns + never creates the window; this form returns
+# cleanly and the window persists with the fresh session running.
+tmux new-window -d -t "$SESSION:" -n "$WIN" -c "$REPO_ROOT" "_S1_LAUNCH=1 '$SELF'" </dev/null >/dev/null 2>&1
+echo "[handoff] fresh max-thinking session launched in tmux session '$SESSION', window '$WIN' (background)."
+echo "[handoff] Switch to it:  tmux select-window -t '$SESSION:$WIN'   (or Ctrl-b then its number)."
 echo "[handoff] This session should now END ITS TURN so the fresh one takes over."
