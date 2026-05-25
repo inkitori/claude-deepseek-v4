@@ -1,9 +1,74 @@
-# S1 handoff — fresh session, pick up here (2026-05-24, ROOT CAUSE CONFIRMED)
+# S1 handoff — fresh session, pick up here
 
 Goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, deterministic
 decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
-checkpoints; never wait. The self-perpetuating loop is NOT running — whoever reads this
-is the sole driver (start `scripts/s1_session_loop.sh` to auto-continue, or drive manually).
+checkpoints; never wait.
+
+## ⇒⇒ SESSION 2 UPDATE (2026-05-25) — READ THIS FIRST; supersedes everything below
+
+**The repeated TPU "Core-halt / different launch id" was CODE DESYNC, not a slice wedge.**
+Head ran edited `tpu_inference` while the 7 workers ran older code (`md5` mismatch) →
+different compiled programs → launch-group halt (always blamed on a worker, e.g. .202).
+`scripts/full_slice_v4_sync.sh` fixes it. Reboot/cache-clear do NOT. The runbook's
+STEP-0b "reboot 7 workers" is the WRONG response. **FIRST ACTION every session: verify
+`md5sum` of the key .py files matches head-vs-all-7-workers; sync if not.** (My MH
+seeddiff also wedged a worker the same way — avoid MH repros while you need the slice.)
+
+**SLICE-SERVING PROTOCOL (marginal slice):** before EVERY smoke: confirm code synced →
+CLEAR `~/.cache/vllm/xla_cache/*` on all 8 hosts (a stale/mixed cache also gives
+"different launch id") → `full_slice_v4_reset.sh` → launch. Init is still a coin-flip
+(intermittent worker SYSTEM_ERROR) — just retry. Engine also crashes intermittently on
+internal NaN after a few requests. The smoke launcher now passes
+`--no-enable-prefix-caching`.
+
+**S1 — CLEANLY REPRODUCED & much narrower than the notes below.** With code synced the
+engine serves and S1 is: token1 = " Paris" (CORRECT), then decode collapses at the FIRST
+decode step into a numeric/incoherent attractor (" Paris, 2012年 …"), NON-DETERMINISTIC
+at temp=0 byte-identical EVEN with prefix-caching off. So the OLD "idle ranks poison the
+replicated state, filling ranks fixes it" framing is not the whole story; here is what's
+now established (on a SYNCED slice, real weights, via always-on per-layer debug prints):
+* **Forward is fine** when finite (token1 Paris; teacher-forced fwd continuation is
+  coherent). It is INTERMITTENTLY NaN from uninitialized-HBM garbage on idle attn_dp
+  ranks, first at **L2 (the first compress_ratio==4 compressor/indexer layer)** — CPU
+  passes this exact cfg, so it's sharding-induced. Materializing debug prints suppress it.
+* **The bug is in DECODE.** Decode diverges at step 1. On finite runs the decode state is
+  finite & sane yet the output is wrong + non-det ⇒ **finite uninitialized-HBM garbage**
+  (the `_linear` |.|<1e8 clamp can't catch finite garbage) on the ~31 idle ranks (a single
+  decode token shards to ~1 rank) contaminating the real token via cross-rank ops
+  (MoE expert all-reduce / replicated-state). Some runs are SEMI-COHERENT (") and the
+  other is") ⇒ the decode MATH is basically right; the garbage breaks it.
+
+**FIX PROGRESS (committed, partial — see git log da969d4b→4d0b4799):**
+* Diagnostic scaffolds added & KEPT (always-on, race-proof; remove when S1 closes):
+  `compute_logits` `nan_to_num` (so NaN logits don't crash jit_sample), per-layer
+  `[fwdh]` in `transformer_body_forward`, `[pf4]` in `attention_prefill`, `[dech]` in
+  `transformer_body_decode_step`.
+* **Runtime fix in `tpu_runner._prepare_inputs_dp`:** for V4 single-seq DECODE
+  (`num_reqs==1 and total_scheduled==1`) place batch metadata REPLICATED `P()` (not
+  `P(ATTN_DATA)`). RESULT: increases decode determinism (2/3 runs byte-identical vs
+  all-different) but does NOT fix the collapse. Confirmed it's the right direction for
+  decode but **the residual collapse is the SEED.**
+* **Do NOT replicate PREFILL** (tried `num_reqs==1` for prefill too): forward goes
+  DETERMINISTICALLY NaN (all-BOS empty) — per-rank metadata still describes the
+  ATTN_DATA layout, so replicating the data is a layout mismatch (== old "Option A"
+  failure). Reverted to decode-only.
+
+**THE OPEN PROBLEM = the SEED.** The decode reads a **deterministically-WRONG seed**
+(runs 2/3 collapse identically). The seed is built during PREFILL on the token-sharded
+activation; its cross-token ops (`_swa_kv_cache_from_prefill` roll,
+`_compressor_state_from_prefill` slice/reshape) are wrong under sharding / contaminated
+by idle ranks (PHASE 7's hypothesis — now the prime, narrowed suspect). Two walls:
+(a) replicating the prefill input breaks the forward (metadata layout mismatch);
+(b) in-jit `with_sharding_constraint(x, P())` Core-halts on idle/empty shards (FIX v2).
+NEXT IDEAS: (1) build the seed's cross-token ops on a correctly-gathered token axis
+without an empty-shard all-gather (pad token axis to dp_size first? reformulate
+roll/slice as sharding-safe gathers?); (2) fix the prefill-replicate metadata so
+replicating prefill ALSO works (then seed is built correct like CPU) — the cleanest if
+the metadata can be made consistent; (3) compute the seed from the (correct) forward `h`
+which is finite, instead of re-deriving from the sharded activation. Verify any fix with
+3× byte-identical " Paris,…" coherent + `LONG_GEN_REQUIRED=1 full_slice_v4_smoke_check.sh`.
+
+Bypass perms; use the TPU; commit+push checkpoints; never wait.
 
 ## ⇒ DEFINITIVE STATUS — read this first (supersedes all PHASE notes below)
 
