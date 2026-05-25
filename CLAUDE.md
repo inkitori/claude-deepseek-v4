@@ -1,5 +1,16 @@
 # claude-deepseek-v4 — S1 runbook (blank-slate)
 
+> **⇒ START HERE (2026-05-25): read `HANDOFF_S1.md` — the "SESSION 2 UPDATE"
+> section at the top is authoritative and SUPERSEDES this file's "First
+> action" and PHASE notes below.** Short version: the repeated TPU
+> "different launch id" Core-halts were CODE DESYNC (run
+> `scripts/full_slice_v4_sync.sh`; do NOT reboot). S1 is cleanly reproduced
+> and narrowed: forward→" Paris" is correct, DECODE collapses at step 1 from
+> a deterministically-WRONG SEED built during the token-sharded prefill
+> (cross-token seed ops). A partial fix (replicate V4 decode input) is
+> committed; the seed fix is open. Ignore the "test the barrier fix
+> 1f212036" instruction below — that fix is long-disproven.
+>
 > Trimmed to **S1 only** and deliberately de-anchored: the root cause
 > is treated as **open**. Full history/backlog is in `CLAUDE.full.md`
 > — read it only if you need the rest of the project.
