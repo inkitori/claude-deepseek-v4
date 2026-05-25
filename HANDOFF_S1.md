@@ -5,7 +5,49 @@ decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
 checkpoints; never wait. Operational details (slice-serving protocol, validation,
 pitfalls) are in `CLAUDE.md` — this file is the live debugging state.
 
-## ⇒⇒⇒ SESSION 3 UPDATE (2026-05-25) — READ THIS FIRST
+## ⇒⇒⇒ SESSION 4 UPDATE (2026-05-25) — READ THIS FIRST (corrects SESSION 3)
+
+**The SESSION-3 ref-vs-decode comparison was CONFOUNDED by a diagnostic bug: the
+prefill "reference" measured a PAD token (id 0), NOT tok1.** So the headline
+"57x dead routed MoE / 4x embed attenuation" ratios are NOT valid evidence — they
+compared {pad token id-0 in prefill} against {real tok1 id-1602 in decode}.
+
+Root of the confound (source-confirmed): prefill right-pads `input_ids` with 0
+(`tpu_runner.py:1487` `input_ids_cpu[total_num_scheduled_tokens:] = 0`), and the
+diagnostic `_v4_lp(z)` / `[moeRS]` took `z[:, -1]` / `[-1]` = the LAST BUFFER slot
+= a PAD (id 0), not the real last token. Decode is unpadded (S=1) so its `[decS]/
+[decL]/[moeRS]` correctly read tok1 — only the PREFILL side was wrong.
+
+Evidence (cheap, no smoke; from the live 094300Z engine log + tokenizer + embed_w):
+* Both the ref prefill (`PROMPT+"21"`, real last tok 1602) AND the test prefill
+  (`PROMPT`, real last tok 223 `" "`) printed the IDENTICAL `[fwdS] L-1 embed
+  max=0.629 mean=0.135`. Different prompts, same value ⇒ it's reading a constant =
+  embed of id 0, not the prompt's real last token.
+* `embed_w[0]` (BOS/pad) has mean|.|=0.13497, max|.|=0.62891 — byte-matches the
+  "reference" embed. `embed_w[1602]` ("21") has mean|.|=0.03382, max|.|=0.14160 —
+  byte-matches the DECODE `[decS]` embed (0.0338 / 0.1416).
+* Tokenizer: `tokenize(PROMPT+"21") == tokenize(PROMPT) + [1602]` (clean boundary),
+  and decode's embed == true `embed_w[1602]` ⇒ decode DOES process the right token.
+
+CONSEQUENCES:
+* **EMBED IS EXONERATED.** The decode embed is the EXACT correct `embed_w[1602]` —
+  there is NO embed attenuation, magnitude or directional. (Concern-1b resolved.)
+* **The "dead MoE" localization is DOWNGRADED: CONFIRMED → PLAUSIBLE-BUT-UNVERIFIED.**
+  Not disproven — but the only direct measurement supporting it is confounded. The
+  decode-internal hint (decode routed_mean 0.083 < shared 0.169, i.e. routed does
+  not dominate) is suggestive but needs a same-token prefill reference to trust.
+* **Still solid:** decode collapses to a deterministic attractor (flat residual →
+  degenerate logits); prefill-everything is coherent; CPU passes. The MECHANISM of
+  the decode collapse is RE-OPENED.
+
+FIX APPLIED THIS SESSION (diagnostics only): `_v4_lp(z, input_ids)` and `[moeRS]`
+now index the LAST NON-PAD position (`input_ids != 0`), so prefill measures the
+SAME token (1602 @ pos 29) as decode. Decode call sites unchanged (S=1). NEXT:
+ONE smoke for the CORRECTED ref-vs-decode + `pew_sum` — only then trust any
+layer-by-layer ratio. Do NOT design a MoE fix until the corrected reference
+confirms the MoE is actually attenuated for the real token.
+
+## ⇒⇒⇒ SESSION 3 UPDATE (2026-05-25) — superseded in part by SESSION 4 above
 
 **S1 IS NOT THE SEED. It is a DEAD MoE (+ attenuated embed) in the decode path under
 the REPLICATED decode activation.** Decisively localized this session with new always-on

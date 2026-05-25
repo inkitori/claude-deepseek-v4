@@ -262,16 +262,29 @@ def hc_post(
     return (a + b).astype(dtype)
 
 
-def _v4_lp(z):
+def _v4_lp(z, input_ids=None):
     """S1 SEED-vs-STEP localizer (always-on, race-proof — no env gate so all
     ray workers compile identically). Returns (max_abs, mean_abs) of the LAST
-    token position only. Comparing the forward's last position over
-    "prompt+tok1" (the coherent prefill-everything reference, processing tok1 at
-    pos T) against the decode step's single position (tok1 at pos T) layer-by-
-    layer pinpoints the first layer/component where decode diverges from prefill.
-    Global-max prints ([fwdh]) can't do this — they're dominated by the BOS
-    massive-activation token. Remove when S1 closes."""
-    zf = z[:, -1].astype(jnp.float32)
+    REAL (non-pad) token position. Comparing the forward's last real position
+    over "prompt+tok1" (the coherent prefill-everything reference, processing
+    tok1 at pos T) against the decode step's single position (tok1 at pos T)
+    layer-by-layer pinpoints the first layer/component where decode diverges.
+
+    CRITICAL (2026-05-25 SESSION 4): prefill right-pads input_ids with 0
+    (`tpu_runner._prepare_inputs` ...input_ids_cpu[n:] = 0), so a bare `z[:, -1]`
+    reads a PAD slot = embed_w[0], NOT the real last token — which silently made
+    the SESSION-3 "reference" the model processing a PAD token (id 0) instead of
+    tok1, confounding every ref-vs-decode ratio. Pass `input_ids` so prefill
+    measures the last non-pad position; omit it (decode = a single real token)
+    to use z[:, -1]. Remove when S1 closes."""
+    if input_ids is not None:
+        S = z.shape[1]
+        valid = input_ids[0] != 0                       # trailing pads are id 0
+        idx = jnp.where(valid, jnp.arange(S), -1).max()  # last real position
+        idx = jnp.where(idx < 0, S - 1, idx)
+        zf = z[:, idx].astype(jnp.float32)
+    else:
+        zf = z[:, -1].astype(jnp.float32)
     return jnp.max(jnp.abs(zf)), jnp.mean(jnp.abs(zf))
 
 
@@ -292,10 +305,10 @@ def block_forward(
     y = rms_norm(y, params.attn_norm_w, params.norm_eps)
     y = attention_prefill(y, params.attn, freqs_cis_full)
     if layer_idx <= 2:  # S1 decomp: attention sub-output (pre hc_post)
-        _m, _a = _v4_lp(y)
+        _m, _a = _v4_lp(y, input_ids)
         jax.debug.print("[fwdS] L{i} attnout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     x = hc_post(y, residual, post, comb)
-    _am, _aa = _v4_lp(x)
+    _am, _aa = _v4_lp(x, input_ids)
     jax.debug.print("[fwdL] L{i} attn max={a} mean={b}", i=layer_idx, a=_am, b=_aa)
 
     # ffn sub-step
@@ -307,10 +320,10 @@ def block_forward(
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx)
     if layer_idx <= 2:  # S1 decomp: MoE sub-output (pre hc_post)
-        _m, _a = _v4_lp(y)
+        _m, _a = _v4_lp(y, input_ids)
         jax.debug.print("[fwdS] L{i} moeout max={m} mean={a}", i=layer_idx, m=_m, a=_a)
     out = hc_post(y, residual, post, comb)
-    _bm, _ba = _v4_lp(out)
+    _bm, _ba = _v4_lp(out, input_ids)
     jax.debug.print("[fwdL] L{i} blk max={a} mean={b}", i=layer_idx, a=_bm, b=_ba)
     return out
 
@@ -475,7 +488,7 @@ def transformer_body_forward(
         return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
     _en, _em = _fin(h)
     jax.debug.print("[fwdh] embed nan={n} max={m}", n=_en, m=_em)
-    _elm, _ela = _v4_lp(h)  # S1 decomp: embed last-position (token tok1 @ pos T)
+    _elm, _ela = _v4_lp(h, input_ids)  # S1 decomp: embed last REAL token (tok1 @ pos T)
     jax.debug.print("[fwdS] L-1 embed max={m} mean={a}", m=_elm, a=_ela)
     for _i, layer in enumerate(params.layers):
         cr = layer.attn.compress_ratio
