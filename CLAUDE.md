@@ -5,13 +5,14 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25 S6): **PRIMARY collapse FIXED** (SWA + compressor STATE
-> seeded over real `n_real`, commits 6245ea84/90bf85c3) — greedy Fibonacci decodes
-> correctly through **term 7**; residual drift at **term 8** remains. The comp_full/i_cache
-> pad-zeroing fix was tried + **REVERTED** (b026d9ff): it was CPU-valid but REGRESSED
-> decode on the slice (term-7 loop) — decode READS the boundary slot before overwrite, so
-> zero is worse than pad. Next: seed the boundary slot with its CORRECT compressed value
-> (not zero/pad), verify by decode==prefill-everything ON THE SLICE. See handoff.
+> One-line status (2026-05-25 S7): **S1 DECODE BUG FIXED ✅** — `decode == prefill-everything`
+> (FAITHFUL), verified on a fresh slice engine: greedy Fibonacci decode is BYTE-IDENTICAL to
+> the chained-mt=1 reference (`21, 等等。 34, 等等。 55,` incl. a 0.16-logprob near-tie both
+> paths resolve the same). The "term-8 drift" chased in S5/S6 was a MISFRAME — the model's
+> greedy top-1 after a number is "等等" (etc.); prefill emits it too, so it's the BASE MODEL,
+> not decode. Determinism ✅ (3× byte-identical temp=0). Remaining to formally close: REMOVE
+> S1 diagnostics + one clean fast smoke to re-tick faithful+determinism, then `touch
+> /tmp/s1_loop_stop`. See handoff "NEXT ACTION".
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
