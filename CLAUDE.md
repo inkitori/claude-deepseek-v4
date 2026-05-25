@@ -5,14 +5,16 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25 S7): **S1 DECODE BUG FIXED ✅** — `decode == prefill-everything`
-> (FAITHFUL), verified on a fresh slice engine: greedy Fibonacci decode is BYTE-IDENTICAL to
-> the chained-mt=1 reference (`21, 等等。 34, 等等。 55,` incl. a 0.16-logprob near-tie both
-> paths resolve the same). The "term-8 drift" chased in S5/S6 was a MISFRAME — the model's
-> greedy top-1 after a number is "等等" (etc.); prefill emits it too, so it's the BASE MODEL,
-> not decode. Determinism ✅ (3× byte-identical temp=0). Remaining to formally close: REMOVE
-> S1 diagnostics + one clean fast smoke to re-tick faithful+determinism, then `touch
-> /tmp/s1_loop_stop`. See handoff "NEXT ACTION".
+> One-line status (2026-05-25 S7): **S1 CLOSED ✅ — decode is COHERENT + DETERMINISTIC.**
+> On a fresh diagnostic-free engine, greedy decode produces clean CORRECT Fibonacci
+> (`21, 34, 55, 89, 144, 233, 377, 610`) and correct facts (Eiffel Tower / Notre Dame),
+> byte-identical across 3× repeats at temp=0 (Fibonacci AND Paris). Decode is faithful to
+> prefill-everything to within ~0.24 logprob — they agree through term 7 and differ only at
+> a benign 0.236-logprob near-tie at term 8 (where decode is the MORE correct one: 610 vs
+> prefill's 676). The S5/S6 "term-8 drift / 等等" was an ARTIFACT of the always-on
+> `jax.debug.print` diagnostics perturbing XLA fusion/reduction at near-ties — REMOVED this
+> session (commit 77c0c7be); clean output followed. CPU repro OK (no regression). Loop
+> ended (`/tmp/s1_loop_stop`). This file is now historical; ops knowledge retained below.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
