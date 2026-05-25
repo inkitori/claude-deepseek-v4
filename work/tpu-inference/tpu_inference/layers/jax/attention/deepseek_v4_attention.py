@@ -1174,18 +1174,6 @@ def attention_init_state_from_prefill(
             comp_full = jnp.concatenate([kv_compressed, pad], axis=1)
         else:
             comp_full = jnp.zeros((B, extra, Dh), dtype=dtype)
-        if n_real is not None:
-            # S1 FIX (extends SESSION 5): comp_full is pooled over PADDED x, so
-            # windows whose source tokens are >= n_real hold pad-token kv. Keep
-            # only the fully-real windows [0, n_real//ratio) and zero the rest
-            # (the exact-length path leaves them zero). Decode overwrites slots
-            # >= n_real//ratio from real generated tokens before their first read.
-            # Mask over the slot axis only (no token-axis gather -> slice-safe,
-            # same idiom as _swa_kv_cache_from_prefill's zero-mask).
-            n_safe = jnp.asarray(n_real, jnp.int32) // jnp.int32(ratio)
-            w = jnp.arange(extra, dtype=jnp.int32)
-            comp_full = jnp.where((w < n_safe).reshape(1, extra, 1),
-                                  comp_full, jnp.zeros_like(comp_full))
         kv_cache = jnp.concatenate([swa, comp_full], axis=1)
         _v4_nan_tripwire("init_kv_cache_post_comp_set", kv_cache, layer_idx, -1)
         c_kv, c_sc = _compressor_state_from_prefill(x, params.compressor, n_real=n_real)
@@ -1214,13 +1202,6 @@ def attention_init_state_from_prefill(
                 i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
         else:
             i_cache = jnp.zeros((B, max_iidx, cfg_index_head_dim), dtype=dtype)
-        if n_real is not None:
-            # S1 FIX (extends SESSION 5): same pad-window zeroing for the
-            # indexer's compressed cache (decode reads [0, (start_pos+1)//ratio)).
-            n_safe = jnp.asarray(n_real, jnp.int32) // jnp.int32(ratio)
-            w = jnp.arange(max_iidx, dtype=jnp.int32)
-            i_cache = jnp.where((w < n_safe).reshape(1, max_iidx, 1),
-                                i_cache, jnp.zeros_like(i_cache))
     else:
         i_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
         i_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
