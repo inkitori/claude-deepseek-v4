@@ -430,10 +430,22 @@ def transformer_body_forward(
     return hidden states from __call__ and apply the head in compute_logits."""
     h = params.embed_w[input_ids]  # [B, S, D]
     h = jnp.broadcast_to(h[:, :, None, :], (*h.shape[:2], cfg.hc_mult, h.shape[-1]))
-    for layer in params.layers:
+    # S1 DIAG SCAFFOLD (always-on, race-proof): per-layer residual-stream finiteness.
+    # The forward produces NaN logits on the synced sharded slice; this localizes the
+    # first layer whose output h goes NaN / blows up. ALWAYS on (no env gate) so all
+    # ray workers compile identically (env-gated reads race -> launch-id halt). 44
+    # host prints/forward — remove when S1 is fixed.
+    def _fin(z):
+        zf = z.astype(jnp.float32)
+        return jnp.sum(jnp.isnan(zf)), jnp.max(jnp.where(jnp.isfinite(zf), jnp.abs(zf), jnp.float32(0.0)))
+    _en, _em = _fin(h)
+    jax.debug.print("[fwdh] embed nan={n} max={m}", n=_en, m=_em)
+    for _i, layer in enumerate(params.layers):
         cr = layer.attn.compress_ratio
         fc = freqs_cis_compressed if cr > 0 else freqs_cis_swa
         h = block_forward(h, input_ids, layer, fc)
+        _n, _m = _fin(h)
+        jax.debug.print("[fwdh] L{i} cr={c} nan={n} max={m}", i=_i, c=cr, n=_n, m=_m)
     return h
 
 
