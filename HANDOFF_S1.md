@@ -42,10 +42,39 @@ CONSEQUENCES:
 
 FIX APPLIED THIS SESSION (diagnostics only): `_v4_lp(z, input_ids)` and `[moeRS]`
 now index the LAST NON-PAD position (`input_ids != 0`), so prefill measures the
-SAME token (1602 @ pos 29) as decode. Decode call sites unchanged (S=1). NEXT:
-ONE smoke for the CORRECTED ref-vs-decode + `pew_sum` — only then trust any
-layer-by-layer ratio. Do NOT design a MoE fix until the corrected reference
-confirms the MoE is actually attenuated for the real token.
+SAME token (1602 @ pos 29) as decode. Decode call sites unchanged (S=1).
+
+### CORRECTED-SMOKE RESULT (smoke 113324Z) — MoE THEORY DISPROVEN; bug is the decode KV/attention path
+
+With the corrected same-token reference (prefill `PROMPT+"21"` @ "21" vs decode "21"):
+* **MoE MATCHES.** `[moeRS]` L0: ref_routed 0.0788 vs dec_routed 0.0779 (**ratio 0.99**),
+  pew_sum IDENTICAL (1.501 == 1.501). L1/L2 likewise. ⇒ routed experts are NOT dead,
+  routing weights NOT collapsed. The entire "57x dead MoE" was the pad confound. **Stop
+  looking at the MoE.** (For the real token "21", routed≈0.08 < shared≈0.7 in BOTH paths
+  — routed-dominates was a property of the id-0 pad token, not a universal truth.)
+* **The divergence is a SMOOTH COMPOUNDING error from L0, NOT attenuation.** blk-mean
+  ref→dec ratio: L0 1.01 (match) → L3 1.21 → L9 1.71 → L12 2.07 → **L17 4.34 (peak)** →
+  reconverges to ~1.1 by L40 (ref grows to meet decode). Decode L0 *attn* already 1.35x
+  ref (0.027→0.036). Magnitudes stay within ~2-4x everywhere ⇒ the fatal error is
+  **DIRECTIONAL** (magnitude fingerprints can't localize it; need cosine/direction).
+* **Logit-level (decisive):** ref predicts "," at logprob −0.0 (prob ~1.0, confident,
+  correct Fibonacci). The decode step's distribution is FLAT/high-entropy: "." −1.82,
+  "\n\n" −2.2, " " −2.36, "," −2.41 (correct token demoted to rank 4, max prob ~0.16).
+  Long gen = "21. The number of the number of the number of…" (degenerate attractor).
+  ⇒ decode hidden state is directionally corrupted → flat logits → attractor.
+* token1 "21" is confident/correct (prefill argmax, logprob −0.01). Only the DECODE
+  STEP collapses (as always).
+
+⇒ **S1 is back in the decode-state / KV-seed / decode-step-attention path** (where
+SESSION-2 was before SESSION-3's debunked MoE pivot). The error enters at L0 decode
+attention (reads the seeded KV) and compounds. "prefill-everything coherent" + "CPU
+passes" + "MoE matches" all point here. OPEN: is it (a) the SEED KV values written by
+prefill being subtly wrong (finite≠correct — `[dech]` only checks NaN/max, not values),
+or (b) the decode-step attention MATH (`attention_decode_step`) computing wrong over a
+correct seed? Magnitude diags can't split these — need a DIRECTION-sensitive diagnostic
+(cosine of decode vs prefill per-layer/per-component) or to inspect deepseek_v4_attention.py.
+NOTE the SESSION-2 seed fixes all FAILED (NaN/halt) — see HARD CONSTRAINT; don't gather
+the activation to replicated.
 
 ## ⇒⇒⇒ SESSION 3 UPDATE (2026-05-25) — superseded in part by SESSION 4 above
 
