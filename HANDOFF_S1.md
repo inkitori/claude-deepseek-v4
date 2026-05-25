@@ -4,7 +4,65 @@ Goal: make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, determin
 decode on the v6e-32 slice (bug **S1**). Bypass perms; use the TPU; commit+push
 checkpoints; never wait.
 
-## ⇒⇒ SESSION 2 UPDATE (2026-05-25) — READ THIS FIRST; supersedes everything below
+## ⇒⇒⇒ SESSION 3 UPDATE (2026-05-25) — READ THIS FIRST; supersedes SESSION 2 + below
+
+**S1 IS NOT THE SEED. It is a DEAD MoE (+ attenuated embed) in the decode path under
+the REPLICATED decode activation.** Decisively localized this session with new always-on
+last-position fingerprints (`[fwdL]`/`[decL]` per-layer; `[fwdS]`/`[decS]` embed/attnout/
+moeout at L0-L2; `[moeRS]` routed-vs-shared in moe_forward). Method: compare the COHERENT
+reference = forward over "prompt+tok1" LAST position (process tok1 @ pos T) vs the DECODE
+step (tok1 @ pos T) layer-by-layer — sidesteps the BOS-massive-activation confound.
+
+FINDINGS (smoke 090522Z, Fibonacci prompt, tok1="21"; reproduced):
+* The collapse is now **DETERMINISTIC** (metadata-replicate decode fix suppressed the
+  non-det); token1="21" correct (prefill forward), token2="." wrong (decode step 1).
+* The decode residual stream **NEVER ACCUMULATES**: ref blk-mean L0=1.46→L26=114→L38=2550
+  (massive-activation buildup → correct logits); decode blk-mean L0=0.05→L38=0.99 (flat,
+  ~embed scale) ⇒ ~1000x attenuated by L38 ⇒ degenerate logits ⇒ attractor.
+* Decomposition (ref-mean vs dec-mean): embed 0.135 vs 0.034 (4x atten); L0 **attnout 1.18
+  vs 1.31 = HEALTHY** (rms_norm normalizes away input scale); L0 **moeout 4.57 vs 0.199 =
+  DEAD (~23x atten)**, same at L1/L2. ⇒ **a wrong SEED cannot cause this — the MoE never
+  reads the KV cache yet its output is ~0.** OVERTURNS SESSION 2's "the SEED is the open
+  problem".
+* ROOT MECHANISM — CONFIRMED (smoke 092723Z, `[moeRS]` routed-vs-shared): the V4 MoE
+  (`layers/jax/moe/deepseek_v4_moe.py::moe_forward`, a BESPOKE dense einsum, NOT the
+  production `fused_moe_gmm` qwen3/v3 use) — its ROUTED-expert contribution is DEAD in
+  decode (routed_mean L0=4.58 fwd → 0.08 decode, ~57x) while the SHARED expert is INTACT
+  (0.17 ≈ fwd 0.11). So decode MoE ≈ shared-only → flat residual → collapse. This happens
+  under the REPLICATED decode activation (predecessor's `tpu_runner._prepare_inputs_dp`
+  metadata-replicate fix, V4-only; qwen3/v3 use ATTN_DATA). Prefill works because its
+  activation arrives ATTN_DATA-sharded (the layout the attn_dp collectives expect);
+  replicating prefill input breaks the forward (NaN) — same layout-mismatch class.
+* **FIX ATTEMPT #1 — FAILED, but INFORMATIVE (smoke 094300Z):** forced the routed sum
+  replicated `with_sharding_constraint(out_NEd.sum(axis=1), P())`. It was a **NO-OP**:
+  `routed_post == routed_pre` exactly (0.083==0.083), token2 still "." ⇒ **the routed sum
+  is ALREADY correctly all-reduced over attn_dp; the deadness is UPSTREAM in the SUMMANDS**
+  (per_expert_weight routing weights × per-expert outputs h_NEi). Reverted (it didn't gather
+  the token axis, so it did NOT halt — wsc on the post-reduction [N,dim] is safe, just
+  useless here).
+* **NEXT EXPERIMENT (staged & committed):** `[moeRS]` now also prints `pew_sum` (sum of
+  |per_expert_weight| for the last token). One smoke splits the two remaining hypotheses:
+  (a) decode pew_sum << fwd ⇒ ROUTING WEIGHTS collapsed (gate/softmax or `_shard_e_last`
+  on per_expert_weight wrong under replicated x) → fix the gate/weight sharding; (b) decode
+  pew_sum ≈ fwd but routed still dead ⇒ the per-expert OUTPUTS (h_NEi via the W1/W2/W3
+  einsums, E-sharded) are wrong under replicated x → instrument h_NEi, fix the expert
+  einsum sharding. (NB embed is separately ~4x attenuated but that's a recoverable MAGNITUDE
+  scale — rms_norm normalizes it, attention is healthy — so embed is NOT the MoE killer;
+  fix it too but it's secondary.) Also worth trying: REVERT the metadata-replicate fix so
+  decode uses ATTN_DATA like qwen3/v3 (now that the `_linear` clamp zeros idle-rank garbage)
+  — the collectives would fire as designed; downside is idle ranks again.
+* Verify any fix: decode `[decL]`/`[decS]`/`[moeRS]` should MATCH the reference (routed_mean
+  ~4.5 at L0, residual accumulates to ~thousands by L38); 3x byte-identical coherent
+  Paris/Fibonacci; then `LONG_GEN_REQUIRED=1 full_slice_v4_smoke_check.sh`.
+* Diagnostics are committed, always-on, race-proof (env-gated reads race → launch-id halt).
+  jax.debug.print drops/reorders under high volume — RE-FIRE a probe to collect missing
+  lines (don't trust one run's completeness). Probe: `/tmp/s1_seedstep_probe.py LOG PROMPT
+  TOK1` (+ grep `[fwdS]`/`[decS]`/`[moeRS]`). Remove all S1 diag prints when closed.
+* SESSION-3 smokes used: 4 (085, 090, 092, 094). Slice served all 4 cleanly (synced); no
+  halts ⇒ slice is HEALTHY when code is synced (confirms SESSION-2 desync finding). The
+  094300Z engine is likely STILL SERVING on :18081 (no-op-fix code); re-smoke to get pew_sum.
+
+## ⇒⇒ SESSION 2 UPDATE (2026-05-25) — superseded by SESSION 3 above
 
 **The repeated TPU "Core-halt / different launch id" was CODE DESYNC, not a slice wedge.**
 Head ran edited `tpu_inference` while the 7 workers ran older code (`md5` mismatch) →

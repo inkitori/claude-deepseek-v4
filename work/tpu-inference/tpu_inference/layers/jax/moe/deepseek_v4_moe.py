@@ -216,17 +216,19 @@ def moe_forward(
 
     # Sum routed experts in fp32 to match the original loop's
     # `y` accumulator dtype, then add the always-on shared expert.
-    y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32
+    y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32 routed sum
     shared = expert_forward(flat_x, None, params.shared_expert)
     if 0 <= layer_idx <= 2:
         # S1 decomp: ROUTED-sum vs SHARED-expert magnitude (last token row).
-        # Hypothesis: under a REPLICATED decode activation the sum over the
-        # attn_dp-sharded E axis isn't all-reduced -> routed contribution dies
-        # (only ~local experts) while shared stays healthy. Always-on/race-proof.
+        # CONFIRMED dead routed MoE in decode (routed_mean 4.58 fwd -> 0.08 decode;
+        # shared intact). DISPROVEN: forcing the sum replicated (_replicate_full)
+        # was a NO-OP (post==pre) => the sum IS correctly all-reduced; the deadness
+        # is UPSTREAM in the summands (per_expert_weight routing weights and/or the
+        # per-expert outputs). NEXT: instrument per_expert_weight + raw h_NEi here.
         import jax as _jax
         _rR = jnp.abs(y[-1].astype(fp32)); _rS = jnp.abs(shared[-1].astype(fp32))
-        _jax.debug.print("[moeRS] L{i} routed_max={a} routed_mean={b} shared_max={c} shared_mean={d}",
-                         i=layer_idx, a=jnp.max(_rR), b=jnp.mean(_rR),
-                         c=jnp.max(_rS), d=jnp.mean(_rS))
+        _jax.debug.print("[moeRS] L{i} routed_mean={b} shared_mean={d} pew_sum={p}",
+                         i=layer_idx, b=jnp.mean(_rR), d=jnp.mean(_rS),
+                         p=jnp.sum(jnp.abs(per_expert_weight[-1].astype(fp32))))
     y = y + shared.astype(fp32)
     return y.astype(dtype).reshape(orig_shape)
