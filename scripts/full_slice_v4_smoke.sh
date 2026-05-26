@@ -17,6 +17,29 @@ MAX_SEQS="${MAX_SEQS:-1}"
 
 mkdir -p "$REPO_ROOT/logs"
 
+# Single-instance guard. Concurrent loop sessions otherwise race into two
+# `vllm serve` engines that both grab the 32-chip placement group — one wins,
+# the other deadlocks "Waiting for placement group", and both can wedge the
+# slice (see CLAUDE.md). flock serializes the check+launch (closes the TOCTOU);
+# the pgrep/port check refuses to launch while an engine is already running or
+# still compiling (port not yet bound). When refused, DON'T relaunch — probe the
+# live engine on :$PORT or `full_slice_v4_reset.sh` first. SMOKE_NO_GUARD=1 skips.
+if [ "${SMOKE_NO_GUARD:-0}" != "1" ]; then
+    exec 9>"/tmp/s1_smoke_launch.lock"
+    if ! flock -n 9; then
+        echo "[smoke] REFUSING: another smoke launch is in progress (lock held)." >&2
+        exit 3
+    fi
+    if pgrep -f 'bin/vllm serve deepseek' >/dev/null 2>&1; then
+        echo "[smoke] REFUSING: a 'vllm serve' is already running/starting. Probe :$PORT or reset first." >&2
+        exit 3
+    fi
+    if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+        echo "[smoke] REFUSING: port $PORT already bound — an engine is up. Probe it or reset first." >&2
+        exit 3
+    fi
+fi
+
 export PATH="$VENV/bin:$PATH"
 export VIRTUAL_ENV="$VENV"
 export PYTHONPATH="$REPO_ROOT/work/vllm:$REPO_ROOT/work/tpu-inference:$VENV/lib/python3.12/site-packages"
@@ -58,6 +81,12 @@ esac
 
 # 300s default trips on first inference recompile; 1h covers cold path.
 export RAY_CGRAPH_get_timeout="${RAY_CGRAPH_get_timeout:-3600}"
+
+# APIServer gives up waiting for EngineCore after this. vllm default is 600s,
+# but a COLD XLA compile of V4-Flash on the slice is 10-30 min (CLAUDE.md) and
+# blows 600s -> "Timed out waiting for engine core processes to start" and the
+# whole serve dies. 2400s covers a cold compile; a warm start ignores it.
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-2400}"
 
 # JAX 0.9 cache policy — cache even small / fast modules (older
 # JAX_COMPILATION_CACHE_MIN_* names are silently ignored).
