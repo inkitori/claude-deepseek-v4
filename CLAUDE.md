@@ -49,11 +49,20 @@ S1. Fixing it is the whole job.
 
 ## The bug (precise)
 
-Decode's **first token is correct** (it's the prefill-forward argmax), then output
-falls into a repeating/numeric attractor starting at the **first decode step**
-(token 2). With the metadata-replicate decode fix live it is now **deterministic**
-at temp=0 (byte-identical collapses). Tiny-config and CPU tests pass — this only
-reproduces on the real model on the sharded TPU slice.
+**NOT a hard collapse** — the model emits coherent-LOOKING decode output even WITH the
+bug present (it has produced increasing Fibonacci-ish sequences for many sessions), so
+**coherent output is NOT proof of a fix.** The "degenerate attractor / collapse" framing
+in older notes is misleading. The two REAL, observable symptoms are:
+1. **Cross-process NON-DETERMINISM** — two fresh engines produce DIFFERENT decode md5 at
+   temp=0 (e.g. A3 `bb5adb1b` ≠ B3 `26d81071`). Within ONE process it IS deterministic
+   (re-runs match): the uninit-HBM garbage is fixed per-process-lifetime. So determinism
+   only shows up as a CROSS-ENGINE md5 difference — single-engine probes can't see it.
+2. **Slight model-QUALITY DEGRADATION** — decode drifts from the correct answer vs a
+   healthy/prefill-everything reference (e.g. Fibonacci tracks correctly for ~7 terms
+   then errs: 570≠610, 1584≠1597). The drift is a SYMPTOM, not "the model being dumb."
+First decode token is correct (prefill-forward argmax). Tiny-config + CPU tests pass —
+only reproduces on the real model on the sharded TPU slice. DONE = both symptoms gone:
+byte-identical md5 across 2 fresh engines AND full quality (correct Fibonacci) vs reference.
 
 ## Success gate (the only definition of done)
 
@@ -66,9 +75,12 @@ Verified **twice** on a fresh real-V4 engine:
 The basic "PASS: … contains 'Paris'" line is a **false positive** — `"capital of
 France"` can hit EOS at token 1, so no decode steps run. Don't trust it, nor
 `usage.completion_tokens` / `max_word_run` / `ends_clean` — all read healthy on
-corrupted output. **Read the actual response text.** A strictly-increasing
-sequence (Fibonacci) cleanly discriminates coherent-vs-attractor; greedy poem
-repetition is a red herring (decode loops too).
+corrupted output. **Read the actual response text** AND compare 2 fresh engines.
+Fibonacci is the probe because its CORRECT continuation is unambiguous: judge
+(a) determinism = same md5 across 2 engines, and (b) quality = terms are the
+CORRECT Fibonacci numbers (not merely increasing) vs the prefill-everything
+reference. "Coherent-looking but slightly wrong + differs across engines" is the
+bug, not a pass. Greedy poem repetition is a red herring (decode loops too).
 
 ## Slice-serving protocol (marginal slice — do this EVERY smoke)
 

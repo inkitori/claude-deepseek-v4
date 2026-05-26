@@ -285,7 +285,7 @@ def moe_forward(
             W13_l = jnp.concatenate(
                 [W1_l.transpose(0, 2, 1), W3_l.transpose(0, 2, 1)],
                 axis=2).astype(fp32)                          # [EP, dim, 2*inter]
-            g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset,
+            g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
                         zero_initialize=True,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
             gate, up = jnp.split(g1, 2, axis=-1)
@@ -294,7 +294,7 @@ def moe_forward(
                 gate = jnp.minimum(gate, swiglu_limit)
             h = (jax.nn.silu(gate) * up).astype(dtype)        # [N*top_k, inter]
             W2g_l = W2_l.transpose(0, 2, 1).astype(dtype)     # [EP, inter, dim]
-            g2 = gmm_v2(h, W2g_l, group_sizes, group_offset,
+            g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
                         zero_initialize=True,
                         preferred_element_type=fp32)          # [N*top_k, dim]
             # Revert to (token, slot) order. Rows for experts not on this rank are
