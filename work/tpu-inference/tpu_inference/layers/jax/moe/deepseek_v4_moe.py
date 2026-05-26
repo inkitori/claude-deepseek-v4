@@ -196,6 +196,11 @@ def moe_forward(
     per_expert_weight = jnp.einsum('nke,nk->ne', one_hot, weights)  # [N, E]
     per_expert_weight = per_expert_weight.astype(dtype).astype(fp32)
     per_expert_weight = _shard_e_last(per_expert_weight)
+    if layer_idx == 0:
+        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
+                        l=layer_idx, n="moe_perexpw",
+                        s=jnp.sum(per_expert_weight),
+                        m=jnp.max(jnp.abs(per_expert_weight)))
 
     x_fp32 = flat_x.astype(fp32)
     W1_fp32 = W1.astype(fp32)
@@ -217,6 +222,15 @@ def moe_forward(
     # Sum routed experts in fp32 to match the original loop's
     # `y` accumulator dtype, then add the always-on shared expert.
     y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32 routed sum
+    if layer_idx == 0:
+        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
+                        l=layer_idx, n="moe_routed_y",
+                        s=jnp.sum(y), m=jnp.max(jnp.abs(y)))
     shared = expert_forward(flat_x, None, params.shared_expert)
+    if layer_idx == 0:
+        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
+                        l=layer_idx, n="moe_shared",
+                        s=jnp.sum(shared.astype(fp32)),
+                        m=jnp.max(jnp.abs(shared.astype(fp32))))
     y = y + shared.astype(fp32)
     return y.astype(dtype).reshape(orig_shape)

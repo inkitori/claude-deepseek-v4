@@ -42,7 +42,7 @@ from jax import lax
 
 from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     AttentionDecodeState, AttentionParams, CompressorParams, IndexerParams,
-    _v4_nan_tripwire, attention_decode_step, attention_init_state_from_prefill,
+    _v4_checksum, _v4_nan_tripwire, attention_decode_step, attention_init_state_from_prefill,
     attention_prefill, hc_split_sinkhorn, precompute_freqs_cis, rms_norm,
     splice_rope,
 )
@@ -324,7 +324,11 @@ def block_init_state_and_forward(
         n_real=n_real,
     )
     y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
+    if layer_idx < 2:
+        _v4_checksum("blk_attn_out", y, layer_idx)
     x = hc_post(y, residual, post, comb)
+    if layer_idx < 2:
+        _v4_checksum("blk_post_attn_x", x, layer_idx)
 
     residual = x
     y, post, comb = hc_pre(
@@ -332,8 +336,13 @@ def block_init_state_and_forward(
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
-    y = moe_forward(y, input_ids, params.moe)
-    return decode_state, hc_post(y, residual, post, comb)
+    y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx)
+    if layer_idx < 2:
+        _v4_checksum("blk_moe_out", y, layer_idx)
+    out = hc_post(y, residual, post, comb)
+    if layer_idx < 2:
+        _v4_checksum("blk_L_out", out, layer_idx)
+    return decode_state, out
 
 
 def block_decode_step(
