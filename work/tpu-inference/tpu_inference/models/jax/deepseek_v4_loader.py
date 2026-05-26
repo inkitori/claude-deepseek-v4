@@ -920,6 +920,7 @@ def place_spec_as_jax_sharded(
     target_dtype,
     target_shape: Tuple[int, ...],
     mesh,
+    return_host_np: bool = False,
 ) -> jnp.ndarray:
     """Slice-aware placement counterpart to `place_torch_as_jax_sharded`.
 
@@ -939,7 +940,8 @@ def place_spec_as_jax_sharded(
         np_arr = _torch_to_numpy_preserve(t)
         if np_arr.dtype != target:
             np_arr = np_arr.astype(target)
-        return jnp.asarray(np_arr)
+        arr = jnp.asarray(np_arr)
+        return (arr, np_arr) if return_host_np else arr
 
     spec_p = pick_partition_spec(target_shape, mesh)
     sharding = NamedSharding(mesh, spec_p)
@@ -955,7 +957,8 @@ def place_spec_as_jax_sharded(
         def cb_full(idx):
             return np.asarray(np_arr[idx])
 
-        return jax.make_array_from_callback(target_shape, sharding, cb_full)
+        arr = jax.make_array_from_callback(target_shape, sharding, cb_full)
+        return (arr, np_arr) if return_host_np else arr
 
     rng = _host_row_range(sharding, target_shape)
     if rng is None:
@@ -966,7 +969,8 @@ def place_spec_as_jax_sharded(
             np_arr = np_arr.astype(target)
         def cb_full(idx):
             return np.asarray(np_arr[idx])
-        return jax.make_array_from_callback(target_shape, sharding, cb_full)
+        arr = jax.make_array_from_callback(target_shape, sharding, cb_full)
+        return (arr, np_arr) if return_host_np else arr
 
     host_start, host_stop = rng
 
@@ -1001,5 +1005,8 @@ def place_spec_as_jax_sharded(
             sub = sub[(slice(None),) + tuple(idx[1:])]
         return np.asarray(sub)
 
-    return jax.make_array_from_callback(target_shape, sharding, cb)
+    arr = jax.make_array_from_callback(target_shape, sharding, cb)
+    # Slice-aware path holds only this host's rows, not the full tensor, so
+    # there is no full host numpy to hand back for host-gather consolidation.
+    return (arr, None) if return_host_np else arr
 

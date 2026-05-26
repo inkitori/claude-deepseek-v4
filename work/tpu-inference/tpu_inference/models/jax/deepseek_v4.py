@@ -1487,6 +1487,7 @@ def _build_class():
             # group's per-leaf set alongside its stacked tensor at a time
             # (peak ~512 MB / chip during the reshard, well within budget).
             import threading as _threading
+            import numpy as _np
             from jax.sharding import NamedSharding, PartitionSpec as _P
             from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams as _MoEParams
             _expert_path_re = _re.compile(
@@ -1496,6 +1497,19 @@ def _build_class():
             _expert_group_lock = _threading.Lock()
             _expert_group_counter: Dict[Tuple[str, int, str], int] = {}
             _consolidated_groups: set = set()
+            # v2a host-gather consolidation: stash the FULL per-expert host
+            # numpy for w1/w3 leaves (captured at placement) so the stacked
+            # tensor is scattered straight into the expert-sharded layout via
+            # make_array_from_callback — avoiding the device-side axis-1->expert
+            # reshard that reads uninit HBM (S26/S27 root cause). Written + read
+            # only on the single drain thread, so no lock needed. w2 (axis-0
+            # leaf) is byte-clean through the device reshard and stays there.
+            _expert_host_np: Dict[str, Any] = {}
+            _host_gather_count = [0]  # w1/w3 groups consolidated via host-gather
+            def _is_stash_leaf(jax_path: str) -> bool:
+                m = (_expert_path_re.match(jax_path)
+                     or _mtp_expert_path_re.match(jax_path))
+                return m is not None and m.group(3) in ("w1", "w3")
 
             def _maybe_consolidate(jax_path: str):
                 # Identify group key, increment counter; if we hit 256,
@@ -1524,15 +1538,37 @@ def _build_class():
                     return
                 if kind == "layer":
                     moe = current.layers[idx].moe
+                    path_prefix = f"layers[{idx}].moe.experts"
                 else:
                     moe = current.mtp[idx].block.moe
-                weights = [getattr(e, wname) for e in moe.experts]
-                if any(w is None for w in weights):
-                    # Late race after another thread already consolidated
-                    # — defensive; shouldn't happen given the lock.
-                    return
+                    path_prefix = f"mtp[{idx}].block.moe.experts"
                 e_spec = NamedSharding(self.mesh, _P('attn_dp', None, None))
-                stacked = jax.device_put(jnp.stack(weights), e_spec)
+                n_e = self.config.n_routed_experts
+                stash_keys = [f"{path_prefix}[{e}].{wname}" for e in range(n_e)]
+                use_host_gather = (
+                    wname in ("w1", "w3")
+                    and all(k in _expert_host_np for k in stash_keys))
+                if use_host_gather:
+                    # Host-gather: stack the captured full per-expert host numpy
+                    # and scatter straight into the expert-sharded layout. No
+                    # device-side axis-1->expert reshard ⇒ no uninit-HBM read
+                    # (S26/S27 root cause). Host holds ~4 GiB/group transiently.
+                    host_stack = _np.stack(
+                        [_expert_host_np.pop(k) for k in stash_keys])
+                    def _e_cb(index, _hs=host_stack):
+                        return _np.asarray(_hs[index])
+                    stacked = jax.make_array_from_callback(
+                        host_stack.shape, e_spec, _e_cb)
+                    _host_gather_count[0] += 1
+                else:
+                    # w2 (axis-0 leaf, byte-clean reshard) or host numpy
+                    # unavailable (full-dequant fallback): device-side reshard.
+                    weights = [getattr(e, wname) for e in moe.experts]
+                    if any(w is None for w in weights):
+                        # Late race after another thread already consolidated
+                        # — defensive; shouldn't happen given the lock.
+                        return
+                    stacked = jax.device_put(jnp.stack(weights), e_spec)
                 stacked.block_until_ready()
                 # Release the per-leaf references so the device buffers can
                 # be reclaimed before we move on to the next group.
@@ -1584,46 +1620,61 @@ def _build_class():
                 file=_sys.stderr, flush=True,
             )
 
-            def _do_place_spec(spec) -> Tuple[Optional[str], Any, str]:
+            def _do_place_spec(spec) -> Tuple[Optional[str], Any, str, Any]:
                 """Worker-side: resolve path + run the slice-aware placement.
-                Returns (jax_path, arr, hf_name); jax_path=None means skip."""
+                Returns (jax_path, arr, hf_name, host_np); jax_path=None means
+                skip. host_np is the FULL per-expert host numpy for w1/w3
+                expert leaves (consumed by host-gather consolidation), else
+                None."""
                 jax_path = map_hf_name_to_jax_path(spec.hf_name)
                 if jax_path is None or jax_path.endswith("<scale>"):
-                    return (None, None, spec.hf_name)
+                    return (None, None, spec.hf_name, None)
                 leaf = path_to_leaf.get(jax_path)
                 if leaf is None:
-                    return (None, None, spec.hf_name)
+                    return (None, None, spec.hf_name, None)
                 target_shape = tuple(leaf.shape)
                 target_dtype = jnp.dtype(leaf.dtype)
-                arr = place_spec_as_jax_sharded(
-                    spec, target_dtype, target_shape, self.mesh,
-                )
-                return (jax_path, arr, spec.hf_name)
+                if _is_stash_leaf(jax_path):
+                    arr, host_np = place_spec_as_jax_sharded(
+                        spec, target_dtype, target_shape, self.mesh,
+                        return_host_np=True,
+                    )
+                else:
+                    arr = place_spec_as_jax_sharded(
+                        spec, target_dtype, target_shape, self.mesh,
+                    )
+                    host_np = None
+                return (jax_path, arr, spec.hf_name, host_np)
 
-            def _do_place_full(item) -> Tuple[Optional[str], Any, str]:
-                """Worker-side equivalent for the full-dequant fallback path."""
+            def _do_place_full(item) -> Tuple[Optional[str], Any, str, Any]:
+                """Worker-side equivalent for the full-dequant fallback path.
+                Does not stash host numpy (host-gather consolidation is only
+                wired for the default slice-aware path), so host_np is None and
+                w1/w3 fall back to the device-side reshard here."""
                 hf_name, torch_t = item
                 jax_path = map_hf_name_to_jax_path(hf_name)
                 if jax_path is None or jax_path.endswith("<scale>"):
-                    return (None, None, hf_name)
+                    return (None, None, hf_name, None)
                 leaf = path_to_leaf.get(jax_path)
                 if leaf is None:
-                    return (None, None, hf_name)
+                    return (None, None, hf_name, None)
                 target_shape = tuple(leaf.shape)
                 target_dtype = jnp.dtype(leaf.dtype)
                 arr = place_torch_as_jax_sharded(
                     torch_t, target_dtype, target_shape, self.mesh,
                 )
-                return (jax_path, arr, hf_name)
+                return (jax_path, arr, hf_name, None)
 
             def _drain_one(future, last_hf_name_box):
-                jax_path, arr, hf_name = future.result()
+                jax_path, arr, hf_name, host_np = future.result()
                 last_hf_name_box[0] = hf_name
                 if jax_path is None:
                     skipped.append(hf_name)
                     return False
                 _assign(jax_path, arr)
                 placed_paths.add(jax_path)
+                if host_np is not None:
+                    _expert_host_np[jax_path] = host_np
                 _maybe_consolidate(jax_path)
                 return True
 
@@ -1637,12 +1688,14 @@ def _build_class():
             if place_workers <= 1:
                 # Single-threaded path (env override or fallback).
                 for item in source_iter:
-                    jax_path, arr, hf_name = worker_fn(item)
+                    jax_path, arr, hf_name, host_np = worker_fn(item)
                     if jax_path is None:
                         skipped.append(hf_name)
                         continue
                     _assign(jax_path, arr)
                     placed_paths.add(jax_path)
+                    if host_np is not None:
+                        _expert_host_np[jax_path] = host_np
                     _maybe_consolidate(jax_path)
                     placed_count += 1
                     if placed_count % 200 == 0:
@@ -1698,7 +1751,8 @@ def _build_class():
             print(
                 f"[deepseek_v4] load_weights_from_dir done: placed="
                 f"{placed_count} skipped={len(skipped)} elapsed={elapsed:.1f}s "
-                f"(slice_aware={slice_aware})",
+                f"(slice_aware={slice_aware}, "
+                f"host_gather_groups={_host_gather_count[0]})",
                 file=_sys.stderr, flush=True,
             )
 
