@@ -280,6 +280,14 @@ def moe_forward(
             h = h * pew_mine[..., None]
             o = jnp.einsum('nei,edi->ned', h.astype(dtype), W2_l.astype(dtype))
             local = o.astype(fp32).sum(axis=1)              # [N, dim] my experts
+            if layer_idx == 0:
+                # [ckL] PRE-psum local sum (per rank r). x_full is confirmed byte-
+                # identical across processes ([ckG]); so if the [ckL] value SET differs
+                # A!=B the EXPERT EINSUM injects per-process uninit, else (set same but
+                # moe_routed differs) the PSUM is the corruptor.
+                jax.debug.print("[ckL] r={r} local_gsum={s:.9e} local_absmax={m:.9e}",
+                                r=r, s=jnp.sum(local),
+                                m=jnp.max(jnp.abs(local)))
             y_full = jax.lax.psum(local, 'attn_dp')         # [N, dim] full sum
             N = x_full.shape[0]
             NP = N // axis
