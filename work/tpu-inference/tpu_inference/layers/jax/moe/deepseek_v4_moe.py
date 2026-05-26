@@ -166,6 +166,20 @@ def moe_forward(
     orig_shape = x.shape
     flat_x = x.reshape(-1, params.dim)             # [N, dim]
     flat_ids = input_ids.reshape(-1)
+
+    def _ckR(name, q):
+        # S16: REAL-ROWS-ONLY (global rows < n_real) checksum. The global [ckS]
+        # sums include per-process-CONSTANT idle/pad-row uninit-HBM garbage from
+        # the shard_map collective, so a raw cross-engine A!=B on [ckS] is NOT
+        # proof of a real-row bug. This masks rows>=n_real to disambiguate.
+        if layer_idx == 0 and n_real is not None:
+            mask = (jnp.arange(q.shape[0]) < jnp.asarray(n_real, jnp.int32))[:, None]
+            qm = mask * q.astype(jnp.float32)
+            jax.debug.print("[ckR] L{l} {n}: rsum={s:.9e} rabsmax={a:.9e}",
+                            l=layer_idx, n=name, s=jnp.sum(qm),
+                            a=jnp.max(jnp.abs(qm)))
+    _ckR("moe_input", flat_x)
+
     weights, indices = gate_forward(
         flat_x.astype(jnp.float32), flat_ids, params.gate)
     # weights: [N, top_k] fp32, indices: [N, top_k] int32
@@ -270,12 +284,14 @@ def moe_forward(
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_routed_y",
                         s=jnp.sum(y), m=jnp.max(jnp.abs(y)))
+    _ckR("moe_routed", y)
     shared = expert_forward(flat_x, None, params.shared_expert)
     if layer_idx == 0:
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_shared",
                         s=jnp.sum(shared.astype(fp32)),
                         m=jnp.max(jnp.abs(shared.astype(fp32))))
+    _ckR("moe_shared", shared)
     y = y + shared.astype(fp32)
     # NOTE: n_real is plumbed here (seed-path only) for a future idle-rank fix.
     # S13 tried zeroing y rows >= n_real (post-gather replicated mask): REFUTED —

@@ -2004,6 +2004,21 @@ def _build_class():
             )
             x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
             logits = x.astype(jnp.float32) @ params.head_w.T
+            # [ckD] S16: per-sample decode-logit fingerprint to localize the
+            # cross-process divergence ONSET. Engines agree first ~15 tokens then
+            # diverge => a tiny per-process logit perturbation eventually flips a
+            # near-tie argmax. prelmh_sum: is the hidden divergent? lsum/labsmax:
+            # sub-argmax drift. argmax/top1/top2: the emitted token + how close
+            # the runner-up is (a shrinking top1-top2 gap predicts the flip).
+            _lg = logits.astype(jnp.float32)
+            _l0 = _lg[-1]                       # last selected pos = token to emit
+            _t2 = jax.lax.top_k(_l0, 2)[0]
+            jax.debug.print(
+                "[ckD] T={t} prelmh_sum={p:.9e} lsum={s:.9e} labsmax={m:.9e} "
+                "argmax={a} top1={t1:.9e} top2={t2:.9e}",
+                t=logits.shape[0], p=jnp.sum(x.astype(jnp.float32)),
+                s=jnp.sum(_lg), m=jnp.max(jnp.abs(_lg)),
+                a=jnp.argmax(_l0), t1=_t2[0], t2=_t2[1])
             # S1 DIAGNOSTIC SCAFFOLD: the decode collapse produces NaN/inf logits
             # that fatally halt the TPU sampling kernel (jit_sample) -> the engine
             # dies before the collapse can be observed. Sanitize so the engine
