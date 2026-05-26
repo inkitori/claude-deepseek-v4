@@ -28,6 +28,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+
 
 def _shard_e_first(x: jnp.ndarray) -> jnp.ndarray:
     """Constrain a stacked-experts tensor `[E, ...]` to be sharded on E
@@ -247,73 +249,85 @@ def moe_forward(
             'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
         y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
     else:
-        # Sharded path: explicit shard_map over 'attn_dp' so XLA never
-        # inserts an implicit collective-matmul (which read uninit HBM on
-        # idle DP shards — S1). Mirrors fused_moe_gmm.py: all_gather x, local
-        # E-expert matmuls, psum, scatter back. per_expert_weight stays
-        # token-sharded (P('attn_dp',None)) to enter the shard_map per-rank.
-        def _routed_local(x_l, pew_l, W1_l, W3_l, W2_l):
-            x_full = jax.lax.all_gather(x_l, 'attn_dp', axis=0, tiled=True)
-            # S17: break any XLA AllGather+Dot collective-matmul fusion that reads
-            # uninit HBM on idle shards (S14 suspicion; the explicit shard_map alone
-            # did NOT stop the real-row per-process variance, and input masking is
-            # insufficient -> the uninit read is in the collective OP itself).
+        # Sharded PREFILL path. Explicit shard_map over 'attn_dp' that dispatches
+        # each token to its top_k experts and runs the per-rank expert FFN through
+        # the production grouped-matmul kernel gmm_v2 with zero_initialize=True.
+        # S18: the prior bespoke dense per-rank einsum here read UNINITIALISED HBM
+        # in its matmul output buffer (identical [ckG] x_full input but divergent
+        # [ckL] output across processes, real rows hit; weights + all_gather both
+        # exonerated). gmm_v2 DMA-zeroes its unvisited output rows — that is the
+        # determinism lever: tokens NOT routed to a rank's experts produce a
+        # deterministic 0 instead of garbage. Dispatch mirrors fused_moe_gmm.py
+        # (_process_tokens_locally + moe_gmm_local), using plain-JAX gather/scatter
+        # (the ragged_* kernels fall back to exactly this) and V4's own gate.
+        EP = E // axis                       # experts per rank (256 // 32 = 8)
+        top_k = params.gate.top_k
+
+        def _routed_local(x_l, w_l, idx_l, W1_l, W3_l, W2_l):
+            x_full = jax.lax.all_gather(x_l, 'attn_dp', axis=0, tiled=True)   # [N,dim]
             x_full = jax.lax.optimization_barrier(x_full)
-            if layer_idx == 0:
-                # [ckG] x_full AFTER all_gather (pad rows already 0 via input mask, so
-                # gsum == real-rows sum). Isolates all_gather (gsum A!=B) vs psum/einsum
-                # (gsum A==B but moe_routed A!=B). Fires per-rank (32x), all identical.
-                jax.debug.print("[ckG] xfull_gsum={s:.9e} xfull_absmax={m:.9e}",
-                                s=jnp.sum(x_full.astype(jnp.float32)),
-                                m=jnp.max(jnp.abs(x_full.astype(jnp.float32))))
-            pew_full = jax.lax.all_gather(pew_l, 'attn_dp', axis=0, tiled=True)
+            w_full = jax.lax.all_gather(w_l, 'attn_dp', axis=0, tiled=True)   # [N,top_k]
+            idx_full = jax.lax.all_gather(idx_l, 'attn_dp', axis=0,
+                                          tiled=True)                        # [N,top_k]
             r = jax.lax.axis_index('attn_dp')
-            EP = E // axis
-            pew_mine = jax.lax.dynamic_slice_in_dim(pew_full, r * EP, EP, axis=1)
-            xf = x_full.astype(fp32)
-            g = jnp.einsum('nd,eid->nei', xf, W1_l.astype(fp32))
-            u = jnp.einsum('nd,eid->nei', xf, W3_l.astype(fp32))
+            Nf = x_full.shape[0]
+            # Dispatch: sort the (token, slot) pairs by global expert id; gmm then
+            # processes THIS rank's EP experts via group_offset (megablox pattern).
+            idx_flat = idx_full.reshape(-1)                                  # [N*top_k]
+            argsort_idx = jnp.argsort(idx_flat)
+            token_idx = jnp.arange(Nf, dtype=jnp.int32).repeat(top_k)
+            token_idx_sorted = token_idx[argsort_idx]                        # [N*top_k]
+            group_sizes = jax.nn.one_hot(idx_flat, E, dtype=jnp.int32).sum(0)  # [E]
+            revert_idx = jnp.argsort(argsort_idx)
+            x_sorted = x_full[token_idx_sorted].astype(fp32)                 # [N*top_k,dim]
+            group_offset = jnp.asarray([r * EP], jnp.int32)
+            # Local weights -> gmm rhs [EP,k,n]; transpose is rank-local (no comm).
+            W13_l = jnp.concatenate(
+                [W1_l.transpose(0, 2, 1), W3_l.transpose(0, 2, 1)],
+                axis=2).astype(fp32)                          # [EP, dim, 2*inter]
+            g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset,
+                        zero_initialize=True,
+                        preferred_element_type=fp32)          # [N*top_k, 2*inter]
+            gate, up = jnp.split(g1, 2, axis=-1)
             if swiglu_limit > 0:
-                u = jnp.clip(u, -swiglu_limit, swiglu_limit)
-                g = jnp.minimum(g, swiglu_limit)
-            h = jax.nn.silu(g) * u
-            h = h * pew_mine[..., None]
-            o = jnp.einsum('nei,edi->ned', h.astype(dtype), W2_l.astype(dtype))
-            local = o.astype(fp32).sum(axis=1)              # [N, dim] my experts
+                up = jnp.clip(up, -swiglu_limit, swiglu_limit)
+                gate = jnp.minimum(gate, swiglu_limit)
+            h = (jax.nn.silu(gate) * up).astype(dtype)        # [N*top_k, inter]
+            W2g_l = W2_l.transpose(0, 2, 1).astype(dtype)     # [EP, inter, dim]
+            g2 = gmm_v2(h, W2g_l, group_sizes, group_offset,
+                        zero_initialize=True,
+                        preferred_element_type=fp32)          # [N*top_k, dim]
+            # Revert to (token, slot) order. Rows for experts not on this rank are
+            # 0 (zero_initialize), so weight-combine + psum gives each token its
+            # exact routed sum over all experts (each (token,slot) has one expert,
+            # owned by exactly one rank -> no double count).
+            token_hidden = g2[revert_idx]                     # [N*top_k, dim]
+            token_topk = token_hidden.reshape(Nf, top_k, -1) * w_full[..., None]
+            local = token_topk.sum(axis=1)                    # [N, dim] fp32
             if layer_idx == 0:
-                # [ckL] PRE-psum local sum (per rank r). x_full is confirmed byte-
-                # identical across processes ([ckG]); so if the [ckL] value SET differs
-                # A!=B the EXPERT EINSUM injects per-process uninit, else (set same but
-                # moe_routed differs) the PSUM is the corruptor.
                 jax.debug.print("[ckL] r={r} local_gsum={s:.9e} local_absmax={m:.9e}",
-                                r=r, s=jnp.sum(local),
-                                m=jnp.max(jnp.abs(local)))
-            y_full = jax.lax.psum(local, 'attn_dp')         # [N, dim] full sum
-            N = x_full.shape[0]
-            NP = N // axis
+                                r=r, s=jnp.sum(local), m=jnp.max(jnp.abs(local)))
+            y_full = jax.lax.psum(local, 'attn_dp')           # [N, dim] full sum
+            NP = Nf // axis
             return jax.lax.dynamic_slice_in_dim(y_full, r * NP, NP, axis=0)
 
-        # S17 FIX: zero PAD rows (global rows >= n_real) of the activation +
-        # routing weights BEFORE the collective. flat_x pad rows are uninit HBM
-        # (per-process garbage); all_gathered into x_full they corrupt REAL rows
-        # through the routed einsum/collective (proven: the dense shared path on
-        # the SAME input stays clean; [ckR] real-rows A!=B only for moe_routed).
-        # SwiGLU(0)->0 so masked pad rows contribute deterministic 0 to the psum;
-        # real rows untouched. Pre-collective INPUT mask (S13 output-row mask was
-        # REFUTED; fused_moe_gmm.py masks token_topk_hidden the same way pre-psum).
+        # Pad rows (global rows >= n_real) carry uninit-HBM garbage in flat_x (the
+        # gate ran on it); zero their activation + routing weight (deterministic 0
+        # contribution) and route them deterministically to expert 0.
         if n_real is not None:
             _keep = (jnp.arange(N) < jnp.asarray(n_real, jnp.int32))[:, None]
             flat_x_sm = jnp.where(_keep, flat_x, 0)
-            pew_sm = jnp.where(_keep, per_expert_weight, 0)
+            weights_sm = jnp.where(_keep, weights, 0)
+            indices_sm = jnp.where(_keep, indices, 0)
         else:
-            flat_x_sm, pew_sm = flat_x, per_expert_weight
+            flat_x_sm, weights_sm, indices_sm = flat_x, weights, indices
         y = jax.shard_map(
             _routed_local, mesh=mesh,
-            in_specs=(P('attn_dp', None), P('attn_dp', None),
+            in_specs=(P('attn_dp', None), P('attn_dp', None), P('attn_dp', None),
                       P('attn_dp', None, None), P('attn_dp', None, None),
                       P('attn_dp', None, None)),
             out_specs=P('attn_dp', None), check_vma=False,
-        )(flat_x_sm, pew_sm, W1, W3, W2)                     # [N, dim] fp32 routed sum
+        )(flat_x_sm, weights_sm, indices_sm, W1, W3, W2)     # [N, dim] fp32 routed sum
     if layer_idx == 0:
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_routed_y",
