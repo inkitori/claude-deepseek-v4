@@ -247,36 +247,49 @@ def moe_forward(
         h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
         out_NEd = _shard_e_mid(jnp.einsum(
             'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
-        # [ckEtot] S25: DECODE takes THIS dense path (N=1 replicated => use_shard_map
-        # False); S24's gmm non-det was PREFILL-only. 2-engine logs: decode moe_input
-        # + moe_shared + routing BYTE-IDENTICAL but moe_routed_y DIVERGES => the dense
-        # routed path corrupts from identical input. Split it: a tiny read-only
-        # shard_map RETURNS each rank's LOCAL out_NEd [gsum,sqsum,absmax] over its 8
-        # experts with NO collective; gather the [axis,3] (post-reduction, tiny, safe)
-        # and print reorder-immune TOTALS as scalars (32 per-rank debug.prints get
-        # dropped; an array print numpy-wraps). [ckEY] = post-all-reduce y. If
-        # [ckEtot] pre_sqsum is byte-identical x2 engines but [ckEY]/moe_routed_y
-        # DIVERGES => the attn_dp all-reduce is the corruptor; if pre_sqsum diverges
-        # => the per-rank local einsum. y unchanged.
+        # [ckSPLIT] S26: out_NEd diverges x2 engines from BYTE-IDENTICAL x+routing
+        # (S25 [ckEtot] verdict). S18 PREFILL had the IDENTICAL signature = the bespoke
+        # einsum's matmul output buffer read uninit HBM (identical input, divergent
+        # output, weights deductively-but-never-measured clean). Localize WHICH stage
+        # first diverges: per-rank LOCAL [gsum,sqsum,absmax] (NO collective) of the
+        # routed weights + every einsum stage, gathered (tiny, post-reduction, safe) +
+        # summed reorder-immune. sqsum is per-rank-sensitive (squares can't cancel) =>
+        # the FIRST quantity whose sqsum differs x2 pins it: W* => routed weight-load
+        # uninit (NEVER measured cross-engine); gate/up => the x@W1/W3 matmul; h => the
+        # silu*weight elementwise; out only => the h@W2 matmul. 'out' sqsum continues
+        # the old [ckEtot] anchor (34.21 eng1 / 34.47 eng2). [ckEY] below = post-all-
+        # reduce y (already exonerated: faithfully reduces divergent locals).
         if layer_idx == 0 and not mesh.empty:
-            def _ckE_local(o):                       # o: [N, E//axis, dim] LOCAL shard
-                of = o.astype(fp32)
-                return jnp.stack([jnp.sum(of), jnp.sum(of * of),
-                                  jnp.max(jnp.abs(of))])[None]            # [1, 3]
-            stats = jax.shard_map(_ckE_local, mesh=mesh,
-                                  in_specs=(P(None, 'attn_dp', None),),
-                                  out_specs=P('attn_dp', None),
-                                  check_vma=False)(out_NEd)               # [axis, 3]
-            stats = jax.lax.with_sharding_constraint(stats, P())          # replicate
-            # pre-reduce TOTALS via gather+LOCAL sum (NOT the suspect all-reduce).
-            # pre_sqsum is reorder-immune & per-rank-sensitive (squares can't cancel):
-            # identical x2 engines => every rank's LOCAL out_NEd is clean, so a
-            # divergent [ckEY] pins the attn_dp ALL-REDUCE; differs x2 => the per-rank
-            # local einsum diverges. pre_gsum should ~= [ckEY] y_gsum (same math, diff
-            # reduction path) -- a within-engine gap is itself all-reduce evidence.
-            jax.debug.print("[ckEtot] pre_gsum={g:.9e} pre_sqsum={q:.9e} "
-                            "pre_absmax={m:.9e}", g=jnp.sum(stats[:, 0]),
-                            q=jnp.sum(stats[:, 1]), m=jnp.max(stats[:, 2]))
+            def _ck_all(*ts):
+                def s(t):
+                    tf = t.astype(fp32)
+                    return jnp.stack([jnp.sum(tf), jnp.sum(tf * tf),
+                                      jnp.max(jnp.abs(tf))])              # [3]
+                return jnp.stack([s(t) for t in ts])[None]               # [1,7,3]
+            stats = jax.shard_map(
+                _ck_all, mesh=mesh,
+                in_specs=(P('attn_dp', None, None), P('attn_dp', None, None),
+                          P('attn_dp', None, None), P(None, 'attn_dp', None),
+                          P(None, 'attn_dp', None), P(None, 'attn_dp', None),
+                          P(None, 'attn_dp', None)),
+                out_specs=P('attn_dp', None, None), check_vma=False)(
+                    W1_fp32, W2, W3_fp32, gate_NEi, up_NEi, h_NEi, out_NEd)  # [axis,7,3]
+            stats = jax.lax.with_sharding_constraint(stats, P())         # replicate
+            sq = jnp.sum(stats[:, :, 1], axis=0)   # [7] reorder-immune pre-reduce sqsum
+            gs = jnp.sum(stats[:, :, 0], axis=0)   # [7] pre-reduce gsum
+            am = jnp.max(stats[:, :, 2], axis=0)   # [7] absmax
+            jax.debug.print("[ckSPLIT] sqsum W1={a:.6e} W2={b:.6e} W3={c:.6e} "
+                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
+                            a=sq[0], b=sq[1], c=sq[2], d=sq[3], e=sq[4],
+                            f=sq[5], g=sq[6])
+            jax.debug.print("[ckSPLIT] gsum W1={a:.6e} W2={b:.6e} W3={c:.6e} "
+                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
+                            a=gs[0], b=gs[1], c=gs[2], d=gs[3], e=gs[4],
+                            f=gs[5], g=gs[6])
+            jax.debug.print("[ckSPLIT] absmax W1={a:.6e} W2={b:.6e} W3={c:.6e} "
+                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
+                            a=am[0], b=am[1], c=am[2], d=am[3], e=am[4],
+                            f=am[5], g=am[6])
         y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
         if layer_idx == 0:                                  # [ckEY] post-all-reduce y
             jax.debug.print("[ckEY] y_gsum={s:.9e} y_sqsum={q:.9e} y_absmax={m:.9e}",
