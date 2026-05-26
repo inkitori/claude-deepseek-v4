@@ -234,17 +234,11 @@ def moe_forward(
                         s=jnp.sum(shared.astype(fp32)),
                         m=jnp.max(jnp.abs(shared.astype(fp32))))
     y = y + shared.astype(fp32)
-    # S1 FIX: zero idle attn_dp token-ranks (flat rows >= n_real). The dense
-    # einsums force `flat_x`'s token axis to all-gather to REPLICATED (via
-    # `_shard_e_mid`); idle ranks contribute uninitialized-HBM garbage at their
-    # rows, which the expert all-reduce then folds in and which propagates into
-    # the residual -> prefill SEED -> nondeterministic decode collapse (S1).
-    # Masking here is safe: `y` is the already-replicated [N, dim] post-reduction
-    # quantity, so this is NOT a size-1 token-axis gather (pitfall #5). The
-    # forward h-path passes n_real=None (its idle rows feed only padded logits,
-    # never the seed) so token-1 argmax is unchanged.
-    if n_real is not None:
-        keep = (jax.lax.broadcasted_iota(jnp.int32, y.shape, 0)
-                < jnp.asarray(n_real, jnp.int32))
-        y = jnp.where(keep, y, jnp.zeros_like(y))
+    # NOTE: n_real is plumbed here (seed-path only) for a future idle-rank fix.
+    # S13 tried zeroing y rows >= n_real (post-gather replicated mask): REFUTED —
+    # decode still collapsed (incoherent), so the garbage is NOT confined to
+    # pad-row VALUES; it enters the real rows via the token-axis all-gather /
+    # expert all-reduce collective itself (same class as the seed _linear no-op,
+    # commit 83f74395). Next: shard_map idle-RANK mask before the psum
+    # (fused_moe_gmm.py:230-245 template), not output row-masking.
     return y.astype(dtype).reshape(orig_shape)
