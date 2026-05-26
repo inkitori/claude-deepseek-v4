@@ -1,5 +1,21 @@
-# Engine B (gmm, commit 21063d80, smoke 20260526T141640Z) — FIB md5=39c33b59 (A19=d99ee354 DIFFERS)
-# 2-engine localization anchor: spin a 2nd gmm engine, compare [ckR] L0. moe_input differs => corruptor UPSTREAM of MoE; only moe_routed differs => gmm zero_init insufficient.
-(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_input: rsum=2.471417236e+02 rabsmax=3.234375000e+00
-(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_routed: rsum=6.134395218e+01 rabsmax=1.709416151e+00
-(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_shared: rsum=7.088032532e+01 rabsmax=3.713140965e+00
+# Engine B (gmm, commit 21063d80 == HEAD 65bc1858 .py-identical, smoke 20260526T141640Z)
+# FIB md5=39c33b59 (A19=d99ee354 DIFFERS). All values host 10.164.0.202, FIRST prefill forward,
+# prompt "The Fibonacci sequence begins 1, 1, 2, 3, 5, 8, 13, " (s1_warmup.py / s1_fib_clean.py).
+# 2-engine localization: spin a 2nd same-code engine, fire s1_warmup.py FIRST, grep [ckS]/[ckR] L0,
+# compare this CHAIN. FIRST quantity that DIFFERS localizes the corruptor (chain runs top->bottom):
+#   seed_x_in differs        => embedding / residual feeding the attention seed
+#   seed_kv_* differs        => attention-seed build (compressor/indexer kv)
+#   blk_attn_out differs     => attention forward compute
+#   blk_post_attn_x differs  => post-attn residual / hyper-connect
+#   moe_input (ckR) differs  => residual/hyper-connect into MoE
+#   moe_routed (ckR) differs => gmm routed path (zero_init insufficient on TPU)
+#   moe_shared (ckR) differs => shared expert
+#
+# [ckS] L0 seed_x_in:          sum=-1.514897728e+01 absmax=1.379635483e-01
+# [ckS] L0 seed_kv_postlinear: sum= 4.572034454e+01 absmax=9.170686603e-01
+# [ckS] L0 seed_kv_cache:      sum= 4.086362915e+02 absmax=5.812500000e+00
+# [ckS] L0 blk_attn_out:       sum= 1.294913125e+05 absmax=1.021337032e+01
+# [ckS] L0 blk_post_attn_x:    sum= 4.099475781e+04 absmax=8.632812500e-01
+# [ckR] L0 moe_input:         rsum= 2.471417236e+02 rabsmax=3.234375000e+00
+# [ckR] L0 moe_routed:        rsum= 6.134395218e+01 rabsmax=1.709416151e+00
+# [ckR] L0 moe_shared:        rsum= 7.088032532e+01 rabsmax=3.713140965e+00

@@ -5,13 +5,11 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S20): **the gmm_v2 + zero_initialize MoE fix (21063d80) is DISPROVEN** — 2 fresh
-> SAME-CODE engines still produce different FIB md5 (A19 d99ee354 numbers/7-12 vs B 39c33b59 prose/0-12; moe md5
-> 1814bc99 identical on all 8 hosts ⇒ no desync). NEW: the non-determinism is in the **PREFILL forward** (B's
-> prefill-argmax first token = `' ...'` ≠ A19's `21`), NOT decode-specific. **NEXT (HANDOFF_S1.md):** spin a 2nd
-> same-code engine, compare `[ckR] L0` to the saved anchor (logs/s1_engB_gmm_ckR_anchor.txt) — moe_input differs
-> ⇒ corruptor UPSTREAM of MoE (S18 misattributed; attention seed suspect); only moe_routed differs ⇒ gmm
-> zero_init insufficient on TPU. Loop NOT stopped.
+> One-line status (2026-05-26 S21): **corruptor LOCALIZED to the routed gmm_v2 path.** 3 fresh engines (A19/B/C)
+> all differ; C-vs-B [ckR] L0: moe_input + moe_shared + attention-seed IDENTICAL, only **moe_routed DIFFERS**
+> (rabsmax too ⇒ real-row uninit, not fp). gmm `zero_initialize=True` insufficient; seed EXONERATED. **NEXT
+> (HANDOFF_S1.md):** fix routed gmm — stable argsort / zero gmm empty-group out / mask y<n_real; gate = moe_routed
+> md5 identical ×2 engines + FIB ×2. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

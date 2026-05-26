@@ -1,0 +1,1 @@
+engC FIB md5=7488bc96 (A19=d99ee354,B=39c33b59 ALL DIFFER). moe_input=247.14 SAME, moe_shared=70.88 SAME, moe_routed C=68.078/abs1.459 vs B=61.344/abs1.709 DIFFER. seed chain SAME. => gmm routed = corruptor.
