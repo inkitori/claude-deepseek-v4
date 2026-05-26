@@ -271,6 +271,17 @@ def moe_forward(
                                           tiled=True)                        # [N,top_k]
             r = jax.lax.axis_index('attn_dp')
             Nf = x_full.shape[0]
+            if layer_idx == 0:
+                # [ckR0] routing determinism + [ckR1] gmm-input baseline. If idx/w
+                # gsum DIFFER across 2 fresh engines, the corruptor is the GATE
+                # (sharded-contraction router all-reduce), not the gmm.
+                jax.debug.print("[ckR0] r={r} idx_gsum={i:.9e} w_gsum={w:.9e} "
+                                "w_absmax={wm:.9e} xfull_gsum={x:.9e} xfull_absmax={xm:.9e}",
+                                r=r, i=jnp.sum(idx_full.astype(jnp.float32)),
+                                w=jnp.sum(w_full.astype(jnp.float32)),
+                                wm=jnp.max(jnp.abs(w_full.astype(jnp.float32))),
+                                x=jnp.sum(x_full.astype(jnp.float32)),
+                                xm=jnp.max(jnp.abs(x_full.astype(jnp.float32))))
             # Dispatch: sort the (token, slot) pairs by global expert id; gmm then
             # processes THIS rank's EP experts via group_offset (megablox pattern).
             idx_flat = idx_full.reshape(-1)                                  # [N*top_k]
@@ -288,6 +299,15 @@ def moe_forward(
             g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
                         zero_initialize=True,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
+            if layer_idx == 0:
+                # [ckR2] g1 (gate/up) masked to THIS rank's OWNED sorted rows. Owned
+                # rows = clean x_sorted @ owned W -> MUST be deterministic. Divergence
+                # here ==> gmm computes owned rows non-deterministically (uninit read).
+                _eid = idx_flat[argsort_idx]
+                _om = ((_eid >= r * EP) & (_eid < (r + 1) * EP))[:, None]
+                _g1o = jnp.where(_om, g1, 0.0)
+                jax.debug.print("[ckR2] r={r} g1own_gsum={s:.9e} g1own_absmax={m:.9e}",
+                                r=r, s=jnp.sum(_g1o), m=jnp.max(jnp.abs(_g1o)))
             gate, up = jnp.split(g1, 2, axis=-1)
             if swiglu_limit > 0:
                 up = jnp.clip(up, -swiglu_limit, swiglu_limit)
@@ -297,6 +317,14 @@ def moe_forward(
             g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
                         zero_initialize=True,
                         preferred_element_type=fp32)          # [N*top_k, dim]
+            if layer_idx == 0:
+                # [ckR3] g2 (down) masked to OWNED sorted rows, BEFORE revert/mask.
+                # ckR2 clean & ckR3 divergent ==> g2 gmm; both divergent ==> g1 gmm.
+                _eid3 = idx_flat[argsort_idx]
+                _om3 = ((_eid3 >= r * EP) & (_eid3 < (r + 1) * EP))[:, None]
+                _g2o = jnp.where(_om3, g2, 0.0)
+                jax.debug.print("[ckR3] r={r} g2own_gsum={s:.9e} g2own_absmax={m:.9e}",
+                                r=r, s=jnp.sum(_g2o), m=jnp.max(jnp.abs(_g2o)))
             # Revert to (token, slot) order. Each (token,slot) has exactly one
             # expert, owned by exactly one rank, so weight-combine + psum must give
             # each token its exact routed sum with no double count -- PROVIDED every
