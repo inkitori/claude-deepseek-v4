@@ -247,7 +247,30 @@ def moe_forward(
         h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
         out_NEd = _shard_e_mid(jnp.einsum(
             'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
+        # [ckE] S25: DECODE takes THIS dense path (N=1 replicated => use_shard_map
+        # False); S24's gmm non-det was PREFILL-only. 2-engine logs show decode
+        # moe_input + moe_shared + routing BYTE-IDENTICAL but moe_routed_y DIVERGES
+        # => the divergence is born in lines 238-250 from identical input. Split it:
+        # a tiny read-only shard_map hands each rank its [N,E//axis,dim] shard so
+        # jnp.sum is rank-LOCAL (no collective); [ckEY] is the post-all-reduce y.
+        # [ckE] per-rank diverges x2 => local einsum/buffer; [ckE] identical but
+        # [ckEY] diverges => the attn_dp E-reduction collective. y unchanged.
+        if layer_idx == 0 and not mesh.empty:
+            def _ckE_local(o):                       # o: [N, E//axis, dim] LOCAL shard
+                of = o.astype(fp32)
+                jax.debug.print("[ckE] r={r} eloc_gsum={s:.9e} eloc_sqsum={q:.9e} "
+                                "eloc_absmax={m:.9e}",
+                                r=jax.lax.axis_index('attn_dp'),
+                                s=jnp.sum(of), q=jnp.sum(of * of),
+                                m=jnp.max(jnp.abs(of)))
+                return jnp.sum(of)[None]
+            jax.shard_map(_ckE_local, mesh=mesh,
+                          in_specs=(P(None, 'attn_dp', None),),
+                          out_specs=P('attn_dp'), check_vma=False)(out_NEd)
         y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
+        if layer_idx == 0:                                  # [ckEY] post-all-reduce y
+            jax.debug.print("[ckEY] y_gsum={s:.9e} y_sqsum={q:.9e} y_absmax={m:.9e}",
+                            s=jnp.sum(y), q=jnp.sum(y * y), m=jnp.max(jnp.abs(y)))
     else:
         # Sharded PREFILL path. Explicit shard_map over 'attn_dp' that dispatches
         # each token to its top_k experts and runs the per-rank expert FFN through

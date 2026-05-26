@@ -5,13 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S24): gmm **dtype REFUTED** (bf16 lhs/rhs ×2 engines STILL non-det: FIB md5
-> 2a3ffbc3≠4d346071). Reorder-immune aggregates: routing + moe_input + moe_shared BYTE-IDENTICAL ×2, only
-> **moe_routed DIVERGES** (7.11e1 vs 2.82e1). x_full identical + deterministic argsort ⇒ gmm INPUT identical ⇒
-> **the gmm kernel computes OWNED rows non-deterministically from IDENTICAL input** (dtype- AND zero_initialize-
-> independent ⇒ suspect = `partial_out_ref` VMEM carry on owned PARTIAL-TILE boundary rows). **NEXT
-> (HANDOFF_S1.md):** SUBLANE-PAD owned group_sizes to kill partial tiles → 2 engines. gate = moe_routed md5 ×2 +
-> FIB ×2 + correct Fib. Loop NOT stopped.
+> One-line status (2026-05-26 S25): **PIVOT — decode uses the DENSE einsum path (moe.py:238-250), NOT gmm**
+> (gmm runs only in PREFILL; `use_shard_map=False` when N=1 replicated). Mined S24 decode-step [ckS] ×2 engines:
+> routing + moe_shared BYTE-IDENTICAL, **moe_routed_y DIVERGES every decode step** ⇒ decode MoE input+routing
+> CLEAN, the dense routed path corrupts from IDENTICAL input. Weights exonerated; CPU-clean einsum ⇒ suspect =
+> `out_NEd.sum(axis=1)` attn_dp cross-rank ALL-REDUCE. **SUBLANE-PAD / gmm fixes DEAD for decode.** IN FLIGHT:
+> [ckE]/[ckEY] decode-active disambiguator (per-rank local vs post-reduce), engine-1 smoke running. gate =
+> decode moe_routed_y md5 ×2 + FIB ×2 + correct Fib. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
