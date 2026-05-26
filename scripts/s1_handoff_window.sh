@@ -37,6 +37,13 @@ EFFORT_FLAG="--effort max"
 # _S1_LAUNCH=1) so there is no second script and no inline-quoting of the
 # multi-line prompt through tmux.
 if [[ "${_S1_LAUNCH:-}" == "1" ]]; then
+  # CRITICAL: clear the flag BEFORE exec'ing claude. `exec` inherits the env, so a
+  # leaked _S1_LAUNCH=1 persists in the spawned session, is inherited by every Bash
+  # tool subprocess, and makes that session's NEXT handoff mis-take THIS launch
+  # branch (exec claude in-line, no new window -- and hangs if the caller piped
+  # stdout, e.g. `... | tail`). Unsetting here makes every spawned session start
+  # with a clean env so its own handoff correctly reaches orchestrate mode below.
+  unset _S1_LAUNCH
   cd "$REPO_ROOT" || exit 1
   if [[ ! -f "$PROMPT_FILE" ]]; then
     echo "FATAL: prompt file missing: $PROMPT_FILE" >&2; exec bash
