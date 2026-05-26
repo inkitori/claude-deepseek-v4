@@ -21,9 +21,24 @@ OPERATING RULES:
   Restart node_guardian if dead (NEVER pkill+restart in one line — the pattern
   self-matches and kills your own shell):
     INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &
-- SPAWN SUBAGENTS AGGRESSIVELY for any bounded investigation (log greps, CPU repros,
-  HLO checks, an ssh probe); have them return ONLY conclusions. This is the main lever
-  for keeping context lean — never read long logs into your own context.
+- SPAWN SUBAGENTS AGGRESSIVELY — AND IN PARALLEL. There is a LARGE usage budget to spend;
+  serial single-threaded work is the WRONG default here. For any bounded question, prefer
+  firing SEVERAL agents in ONE batch (multiple Agent calls in a single message) over doing
+  it yourself. This keeps YOUR context lean (agents return ONLY conclusions — never read
+  long logs/files into your own context) AND covers more ground per wall-clock minute.
+  Good parallel fan-out for S1:
+    * Root-cause fan-out: one agent PER hypothesis (KV-block zeroing, MoE idle-rank sum, a
+      nondet collective, the nan_to_num clamp, ...) — each audits its suspect, returns
+      file:line + verdict; you synthesize.
+    * Parallel reads/analysis: log greps, HLO inspection, CPU repros, reference (torch /
+      vLLM-GPU) cross-checks, commit archaeology — all at once.
+    * While a smoke compiles (~6-30 min), keep agents busy on code audits / probe prep.
+  QUALITY BAR (do NOT spawn for the sake of it): every agent needs a REAL, bounded question
+  whose answer changes your next step; give it sharp scope + "return only conclusions".
+  Don't fan out trivia you can answer in one call, and don't spawn agents that duplicate
+  each other. SERIALIZE SLICE ACCESS: the TPU is ONE fragile engine (smoke.sh self-guards,
+  and it wedges on a new request shape) — agents may READ/analyze in parallel, but only ONE
+  may drive an engine/probe at a time.
 - After EVERY code edit: scripts/full_slice_v4_sync.sh (else 7/8 workers run stale code).
 - Commit + push after EVERY validated step. Clean up ONLY via full_slice_v4_reset.sh.
 - Reserve full smokes (~25-45 min) for confirming a fix that already survives a cheaper
