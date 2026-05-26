@@ -23,24 +23,29 @@ ONLY in PREFILL. So S24's "gmm kernel non-det on owned rows" is a real but **PRE
   + the `out_NEd.sum(axis=1)` XLA-inferred CROSS-RANK all-reduce. Prime suspect = that reduction/its buffers
   (the einsum compute itself is least likely; CPU-clean). Structurally same reduction as prefill psum :360.
 
-## IN FLIGHT — [ckE]/[ckEY] disambiguator smoke (engine 1 RUNNING)
-Added to dense path (moe.py ~250, decode-active `layer_idx==0`, read-only, y unchanged):
-* **[ckE]** = PER-RANK LOCAL `out_NEd` partial (sum over this rank's 8 experts) via a tiny read-only
-  `shard_map(in_specs=P(None,'attn_dp',None), out_specs=P('attn_dp'))` ⇒ NO collective (breaks the
-  jnp.sum-all-reduces circularity). Prints per-rank `r=`.
-* **[ckEY]** = post-all-reduce `y` checksum.
-Synced 8/8 (md5 a6bd46d1..., 3 ckE refs each); xla_cache cleared; engine 1 log:
-`logs/full-slice-v4-smoke-20260526T184944Z.log` (pid 2694074, COLD compile ~10-30 min).
+## IN FLIGHT — [ckEtot]/[ckEY] disambiguator smoke (engine 1 RUNNING)
+Added to dense path (moe.py ~250, decode-active `layer_idx==0`, read-only, y unchanged). NOTE: per-rank
+debug.print is too LOSSY (S25 first run: only 2/32 ranks survived; jax.debug.print drops 32 competing lines),
+so the hardened version returns per-rank stats from the shard_map and prints SCALAR totals:
+* **[ckEtot]** `pre_gsum/pre_sqsum/pre_absmax` = pre-reduce TOTALS via shard_map(out_specs=P('attn_dp',None))
+  returning each rank's LOCAL out_NEd [gsum,sqsum,absmax] (NO collective), gathered (wsc P(), tiny/safe) +
+  LOCAL-summed. `pre_sqsum` is reorder-immune + per-rank-sensitive.
+* **[ckEY]** `y_gsum/...` = post-all-reduce y (the suspect path; == [ckS] moe_routed_y decode value).
+Synced 8/8 (md5 8111447b..., ckEtot=3 each); xla_cache cleared; engine 1 log:
+`logs/full-slice-v4-smoke-20260526T190818Z.log` (pid 2758672, COLD compile ~10-30 min). (Prior 184944Z run
+used the lossy per-rank [ckE] — superseded; that run did confirm decode generates correct '21' + moe_routed_y
+decode=60.05.) Grep: `bash /tmp/s1_cke.sh <log>`. Probe: `python /tmp/s1_probe2.py 2` (max_tokens=2).
 
 ## NEXT ACTION
-1. Wait for engine-1 `Application startup complete`. Fire `max_tokens=2` as the FIRST request (1 clean decode
-   step) on FIB prompt; capture FIB md5 + grep `[ckE]`/`[ckEY]`/`[ckS] ...moe_routed_y` (collect [ckE] across
-   ALL 8 host logs — shard_map prints once per rank).
+1. Wait for engine-1 `Application startup complete`. Fire `python /tmp/s1_probe2.py 2` FIRST (1 clean decode
+   step). `bash /tmp/s1_cke.sh <log>` → record [ckEtot] (decode line) + [ckEY] + FIB-ish text.
 2. reset + smoke ENGINE 2, same. Compare across engines:
-   * **[ckE] per-rank DIFFERS ×2** ⇒ corruptor is the PER-RANK LOCAL compute (einsum/XLA matmul scratch /
-     _shard_e_mid reshard buffer) — NOT the reduction.
-   * **[ckE] byte-identical ×2 but [ckEY] DIFFERS ×2** ⇒ corruptor is the attn_dp E-REDUCTION collective.
-3. Fix follows the verdict (next session): reduction ⇒ force a deterministic explicit psum / clean the
+   * **[ckEtot] pre_sqsum byte-identical ×2 but [ckEY]/moe_routed_y DIFFERS ×2** ⇒ corruptor is the attn_dp
+     ALL-REDUCE (every rank's LOCAL out_NEd is clean).
+   * **[ckEtot] pre_sqsum DIFFERS ×2** ⇒ corruptor is the PER-RANK LOCAL einsum (XLA matmul scratch /
+     _shard_e_mid reshard).
+   (Within-engine: pre_gsum should ~= [ckEY] y_gsum; a big gap is itself all-reduce evidence.)
+3. Fix follows the verdict (next session): all-reduce ⇒ force a deterministic explicit psum / clean the
    reduce-scatter+all-gather buffer; local ⇒ chase the einsum output/reshard uninit. GATE = decode moe_routed_y
    md5 ×2 + FIB md5 ×2 + correct Fibonacci, then CLAUDE.md formal gate ×2 + `touch /tmp/s1_loop_stop`.
 

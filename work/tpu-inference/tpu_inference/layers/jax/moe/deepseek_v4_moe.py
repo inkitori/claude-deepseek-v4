@@ -247,26 +247,36 @@ def moe_forward(
         h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
         out_NEd = _shard_e_mid(jnp.einsum(
             'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
-        # [ckE] S25: DECODE takes THIS dense path (N=1 replicated => use_shard_map
-        # False); S24's gmm non-det was PREFILL-only. 2-engine logs show decode
-        # moe_input + moe_shared + routing BYTE-IDENTICAL but moe_routed_y DIVERGES
-        # => the divergence is born in lines 238-250 from identical input. Split it:
-        # a tiny read-only shard_map hands each rank its [N,E//axis,dim] shard so
-        # jnp.sum is rank-LOCAL (no collective); [ckEY] is the post-all-reduce y.
-        # [ckE] per-rank diverges x2 => local einsum/buffer; [ckE] identical but
-        # [ckEY] diverges => the attn_dp E-reduction collective. y unchanged.
+        # [ckEtot] S25: DECODE takes THIS dense path (N=1 replicated => use_shard_map
+        # False); S24's gmm non-det was PREFILL-only. 2-engine logs: decode moe_input
+        # + moe_shared + routing BYTE-IDENTICAL but moe_routed_y DIVERGES => the dense
+        # routed path corrupts from identical input. Split it: a tiny read-only
+        # shard_map RETURNS each rank's LOCAL out_NEd [gsum,sqsum,absmax] over its 8
+        # experts with NO collective; gather the [axis,3] (post-reduction, tiny, safe)
+        # and print reorder-immune TOTALS as scalars (32 per-rank debug.prints get
+        # dropped; an array print numpy-wraps). [ckEY] = post-all-reduce y. If
+        # [ckEtot] pre_sqsum is byte-identical x2 engines but [ckEY]/moe_routed_y
+        # DIVERGES => the attn_dp all-reduce is the corruptor; if pre_sqsum diverges
+        # => the per-rank local einsum. y unchanged.
         if layer_idx == 0 and not mesh.empty:
             def _ckE_local(o):                       # o: [N, E//axis, dim] LOCAL shard
                 of = o.astype(fp32)
-                jax.debug.print("[ckE] r={r} eloc_gsum={s:.9e} eloc_sqsum={q:.9e} "
-                                "eloc_absmax={m:.9e}",
-                                r=jax.lax.axis_index('attn_dp'),
-                                s=jnp.sum(of), q=jnp.sum(of * of),
-                                m=jnp.max(jnp.abs(of)))
-                return jnp.sum(of)[None]
-            jax.shard_map(_ckE_local, mesh=mesh,
-                          in_specs=(P(None, 'attn_dp', None),),
-                          out_specs=P('attn_dp'), check_vma=False)(out_NEd)
+                return jnp.stack([jnp.sum(of), jnp.sum(of * of),
+                                  jnp.max(jnp.abs(of))])[None]            # [1, 3]
+            stats = jax.shard_map(_ckE_local, mesh=mesh,
+                                  in_specs=(P(None, 'attn_dp', None),),
+                                  out_specs=P('attn_dp', None),
+                                  check_vma=False)(out_NEd)               # [axis, 3]
+            stats = jax.lax.with_sharding_constraint(stats, P())          # replicate
+            # pre-reduce TOTALS via gather+LOCAL sum (NOT the suspect all-reduce).
+            # pre_sqsum is reorder-immune & per-rank-sensitive (squares can't cancel):
+            # identical x2 engines => every rank's LOCAL out_NEd is clean, so a
+            # divergent [ckEY] pins the attn_dp ALL-REDUCE; differs x2 => the per-rank
+            # local einsum diverges. pre_gsum should ~= [ckEY] y_gsum (same math, diff
+            # reduction path) -- a within-engine gap is itself all-reduce evidence.
+            jax.debug.print("[ckEtot] pre_gsum={g:.9e} pre_sqsum={q:.9e} "
+                            "pre_absmax={m:.9e}", g=jnp.sum(stats[:, 0]),
+                            q=jnp.sum(stats[:, 1]), m=jnp.max(stats[:, 2]))
         y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
         if layer_idx == 0:                                  # [ckEY] post-all-reduce y
             jax.debug.print("[ckEY] y_gsum={s:.9e} y_sqsum={q:.9e} y_absmax={m:.9e}",
