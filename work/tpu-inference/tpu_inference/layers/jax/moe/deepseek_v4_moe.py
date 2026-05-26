@@ -273,13 +273,27 @@ def moe_forward(
             NP = N // axis
             return jax.lax.dynamic_slice_in_dim(y_full, r * NP, NP, axis=0)
 
+        # S17 FIX: zero PAD rows (global rows >= n_real) of the activation +
+        # routing weights BEFORE the collective. flat_x pad rows are uninit HBM
+        # (per-process garbage); all_gathered into x_full they corrupt REAL rows
+        # through the routed einsum/collective (proven: the dense shared path on
+        # the SAME input stays clean; [ckR] real-rows A!=B only for moe_routed).
+        # SwiGLU(0)->0 so masked pad rows contribute deterministic 0 to the psum;
+        # real rows untouched. Pre-collective INPUT mask (S13 output-row mask was
+        # REFUTED; fused_moe_gmm.py masks token_topk_hidden the same way pre-psum).
+        if n_real is not None:
+            _keep = (jnp.arange(N) < jnp.asarray(n_real, jnp.int32))[:, None]
+            flat_x_sm = jnp.where(_keep, flat_x, 0)
+            pew_sm = jnp.where(_keep, per_expert_weight, 0)
+        else:
+            flat_x_sm, pew_sm = flat_x, per_expert_weight
         y = jax.shard_map(
             _routed_local, mesh=mesh,
             in_specs=(P('attn_dp', None), P('attn_dp', None),
                       P('attn_dp', None, None), P('attn_dp', None, None),
                       P('attn_dp', None, None)),
             out_specs=P('attn_dp', None), check_vma=False,
-        )(flat_x, per_expert_weight, W1, W3, W2)             # [N, dim] fp32 routed sum
+        )(flat_x_sm, pew_sm, W1, W3, W2)                     # [N, dim] fp32 routed sum
     if layer_idx == 0:
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_routed_y",
