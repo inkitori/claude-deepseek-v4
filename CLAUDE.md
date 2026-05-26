@@ -1,21 +1,18 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 12)" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 17)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S16): **gate FAILS — but LOCALIZED.** cfc65ca4 (attn-seed input mask,
-> S15) validated on 2 fresh engines → still fails (ENG_A FIB `0a72aece` vs ENG_B `ba467a77`; both
-> coherent + within-engine deterministic but DIFFER cross-engine). Log-mining (STABLE-within /
-> DIVERGENT-across, noise-filtered) at L0: seed_x_in/seed_kv/blk_attn_out/blk_post_attn_x(MoE
-> input)/moe_perexpw(gate)/moe_shared ALL byte-identical A==B; **`moe_routed_y` (routed-expert
-> collective) is the FIRST divergence.** ⇒ **SEED IS CLEAN** (S14's "variance upstream in seed"
-> REFUTED; cfc65ca4 KEPT as sound partial — it made seed checksums identical). Variance is in the **MoE
-> ROUTED collective** (S14 shard_map PARTIAL; matches S13). CAVEAT: moe_routed_y is a GLOBAL sum —
-> confirm REAL rows (rows<n_real) diverge with a real-rows checksum BEFORE fixing (prior sessions burned
-> smokes on idle-row global-sum noise). Model is INSTRUCT (coherence via /v1/chat). NEXT in
-> HANDOFF_S1.md. Loop NOT stopped.
+> One-line status (2026-05-26 S17): **ROOT CAUSE NAILED.** Real-rows checksum `[ckR]` (rows<n_real,
+> masking pad-garbage) on 2 fresh engines (FIB md5 `f3362d36` vs `aa9eb2ed`, differ): `moe_input` and
+> `moe_shared` real-rows are byte-identical A==B, but **`moe_routed` (routed-expert COLLECTIVE) real-rows
+> DIFFER** on BOTH prompts ⇒ same input, clean dense path, the SHARD_MAP all_gather/einsum/psum corrupts
+> REAL token rows per-process (NOT pad-row noise; S16 caveat resolved). Decode path + seed re-audited
+> CLEAN. **NEXT = FIX:** zero flat_x pad rows (>=n_real) on the INPUT side BEFORE the shard_map (S13
+> output-masking REFUTED; mask must be pre-collective, fused_moe_gmm template). Details in HANDOFF_S1.md.
+> Model is INSTRUCT (/v1/chat). Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
