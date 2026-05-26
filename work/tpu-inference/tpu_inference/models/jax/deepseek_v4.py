@@ -336,7 +336,7 @@ def block_init_state_and_forward(
         params.hc_mult, params.hc_sinkhorn_iters, params.norm_eps, params.hc_eps,
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
-    y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx)
+    y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx, n_real=n_real)
     if layer_idx < 2:
         _v4_checksum("blk_moe_out", y, layer_idx)
     out = hc_post(y, residual, post, comb)

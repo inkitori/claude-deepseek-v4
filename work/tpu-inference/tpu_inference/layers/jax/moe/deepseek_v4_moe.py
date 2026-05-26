@@ -155,6 +155,7 @@ def moe_forward(
     input_ids: jnp.ndarray,   # [B, S] int
     params: MoEParams,
     layer_idx: int = -1,
+    n_real=None,              # traced int32 scalar: # real (non-pad) flat tokens
 ) -> jnp.ndarray:
     """MoE forward = sum_i (route_weight_i * expert_i(x)) + shared_expert(x).
     Vectorized dense: per-expert weights stacked into `[E, ...]` and
@@ -233,4 +234,17 @@ def moe_forward(
                         s=jnp.sum(shared.astype(fp32)),
                         m=jnp.max(jnp.abs(shared.astype(fp32))))
     y = y + shared.astype(fp32)
+    # S1 FIX: zero idle attn_dp token-ranks (flat rows >= n_real). The dense
+    # einsums force `flat_x`'s token axis to all-gather to REPLICATED (via
+    # `_shard_e_mid`); idle ranks contribute uninitialized-HBM garbage at their
+    # rows, which the expert all-reduce then folds in and which propagates into
+    # the residual -> prefill SEED -> nondeterministic decode collapse (S1).
+    # Masking here is safe: `y` is the already-replicated [N, dim] post-reduction
+    # quantity, so this is NOT a size-1 token-axis gather (pitfall #5). The
+    # forward h-path passes n_real=None (its idle rows feed only padded logits,
+    # never the seed) so token-1 argmax is unchanged.
+    if n_real is not None:
+        keep = (jax.lax.broadcasted_iota(jnp.int32, y.shape, 0)
+                < jnp.asarray(n_real, jnp.int32))
+        y = jnp.where(keep, y, jnp.zeros_like(y))
     return y.astype(dtype).reshape(orig_shape)
