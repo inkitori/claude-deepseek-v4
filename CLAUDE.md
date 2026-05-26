@@ -5,14 +5,14 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S12): **gate FAILS — but per-process nondeterminism LOCALIZED to the
-> LAYER-0 FORWARD (downstream of the attn kv-seed), NOT the seed.** Seed-checksum 2-engine diff:
-> layer-0 seed byte-identical across processes, but layer-1 residual INPUT differs (grows with
-> depth) ⇒ garbage enters in layer 0's `block_forward` (attention_prefill / **moe_forward** /
-> hc_post). MoE is prime suspect. fp32 matmul band-aid REFUTED (model already mostly fp32). The S10
-> ":775 seed all-reduce" mechanism is DEAD (refuted S11). NEXT: checksum attn_out vs moe_out in
-> block_forward L0 to pinpoint, then zero idle-rank contributions there. Loop NOT stopped — see
-> HANDOFF_S1.md.
+> One-line status (2026-05-26 S14): **gate FAILS.** MoE shard_map fix SHIPPED (5ca26d66, CPU-validated,
+> KEPT) but is PARTIAL: 2 fresh engines both DECODE coherently yet DIFFER (ENG_A FIB `b9876039`/chat
+> correct vs ENG_B `b5659d9c`/chat 620≠610) ⇒ per-process variance PERSISTS. Variance shows at the 1st
+> decode-token logprob ⇒ the prefill SEED differs per-process; MoE real rows are clean given clean
+> input, so the source is UPSTREAM = the **attention SEED build** (not MoE). `[ckS]` global sums are
+> NOISY (idle-rank) — S13's MoE localization partly measured noise; use REAL-ROWS-ONLY checksums +
+> output md5. Model is INSTRUCT (test coherence via /v1/chat). NEXT: real-rows localize the attention
+> seed. Loop NOT stopped — see HANDOFF_S1.md.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
