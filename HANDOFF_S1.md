@@ -27,26 +27,27 @@ diagnostics were REMOVED from source (CLAUDE.md "always-on" is STALE); `_v4_nan_
 env-gated (`V4_DECODE_NAN_TRIPWIRE`, default 0) AND only catches GROSS garbage (the `_linear`
 `|r|<1e8` clamp suppresses it pre-tripwire; the FINITE residual is the real culprit and is unlogged).
 
-## NEXT ACTIONS — ranked (the bug is now well-localized: kill per-process uninit-HBM in the seed)
-1. **(CHEAP, no code, try FIRST) `JAX_DEFAULT_MATMUL_PRECISION=highest`** (± determinism flags). A
-   tiny perturbation only flips the argmax because bf16 matmul error (~1e-2) is the same order as
-   the derail-step logit gap. Full-fp32 matmuls may widen the correct-token margin enough to stay
-   coherent AND deterministic, orthogonal to the garbage. MUST propagate to all 8 ray workers
-   (env-gated divergence → launch-id halt — see pitfall #0); confirm smoke.sh/ray_env propagates it
-   BEFORE smoking. Cold smoke (cache differs) → 2-engine FIB×3 → want byte-identical + coherent.
-   Optional add via `V4_XLA_FLAGS` (validate `python -c "import jax; jax.devices()"` first):
-   `--xla_tpu_enable_latency_hiding_scheduler=false --xla_enable_async_all_reduce=false`.
-2. **(THE FIX if #1 fails) zero idle-rank contributions in the prefill SEED build, structurally.**
-   The reverted `wsc(x,P())` all-gather Core-halts; instead `shard_map` the seed-build activation
-   over ATTN_DATA: each rank emits `jnp.where(is_live, real, 0.0)` then `jax.lax.psum` to replicate
-   → idle ranks contribute deterministic ZERO, no token-axis gather. `is_live` from the
-   ATTN_DATA-sharded `seq_lens` (0 on idle ranks, tpu_runner.py:1502); shard_map precedent
+## NEXT ACTIONS — ranked. Reuse the SAME 2-warm-engine FIB×3 A/B (`/tmp/s1_fib2.py ENG1`/`ENG2`,
+compare md5 + READ TEXT) as the pass/fail test for ANY attempt: each engine ~5min warm start.
+1. **(FASTEST gate shot — try FIRST) force full-fp32 matmuls via CODE, not env.** A tiny per-process
+   perturbation only flips the argmax because bf16 matmul error (~1e-2) ≈ the derail-step logit gap;
+   full fp32 may widen the correct-token margin enough to stay coherent AND deterministic even with
+   the garbage present (band-aid, but the gate only needs coherent+deterministic). Use the CODE route
+   — `jax.config.update("jax_default_matmul_precision", "highest")` at model init (synced to all 8
+   hosts ⇒ NO env-propagation launch-id race; do NOT use the `JAX_DEFAULT_MATMUL_PRECISION` env var,
+   it risks pitfall #0). Watch for fp32 HBM/OOM. sync → cold smoke → 2-engine FIB×3.
+2. **(THE FIX if #1 fails) — but LOCALIZE before editing.** S11 agents argued the seed P()-combine is
+   a benign all-gather, yet garbage demonstrably enters per-process SOMEWHERE — so don't blind-edit.
+   First add a custom diagnostic (norm/checksum of the seed `kv_cache` + the post-`_linear` `kv` +
+   the decode-step kv read), sync, cold smoke, run 2 engines, compare checksums → find the FIRST
+   buffer that DIFFERS across processes. THEN zero idle-rank contributions at that spot: `shard_map`
+   the producing op over ATTN_DATA, each rank emits `jnp.where(is_live, real, 0.0)` + `jax.lax.psum`
+   to replicate (idle ranks → deterministic 0, NO token-axis gather that Core-halts). `is_live` from
+   ATTN_DATA-sharded `seq_lens` (0 on idle ranks, tpu_runner.py:1502); precedents
    `_select_from_array_fn` tpu_runner.py:1152, `moe_gmm_local` valid-rows mask fused_moe_gmm.py:115.
-   Target file: deepseek_v4_attention.py `attention_init_state_from_prefill` (:1066) / `_linear` (:457).
-   Cold smoke + 2-engine verify (byte-identical across engines AND coherent through 1597).
-3. (diagnostic only) `V4_DECODE_NAN_TRIPWIRE=1` localizes GROSS garbage but NOT the finite residual;
-   a custom seed-norm/checksum printed + compared across 2 processes would directly show the
-   per-process-varying buffer. Use only if #1/#2 both miss.
+   Likely target: deepseek_v4_attention.py `attention_init_state_from_prefill` (:1066) / `_linear` (:457).
+   (`V4_DECODE_NAN_TRIPWIRE=1` only catches GROSS garbage — the clamp suppresses it — so it WON'T
+   localize the finite residual; you must add a checksum print.)
 
 ## DONE gate (unchanged): FIB coherent through 1597 (READ TEXT) + byte-identical across TWO fresh
 engines + survives 5 reqs. NB engine CORE-HALTS on the PARIS shape — fire FIB-only when probing.
