@@ -1,20 +1,19 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 6)" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 9)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S8): **S1 token-2 COLLAPSE = FIXED (reconfirmed); residual =
-> same-engine temp=0 NONDETERMINISM on flat prompts (now CONFIRMED, looks FIXABLE).** Greedy
-> Fibonacci/Paris coherent + deterministic + faithful to prefill; chat-with-system coherent;
-> open-ended LOOPING is the MODEL (gate `smoke_check.sh` is a broken loop detector — false-passes
-> phrase loops). NEW: same flat prompt, ONE engine, temp=0/seed=0, 3 fires → 2 unique outputs +
-> logits jitter run-to-run (rules out inherent FP-order ⇒ real nondet source: uninit-HBM/idle-rank/
-> nondet-collective, plausibly residual pad/uninit-KV = S1 tail). OPS HARDENED: `smoke.sh` now has
-> a flock single-instance GUARD (concurrent loop sessions were colliding into 2 fighting engines)
-> + `VLLM_ENGINE_READY_TIMEOUT_S=2400` (cold compile >600s was killing smokes). NEXT: torch-reference
-> lead (slice-free) + localize the nondet source. Loop NOT stopped — real fixable work remains.
+> One-line status (2026-05-26 S9): **S1 token-2 COLLAPSE = FIXED; residual = run-to-run logit
+> JITTER at temp=0.** Now sharply characterized (n=6 fresh-engine probe): Mars flat prompt → 3
+> unique/6 (jitter ~0.4 nats, occasionally flips argmax → loop); **Fibonacci EXACT (text+logprob
+> −0.19027 reproduced)**. ⇒ jitter is **INPUT-SPECIFIC, not pervasive** → **REFUTES the
+> "nondeterministic attn_dp collective" hypothesis** (would jitter Fib too). ~0.4 nats ≫ FP-order
+> noise ⇒ **uninitialized-HBM read** on a Mars-length-specific path; NOT stale-KV (history A==C,
+> KV rebuilt wholesale). LEAD: prefill compressor/indexer NOT `n_real`-aware → pad contamination
+> (naive zeroing DISPROVEN S6 — must thread traced `n_real`). NEXT: re-add a decode-step checksum
+> diagnostic to localize attn-vs-MoE-vs-compressor, then fix. Loop NOT stopped — fixable work remains.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
