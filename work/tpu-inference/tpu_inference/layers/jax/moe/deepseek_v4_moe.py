@@ -297,11 +297,20 @@ def moe_forward(
             g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
                         zero_initialize=True,
                         preferred_element_type=fp32)          # [N*top_k, dim]
-            # Revert to (token, slot) order. Rows for experts not on this rank are
-            # 0 (zero_initialize), so weight-combine + psum gives each token its
-            # exact routed sum over all experts (each (token,slot) has one expert,
-            # owned by exactly one rank -> no double count).
+            # Revert to (token, slot) order. Each (token,slot) has exactly one
+            # expert, owned by exactly one rank, so weight-combine + psum must give
+            # each token its exact routed sum with no double count -- PROVIDED every
+            # row whose expert is NOT on this rank contributes 0.
+            # S22: gmm zero_initialize only zeros the OUTER ends of the sorted
+            # buffer, NOT the interior rows of OTHER ranks' experts (which interleave
+            # among real tokens); those read uninit HBM and the combine pulls that
+            # garbage into REAL tokens (the S1 cross-process nondeterminism). So
+            # explicitly zero every non-owned (token,slot) here, mirroring production
+            # fused_moe_gmm's valid_rows_mask. idx_flat is already in (token,slot)
+            # order, aligning row-for-row with token_hidden after the revert.
             token_hidden = g2[revert_idx]                     # [N*top_k, dim]
+            _owned = (idx_flat >= r * EP) & (idx_flat < (r + 1) * EP)  # [N*top_k]
+            token_hidden = jnp.where(_owned[:, None], token_hidden, 0)
             token_topk = token_hidden.reshape(Nf, top_k, -1) * w_full[..., None]
             local = token_topk.sum(axis=1)                    # [N, dim] fp32
             if layer_idx == 0:
@@ -341,11 +350,8 @@ def moe_forward(
                         m=jnp.max(jnp.abs(shared.astype(fp32))))
     _ckR("moe_shared", shared)
     y = y + shared.astype(fp32)
-    # NOTE: n_real is plumbed here (seed-path only) for a future idle-rank fix.
-    # S13 tried zeroing y rows >= n_real (post-gather replicated mask): REFUTED —
-    # decode still collapsed (incoherent), so the garbage is NOT confined to
-    # pad-row VALUES; it enters the real rows via the token-axis all-gather /
-    # expert all-reduce collective itself (same class as the seed _linear no-op,
-    # commit 83f74395). Next: shard_map idle-RANK mask before the psum
-    # (fused_moe_gmm.py:230-245 template), not output row-masking.
+    # NOTE: the S22 owned-expert mask inside _routed_local IS the "idle-rank mask
+    # before the psum" deferred here. S13's post-gather y>=n_real mask was REFUTED
+    # (garbage is not pad-row VALUES); the working fix masks by expert OWNERSHIP in
+    # the sorted gmm output, mirroring fused_moe_gmm's valid_rows_mask.
     return y.astype(dtype).reshape(orig_shape)
