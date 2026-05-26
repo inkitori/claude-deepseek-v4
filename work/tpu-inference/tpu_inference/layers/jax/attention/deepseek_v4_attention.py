@@ -1120,6 +1120,24 @@ def attention_init_state_from_prefill(
     # slice healthy, S1 still OPEN). A correct fix must seed the short-prefill
     # state WITHOUT a degenerate empty-shard all-gather.
 
+    # S1 FIX (SESSION 15): kill the idle-rank uninit-HBM read at its SOURCE.
+    # The cross-token seed ops below (compressor reshape/overlap/dynamic_slice,
+    # SWA roll/take_along_axis) run over the attn_dp-sharded token axis T. For a
+    # short prompt only positions [0, n_real) are real (rank 0); [n_real, T) are
+    # pad (rank-0 tail) + ~31 EMPTY ranks whose HBM is UNINITIALIZED and varies
+    # per-process. Those cross-token ops pull that garbage into the REAL seed
+    # slots -> decode's 1st-token logprob differs per engine (the residual S1
+    # nondeterminism, now localized HERE, not MoE). Zero positions >= n_real at
+    # the INPUT: a LOCAL elementwise write (NOT a with_sharding_constraint /
+    # all-gather, so no empty-shard Core-halt -- pitfall #5), so every downstream
+    # cross-token op reads deterministic zeros in the pad/idle region. Real rows
+    # [0,n_real) untouched => closed-form correctness preserved (CPU exact-length
+    # n_real==T path: mask is a no-op). Distinct from the DEAD S6 fix (which
+    # zeroed compressor OUTPUT slots, after the read) and the DEAD _replicate(x).
+    if n_real is not None and T > 0:
+        _keep = (jnp.arange(T, dtype=jnp.int32) < jnp.asarray(n_real, jnp.int32))
+        x = jnp.where(_keep.reshape(1, T, 1), x, jnp.zeros_like(x))
+
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
     _v4_checksum("seed_x_in", x, layer_idx)
     # SWA kv (matches attention_prefill's kv computation).
