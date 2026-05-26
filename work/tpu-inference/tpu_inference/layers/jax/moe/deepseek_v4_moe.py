@@ -297,7 +297,7 @@ def moe_forward(
                 [W1_l.transpose(0, 2, 1), W3_l.transpose(0, 2, 1)],
                 axis=2).astype(fp32)                          # [EP, dim, 2*inter]
             g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
-                        zero_initialize=True,
+                        zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
             if layer_idx == 0:
                 # [ckR2] g1 (gate/up) masked to THIS rank's OWNED sorted rows. Owned
@@ -315,7 +315,7 @@ def moe_forward(
             h = (jax.nn.silu(gate) * up).astype(dtype)        # [N*top_k, inter]
             W2g_l = W2_l.transpose(0, 2, 1).astype(dtype)     # [EP, inter, dim]
             g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
-                        zero_initialize=True,
+                        zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, dim]
             if layer_idx == 0:
                 # [ckR3] g2 (down) masked to OWNED sorted rows, BEFORE revert/mask.
