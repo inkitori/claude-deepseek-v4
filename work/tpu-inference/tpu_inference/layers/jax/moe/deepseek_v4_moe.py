@@ -196,33 +196,76 @@ def moe_forward(
     one_hot = jax.nn.one_hot(indices, E, dtype=fp32)        # [N, top_k, E]
     per_expert_weight = jnp.einsum('nke,nk->ne', one_hot, weights)  # [N, E]
     per_expert_weight = per_expert_weight.astype(dtype).astype(fp32)
-    per_expert_weight = _shard_e_last(per_expert_weight)
+    # Route the routed-expert collective by the activation's token sharding:
+    # explicit shard_map for token-sharded PREFILL (token axis N divisible across
+    # attn_dp — the S1-buggy case where idle DP ranks feed uninit HBM into the
+    # implicit collective-matmul), else the dense einsum (CPU/no-mesh AND
+    # single-token DECODE, whose activation is replicated by _v4_decode_replicate
+    # so N=1 cannot — and need not — be sharded over attn_dp).
+    mesh = jax.sharding.get_abstract_mesh()
+    axis = (mesh.shape['attn_dp'] if not mesh.empty else 1)
+    N = flat_x.shape[0]
+    use_shard_map = (not mesh.empty) and axis > 1 and N >= axis and N % axis == 0
+    # E-sharded only for the dense path; the shard_map path keeps it
+    # token-sharded so each rank carries its tokens' full [N/axis, E] weights.
+    if not use_shard_map:
+        per_expert_weight = _shard_e_last(per_expert_weight)
     if layer_idx == 0:
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_perexpw",
                         s=jnp.sum(per_expert_weight),
                         m=jnp.max(jnp.abs(per_expert_weight)))
 
-    x_fp32 = flat_x.astype(fp32)
-    W1_fp32 = W1.astype(fp32)
-    W3_fp32 = W3.astype(fp32)
-    gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))
-    up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))
-    if swiglu_limit > 0:
-        up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
-        gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
-    h_NEi = jax.nn.silu(gate_NEi) * up_NEi
-    h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
+    if not use_shard_map:
+        # Dense einsum path (CPU/no-mesh + replicated decode): bit-for-bit
+        # unchanged from the original implementation.
+        x_fp32 = flat_x.astype(fp32)
+        W1_fp32 = W1.astype(fp32)
+        W3_fp32 = W3.astype(fp32)
+        gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))
+        up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))
+        if swiglu_limit > 0:
+            up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
+            gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
+        h_NEi = jax.nn.silu(gate_NEi) * up_NEi
+        h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
+        out_NEd = _shard_e_mid(jnp.einsum(
+            'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
+        y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
+    else:
+        # Sharded path: explicit shard_map over 'attn_dp' so XLA never
+        # inserts an implicit collective-matmul (which read uninit HBM on
+        # idle DP shards — S1). Mirrors fused_moe_gmm.py: all_gather x, local
+        # E-expert matmuls, psum, scatter back. per_expert_weight stays
+        # token-sharded (P('attn_dp',None)) to enter the shard_map per-rank.
+        def _routed_local(x_l, pew_l, W1_l, W3_l, W2_l):
+            x_full = jax.lax.all_gather(x_l, 'attn_dp', axis=0, tiled=True)
+            pew_full = jax.lax.all_gather(pew_l, 'attn_dp', axis=0, tiled=True)
+            r = jax.lax.axis_index('attn_dp')
+            EP = E // axis
+            pew_mine = jax.lax.dynamic_slice_in_dim(pew_full, r * EP, EP, axis=1)
+            xf = x_full.astype(fp32)
+            g = jnp.einsum('nd,eid->nei', xf, W1_l.astype(fp32))
+            u = jnp.einsum('nd,eid->nei', xf, W3_l.astype(fp32))
+            if swiglu_limit > 0:
+                u = jnp.clip(u, -swiglu_limit, swiglu_limit)
+                g = jnp.minimum(g, swiglu_limit)
+            h = jax.nn.silu(g) * u
+            h = h * pew_mine[..., None]
+            o = jnp.einsum('nei,edi->ned', h.astype(dtype), W2_l.astype(dtype))
+            local = o.astype(fp32).sum(axis=1)              # [N, dim] my experts
+            y_full = jax.lax.psum(local, 'attn_dp')         # [N, dim] full sum
+            N = x_full.shape[0]
+            NP = N // axis
+            return jax.lax.dynamic_slice_in_dim(y_full, r * NP, NP, axis=0)
 
-    out_NEd = _shard_e_mid(jnp.einsum(
-        'nei,edi->ned',
-        h_NEi.astype(dtype),
-        W2.astype(dtype),
-    ))                                                       # [N, E, dim] E-sharded
-
-    # Sum routed experts in fp32 to match the original loop's
-    # `y` accumulator dtype, then add the always-on shared expert.
-    y = out_NEd.astype(fp32).sum(axis=1)                    # [N, dim] fp32 routed sum
+        y = jax.shard_map(
+            _routed_local, mesh=mesh,
+            in_specs=(P('attn_dp', None), P('attn_dp', None),
+                      P('attn_dp', None, None), P('attn_dp', None, None),
+                      P('attn_dp', None, None)),
+            out_specs=P('attn_dp', None), check_vma=False,
+        )(flat_x, per_expert_weight, W1, W3, W2)             # [N, dim] fp32 routed sum
     if layer_idx == 0:
         jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
                         l=layer_idx, n="moe_routed_y",
