@@ -1,67 +1,58 @@
-# S1 handoff — PIVOT: decode = DENSE path, not gmm; routed output diverges from IDENTICAL input
+# S1 handoff — VERDICT: decode corruptor = per-rank LOCAL dense einsum (all-reduce + input EXONERATED)
 
 Goal: coherent, RELIABLE (cross-process deterministic) decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash`
 on v6e-32. Ops in `CLAUDE.md`; this is live state.
 
 ## GOAL / how to judge (see [[s1-symptom-nondeterminism-not-collapse]])
-Bug is NOT collapse. Symptoms: (1) cross-process non-determinism (FIB md5 differs across fresh engines;
-deterministic WITHIN a process), (2) quality drift. DONE = byte-identical md5 across 2 fresh engines AND
-correct Fibonacci. Model is INSTRUCT. Correct FIB after "13, " = 21,34,55,89,144,233,377,610,987,1597,2584,4181,6765.
+Bug is NOT collapse. Symptoms: (1) cross-process non-determinism (decode routed output differs across fresh
+engines; deterministic WITHIN a process), (2) quality drift. DONE = byte-identical FIB md5 across 2 fresh
+engines AND correct Fibonacci. Model INSTRUCT. Correct FIB after "13, " = 21,34,55,89,144,233,377,610,987,1597...
 
-## STATE (2026-05-26 S25) — MAJOR PIVOT: S24's gmm finding was PREFILL-ONLY; decode uses the DENSE path
-Decode (N=1, replicated by `_v4_decode_replicate`) takes `use_shard_map=False` (deepseek_v4_moe.py:224,
-`N>=axis` false for N=1<32) ⇒ the **DENSE einsum path (moe.py:238-250)**, which NEVER calls gmm_v2. gmm runs
-ONLY in PREFILL. So S24's "gmm kernel non-det on owned rows" is a real but **PREFILL** finding; SUBLANE-PAD is
-**DEAD for the decode symptom**.
-* **Mined S24 server logs (174930Z/180255Z) for DECODE-step [ckS] across 2 engines:** `moe_perexpw`
-  (routing) BYTE-IDENTICAL ×2 every step; `moe_shared` (=f(flat_x), same input) BYTE-IDENTICAL ×2 every step;
-  **`moe_routed_y` DIVERGES ×2 EVERY decode step** (e.g. decode-1 7.78 vs 2.18). ⇒ decode MoE INPUT + routing
-  are CLEAN; the dense routed path (lines 238-250) computes DIVERGENT routed output from BYTE-IDENTICAL input.
-* **Weights EXONERATED** (agent + safetensors index): w1/2/3_stacked are jnp.stack of fully-loaded experts,
-  E=256/32=8 exact (no pad), block_until_ready before release. Not the corruptor.
-* **CPU runs the SAME dense einsum deterministically** ⇒ the only TPU-added factor is E-sharding over attn_dp
-  + the `out_NEd.sum(axis=1)` XLA-inferred CROSS-RANK all-reduce. Prime suspect = that reduction/its buffers
-  (the einsum compute itself is least likely; CPU-clean). Structurally same reduction as prefill psum :360.
+## STATE (2026-05-26 S25) — VERDICT: the PER-RANK LOCAL dense einsum is the decode corruptor
+Decode takes the DENSE einsum path (moe.py:238-250; N=1 replicated ⇒ use_shard_map False; gmm is PREFILL-only,
+so S24's gmm lead is DEAD for decode). 2 fresh engines, max_tokens=2 decode step, identical code (md5 8111447b):
+| quantity (decode, layer 0)        | engine-1 (190818Z) | engine-2 (192051Z) | verdict   |
+|-----------------------------------|--------------------|--------------------|-----------|
+| moe_shared (=f(input))            | -33.92131042       | -33.92131042       | IDENTICAL |
+| moe_perexpw (routing)             |  1.499023438       |  1.499023438       | IDENTICAL |
+| [ckEtot] pre_sqsum (per-rank LOCAL out_NEd, gather path — NOT all-reduce) | 34.21117020 | 34.47301102 | **DIFFERS** |
+| [ckEtot] pre_gsum                 |  1.467573643       |  3.376025200       | **DIFFERS** |
+| [ckEY] y / moe_routed_y (post-reduce) | 1.467573643    |  3.376025200       | DIFFERS (downstream) |
+⇒ **the per-rank LOCAL out_NEd diverges from BYTE-IDENTICAL input.** pre_sqsum is reorder-immune & computed via
+gather+local-sum (NOT the suspect all-reduce), yet differs ×2 ⇒ corruptor is UPSTREAM of any cross-rank reduce,
+in the local compute (einsum chain `x@W1/W3 → silu·w → @W2`, lines 238-249). **ALL-REDUCE EXONERATED** (faithfully
+reduces already-divergent locals). **INPUT/cascade EXONERATED** (moe_shared+routing byte-identical ×2).
+Within-process: decode is DETERMINISTIC (engine-2 decode constant across 10 re-fires; only prefill [ckS] globals
+vary per-request = known PAD-ROW noise, N=1 decode has none). Both engines generate correct '21' (md5 5bf42256).
 
-## IN FLIGHT — [ckEtot]/[ckEY] disambiguator smoke (engine 1 RUNNING)
-Added to dense path (moe.py ~250, decode-active `layer_idx==0`, read-only, y unchanged). NOTE: per-rank
-debug.print is too LOSSY (S25 first run: only 2/32 ranks survived; jax.debug.print drops 32 competing lines),
-so the hardened version returns per-rank stats from the shard_map and prints SCALAR totals:
-* **[ckEtot]** `pre_gsum/pre_sqsum/pre_absmax` = pre-reduce TOTALS via shard_map(out_specs=P('attn_dp',None))
-  returning each rank's LOCAL out_NEd [gsum,sqsum,absmax] (NO collective), gathered (wsc P(), tiny/safe) +
-  LOCAL-summed. `pre_sqsum` is reorder-immune + per-rank-sensitive.
-* **[ckEY]** `y_gsum/...` = post-all-reduce y (the suspect path; == [ckS] moe_routed_y decode value).
-Synced 8/8 (md5 8111447b..., ckEtot=3 each); xla_cache cleared; engine 1 log:
-`logs/full-slice-v4-smoke-20260526T190818Z.log` (pid 2758672, COLD compile ~10-30 min). (Prior 184944Z run
-used the lossy per-rank [ckE] — superseded; that run did confirm decode generates correct '21' + moe_routed_y
-decode=60.05.) Grep: `bash /tmp/s1_cke.sh <log>`. Probe: `python /tmp/s1_probe2.py 2` (max_tokens=2).
+## NEXT ACTION — sub-localize WITHIN the local compute (lines 238-249)
+The dense path is "bit-for-bit unchanged original" + runs DETERMINISTICALLY on CPU ⇒ the TPU-specific factor
+(E-sharding / wsc reshard / MXU M=1 matmul scratch / routed-weight load) reads per-process-constant uninit. Test:
+1. **Checksum routed weights W1/W2/W3 cross-engine** (decode-active, layer 0): a SINGLE-LINE scalar sum/sqsum of
+   each stacked routed weight (gathered, like [ckEtot]). If a weight sum DIFFERS ×2 ⇒ routed E-stacked load is
+   uninit (shared expert is clean ⇒ moe_shared identical, but routed E-stacking is a different tensor). If
+   IDENTICAL ⇒ weights clean, the matmul/reshard reads uninit.
+2. **Split the einsum chain**: add scalar [ckEtot]-style per-rank-local checksums of gate_NEi/up_NEi (post x@W1/W3)
+   and h_NEi, vs out_NEd (post @W2). Which stage first diverges ×2 pins the einsum (vs the _shard_e_mid wsc).
+3. Likely fix: weights ⇒ fix routed load/stack zero-init; matmul ⇒ uninit MXU/accumulator scratch on M=1 decode;
+   reshard ⇒ the _shard_e_mid with_sharding_constraint. GATE = decode moe_routed_y md5 ×2 + FIB md5 ×2 + correct
+   Fibonacci, then CLAUDE.md formal gate ×2 + `touch /tmp/s1_loop_stop`.
 
-## NEXT ACTION
-1. Wait for engine-1 `Application startup complete`. Fire `python /tmp/s1_probe2.py 2` FIRST (1 clean decode
-   step). `bash /tmp/s1_cke.sh <log>` → record [ckEtot] (decode line) + [ckEY] + FIB-ish text.
-2. reset + smoke ENGINE 2, same. Compare across engines:
-   * **[ckEtot] pre_sqsum byte-identical ×2 but [ckEY]/moe_routed_y DIFFERS ×2** ⇒ corruptor is the attn_dp
-     ALL-REDUCE (every rank's LOCAL out_NEd is clean).
-   * **[ckEtot] pre_sqsum DIFFERS ×2** ⇒ corruptor is the PER-RANK LOCAL einsum (XLA matmul scratch /
-     _shard_e_mid reshard).
-   (Within-engine: pre_gsum should ~= [ckEY] y_gsum; a big gap is itself all-reduce evidence.)
-3. Fix follows the verdict (next session): all-reduce ⇒ force a deterministic explicit psum / clean the
-   reduce-scatter+all-gather buffer; local ⇒ chase the einsum output/reshard uninit. GATE = decode moe_routed_y
-   md5 ×2 + FIB md5 ×2 + correct Fibonacci, then CLAUDE.md formal gate ×2 + `touch /tmp/s1_loop_stop`.
+## Ops (CRITICAL: jax.debug.print is LOSSY — use SCALAR single-line prints, never 32 per-rank lines)
+* ONE engine. Warm xla cache ⇒ ~5 min ready (cache now warm from S25). FIRST req recompiles ~324s. Probe:
+  `python /tmp/s1_probe2.py 2` (max_tokens=2 = 1 clean decode step; output '21,'). Grep: `bash /tmp/s1_cke.sh <log>`.
+  Decode prints DROP under volume — RE-FIRE the same probe several times and `sort -u` to collect (decode is
+  deterministic within-process, so re-fires give the same value; only need it to survive a drop once).
+* edit→`full_slice_v4_sync.sh` (verify md5 8/8 as **enyouki@**, NOT mark)→CLEAR xla_cache 8 hosts if .py changed→
+  `reset.sh`→`smoke.sh`→wait `Application startup complete`. ssh -i ~/.ssh/google_compute_engine.
+  scripts/full_slice_v4_discover.sh for IPs. node_guardian UP (pid 497956); meta_guardian BROKEN, cluster HEALTHY.
+* Diagnostics IN (cleanup AFTER fix): [ckEtot]/[ckEY] dense path ~250 (S25, decode-active, scalar); [ckS]
+  moe_perexpw/moe_routed_y/moe_shared (:230/:382/:388, BOTH paths layer 0); prefill-only [ckR0/1b/2/3]/[ckR]/[ckL]
+  in shard_map branch; [ckD] decode-logit deepseek_v4.py:2017.
 
-## Ops
-* ONE engine. Warm xla cache ⇒ ~5 min ready; cleared now ⇒ COLD ~10-30 min. FIRST req recompiles. Fire
-  `max_tokens=2` FIRST (the 40-tok warmup pollutes per-step prints). `python /tmp/s1_warmup.py` = FIB 40tok
-  md5+text. `bash /tmp/s1_ck.sh <log>` greps checksums. ssh user = **enyouki@** (NOT mark — DenyUsers).
-  ssh -i ~/.ssh/google_compute_engine. Discover IPs: scripts/full_slice_v4_discover.sh.
-* edit→`full_slice_v4_sync.sh`(verify md5 8/8 as enyouki@)→CLEAR xla_cache 8 hosts if .py changed→`reset.sh`→`smoke.sh`.
-  node_guardian UP (pid 497956). meta_guardian BROKEN but cluster HEALTHY — don't re-fight.
-* Diagnostics IN (cleanup AFTER fix): [ckE]/[ckEY] dense path ~250 (NEW S25), [ckR0/1b/2/3] prefill shard_map
-  branch, [ckR] real-rows :172-182, [ckS] :230/:382/:388, [ckL] :358, [ckD] decode-logit deepseek_v4.py:2017.
-  [ckS] fires BOTH paths (layer_idx==0); [ckR*]/_ckR fire PREFILL-only (n_real is not None).
-
-## DEAD (do not retry): SUBLANE-PAD / any gmm-kernel fix for DECODE (gmm is prefill-only); bf16↔fp32 gmm dtype
-(both non-det, prefill); zero_initialize; partial_out_ref carry; gmm_v2:518 OOB; GATE/ROUTING sharding (routing
-byte-identical ×2 in decode too); EXPERT WEIGHTS uninit (E-stacked, fully written, safetensors-verified);
-wsc(act,P()); prefill-replicate decode meta. Anchors: logs 174930Z+180255Z (S24, decode [ckS] divergence);
-this session's engine logs from 184944Z onward.
+## DEAD (do not retry): the attn_dp ALL-REDUCE (exonerated — per-rank local already diverges); input/prefill
+CASCADE into decode (moe_shared+routing byte-identical ×2 in decode); SUBLANE-PAD / any gmm-kernel fix for DECODE
+(gmm is prefill-only); bf16↔fp32 gmm dtype; zero_initialize; partial_out_ref carry; gmm_v2:518 OOB; GATE/ROUTING
+sharding; EXPERT WEIGHTS uninit per S24 static analysis (BUT routed E-stacked weights NOT yet cross-engine
+checksummed — that's NEXT step 1, don't assume clean); wsc(act,P()) on token axis. Anchors: /tmp/s1_eng1_s25.txt;
+logs 190818Z (eng1) + 192051Z (eng2).
