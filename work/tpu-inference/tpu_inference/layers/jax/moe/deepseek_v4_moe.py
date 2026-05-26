@@ -254,6 +254,18 @@ def moe_forward(
         # token-sharded (P('attn_dp',None)) to enter the shard_map per-rank.
         def _routed_local(x_l, pew_l, W1_l, W3_l, W2_l):
             x_full = jax.lax.all_gather(x_l, 'attn_dp', axis=0, tiled=True)
+            # S17: break any XLA AllGather+Dot collective-matmul fusion that reads
+            # uninit HBM on idle shards (S14 suspicion; the explicit shard_map alone
+            # did NOT stop the real-row per-process variance, and input masking is
+            # insufficient -> the uninit read is in the collective OP itself).
+            x_full = jax.lax.optimization_barrier(x_full)
+            if layer_idx == 0:
+                # [ckG] x_full AFTER all_gather (pad rows already 0 via input mask, so
+                # gsum == real-rows sum). Isolates all_gather (gsum A!=B) vs psum/einsum
+                # (gsum A==B but moe_routed A!=B). Fires per-rank (32x), all identical.
+                jax.debug.print("[ckG] xfull_gsum={s:.9e} xfull_absmax={m:.9e}",
+                                s=jnp.sum(x_full.astype(jnp.float32)),
+                                m=jnp.max(jnp.abs(x_full.astype(jnp.float32))))
             pew_full = jax.lax.all_gather(pew_l, 'attn_dp', axis=0, tiled=True)
             r = jax.lax.axis_index('attn_dp')
             EP = E // axis
