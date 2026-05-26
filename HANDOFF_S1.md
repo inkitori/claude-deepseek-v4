@@ -33,14 +33,18 @@ Decode path (attn/KV + logits/select/sample tail) + the attention seed were re-a
 [ckD] decode-logit probe is BUGGED (reads dp_rank-31 pad row) — ignore it. Do NOT re-hunt decode/seed.
 
 ## NEXT ACTION
-1. **Isolate einsum vs psum (ONE diagnostic smoke pair, CHEAP/low-risk).** In `_routed_local`, after
-   `local = o.astype(fp32).sum(axis=1)`, add (GLOBAL sum is valid here BECAUSE [ckG] proved x_full — the
-   einsum input — is identical across processes; so any per-process diff in `local` is the einsum's fault):
-   `if layer_idx==0: jax.debug.print("[ckL] r={r} local_gsum={s:.9e}", r=r, s=jnp.sum(local))`.
-   CPU-syntax-check, sync+md5, 2 fresh engines, compare the `[ckL]` value SET (per rank `r`) A vs B (use
-   `comm` like /tmp/ckg_*.txt). **local SET differs A≠B → the EXPERT EINSUM injects per-process uninit**
-   (its output buffer or a matmul accumulator); **local SET identical but moe_routed differs → the PSUM** is
-   the corruptor.
+1. **Isolate einsum vs psum — `[ckL]` is ALREADY ADDED + committed (2d21664a, moe md5 0e76922b) + synced; and
+   engine A3 ALREADY RAN it.** A3 (FIB md5 `bb5adb1b`, moe_routed FIB real-rows `4.582982254e+01`) [ckL]
+   `local_gsum` distinct SET saved at `logs/s1_engA4_ckL.txt` (23 vals; discriminator: a large `9.417071875e+04`
+   + e.g. `-4.764e2`,`-5.094e2`,`6.268e1`), [ckG] at `logs/s1_engA4_ckG.txt`; full A3 log
+   `logs/full-slice-v4-smoke-20260526T120100Z.log`. ⇒ **NEXT SESSION: run ONE engine B3 (warmup→fib2; DO NOT
+   edit code first — must be the SAME executable as A3), extract B3's [ckL] set
+   (`grep -hoE 'local_gsum=[-0-9.e+]+' B3LOG | sed -E 's/local_gsum=//' | sort -u`) and `comm` vs
+   logs/s1_engA4_ckL.txt.** Also confirm B3 FIB md5 ≠ bb5adb1b (bug still reproduces) + B3 moe_routed real-rows
+   ≠ 45.83. Interpretation: **[ckL] sets DIFFER A3≠B3 (esp. the large ~9.4e4 discriminator) → the EXPERT
+   EINSUM injects per-process uninit** (output buffer / matmul accumulator); **[ckL] sets IDENTICAL but
+   moe_routed differs → the PSUM** is the corruptor. (Global sum is valid here because [ckG] proved x_full —
+   the einsum input — is byte-identical across processes.)
 2. **Fix by culprit:**
    * EINSUM: try forcing fp32 accumulation / a clean output (the einsum on the all_gathered full [N,dim] with
      per-rank experts may leave/READ uninit; compare to the DENSE shared einsum which is clean — what differs
@@ -64,8 +68,9 @@ Decode path (attn/KV + logits/select/sample tail) + the attention seed were re-a
   (FIB-prompt value = the 4×-count; chat = 1×). `/tmp/s1_ckdiff.py LOG_A LOG_B` also exists.
 * xla_cache WARM ⇒ startup ~5-6 min; a code edit recompiles only changed programs (warmup absorbs ~350s).
   KEEP cache unless a launch-id halt. md5-verify after sync: key `-i ~/.ssh/google_compute_engine`, user enyouki.
-* Diagnostics in tree: `[ckR]`/`[ckS]` (moe_forward), `[ckG]` (x_full, in shard_map), `[ckD]` (compute_logits,
-  BUGGED-ignore), `[fwd*]`/`[dec*]`. REMOVE ALL when S1 closes.
+* Diagnostics in tree: `[ckR]`/`[ckS]` (moe_forward), `[ckG]`+`[ckL]` (x_full / pre-psum local, in shard_map),
+  `[ckD]` (compute_logits, BUGGED-ignore), `[fwd*]`/`[dec*]`. Plus the input-mask + optimization_barrier
+  (sound/harmless, KEPT). REMOVE ALL diagnostics when S1 closes (the input-mask + barrier can stay or go).
 * Slice HEALTHY (8 clean smokes S17, no halts). Guardians up. Reset CLEAN 0/32. `/tmp/s1_loop_stop` NOT set.
 
 ## DEAD (do not retry)
