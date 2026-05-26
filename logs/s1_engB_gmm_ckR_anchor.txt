@@ -1,0 +1,5 @@
+# Engine B (gmm, commit 21063d80, smoke 20260526T141640Z) — FIB md5=39c33b59 (A19=d99ee354 DIFFERS)
+# 2-engine localization anchor: spin a 2nd gmm engine, compare [ckR] L0. moe_input differs => corruptor UPSTREAM of MoE; only moe_routed differs => gmm zero_init insufficient.
+(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_input: rsum=2.471417236e+02 rabsmax=3.234375000e+00
+(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_routed: rsum=6.134395218e+01 rabsmax=1.709416151e+00
+(EngineCore pid=1729297) [36m(RayWorkerWrapper pid=133241, ip=10.164.0.202)[0m [ckR] L0 moe_shared: rsum=7.088032532e+01 rabsmax=3.713140965e+00

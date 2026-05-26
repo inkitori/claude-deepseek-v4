@@ -5,14 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S18): **bug = the per-rank expert EINSUM in the MoE routed shard_map reads
-> uninit HBM (psum + all_gather EXONERATED).** Isolated via `[ckL]` pre-psum local-sum, engine B3 vs A3:
-> identical einsum INPUT (`[ckG]` x_full byte-identical) but the einsum OUTPUT sets share 0 values (lone ~1e5
-> outlier differs, 9.42e4 vs 8.50e4); `[ckR]` moe_routed REAL rows differ (91.5 vs 45.8) ⇒ the einsum hits
-> REAL rows, so pad/valid-row masking is REFUTED (per-element psum can't spread pad→real). Clean contrast: the
-> dense auto-SPMD einsum + moe_shared are deterministic. **NEXT (HANDOFF_S1.md):** find the uninit source
-> (weight/x_full physical padding the MXU reads) & fix, else port the fused_moe_gmm gmm kernel; validate on 2
-> fresh engines (single-engine [ckR] is globally reduced — can't see the bug). Loop NOT stopped.
+> One-line status (2026-05-26 S20): **the gmm_v2 + zero_initialize MoE fix (21063d80) is DISPROVEN** — 2 fresh
+> SAME-CODE engines still produce different FIB md5 (A19 d99ee354 numbers/7-12 vs B 39c33b59 prose/0-12; moe md5
+> 1814bc99 identical on all 8 hosts ⇒ no desync). NEW: the non-determinism is in the **PREFILL forward** (B's
+> prefill-argmax first token = `' ...'` ≠ A19's `21`), NOT decode-specific. **NEXT (HANDOFF_S1.md):** spin a 2nd
+> same-code engine, compare `[ckR] L0` to the saved anchor (logs/s1_engB_gmm_ckR_anchor.txt) — moe_input differs
+> ⇒ corruptor UPSTREAM of MoE (S18 misattributed; attention seed suspect); only moe_routed differs ⇒ gmm
+> zero_init insufficient on TPU. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
