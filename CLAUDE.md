@@ -5,15 +5,16 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-25 S7): **S1 decode collapse FIXED (confirmed); the only residual —
-> open-ended LOOPING — is the MODEL, not decode.** The precise S1 bug (token-2 attractor) is
-> gone: greedy Fibonacci decodes correct (`21…377, 610`), 3× byte-identical (deterministic),
-> faithful to prefill; short factual CHAT works (instruct model, native chat, needs a system
-> prompt). Open-ended gen ("teach me topology") LOOPS — but CONFIRMED to be the MODEL:
-> prefill-everything (the true forward, no decode-state path) loops IDENTICALLY to decode at
-> temp=0, so decode is FAITHFUL. The looping is neural-text-degeneration (out of S1 scope; try
-> min_p / higher temp / longer max_tokens). Loop stopped (`/tmp/s1_loop_stop`); engine LIVE on
-> :18081. The S1 sharding decode bug is closed; remaining work is model/serving-params, not S1.
+> One-line status (2026-05-26 S8): **S1 token-2 COLLAPSE = FIXED (reconfirmed); residual =
+> same-engine temp=0 NONDETERMINISM on flat prompts (now CONFIRMED, looks FIXABLE).** Greedy
+> Fibonacci/Paris coherent + deterministic + faithful to prefill; chat-with-system coherent;
+> open-ended LOOPING is the MODEL (gate `smoke_check.sh` is a broken loop detector — false-passes
+> phrase loops). NEW: same flat prompt, ONE engine, temp=0/seed=0, 3 fires → 2 unique outputs +
+> logits jitter run-to-run (rules out inherent FP-order ⇒ real nondet source: uninit-HBM/idle-rank/
+> nondet-collective, plausibly residual pad/uninit-KV = S1 tail). OPS HARDENED: `smoke.sh` now has
+> a flock single-instance GUARD (concurrent loop sessions were colliding into 2 fighting engines)
+> + `VLLM_ENGINE_READY_TIMEOUT_S=2400` (cold compile >600s was killing smokes). NEXT: torch-reference
+> lead (slice-free) + localize the nondet source. Loop NOT stopped — real fixable work remains.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
@@ -79,7 +80,9 @@ repetition is a red herring (decode loops too).
    wedge; do NOT reboot — sync fixes it).
 2. Clear `~/.cache/vllm/xla_cache/*` on all 8 hosts (stale/mixed cache also → launch-id halt).
 3. `scripts/full_slice_v4_reset.sh` (stops any engine, cleans lockfiles).
-4. `scripts/full_slice_v4_smoke.sh` (backgrounds vllm serve; prints log path).
+4. `scripts/full_slice_v4_smoke.sh` (backgrounds vllm serve; prints log path). Self-guards now:
+   flock single-instance (REFUSES if an engine is up/starting — `SMOKE_NO_GUARD=1` escapes) +
+   `VLLM_ENGINE_READY_TIMEOUT_S=2400` so a cold compile doesn't die at vllm's 600s default.
 5. Wait for `Application startup complete` (~6 min when xla cache warm; cold compile
    10-30 min). Then probe with curls; **fire critical probes first** (engine can crash
    on internal NaN after a few requests; the `compute_logits` nan_to_num clamp keeps it
@@ -142,6 +145,9 @@ is cheap but **CPU passes — it cannot reproduce S1** (no sharding). Budget: at
 5. **`with_sharding_constraint(activation, P())` that GATHERS a size-1 decode token axis
    Core-halts the slice** (proven ~8x). A wsc on a POST-reduction `[N,dim]` quantity is
    safe (doesn't gather the token axis). Don't gather the activation to replicated.
+6. **A live engine WEDGES on a new request shape** (HTTP500 → connection-refused; process stays
+   alive but stops serving), esp. the chat-path resharding. Raw `/completions` SAME shape survived
+   3 fires. When probing: pick ONE shape, fire critical probes first, reset+re-smoke if wedged.
 
 ## Slice bootstrap
 
