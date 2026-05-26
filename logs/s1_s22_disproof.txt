@@ -1,0 +1,32 @@
+# S1 SESSION 22 — owned-expert mask DISPROVEN as COMPLETE fix (but kept: necessary+correct progress)
+# Fix = commit b022ff10: _routed_local masks g2 output rows whose expert not in [r*EP,(r+1)*EP) before psum.
+#
+# 2-ENGINE GATE (same code b022ff10, fresh engines):
+#   eng1 FIB md5=06bfeeb9 leading_correct=10/12  '...610,987,1597,2583,4160'  (smoke T152836Z)
+#   eng2 FIB md5=0a72aece leading_correct= 7/12   '...377, <breaks into prompt repeat>'  (smoke T154627Z)
+#   => md5 DIFFER => CROSS-PROCESS NON-DETERMINISM REMAINS.
+#
+#   [ckR] L0 moe_input : eng1==eng2==247.14/abs3.234   IDENTICAL (always clean)
+#   [ckR] L0 moe_shared: eng1==eng2==70.88/abs3.713     IDENTICAL (always clean)
+#   [ckR] L0 moe_routed: eng1=55.230/abs1.423189878  eng2=85.719/abs1.424025536
+#        => rsum DIFFERS BIG (55 vs 85) but rabsmax CONVERGED+nearly-equal (1.4232 vs 1.4240).
+#        Pre-fix was B=61.34/abs1.709 C=68.08/abs1.459 (absmax also differed).
+#   seed chain (seed_x_in/seed_kv_*) eng1==eng2==anchor  IDENTICAL (clean).
+#
+# INTERPRETATION: mask REMOVED the large-magnitude NON-owned garbage (absmax dropped 1.71->1.42 & converged),
+#   but a SMALL-magnitude residual remains in rows that SURVIVE the mask = the OWNED-expert rows (sum shifts
+#   55->85, absmax stable). Owned rows have deterministic inputs/weights => residual = uninit HBM/VMEM read
+#   INSIDE the gmm for VALID owned rows.
+#
+# AGENT VERDICTS (this session):
+#  - gmm acc_ref (matmul accumulator): PROVABLY CLEAN (write-before-read along k; first-k-step overwrites). NOT it.
+#  - gmm partial_out_ref (cross-SUBLANE carry scratch, gmm_v2.py:1217 decl, :501 read into real row0, :515-519 write):
+#       uninit VMEM, NOT touched by zero_initialize, flows into VALID OWNED rows. Guard is only `gm_id==0`.
+#       SUSPECT iff num_n>1 (V4 dim large => yes) AND gm_id==0 is GLOBAL not LOCAL under group_offset=[r*EP]
+#       => ranks with group_offset>0 (31/32) read uninit for their first owned group's boundary row. LEADING HYPOTHESIS.
+#  - production fused_moe_func swap: NOT recommended (medium rewrite: sqrtsoftplus/hash-route/bias-pre-topk/fp32/shared;
+#       and prod uses SAME zero_init+downstream-mask => same latent uninit, would not cure owned-row bug).
+#
+# NEXT: localize WHERE owned-row nondet enters — add owned-masked checksums splitting the TWO gmms inside
+#  _routed_local (g1 gate/up out, g2 down out, x_full input), 2 fresh engines, find FIRST divergent quantity.
+#  If g1/g2 owned output already differs => gmm kernel (audit partial_out_ref under group_offset, gmm_v2.py:495-521).

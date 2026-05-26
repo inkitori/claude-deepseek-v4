@@ -1,4 +1,4 @@
-# S1 handoff — corruptor LOCALIZED to the gmm ROUTED path; seed/input exonerated; next = fix gmm zero_init
+# S1 handoff — owned-mask removed the BIG non-owned garbage but owned-row residual REMAINS; localize which gmm
 
 Goal: coherent, RELIABLE (cross-process deterministic) decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash`
 on v6e-32. Ops in `CLAUDE.md`; this is live state.
@@ -8,28 +8,42 @@ Bug is NOT collapse. Symptoms: (1) cross-process non-determinism (FIB md5 differ
 deterministic WITHIN a process), (2) quality drift. DONE = byte-identical md5 across 2 fresh engines AND
 correct Fibonacci. Model is INSTRUCT. Validate: warmup absorbs ~336s recompile, then s1_fib_clean ×2 / 2 engines.
 
-## STATE (2026-05-26 S21) — DECISIVE: corruptor = the gmm ROUTED path; input+shared+seed all CLEAN
-3 fresh same-code engines (commit 21063d80=HEAD .py) ALL differ: A19=d99ee354, B=39c33b59, C=7488bc96.
-Engine C (host .202, first prefill, Fib prompt) vs B anchor, REAL-ROWS [ckR] L0:
-* `moe_input` 247.14/abs3.234 = **IDENTICAL** • `moe_shared` 70.88/abs3.713 = **IDENTICAL** •
-  `moe_routed` C 68.078/abs1.459 vs B 61.344/abs1.709 = **DIFFERS**. seed_x_in/seed_kv*/blk_attn_out all IDENTICAL.
-* abs**max** differs ⇒ genuine element-wise garbage in REAL rows, NOT fp reorder ⇒ uninit-HBM in routed path.
-⇒ Corruptor is the **routed-expert gmm_v2 path** (moe_input/shared/seed clean). S20's "upstream/attention-seed"
-  lead is REFUTED. S19's `zero_initialize=True` is INSUFFICIENT on TPU. (Re-confirms S18: routed path is it.)
+## STATE (2026-05-26 S22) — owned-expert mask = PARTIAL fix (kept), residual is in OWNED gmm rows
+HEAD **b022ff10**: `_routed_local` (deepseek_v4_moe.py:304-315) now masks g2 rows whose expert∉[r·EP,(r+1)·EP)
+to 0 before the weight-combine/psum (the `valid_rows_mask` production has; the code's own NOTE deferred exactly
+this). 2-engine gate (full detail: `logs/s1_s22_disproof.txt`):
+* eng1 FIB md5=06bfeeb9 (10/12: ...610,987,1597,**2583,4160**) ≠ eng2 md5=0a72aece (7/12, breaks) ⇒ **STILL NON-DET**.
+* `[ckR] L0 moe_routed` eng1=**55.23/abs1.423189878** vs eng2=**85.72/abs1.424025536**: rsum DIFFERS big,
+  but rabsmax **CONVERGED & nearly-equal** (pre-fix B=61.34/abs1.709 C=68.08/abs1.459 — absmax also differed).
+* moe_input/moe_shared/seed chain = byte-identical ×2 (always clean).
+⇒ mask correctly removed the LARGE non-owned garbage (absmax converged); the SMALL residual (sum 55→85, absmax
+  stable) is in rows that SURVIVE the mask = the **OWNED-expert rows** ⇒ uninit read INSIDE the gmm for VALID
+  owned rows. **KEEP the mask** (correct + necessary; production has it). S21's "routed gmm is corruptor" stands.
 
-## NEXT ACTION — fix the gmm routed non-determinism; verify with C-vs-new-engine moe_routed match
-Audit gave 2 candidates (try cheap first, ONE smoke each, keep cache unless kernel edit):
-1. **stable argsort** `deepseek_v4_moe.py:277,281` add `stable=True` (cheap; LOW odds — revert is a permutation
-   so no ties; but free). 2. **zero whole gmm out** `kernels/megablox/gmm_v2.py` zero_out_start only zeros
-   edges → empty-expert-group rows uninit; force `out_ref[...] = 0`. 3. simplest: **mask routed y to real rows
-   (<n_real)** BEFORE the un-sort/psum in moe_forward. Gate verdict = C's moe_routed md5 stays IDENTICAL across
-   2 fresh engines AND FIB md5 matches ×2. Anchor: logs/s1_engB_gmm_ckR_anchor.txt + logs/s1_engC_localization.txt.
+## NEXT ACTION — localize WHICH gmm produces the nondet owned rows, THEN fix the kernel scratch
+1. Add **owned-masked checksums** inside `_routed_local` to split the two gmms (diagnostics only; .py edit ⇒
+   sync + CLEAR cache + cold compile): after `x_full` (gmm INPUT — re-confirm deterministic w/ mask in place),
+   after g1 (gate/up, masked to owned in SORTED space), after the g2 owned-mask (`token_hidden`). Print
+   per-rank rsum/rabsmax (like the existing `[ckL]` at :307). 2 fresh engines → FIRST divergent quantity localizes it.
+2. **Leading hypothesis** (Agent audit): gmm **`partial_out_ref`** (cross-SUBLANE carry scratch — gmm_v2.py:1217
+   decl, **:501** `tiled_out_ref[0]+=where(gm_id==0,0,partial_out_ref)`, :515-519 write). It is uninit VMEM, NOT
+   touched by `zero_initialize`, and flows into VALID owned rows; guard is only `gm_id==0`. SUSPECT iff num_n>1
+   (V4 dim large ⇒ yes) AND `gm_id==0` is the GLOBAL gm-index not this rank's LOCAL first group under
+   `group_offset=[r·EP]` — then 31/32 ranks read uninit for their first owned group's boundary row. If g1/g2
+   owned output diverges, audit gmm_v2.py:495-521 + the gm_id/group_offset semantics; fix = seed partial_out_ref=0
+   on this rank's first owned gm-tile (local), or zero that scratch.
+3. gmm **acc_ref** matmul accumulator is PROVABLY CLEAN (don't re-audit). Production `fused_moe_func` swap is NOT
+   worth it (medium rewrite; same latent uninit+mask). Gate verdict = `[ckR] moe_routed` byte-identical ×2 AND FIB md5 ×2.
 
 ## Ops
-* ONE engine. Warm cache ⇒ ~5 min ready; FIRST req recompiles ~336s. `/tmp/s1_warmup.py`(Fib) absorbs it, then
-  `/tmp/s1_fib_clean.py <lbl>`. Compare [ckR] L0 (real rows) NOT [ckS] (unmasked=padding noise). ssh -i ~/.ssh/google_compute_engine.
+* ONE engine. Warm cache ⇒ ~5 min ready; FIRST req recompiles ~336s. `python /tmp/s1_warmup.py`(Fib) absorbs it.
+  Verify both engines in one shot: `bash /tmp/s1_verify.sh <lbl> <smoke-log>` (warmup + s1_fib_clean ×2 +
+  greps [ckR]/[ckS] L0). Compare [ckR] L0 moe_routed (real rows) NOT [ckS] (per-forward/decode noise).
+  ssh -i ~/.ssh/google_compute_engine.
 * edit→`full_slice_v4_sync.sh`(md5)→cache: KEEP if .py unchanged / CLEAR if changed→`reset.sh`→`smoke.sh`. Guardians up.
-* HYGIENE: 4 stale parked claude sessions in tmux (122150/130123/141328/144348Z) — harmless but accumulating; kill old windows.
-* Diagnostics IN (cleanup AFTER fix): [ckR]180-182,[ckS]230-233,[ckL]308-309,[ckD] dsv4 2016-21. Keep row-mask+nan_to_num.
+* HYGIENE: ~5 stale parked claude sessions in tmux accumulating (handoff-window spawns); harmless, kill old windows.
+* Diagnostics IN (cleanup AFTER fix): [ckR]180-182, [ckS]230-233, [ckL]307-309, [ckD] dsv4 2016-21. Keep row-mask+nan_to_num.
 
-## DEAD (do not retry): gmm_v2+zero_init alone; attention SEED (clean this session); psum/all_gather/x_full/weights/all pad-masking; wsc(act,P()); prefill-replicate decode meta.
+## DEAD (do not retry): S22 owned-mask ALONE (necessary, insufficient — owned-row residual remains); gmm acc_ref
+(provably clean); gmm_v2+zero_init alone; production fused_moe_func swap; attention SEED; psum/all_gather/x_full/weights
+/y≥n_real pad-masking; wsc(act,P()); prefill-replicate decode meta. Anchors: logs/s1_s22_disproof.txt, s1_eng1_s22fix.txt.

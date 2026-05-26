@@ -1,0 +1,9 @@
+# Engine #1 (S22 owned-expert mask, commit b022ff10), smoke 20260526T152836Z
+# FIB md5=06bfeeb9 leading_correct=10/12 (x2 within-engine identical)
+#   '21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2583, 4160,  ...'
+#   (first 10 EXACT incl 610,1597; derails term11 2583!=2584, term12 4160!=4181)
+# [ckR] L0 moe_input:  rsum=2.471417236e+02 rabsmax=3.234375000e+00  (== anchor, clean)
+# [ckR] L0 moe_routed: rsum=5.522983551e+01 rabsmax=1.423189878e+00  (NEW vs B=61.34/C=68.08 -- garbage->0)
+# [ckR] L0 moe_shared: rsum=7.088032532e+01 rabsmax=3.713140965e+00  (== anchor, clean)
+# seed_x_in/seed_kv_postlinear/seed_kv_cache == B anchor exactly (clean)
+# GATE for eng2: md5==06bfeeb9 AND moe_routed==5.522983551e+01/abs1.423189878 byte-identical => determinism FIXED
