@@ -5,14 +5,17 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S14): **gate FAILS.** MoE shard_map fix SHIPPED (5ca26d66, CPU-validated,
-> KEPT) but is PARTIAL: 2 fresh engines both DECODE coherently yet DIFFER (ENG_A FIB `b9876039`/chat
-> correct vs ENG_B `b5659d9c`/chat 620≠610) ⇒ per-process variance PERSISTS. Variance shows at the 1st
-> decode-token logprob ⇒ the prefill SEED differs per-process; MoE real rows are clean given clean
-> input, so the source is UPSTREAM = the **attention SEED build** (not MoE). `[ckS]` global sums are
-> NOISY (idle-rank) — S13's MoE localization partly measured noise; use REAL-ROWS-ONLY checksums +
-> output md5. Model is INSTRUCT (test coherence via /v1/chat). NEXT: real-rows localize the attention
-> seed. Loop NOT stopped — see HANDOFF_S1.md.
+> One-line status (2026-05-26 S16): **gate FAILS — but LOCALIZED.** cfc65ca4 (attn-seed input mask,
+> S15) validated on 2 fresh engines → still fails (ENG_A FIB `0a72aece` vs ENG_B `ba467a77`; both
+> coherent + within-engine deterministic but DIFFER cross-engine). Log-mining (STABLE-within /
+> DIVERGENT-across, noise-filtered) at L0: seed_x_in/seed_kv/blk_attn_out/blk_post_attn_x(MoE
+> input)/moe_perexpw(gate)/moe_shared ALL byte-identical A==B; **`moe_routed_y` (routed-expert
+> collective) is the FIRST divergence.** ⇒ **SEED IS CLEAN** (S14's "variance upstream in seed"
+> REFUTED; cfc65ca4 KEPT as sound partial — it made seed checksums identical). Variance is in the **MoE
+> ROUTED collective** (S14 shard_map PARTIAL; matches S13). CAVEAT: moe_routed_y is a GLOBAL sum —
+> confirm REAL rows (rows<n_real) diverge with a real-rows checksum BEFORE fixing (prior sessions burned
+> smokes on idle-row global-sum noise). Model is INSTRUCT (coherence via /v1/chat). NEXT in
+> HANDOFF_S1.md. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

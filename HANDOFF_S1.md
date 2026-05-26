@@ -1,76 +1,82 @@
-# S1 handoff — MoE shard_map shipped (partial); per-process variance is UPSTREAM in the attention SEED
+# S1 handoff — variance LOCALIZED to the MoE ROUTED-EXPERT collective (L0); attention seed is CLEAN
 
-Goal: coherent, RELIABLE decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the v6e-32 slice.
-Ops in `CLAUDE.md`; this is live state.
+Goal: coherent, RELIABLE (cross-process deterministic) decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash`
+on v6e-32. Ops in `CLAUDE.md`; this is live state.
 
-## GOAL (user-confirmed, S14)  — see memory [[s1-goal-reliable-coherence]]
-DONE = **reliably coherent decode on EVERY fresh engine** (bug is a per-process coin flip). Validate
-with the RIGOROUS gate: **byte-identical (md5) FIB across 2 fresh engines AND read the text for
-coherence** (within a process the TPU is byte-deterministic, so a COMPLETE fix ⇒ identical across
-processes; coherence alone passes by luck). The model is INSTRUCT — assess coherence via
-`/v1/chat/completions` (system+user); the raw `/v1/completions` FIB loop is an off-distribution
-ARTIFACT, use it only as the wedge-safe determinism (md5) probe.
+## GOAL (user-confirmed) — see memory [[s1-goal-reliable-coherence]]
+DONE = **reliably coherent decode on EVERY fresh engine** (bug is a per-process coin flip). RIGOROUS gate:
+**byte-identical (md5) FIB across 2 fresh engines AND coherent chat text.** Model is INSTRUCT — coherence
+via `/v1/chat/completions` (system+user). Raw `/v1/completions` FIB = wedge-safe md5 determinism probe only.
 
-## STATE (2026-05-26, SESSION 14)
+## STATE (2026-05-26 SESSION 16) — DECISIVE LOCALIZATION (reverts S14, confirms S13)
+cfc65ca4 (attention-seed input mask, S15) was VALIDATED on 2 fresh engines → **gate STILL FAILS**:
+* ENG_A: FIB md5 `0a72aece` (3× identical, coherent `21,34,55,89,144,233,377`), chat `46aadc63` (correct first-15 then over-gen ramble).
+* ENG_B: FIB md5 `ba467a77` (3× identical, coherent prose), chat `2b0dc29c` (correct `1,1,…,610,987`, clean stop).
+* Both coherent + within-engine deterministic, DIFFER cross-engine ⇒ per-process variance PERSISTS.
 
-**MoE shard_map fix SHIPPED but is at most PARTIAL — gate STILL FAILS.** Commit `5ca26d66`: rewrote
-`moe_forward`'s routed-expert section as explicit `jax.shard_map` over 'attn_dp' (all_gather x +
-per_expert_weight → local E/axis einsums → `jax.lax.psum` → dynamic_slice back; static gate
-`use_shard_map = N%attn_dp==0 and N>=attn_dp` so PREFILL uses it, replicated decode N=1 + CPU use the
-dense path). CPU-validated: shard_map == dense (MAXDIFF=0.0), `s1_cpu_repro both` match. **2-engine
-slice test:**
-* ENG_A: FIB md5 `b9876039` (×4 identical), chat "0,1,1,2,…,233,377" **correct**.
-* ENG_B: FIB md5 `b5659d9c` (×3 identical), chat "1,1,2,…,233,377,**620**"  (**620 wrong**, =610).
-* Both DECODE coherently (no hard "Fibs Fibs" collapse) but **DIFFER cross-engine ⇒ per-process
-  variance PERSISTS ⇒ gate FAILS. MoE was NOT the (sole) source.**
+**ROOT CAUSE (rigorous, noise-filtered).** Mined both engine logs for quantities STABLE-within-each-engine
+but DIVERGENT-across (the ONLY valid signal — global `[ckS]` sums include per-process-CONSTANT idle-rank
+garbage, so a raw A≠B is not proof). At L0:
+* BYTE-IDENTICAL A==B: `seed_x_in`, `seed_kv_postlinear`, `seed_kv_cache`, `blk_attn_out`, `blk_post_attn_x`
+  (= MoE input), `moe_perexpw` (gate), `moe_shared` (shared expert).
+* FIRST DIVERGENCE: **`moe_routed_y`** (routed-expert collective output) — A=8.685e4 vs B=1.007e5.
+⇒ **The ATTENTION SEED IS CLEAN** (S14's "variance upstream in the seed" is REFUTED; cfc65ca4 made the seed
+checksums identical = it worked for the seed). The variance enters at the **MoE ROUTED-EXPERT collective**
+(the S14 shard_map all_gather/psum, `deepseek_v4_moe.py` ~241-268). Same input + same gate + clean shared
+expert, only the routed COLLECTIVE diverges. S13's MoE-L0 localization was RIGHT; S14 shard_map is PARTIAL.
+Evidence logs: `logs/full-slice-v4-smoke-20260526T074717Z.log` (A), `...081139Z.log` (B).
 
-**WHERE THE VARIANCE IS NOW (refined):** it's present at the **1st decode token's logprob** (ENG_A
-gap 2.57 vs ENG_B gap 4.31, both argmax '21') ⇒ the **prefill-built SEED differs per-process**,
-upstream of decode. The shard_map keeps MoE real rows clean *given clean input*, but the MoE input
-real rows arrive **already contaminated from the ATTENTION SEED build**. ⇒ **NEXT TARGET = the
-attention seed** (`attention_init_state_from_prefill`: seed KV / SWA / compressor / indexer reading
-idle attn_dp-rank uninit HBM), NOT the MoE.
-
-**METHODOLOGY FIX:** the `[ckS]` GLOBAL sums are **NOISY** — they include idle-rank uninit garbage
-that varies request-to-request WITHIN one engine (ENG_A blk_moe_out swung 9.41e4↔9.73e4 while the
-decode OUTPUT stayed byte-identical `b9876039`). So S13's "blk_moe_out differs cross-engine ⇒ MoE"
-localization was **partly measuring noise**. Trust the decode **OUTPUT md5**; for localization use
-**REAL-ROWS-ONLY** checksums (rows < n_real), not global sums.
+## ⚠ CRITICAL CAVEAT — confirm REAL rows before fixing (prior sessions burned smokes on this)
+`moe_routed_y` is a GLOBAL sum. For E=256, attn_dp=32 (N%32==0, 8 experts/rank) there is NO padding/idle-
+expert slot, so the shard_map has no obvious uninit read (the "E%axis mask" idea is a NO-OP here — dead).
+The A≠B could be (a) REAL-row corruption (the bug) OR (b) per-process-constant garbage in PAD/idle ROWS
+(rows>=n_real) of the sum (noise). MUST disambiguate with a REAL-ROWS-ONLY checksum.
 
 ## NEXT ACTION
-1. Add **real-rows-only** (rows < n_real) checksums in the SEED path — esp. inside
-   `attention_init_state_from_prefill` (seed_kv/SWA/compressor/indexer) and `block_init_state_and_
-   forward` (slice real rows BEFORE the global sum). n_real is already traced/plumbed
-   (deepseek_v4.py:1865, seed path). The real-row LAYOUT is the catch: for a single request all real
-   tokens sit in ONE attn_dp rank's slice (rows [k·N/32, k·N/32+n_real)), not [0,n_real) — confirm
-   the offset (which dp_rank) before slicing. (See [[s1-experiment-confounds]], runner
-   `_prepare_inputs_dp` token_offset.)
-2. Run 2 fresh engines, diff the real-rows checksums → the FIRST real-rows-divergent quantity is the
-   true entry point. Fix it analogously (shard_map / kill the idle-rank read in that collective; NO
-   size-1 token-axis wsc — pitfall #5).
-3. Re-validate: 2 fresh engines md5-identical FIB + coherent chat (no math errors) + survives 5 reqs.
-4. KEEP the MoE shard_map fix (sound, CPU-validated, removes the implicit collective-matmul; plausibly
-   fixes the MoE source). Only revert if it complicates the attention-seed work.
+1. **Confirm with a REAL-ROWS-ONLY checksum.** In `moe_forward` add a checksum of routed-y over rows < n_real:
+   `((jnp.arange(N) < n_real)[:,None] * y_routed).sum()` (real rows are at GLOBAL [0,n_real)). Plumb `n_real`
+   into `moe_forward` if absent (it's traced in the seed path; thread from `block_init_state_and_forward`).
+   Also checksum MoE input + `moe_shared` the same way as controls. CPU-validate (`s1_cpu_repro both`), sync,
+   2 fresh engines, diff the real-rows values.
+   * **REAL rows DIVERGE** → routed collective corrupts real rows → fix the collective (see 2).
+   * **REAL rows CLEAN** → it's idle/pad-row global-sum noise; moe_routed_y is NOT the bug — re-localize the
+     next stable-divergent REAL-rows quantity downstream (lm_head/final-norm token-axis reduction is the one
+     UNTESTED-by-location suspect; decode-step is the other).
+2. **Fix lead (if real rows diverge):** production `fused_moe_gmm.py` (lines 236-238, `valid_rows_mask` →
+   `jnp.where(mask, token_topk_hidden, 0.0)` BEFORE the per-rank sum/psum) makes idle ranks emit zeros into
+   the collective; bespoke `deepseek_v4_moe.py` LACKS any pre-psum mask (line ~257). PORT a pad-row mask
+   (`jnp.where(arange(N)<n_real, ..., 0)`) before the psum — BUT note: the two impls use DIFFERENT token↔expert
+   decompositions, so verify the mask semantics; the audit-agent's specific `(r+1)*NP` mask code was WRONG.
+   Alternative: adopt the production `fused_moe_gmm` for V4 outright. LOCAL elementwise only — NO new
+   `with_sharding_constraint` gathering a size-1/empty axis (pitfall #5, Core-halts ~8×).
+3. Validate: 2 fresh engines FIB md5 identical + coherent chat (READ TEXT) + survives 5 reqs.
 
-## DONE gate: md5-identical FIB across TWO fresh engines + coherent chat (READ TEXT). Engine
-CORE-HALTS on PARIS shape — FIB-only for completions. Smoke serves **max_model_len=256** (chat
-max_tokens<=256).
+## KEEP cfc65ca4 (attn-seed input mask): CONFIRMED it makes the seed deterministic (identical seed checksums
+A==B); sound + matches torch/vLLM-GPU reference (seed built only from real positions). Revert only if it
+complicates the MoE work.
+
+## DONE gate: md5-identical FIB across TWO fresh engines + coherent chat (READ TEXT). Engine CORE-HALTS on
+PARIS shape → FIB-only for completions. Smoke serves max_model_len=256 (chat max_tokens<=256).
 
 ## Tools / ops
-* Probes: `/tmp/s1_warmup.py` (FIB, timeout 2400 absorbs cold compile), `/tmp/s1_fib2.py <label>`
-  (FIB×3, md5+fib_terms — DETERMINISM probe), `/tmp/s1_chat.py <label> [prompt]` (instruct COHERENCE
-  probe, max_tokens=200). Results saved `/tmp/s1_eng{A,B}_results.txt`.
-* `[ckS]` (NOISY global sums) LIVE in block_init_state_and_forward + moe internals +
-  attention_init_state_from_prefill; `_v4_checksum` at deepseek_v4_attention.py:70.
-  **REPLACE with real-rows-only versions for localization; REMOVE ALL when S1 closes.**
-* Slice HEALTHY (many clean smokes S14, no halts). Guardians up (node 497956, meta 4039835).
-  Reset CLEAN 0/32. `/tmp/s1_loop_stop` NOT set. Cold compile of the shard_map ~330s on 1st request.
+* Probes: `/tmp/s1_warmup.py` (FIB — RUN FIRST: primes the ~345s cold compile of the completions+logprobs
+  path; `s1_fib2.py`'s 180s per-req timeout is TOO SHORT for that cold compile and will look like a hang),
+  `/tmp/s1_fib2.py <label>` (FIB×3 md5 — wedge-safe determinism), `/tmp/s1_chat.py <label> [prompt]` (instruct
+  coherence). Results → `/tmp/s1_eng{A,B}_results.txt`.
+* On-disk `xla_cache` is WARM for current code ⇒ engine startup ~5-6 min; after engine A's warmup primes the
+  logprobs+chat compiles, engine B's probes are fast (shared on-disk cache). KEEP the cache (don't clear)
+  unless a launch-id halt. Per-engine smoke ≈ startup + 1 warmup compile + probes.
+* Checksums via `_v4_checksum` (`deepseek_v4_attention.py:70`); labels seed_*/blk_*/moe_*. GLOBAL = noisy →
+  ADD real-rows-only versions for localization; REMOVE ALL diagnostics when S1 closes.
+* Slice HEALTHY (many clean smokes S16, no halts). Guardians up (node 497956, meta 4039835). Reset CLEAN 0/32.
+  `/tmp/s1_loop_stop` NOT set. Both engines were reset down — slice is idle/clean.
 
-## DEAD fixes (do NOT retry)
-* **MoE shard_map alone (S14, 5ca26d66)** — does NOT achieve cross-engine determinism (variance is
-  upstream in the attention seed). KEPT as a sound partial fix.
-* **XLA flag `--xla_tpu_*_collective_matmul_mode=none/post_spmd` (S14)** — REJECTED by this libtpu
-  ("Unknown flags in XLA_FLAGS", engine crashes at init).
-* MoE output-row / input-pos / pad-replicate masks (S6/S13) — no-ops (collective/idle-rank, not data
-  values). Option A prefill-replicate → NaN/all-BOS (metadata layout mismatch). fp32 matmul (S12).
-  `wsc(activation,P())` gathering empty/idle or size-1 token axis → Core-halts (~8×).
+## DEAD (do not retry)
+* **cfc65ca4 attn-seed mask ALONE** — does NOT achieve cross-engine determinism (variance is in MoE routed, not
+  seed). KEPT as a sound partial.
+* **MoE shard_map ALONE (5ca26d66)** — PARTIAL; routed collective still admits per-process variance.
+* **E%axis expert-slot mask in the shard_map** — NO-OP for E=256 (256%32==0); not the bug.
+* XLA `--xla_tpu_*_collective_matmul_mode` flag — REJECTED by libtpu. fp32 matmul (S12). Option A prefill-
+  replicate → NaN/all-BOS. Zeroing MoE output/input/pad rows (S6/S13) — no-op (collective/scratch, not data).
+  Zeroing comp_full/i_cache SEED pad-slots (S6) — regressed decode. `wsc(activation,P())` gathering empty/idle/
+  size-1 token axis → Core-halts (~8×).
