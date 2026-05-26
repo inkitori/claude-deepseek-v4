@@ -1,75 +1,64 @@
-# S1 handoff — RUNTIME per-process nondeterminism CONFIRMED (uninit HBM); :775 + cold-compile both refuted
+# S1 handoff — LOCALIZED: per-process garbage enters in LAYER-0 FORWARD (downstream of attn kv-seed); fp32 REFUTED
 
 Goal: coherent, **deterministic** decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the
 v6e-32 slice. Ops in `CLAUDE.md`; this is live state.
 
-## STATE (2026-05-26, SESSION 11) — DECISIVE: it is RUNTIME per-process, not cold-compile
+## STATE (2026-05-26, SESSION 12) — two decisive results
 
-**Clean experiment (never run before): 2 sequential engines from the SAME warm xla_cache (no code
-change, no cache clear) → engine#2 reuses engine#1's IDENTICAL compiled executable.** Both warm
-starts (275s / 315s). FIB×3 temp=0 seed=0 (`/tmp/s1_fib2.py`):
-* ENG1: `21, 34, 55, 89, 144,`+whitespace | md5 32c0a09d | first-tok '21' lp **−0.05688** | 5 terms
-* ENG2: `21,34,55,89,144,233,377,410,410,410…` | md5 30cb9775 | lp **−0.01035** | 7 terms→410-loop
-* Each engine BYTE-IDENTICAL within itself (×3); **DIFFERENT across the two processes.**
+**1. fp32 matmul band-aid REFUTED.** Global `jax_default_matmul_precision=highest` via CODE, 2
+engines same warm cache: ENG1 `fef3a2e4` ("21,34,55,…"+prose) ≠ ENG2 `50aae3c0`
+("…377,521,618,139…"). Per-process nondeterminism SURVIVES full fp32. Root: V4 is ALREADY mostly
+fp32 (logits deepseek_v4.py:2008, `_linear` :469, MoE gate/up W1/W3 pinned) — only MoE W2 + misc
+flipped — so uninit-HBM garbage propagates regardless of matmul precision. fp32 reverted.
 
-⇒ **Same executable, different output per process = RUNTIME PER-PROCESS nondeterminism.** This
-RULES OUT cold-compile reduction-order variance (executable is identical) AND confirms the only
-remaining class: **uninitialized/recycled HBM read fresh per process** (fixed within a process →
-byte-identical ×3; differs across processes; survives a fixed compiled schedule). The team's
-idle-rank-uninit-HBM intuition was RIGHT; the LOCATION (:775 all-reduce) was WRONG (it's a benign
-all-gather — S11 agents). Manifests as a tiny per-process logit perturbation that derails Fibonacci
-at a process-dependent term (5 / 7 / full like S9) — NOT a step-1 collapse (first ~7 decode steps
-are correct), so the seed is mostly-right but slightly contaminated.
+**2. LOCALIZED to LAYER 0 FORWARD via seed checksums.** Added always-on `_v4_checksum`
+(deepseek_v4_attention.py) printing sum+absmax at 4 seed-build points; ran 2 fresh engines (ENG3
+`764fe7cd`, ENG4 `ad51abcd` — EVERY process gives a DIFFERENT FIB continuation), diffed the
+`[ckS]` global-all-reduce sums (`/tmp/s1_ckdiff.py LOG_A LOG_B`):
+* **Layer-0 seed BYTE-IDENTICAL across processes** (seed_x_in 1.8616e3 both; kv/kv_cache identical).
+* **Layer-1 input (`seed_x_in`) DIFFERS** (1683.6 vs 1719.4, Δ≈36, real not float-noise) and grows
+  with depth (NaN by L36-42; the `_linear` clamp turns NaN→finite so kv_postlinear stays
+  finite-but-divergent). 111/172 checksums differ.
+⇒ `seed_x_in(L)` = layer L's residual input; L0 input (embedding) is identical ⇒ **per-process
+garbage FIRST enters during LAYER 0's forward, DOWNSTREAM of the attention kv-seed** (L0 seed is
+identical). REFOCUSES off the attention seed (S5-S10 dead-end) onto layer 0 `block_forward`.
 
-Also nailed this session: greedy is RNG-free + seed=0 deterministic (NOT sampling); MoE expert-sum
-has NO idle expert-ranks (8/rank) and routed experts are healthy ([moeRS]); the `[decL]/[fwdL]`
-diagnostics were REMOVED from source (CLAUDE.md "always-on" is STALE); `_v4_nan_tripwire` is
-env-gated (`V4_DECODE_NAN_TRIPWIRE`, default 0) AND only catches GROSS garbage (the `_linear`
-`|r|<1e8` clamp suppresses it pre-tripwire; the FINITE residual is the real culprit and is unlogged).
-
-## NEXT ACTIONS — ranked. Reuse the SAME 2-warm-engine FIB×3 A/B (`/tmp/s1_fib2.py ENG1`/`ENG2`,
-compare md5 + READ TEXT) as the pass/fail test for ANY attempt: each engine ~5min warm start.
-1. **(FASTEST gate shot — try FIRST) force full-fp32 matmuls via CODE, not env.** A tiny per-process
-   perturbation only flips the argmax because bf16 matmul error (~1e-2) ≈ the derail-step logit gap;
-   full fp32 may widen the correct-token margin enough to stay coherent AND deterministic even with
-   the garbage present (band-aid, but the gate only needs coherent+deterministic). Use the CODE route
-   — `jax.config.update("jax_default_matmul_precision", "highest")` at model init (synced to all 8
-   hosts ⇒ NO env-propagation launch-id race; do NOT use the `JAX_DEFAULT_MATMUL_PRECISION` env var,
-   it risks pitfall #0). Watch for fp32 HBM/OOM. sync → cold smoke → 2-engine FIB×3.
-2. **(THE FIX if #1 fails) — but LOCALIZE before editing.** S11 agents argued the seed P()-combine is
-   a benign all-gather, yet garbage demonstrably enters per-process SOMEWHERE — so don't blind-edit.
-   First add a custom diagnostic (norm/checksum of the seed `kv_cache` + the post-`_linear` `kv` +
-   the decode-step kv read), sync, cold smoke, run 2 engines, compare checksums → find the FIRST
-   buffer that DIFFERS across processes. THEN zero idle-rank contributions at that spot: `shard_map`
-   the producing op over ATTN_DATA, each rank emits `jnp.where(is_live, real, 0.0)` + `jax.lax.psum`
-   to replicate (idle ranks → deterministic 0, NO token-axis gather that Core-halts). `is_live` from
-   ATTN_DATA-sharded `seq_lens` (0 on idle ranks, tpu_runner.py:1502); precedents
-   `_select_from_array_fn` tpu_runner.py:1152, `moe_gmm_local` valid-rows mask fused_moe_gmm.py:115.
-   Likely target: deepseek_v4_attention.py `attention_init_state_from_prefill` (:1066) / `_linear` (:457).
-   (`V4_DECODE_NAN_TRIPWIRE=1` only catches GROSS garbage — the clamp suppresses it — so it WON'T
-   localize the finite residual; you must add a checksum print.)
+## NEXT ACTION — pinpoint WITHIN layer 0, then fix.
+`block_forward` (deepseek_v4.py:265-291): residual→hc_pre→rms→**attention_prefill(:280)**→
+hc_post(:281)→residual→hc_pre→**moe_forward(:290)**→hc_post(:291). Add `_v4_checksum` (gate to
+layer_idx<2; import from deepseek_v4_attention) on: y after :280 (attn out), x after :281, y after
+:290 (MoE out), out after :291. sync→clear xla_cache→cold smoke→`/tmp/s1_warmup.py`→grep `[ckS]`→
+reset→warm 2nd engine→warmup→`/tmp/s1_ckdiff.py`. FIRST of {attn_out, moe_out} that differs across
+the 2 processes = the culprit op. **MoE is prime suspect**: bespoke `out_NEd.sum(axis=1)` over
+attn_dp-sharded experts (deepseek_v4_moe.py `moe_forward`) — in prefill, idle ranks (no tokens) can
+sum uninit-HBM garbage; it's CLAUDE.md's standing suspect.
+THEN fix at that op: zero idle-rank/idle-token contributions (shard_map + `jnp.where(is_live, real,
+0.0)` + `lax.psum`, NO token-axis gather — precedents in CLAUDE.md). Re-verify: 2-engine FIB
+byte-identical + coherent.
 
 ## DONE gate (unchanged): FIB coherent through 1597 (READ TEXT) + byte-identical across TWO fresh
-engines + survives 5 reqs. NB engine CORE-HALTS on the PARIS shape — fire FIB-only when probing.
-
-## DEAD fixes (do NOT retry)
-* `wsc(activation, P())` gathering empty/idle shards → Core-halts (~8×).
-* mask matmul INPUT x / `position<n_real` on kv/x → no-op (garbage on idle RANKS not pad positions).
-* zero compressor/indexer SEED-OUTPUT pad-slots → regressed (S6).
-* ANY :775-seed-replicate fix (shard_map seed / is_live on packed buffer) → benign all-gather (S11).
-* MoE `out_NEd.sum` mask → no idle expert-ranks (S11). Cold-compile determinism flags as the SOLE
-  fix → executable is identical across the differing engines, so flags alone can't be the whole story
-  (they may still help #1 by widening margins).
+engines + survives 5 reqs. Engine CORE-HALTS on the PARIS shape — FIB-only when probing. NB: every
+process now gives a DIFFERENT coherent-ish FIB ("21,34,55…"+prose or +numeric-derail) ⇒ COHERENCE
+is no longer the discriminator; CROSS-PROCESS determinism is.
 
 ## Tools / ops
-* `/tmp/s1_fib2.py <label>` (FIB-only ×3, engine-labelled, prints md5+fib_terms+first-tok lp). Reuse it.
-* engine#1 log `logs/...T023908Z.log`, engine#2 `...T025001Z.log` (no internal diagnostics — prints removed).
-* Reset CLEAN (0/32). Guardians up (3×node + meta). Slice HEALTHY (2 clean warm smokes this session).
-* Warm-cache A/B caveat: small modules may recompile per-process (default thresholds); set
-  `VLLM_XLA_CHECK_RECOMPILATION=1` to force-cache everything for a perfectly clean A/B.
+* `/tmp/s1_warmup.py` (1 FIB, 2400s timeout, absorbs the DEFERRED cold compile → result file).
+  `/tmp/s1_fib2.py <label>` (FIB×3 within-engine). `/tmp/s1_ckdiff.py LOG_A LOG_B` (diff [ckS] sums).
+* `_v4_checksum(name,x,layer_idx)` always-on in deepseek_v4_attention.py + 4 calls in
+  attention_init_state_from_prefill — **REMOVE all `[ckS]`/helper when S1 closes.**
+* ENG3 log `logs/...034437Z.log`, ENG4 log `logs/...035449Z.log` (both have `[ckS]`).
+* Reset CLEAN (0/32). Guardians up (node 497956 + meta 4039835). Slice HEALTHY (4 clean smokes
+  this session). Cold compile is DEFERRED to the 1st request (startup completes ~6min even cold).
+
+## DEAD fixes (do NOT retry)
+* **fp32 matmul highest (S12)** — survives; model already fp32.
+* **attention KV-SEED fixes (S12)** — L0 seed is byte-identical across processes; garbage is in the
+  layer-0 FORWARD, not the seed. (Subsumes: :775 seed-replicate=benign all-gather S11; zero
+  compressor/indexer seed pad-slots=regressed S6.)
+* `wsc(activation,P())` gathering empty/idle shards → Core-halts (~8×).
+* mask matmul INPUT x / position<n_real → no-op (garbage on idle RANKS not pad positions).
 
 ## Durable lessons
 * `wsc(ACTIVATION,P())` gathering empty/idle shards Core-halts. decode-vs-prefill ON SLICE is the test.
 * `different launch id`/`Core halted` BEFORE startup = CODE DESYNC → sync + clear xla_cache. Don't reboot.
-* Engine core-halts on the PARIS request shape — FIB-only when probing for the gate.
 * (`/tmp/s1_loop_stop` NOT set.)

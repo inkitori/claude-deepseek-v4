@@ -1,20 +1,18 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 10)" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 12)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S10): **gate FAILS — token-2 collapse fixed, but CROSS-ENGINE
-> idle-rank SEED contamination remains.** S10 smoke: Fibonacci byte-identical within-engine but
-> DERAILS at term 8 (`...377,410,...656-loop`, logprob −0.02520) vs S9's correct `...610,987,1597`
-> (−0.19027) — SAME code ⇒ cross-engine nondeterminism breaks coherence on a bad-seed engine.
-> MECHANISM (pinned): idle attn_dp ranks (ATTN_DATA on the size-1 B axis → 1 live rank, ~31
-> EMPTY-B-shard ranks) materialize uninitialized-HBM output buffers (seed output spec is P()),
-> all-reduce-SUMmed into the replicated seed at `wsc(b,P())` deepseek_v4.py:775. Garbage is on idle
-> RANKS not pad positions ⇒ all position/input/wsc-gather fixes are dead. NEXT: force idle-rank
-> contributions to ZERO via (1) shard_map the seed build, or (2) per-rank is_live mask on the
-> post-reduction packed buffer (both no-gather). Loop NOT stopped — see HANDOFF_S1.md.
+> One-line status (2026-05-26 S12): **gate FAILS — but per-process nondeterminism LOCALIZED to the
+> LAYER-0 FORWARD (downstream of the attn kv-seed), NOT the seed.** Seed-checksum 2-engine diff:
+> layer-0 seed byte-identical across processes, but layer-1 residual INPUT differs (grows with
+> depth) ⇒ garbage enters in layer 0's `block_forward` (attention_prefill / **moe_forward** /
+> hc_post). MoE is prime suspect. fp32 matmul band-aid REFUTED (model already mostly fp32). The S10
+> ":775 seed all-reduce" mechanism is DEAD (refuted S11). NEXT: checksum attn_out vs moe_out in
+> block_forward L0 to pinpoint, then zero idle-rank contributions there. Loop NOT stopped — see
+> HANDOFF_S1.md.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
