@@ -5,12 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S22): owned-expert mask (HEAD b022ff10, the `valid_rows_mask` prod has) **removed
-> the LARGE non-owned gmm garbage** — moe_routed absmax CONVERGED 1.71→1.42 ×2 engines — **but cross-process
-> non-det REMAINS** in the rows the mask KEEPS = the OWNED gmm rows (moe_routed rsum 55 vs 85; FIB md5 still
-> differs). KEEP the mask. Leading suspect: gmm **`partial_out_ref`** sublane-carry scratch (uninit, NOT zeroed by
-> zero_initialize) read into valid owned rows. **NEXT (HANDOFF_S1.md):** owned-masked checksums splitting g1/g2
-> inside _routed_local → 2 engines → which gmm; then fix kernel scratch. gate = moe_routed md5 ×2 + FIB ×2. Loop NOT stopped.
+> One-line status (2026-05-26 S24): gmm **dtype REFUTED** (bf16 lhs/rhs ×2 engines STILL non-det: FIB md5
+> 2a3ffbc3≠4d346071). Reorder-immune aggregates: routing + moe_input + moe_shared BYTE-IDENTICAL ×2, only
+> **moe_routed DIVERGES** (7.11e1 vs 2.82e1). x_full identical + deterministic argsort ⇒ gmm INPUT identical ⇒
+> **the gmm kernel computes OWNED rows non-deterministically from IDENTICAL input** (dtype- AND zero_initialize-
+> independent ⇒ suspect = `partial_out_ref` VMEM carry on owned PARTIAL-TILE boundary rows). **NEXT
+> (HANDOFF_S1.md):** SUBLANE-PAD owned group_sizes to kill partial tiles → 2 engines. gate = moe_routed md5 ×2 +
+> FIB ×2 + correct Fib. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
