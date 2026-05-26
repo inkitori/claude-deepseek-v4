@@ -5,14 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S17): **ROOT CAUSE NAILED.** Real-rows checksum `[ckR]` (rows<n_real,
-> masking pad-garbage) on 2 fresh engines (FIB md5 `f3362d36` vs `aa9eb2ed`, differ): `moe_input` and
-> `moe_shared` real-rows are byte-identical A==B, but **`moe_routed` (routed-expert COLLECTIVE) real-rows
-> DIFFER** on BOTH prompts ⇒ same input, clean dense path, the SHARD_MAP all_gather/einsum/psum corrupts
-> REAL token rows per-process (NOT pad-row noise; S16 caveat resolved). Decode path + seed re-audited
-> CLEAN. **NEXT = FIX:** zero flat_x pad rows (>=n_real) on the INPUT side BEFORE the shard_map (S13
-> output-masking REFUTED; mask must be pre-collective, fused_moe_gmm template). Details in HANDOFF_S1.md.
-> Model is INSTRUCT (/v1/chat). Loop NOT stopped.
+> One-line status (2026-05-26 S17): **ROOT CAUSE = MoE ROUTED COLLECTIVE OP (all_gather/psum) reads uninit
+> HBM into REAL rows, input-independent.** `[ckR]` real-rows checksum on 4 fresh engines: `moe_input` +
+> `moe_shared` real-rows always byte-identical A==B, `moe_routed` real-rows ALWAYS DIFFER per-process (NOT
+> pad-row noise). Input-side pad mask (a3982a2b) = INSUFFICIENT (proven: pad INPUTS zeroed yet moe_routed
+> still differs A'5.66e1/B'5.14e1) ⇒ the uninit read is in the COLLECTIVE OP itself, not input values.
+> Decode path + seed re-audited CLEAN. **NEXT (HANDOFF_S1.md):** optimization_barrier(x_full) shot +
+> [ckG] x_full checksum to isolate all_gather-vs-psum; last resort = adopt fused_moe_gmm. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

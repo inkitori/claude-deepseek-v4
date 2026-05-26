@@ -32,22 +32,40 @@ values, OR the collective lowering) — the dense shared path (no collective) is
 is the tell. S13 output-row masking (zero y rows>=n_real AFTER) was REFUTED; S14 shard_map ALONE was PARTIAL.
 ⇒ Must kill the garbage on the INPUT side, BEFORE the collective/einsum.
 
-## NEXT ACTION — FIX (input-side pad mask before the routed collective)
-In `moe_forward` (`layers/jax/moe/deepseek_v4_moe.py`), zero flat_x PAD rows (global rows >= n_real) BEFORE the
-shard_map (so x_l, hence x_full, has deterministic 0 in pad rows; SwiGLU(0)→0 so o pad rows = 0, psum clean,
-real rows unaffected by garbage). Concretely, when `use_shard_map and n_real is not None`:
-`flat_x_routed = jnp.where((jnp.arange(N) < n_real)[:,None], flat_x, 0)` and feed `flat_x_routed` into the
-shard_map (keep the dense path + shared-expert path on the ORIGINAL flat_x — they're already clean & this
-preserves bit-for-bit dense behavior). Reference template: production `fused_moe_gmm.py` masks
-`token_topk_hidden` with `valid_rows_mask` BEFORE the per-rank sum/psum (it makes idle ranks emit zeros).
-NO new `with_sharding_constraint` gathering a size-1/empty axis (pitfall #5). Then:
-1. CPU-validate: `PYTHONPATH=work/tpu-inference:work/vllm work/vllm_env/bin/python3 scripts/s1_cpu_repro_v4flash.py both` → "OK: both match".
-2. sync (`scripts/full_slice_v4_sync.sh`) + md5-verify (key `-i ~/.ssh/google_compute_engine`, user enyouki).
-3. 2 fresh engines (warmup→fib2→chat each). PASS = `[ckR] moe_routed` real-rows A==B identical AND FIB md5
-   A==B identical AND coherent chat (READ TEXT) AND survives 5 reqs. Compare via `/tmp/s1_ckdiff.py` or the
-   uniq-count grep used in S17 (FIB-prompt [ckR] = the 4×-count value).
-If real rows STILL differ after input masking → the contamination is in the collective op itself; fall back to
-adopting production `fused_moe_gmm` for V4 routed experts (bigger change).
+## ⚠ INPUT-MASK FIX (a3982a2b) = INSUFFICIENT — proven on 2 fresh engines (S17, 2nd smoke pair)
+Added input-side pad mask (zero flat_x + per_expert_weight rows >= n_real BEFORE the shard_map). Re-ran 2 fresh
+engines: `moe_input` real-rows A'==B' identical (mask works — pad inputs ARE zeroed), `moe_shared` real-rows
+A'==B' identical, but **`moe_routed` real-rows STILL DIFFER (A'=5.656e1 / B'=5.136e1) and FIB md5 STILL DIFFER
+(1b95d044 / fdadf4b4)**. ⇒ With pad-row INPUTS provably zeroed, the collective STILL injects per-process
+variance into REAL rows. The uninit-HBM read is in the **COLLECTIVE OP itself (all_gather and/or psum),
+INDEPENDENT of input values** — NOT fixable by masking inputs. (A 10% divergence is far too big for FP
+non-associativity; it's a gross uninit read.) Mask KEPT (sound: pad rows -> deterministic 0; may be needed
+alongside the real fix). The `fused_moe_gmm` valid_rows-mask "minimal port" is REDUNDANT with this (our local
+pad rows are already 0) — DEAD. Units of the mask verified correct (hc collapsed before MoE; n_real=seq_lens[0]
+= positions = N; matches cfc65ca4's attn-seed mask).
+
+## NEXT ACTION — isolate the collective op + cheap fix shots (in priority order)
+The corruptor is inside `_routed_local`: `all_gather(x_l,tiled=True)` -> einsum -> `psum`. Real rows clean in
+== out is violated. Try, cheapest first (each = CPU-validate, sync+md5, 2 fresh engines, PASS = `[ckR]
+moe_routed` real-rows A==B AND FIB md5 A==B AND coherent chat, READ TEXT):
+1. **optimization_barrier shot + isolation diagnostic (ONE smoke pair).** After `x_full = all_gather(...)`, add
+   `x_full = jax.lax.optimization_barrier(x_full)` (breaks any XLA AllGather+Dot collective-matmul fusion that
+   reads uninit HBM — S14's original suspicion; the explicit shard_map may not stop the *fusion*). ALSO add a
+   global checksum of x_full INSIDE _routed_local at L0 (`jax.debug.print("[ckG] xfull_gsum={s:.9e}",
+   s=jnp.sum(x_full.astype(jnp.float32)))`, fires 32x/rank, all identical) so the SAME smoke tells you: barrier
+   fixed it (moe_routed A==B)? else is x_full A!=B (all_gather corrupts) or x_full A==B but moe_routed A!=B
+   (psum/einsum corrupts)? [ckG]: pad rows already 0 so gsum == real-rows sum.
+2. If x_full DIFFERS (all_gather is the corruptor): the tiled all_gather reads uninit on idle shards. Try
+   `reduce_scatter`-free reforms, or replicate x via `with_sharding_constraint` to P() OUTSIDE the shard_map
+   (CAUTION pitfall #5 — only safe on a POST-reduction [N,dim], and N here is the full padded token axis, NOT a
+   size-1 decode axis, so a wsc to gather x to replicated may be OK — but VERIFY it doesn't Core-halt).
+3. If x_full CLEAN but moe_routed DIFFERS (psum is the corruptor): the psum reads uninit. Try masking `local`
+   rows>=n_real to 0 before psum (thread n_real into the shard_map) — though if x_full pad=0 this is already 0;
+   alternatively replace `psum`+`dynamic_slice` with `psum_scatter`/`reduce_scatter`.
+4. LAST RESORT: full `fused_moe_gmm` adoption (gmm grouped-matmul + ragged gather/scatter, zero_init kernel,
+   bounded to valid rows so it NEVER touches uninit). BIG: V4 is dense (per_expert_weight[N,E], sqrtsoftplus,
+   hash-routing) vs gmm's top_k-sparse (argsort/group_sizes/[E,2*inter] layout). Agent gap-analysis: needs a
+   rewrite, not a direct call.
 
 ## KNOWN INSTRUMENTATION BUG (fix if you reuse [ckD])
 `[ckD]` in `compute_logits` reads `_lg[-1]` = dp_rank-31 PAD row (T=32 = 1 row/dp_rank; real token is row 0
