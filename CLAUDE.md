@@ -1,19 +1,20 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 9)" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 10)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S9): **S1 token-2 COLLAPSE = FIXED; residual = run-to-run logit
-> JITTER at temp=0.** Now sharply characterized (n=6 fresh-engine probe): Mars flat prompt → 3
-> unique/6 (jitter ~0.4 nats, occasionally flips argmax → loop); **Fibonacci EXACT (text+logprob
-> −0.19027 reproduced)**. ⇒ jitter is **INPUT-SPECIFIC, not pervasive** → **REFUTES the
-> "nondeterministic attn_dp collective" hypothesis** (would jitter Fib too). ~0.4 nats ≫ FP-order
-> noise ⇒ **uninitialized-HBM read** on a Mars-length-specific path; NOT stale-KV (history A==C,
-> KV rebuilt wholesale). LEAD: prefill compressor/indexer NOT `n_real`-aware → pad contamination
-> (naive zeroing DISPROVEN S6 — must thread traced `n_real`). NEXT: re-add a decode-step checksum
-> diagnostic to localize attn-vs-MoE-vs-compressor, then fix. Loop NOT stopped — fixable work remains.
+> One-line status (2026-05-26 S10): **gate FAILS — token-2 collapse fixed, but CROSS-ENGINE
+> idle-rank SEED contamination remains.** S10 smoke: Fibonacci byte-identical within-engine but
+> DERAILS at term 8 (`...377,410,...656-loop`, logprob −0.02520) vs S9's correct `...610,987,1597`
+> (−0.19027) — SAME code ⇒ cross-engine nondeterminism breaks coherence on a bad-seed engine.
+> MECHANISM (pinned): idle attn_dp ranks (ATTN_DATA on the size-1 B axis → 1 live rank, ~31
+> EMPTY-B-shard ranks) materialize uninitialized-HBM output buffers (seed output spec is P()),
+> all-reduce-SUMmed into the replicated seed at `wsc(b,P())` deepseek_v4.py:775. Garbage is on idle
+> RANKS not pad positions ⇒ all position/input/wsc-gather fixes are dead. NEXT: force idle-rank
+> contributions to ZERO via (1) shard_map the seed build, or (2) per-rank is_live mask on the
+> post-reduction packed buffer (both no-gather). Loop NOT stopped — see HANDOFF_S1.md.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

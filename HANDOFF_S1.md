@@ -1,63 +1,72 @@
-# S1 handoff — decode COLLAPSE fixed; residual = INPUT-SPECIFIC uninit-HBM logit jitter
+# S1 handoff — gate FAILS via CROSS-ENGINE idle-rank seed contamination (mechanism pinned)
 
 Goal: coherent, **deterministic** decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the
 v6e-32 slice. Ops in `CLAUDE.md`; this is live state.
 
-## STATE (2026-05-26, SESSION 9)
+## STATE (2026-05-26, SESSION 10) — supersedes S9's "input-specific jitter" framing
 
-COLLAPSE = FIXED (reconfirmed: greedy Fibonacci `21,34,55,89,144,233,377,610,987,1597` correct).
-Residual = run-to-run **logit JITTER** at temp=0, now sharply characterized on a fresh engine
-(probe `/tmp/s1_confirm.py`, smoke log `...010801Z`):
+**The success gate FAILS on a fresh engine.** Smoke `...015522Z`, HEAD 98b25474 (NO code change
+since S9), probe `/tmp/s1_gate.py`:
+* FIB temp=0/seed=0 ×3 → **byte-identical WITHIN the engine** (md5 0781ab9b) but the TEXT is WRONG:
+  `21,34,55,89,144,233,377,` **`410,611,632,656,656,656,656`** — correct through 377 (term 7) then
+  DERAILS (410≠610) and collapses to a 656-loop. First-tok '21' logprob **−0.02520** (gap 5.5).
+* S9 on the SAME code/prompt/seed: correct through `610,987,1597`, logprob **−0.19027** (gap 3.6).
+* ⇒ **CROSS-ENGINE NONDETERMINISM**: identical input, different engine → different logits
+  (−0.025 vs −0.190) → different trajectory, severe enough to **break Fibonacci coherence on a
+  "bad-seed" engine.** Within-engine deterministic; ACROSS fresh engines nondeterministic. The gate
+  (coherent + deterministic, verified TWICE on fresh engines) cannot pass while a fresh engine can
+  draw a bad seed → incoherent looping.
 
-* **NONDETERMINISM CONFIRMED, n=6:** Mars flat prompt temp=0/seed=0 → **3 unique/6**. mars0-3 byte-
-  identical coherent text but chosen-tok logprob jitters −2.03/−1.63/−1.80/−1.61; mars4,mars5 DIVERGED
-  into loops. ⇒ the jitter sometimes flips the argmax and pushes decode into a loop attractor — the
-  "open-ended looping" is **partly a SYMPTOM of the jitter**, not purely the model.
-* **INPUT-SPECIFIC, not pervasive:** Fibonacci is **EXACT twice** — text AND logprob (−0.19027, gap 3.6)
-  byte-reproduced. ⇒ jitter hits Mars but NOT Fib. This **REFUTES the "nondeterministic attn_dp collective"
-  verdict** (2 code-audit agents claimed `out_NEd.sum(axis=1)` all-reduce reorders run-to-run): a
-  reordering all-reduce runs every layer for Fib too and would jitter Fib's logprob — it's exact to 5 dp.
-* **~0.4 nats** jitter is far too large for FP-reduction-order noise (bf16 ≈1e-3) ⇒ an **UNINITIALIZED-HBM
-  read**, not a benign reorder. mars0 (−2.03) is a cold-buffer warmup outlier vs warm −1.6..−1.8.
-* **NOT stale-KV reuse:** history test mars-A==mars-C (the intervening Fib did NOT determine the result);
-  code audit confirms decode KV is rebuilt wholesale per request (`jnp.zeros` once + `concatenate` of
-  fully-defined arrays) and SWA/compressed/indexer decode masking is EXACT. So it's a **per-request uninit
-  read in the FORWARD**, input-dependent.
-* Ruled out this session: torch-reference cross-check (INFEASIBLE on host — random-weights-only toy config,
-  fp8/fp4 weights it can't consume, ~554GB > 391GB RAM); prefix-caching artifact (APC explicit `--no-...`).
+S9 was wrong twice: (1) "Fib exact / input-specific" — Fib is NOT immune, it was a lucky-seed engine;
+the jitter is PERVASIVE, derailment depends on the random per-engine seed. (2) "refutes the collective"
+— it's not benign reorder; see mechanism. (Peaked-vs-flat masks the jitter in a logprob but not in the
+multi-step trajectory.)
 
-LEAD (sharpened; matches memory [[s1-prefill-padding-contamination]]): the prefill compressor/indexer are
-NOT `n_real`-aware → they process PAD positions → pad-contaminated `comp_full`/`i_cache` seed, hidden by the
-`nan_to_num` / `|r|<1e8` clamp; input-LENGTH-specific (Mars's length contaminates its selected logits, Fib's
-doesn't). NB: naive zeroing of `comp_full`/`i_cache` SEED pad-slots was DISPROVEN (regressed decode, S6) —
-the fix must thread the traced `n_real` so pad positions are NEVER processed, not post-hoc zeroed.
+## MECHANISM (pinned S10: 8 read-only agents + firsthand reads + [[s1-validated-facts]])
+Idle attn_dp ranks read **uninitialized/recycled HBM** in the PREFILL seed build:
+* Prefill activation is `P(ATTN_DATA)` and **ATTN_DATA binds the leading B axis (size 1)** (tpu_runner
+  :1380; ids reshaped [1,T] deepseek_v4.py:1824). So **1 rank holds the whole [1,T,dim]; ~31 ranks hold
+  EMPTY B-shards.** Idle ranks materialize FULL-shape output buffers (seed output spec is replicated
+  `P()`) = uninitialized HBM = finite garbage (V4_DECODE_NAN_TRIPWIRE: L1 kv-matmul ~1e37, varies
+  run-to-run; the `_linear` `|r|<1e8` clamp catches NaN/big but NOT finite sub-1e8).
+* That garbage is **all-reduce-SUMmed into the replicated P() seed** at `with_sharding_constraint(b,P())`
+  (`_v4_constrain_packed_replicated`, deepseek_v4.py:775, called :859) — GSPMD sums all shards (can't
+  prove n_real liveness statically). Contaminated-AND-read = the SWA `kv_cache[:,:win]` seed.
+* Garbage is on idle **RANKS**, NOT pad **positions** ⇒ any live-rank position/input mask MISSES it.
 
-## NEXT ACTION (slice CLEAN 0/32, engine reset, guardians up)
-LOCALIZE the uninit buffer, then fix its `n_real`-awareness:
-1. Re-add a MINIMAL decode-step checksum diagnostic — `jax.debug.print` of sum/std of attn-out vs moe-out
-   vs compressor-seed at decode step 1 (pattern = the just-removed `[fwdS]`/`[decS]` prints, commit
-   `77c0c7be`). sync → reset → smoke (~6min WARM) → fire Mars ×2 (`python3 /tmp/s1_confirm.py`, or trim it
-   to mars-only) → see which checksum VARIES run-to-run. Pinpoints attn vs MoE vs compressor.
-2. Make THAT buffer `n_real`-aware so prefill compressor/indexer skip pad positions. Verify on a fresh
-   engine: same-engine Mars temp=0 ×6 BYTE-IDENTICAL **and** Fib still exact.
+## DEAD fixes (do NOT retry — proven S10 + history)
+* `with_sharding_constraint(activation, P())` anywhere → Core-halts via empty shards (f1598b82, 7500c742).
+* mask the matmul INPUT x → no-op (garbage is output-driven, not input; 83f74395).
+* explicit `position<n_real` mask on `kv`/`x` → **no-op, WRONG AXIS** (garbage on a different RANK, not a
+  pad position; confirmed S10 by fix-design agent).
+* zero compressor/indexer SEED-OUTPUT pad-slots → regressed (S6, b026d9ff; boundary slot read pre-overwrite).
+
+## NEXT ACTION — force IDLE-RANK contributions to deterministic ZERO before the :775 collapse (no gather)
+Two tractable directions (respect every dead-fix constraint; each needs a COLD-compile smoke):
+1. **(preferred) `shard_map` the seed build** `transformer_body_init_state_to_buffer` (deepseek_v4.py:853)
+   with `in_specs=P(ATTN_DATA), out_specs=P()` so each rank's LOCAL program runs on its own B-slice and
+   empty-B-shard ranks provably emit ZEROS (not recycled HBM), replacing the GSPMD all-reduce-SUM at :775.
+   No token-axis gather → no Core-halt. RISK: shard_map empty-shard semantics may still materialize garbage.
+2. **(alt) per-rank `is_live` mask on the PACKED POST-REDUCTION buffer** before the wsc at :775: multiply
+   the `[N,dim]` packed seed by `is_live` (1 on the rank the request landed on, 0 on idle ranks). A
+   post-reduction `[N,dim]` op = SAFE (pitfall #5). OPEN: source the per-rank is_live (n_real>0 /
+   num_scheduled_tokens_per_dp_rank>0) — may need threading a per-rank array into the jit.
+FIRST STEP: 1-2 read-only agents to (a) confirm the EXACT sharding of the packed buffer at :775 + whether
+shard_map zeros idle shards, (b) locate/derive the per-rank is_live signal. THEN implement → sync (clear
+xla_cache → COLD 10-30 min) → smoke → verify Fib COHERENT (correct through 1597) AND byte-identical on
+TWO fresh engines.
 
 ## Tools / ops
-* Probe: `/tmp/s1_confirm.py` (Mars×6 nondet + history discriminator + Paris + Fib, logprobs, critical-first,
-  guarded). `/tmp/s1_det.py`, `/tmp/s1_gate_supp.py` also present.
-* **ENGINE FRAGILITY (reconfirmed):** died (HTTP 000) after ~9 fires when Paris (a NEW prompt shape) fired.
-  Fire critical probes FIRST; prefer ONE prompt shape per smoke; reset+re-smoke if 500/000.
-* No code changed this session → xla_cache is WARM; do NOT clear it (keeps smoke ~6min not 10-30min).
-* **MULTI-SESSION:** a peer session (PID 3199849, tmux claude-5:5) STOOD DOWN and is idle at a prompt —
-  harmless. Verify `ps|grep 'bin/vllm serve'` is yours before probing.
-
-## Real fixes (committed, live)
-* COLLAPSE: SWA seed `6245ea84` + compressor/indexer STATE `90bf85c3` thread traced `n_real`;
-  metadata-replicate decode `_v4_decode_replicate`; diagnostics removed `77c0c7be`.
-* OPS: `smoke.sh` flock guard + `VLLM_ENGINE_READY_TIMEOUT_S=2400` (S8).
+* Probe `/tmp/s1_gate.py` (FIB×3 critical-first + PARIS×3 + 5 misc; reads text, fib_terms, logprobs).
+  `/tmp/s1_confirm.py` (Mars×6 + history) also present.
+* **ENGINE CRASHES on PARIS** (new shape): 015522Z died with a TPU register-dump (proto_based_error_
+  collector) + "Shutting down" when Paris followed the Fib×3 fires. Fire FIB first; ONE shape/smoke;
+  the gate's Paris/robustness clauses likely need a separate smoke or a less-fragile prompt set.
+* Slice reset CLEAN (0/32, no failures); guardians up. xla_cache WARM now, but the FIX is a code change
+  ⇒ next smoke is COLD (sync + clear xla_cache on 8 hosts, 10-30 min).
 
 ## Durable lessons
-* HARD (~8×): `with_sharding_constraint(ACTIVATION, P())` gathering a size-1 decode token axis Core-halts.
-* `different launch id`/`Core halted` before startup = CODE DESYNC → `full_slice_v4_sync.sh` + clear
-  `~/.cache/vllm/xla_cache/*` (only when code CHANGED). Don't reboot. Reset: `full_slice_v4_reset.sh`.
+* HARD (~8×): `wsc(ACTIVATION, P())` gathering empty/idle shards Core-halts (NOT a size-1-only rule).
+* `different launch id`/`Core halted` BEFORE startup = CODE DESYNC → sync + clear xla_cache. Don't reboot.
 * decode-vs-prefill-everything ON THE SLICE is the faithful test; CPU parity non-predictive.
-* (`/tmp/s1_loop_stop` NOT set — real fixable work remains: the jitter fix.)
+* (`/tmp/s1_loop_stop` NOT set — gate fails, real fixable work remains.)
