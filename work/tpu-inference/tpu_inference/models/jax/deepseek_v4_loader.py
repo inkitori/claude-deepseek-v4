@@ -465,8 +465,7 @@ def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
 _MIN_SHARD_ELEMENTS = 8 * 1024
 
 
-def pick_partition_spec(shape: Tuple[int, ...], mesh,
-                        prefer_axis0: bool = False) -> P:
+def pick_partition_spec(shape: Tuple[int, ...], mesh) -> P:
     """Heuristically pick a `PartitionSpec` for a weight of `shape` on `mesh`.
 
     Goal: shard the weight along its largest dim that's divisible by the
@@ -479,15 +478,6 @@ def pick_partition_spec(shape: Tuple[int, ...], mesh,
     that holds all 32 chips when `enable_dp_attention=True` is set, which is
     the deploy shape for V4-Flash. Other axes are considered only if they
     happen to carry size > 1.
-
-    `prefer_axis0`: shard axis 0 (if divisible) rather than the largest dim.
-    Set for routed-MoE expert leaves (w1/w2/w3): w2 [dim,inter] already shards
-    axis 0, but w1/w3 [inter,dim] would otherwise shard axis 1 (the larger
-    `dim`). Forcing axis 0 makes all three leaves enter the per-expert stack
-    consolidation (deepseek_v4.py `_maybe_consolidate`) via the *same*
-    axis-0 layout, so the `device_put(stack, P('attn_dp',None,None))` reshard
-    is identical for all three. w2's reshard is byte-clean; w1/w3's axis-1
-    reshard read uninitialized HBM (S1 / S26 root cause). Idempotent for w2.
     """
     if mesh is None or not shape:
         return P()
@@ -514,14 +504,6 @@ def pick_partition_spec(shape: Tuple[int, ...], mesh,
             break
     if chosen_axis is None:
         return P()
-
-    # Expert leaves: force axis-0 sharding so w1/w2/w3 consolidate identically
-    # (see docstring). Only when axis 0 is itself sharddable on chosen_axis.
-    if (prefer_axis0 and len(shape) >= 1
-            and shape[0] % chosen_size == 0 and shape[0] >= chosen_size):
-        spec = [None] * len(shape)
-        spec[0] = chosen_axis
-        return P(*spec)
 
     # Pick the largest dim divisible by chosen_size. Tie-break: earlier dim.
     best_dim = -1
@@ -938,7 +920,6 @@ def place_spec_as_jax_sharded(
     target_dtype,
     target_shape: Tuple[int, ...],
     mesh,
-    prefer_axis0: bool = False,
 ) -> jnp.ndarray:
     """Slice-aware placement counterpart to `place_torch_as_jax_sharded`.
 
@@ -946,9 +927,6 @@ def place_spec_as_jax_sharded(
     `attn_dp=32` on the largest dim), only reads the rows the local host's
     devices need. Falls back to the full-tensor path when the leaf is
     replicated, sharded on a non-axis-0 dim, or unaligned for fp8.
-
-    `prefer_axis0` (routed-MoE expert leaves) forces axis-0 sharding so w1/w3
-    take w2's byte-clean slice-aware path — see `pick_partition_spec`.
     """
     target = jnp.dtype(target_dtype)
     out_dim = target_shape[0] if target_shape else 1
@@ -963,7 +941,7 @@ def place_spec_as_jax_sharded(
             np_arr = np_arr.astype(target)
         return jnp.asarray(np_arr)
 
-    spec_p = pick_partition_spec(target_shape, mesh, prefer_axis0=prefer_axis0)
+    spec_p = pick_partition_spec(target_shape, mesh)
     sharding = NamedSharding(mesh, spec_p)
     sharded_axis = next((i for i, ax in enumerate(spec_p) if ax is not None), None)
 

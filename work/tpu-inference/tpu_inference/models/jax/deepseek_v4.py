@@ -1595,14 +1595,8 @@ def _build_class():
                     return (None, None, spec.hf_name)
                 target_shape = tuple(leaf.shape)
                 target_dtype = jnp.dtype(leaf.dtype)
-                # Routed-MoE expert leaves (w1/w2/w3) must shard axis-0 so all
-                # three consolidate via w2's byte-clean reshard path; w1/w3's
-                # default axis-1 sharding bakes in uninit HBM (S1 / S26).
-                is_expert = bool(_expert_path_re.match(jax_path)
-                                 or _mtp_expert_path_re.match(jax_path))
                 arr = place_spec_as_jax_sharded(
                     spec, target_dtype, target_shape, self.mesh,
-                    prefer_axis0=is_expert,
                 )
                 return (jax_path, arr, spec.hf_name)
 

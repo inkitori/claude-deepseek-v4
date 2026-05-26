@@ -5,13 +5,14 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S26): **VERDICT — decode corruptor = the routed W1 & W3 weight LOAD.**
-> [ckSPLIT] (moe.py ~250) checksummed routed W1/W2/W3 + every einsum stage on 2 FRESH engines: **W1 & W3
-> w*_stacked DIVERGE ×2** (gsum ~20%, absmax value-flips) while **W2 is BYTE-IDENTICAL** ⇒ gate/up/h/out all
-> diverge downstream. Mechanism: `pick_partition_spec` (deepseek_v4_loader.py:508) shards w1/w3 [2048,4096] on
-> axis-1 but w2 [4096,2048] on axis-0, so consolidation `device_put(stack, E_spec)` (deepseek_v4.py:1535) reshards
-> w1/w3 through a path that BAKES IN uninit HBM. NEXT: make w1/w3 consolidate via w2's clean reshard path; gate =
-> [ckSPLIT] W1&W3 byte-identical ×2 + FIB md5 ×2 + correct Fib. Loop NOT stopped. (jax.debug.print LOSSY ⇒ re-fire.)
+> One-line status (2026-05-26 S27): **ROOT CAUSE STANDS (routed W1/W3 weight LOAD); the obvious fix FAULTS the load.**
+> S26 verdict unrefuted: w1/w3 consolidation reshard (deepseek_v4.py:1535) bakes in uninit HBM, W2 clean. S27 fix
+> v1 (force expert leaves to shard axis-0 via `pick_partition_spec(prefer_axis0)`, commit 446950f3) was CPU-valid
+> but **deterministically faults layer-0 expert consolidation on TPU** — 3 fresh smokes died at exactly 600 tensors
+> (worker SIGKILL, no Python traceback); reverted code loaded past 6800 ⇒ slice HEALTHY, v1 is the culprit. v1
+> REVERTED. NEXT: v2 = fix the consolidation reshard WITHOUT changing w1/w3 LEAF sharding — recommended host-gather
+> (`np.stack` leaves on host → `make_array_from_callback` to e_spec, no device reshard). See HANDOFF_S1.md. Loop NOT
+> stopped. (jax.debug.print LOSSY ⇒ re-fire.)
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 

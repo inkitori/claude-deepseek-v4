@@ -1,4 +1,4 @@
-# S1 handoff — VERDICT: decode corruptor = the routed W1/W3 weight LOAD (consolidation reshard bakes in uninit HBM)
+# S1 handoff — S26 VERDICT STANDS (W1/W3 weight LOAD); S27 fix v1 REFUTED (faults the load)
 
 Goal: coherent, RELIABLE (cross-process deterministic) decode for `vllm serve deepseek-ai/DeepSeek-V4-Flash`
 on v6e-32. Ops in `CLAUDE.md`; this is live state.
@@ -8,62 +8,66 @@ Bug is NOT collapse. Symptoms: (1) cross-process non-determinism (decode output 
 deterministic WITHIN a process), (2) quality drift. DONE = byte-identical FIB md5 across 2 fresh engines AND
 correct Fibonacci. Model INSTRUCT. Correct FIB after "13, " = 21,34,55,89,144,233,377,610,987,1597...
 
-## STATE (2026-05-26 S26) — VERDICT: the routed W1 & W3 stacked weights LOAD non-deterministically
-S26 added [ckSPLIT] (moe.py ~250): ONE read-only shard_map prints per-rank-LOCAL [gsum,sqsum,absmax] (gather+
-local-sum, reorder-immune, NO all-reduce) of routed weights W1/W2/W3 + every dense-einsum stage. Ran on 2 FRESH
-engines, decode step (FIB max_tokens=2, both md5 5bf42256, correct '21'):
-| quantity (decode L0) | eng1 gsum | eng2 gsum | eng1 absmax | eng2 absmax | verdict |
-|----------------------|-----------|-----------|-------------|-------------|---------|
-| W1 (w1_stacked)      | 4192.49   | **5159.84** | 0.250     | **0.1875**  | **DIFFERS** |
-| W2 (w2_stacked)      | 143.6895  | 143.6895  | 0.250       | 0.250       | IDENTICAL |
-| W3 (w3_stacked)      | 5260.76   | **4293.41** | 0.1875    | **0.250**   | **DIFFERS** |
-| gate=x@W1, up=x@W3, h, out | (all DIFFER, downstream of W1/W3) | | | | DIFFERS |
-sqsum barely moves (5th sig fig: a few garbage bf16 elems) but gsum ~20% + absmax value-FLIPS ⇒ **W1 & W3 carry
-per-process uninit/garbage elements; W2 is byte-identical.** [ckSPLIT] reads the CONSOLIDATED E-sharded weights
-with a MATCHING in_spec (P('attn_dp',None,None)) ⇒ NO reshard in the probe ⇒ the garbage is BAKED INTO
-w1_stacked/w3_stacked at load, not a probe artifact. Refines (does not contradict) S25: the local einsum diverges
-*because its weight inputs W1/W3 diverge*. S25 never measured the weights (only deduced clean). Data:
-/tmp/s1_eng1_s26.txt, /tmp/s1_eng2_s26.txt. Logs 204316Z (eng1) 210710Z (eng2).
+## STATE (2026-05-26 S27) — root cause STANDS, but the obvious fix FAULTS the load
+ROOT CAUSE (S26, unrefuted): decode corruptor = the routed **W1 & W3 stacked-weight LOAD**. [ckSPLIT] (moe.py
+~262) checksummed routed W1/W2/W3 on 2 fresh engines: **W1 & W3 diverge ×2** (gsum ~20%, absmax value-flips),
+**W2 byte-IDENTICAL**. Mechanism (3 agents hardened it): `pick_partition_spec` (loader:508) shards w1/w3
+[inter=2048,dim=4096] on axis-1 (largest dim) but w2 [4096,2048] on axis-0; at consolidation
+`device_put(jnp.stack(leaves), P('attn_dp',None,None))` (deepseek_v4.py:1535) the w1/w3 axis-1→expert reshard
+reads uninit HBM, w2's axis-0→expert reshard is byte-clean.
 
-## MECHANISM (agent-traced, strong) — pick_partition_spec largest-dim fork
-`deepseek_v4_loader.py:508-519 pick_partition_spec` shards each weight on its LARGEST axis-divisible dim:
-per-expert w1/w3 [inter=2048, dim=4096] → axis 1 (4096) sharded; w2 [dim=4096, inter=2048] → axis 0 (4096)
-sharded. So at consolidation `deepseek_v4.py:1535 jax.device_put(jnp.stack(weights), e_spec=P('attn_dp',None,None))`,
-w1/w3 leaves (inner-axis-sharded → post-stack axis-2-sharded) need a DIFFERENT reshard to E-major than w2
-(axis-0 leaf). The w1/w3 reshard path reads uninit HBM on TPU (CPU reshard values verified bit-exact ⇒ it's the
-known uninit-HBM read, NOT a math bug). Refuted: fused gate_up_proj (checkpoint has separate w1/w2/w3 keys).
+S27 FIX v1 = **REFUTED** (commit 446950f3, now reverted): added `prefer_axis0` to `pick_partition_spec` +
+`place_spec_as_jax_sharded`, set it for expert leaves in `_do_place_spec` → force w1/w3 leaves to shard axis-0
+like w2 (CPU unit-test PASSED: w1/w3→P('attn_dp',None), w2 idempotent, non-experts untouched). On TPU it
+**deterministically faults layer-0 expert consolidation**: 3 fresh smokes ALL died at exactly **600 tensors**
+(`layers.0.ffn.experts...`) with worker SIGKILL → `SLICE_FAILURE_SW_INJECT_ERROR`/`ActorDiedError`, **NO Python
+traceback** (= device/libtpu fault, not a code exception). DECISIVE control: reverted (original) code placed
+**6800 tensors** in ~90s (past the death zone) ⇒ **slice infra is HEALTHY; v1 is the culprit.**
 
-## NEXT ACTION — fix the W1/W3 consolidation so it reshards WITHOUT reading uninit, then validate
-Make w1/w3 load through the SAME clean reshard path as w2. Candidates (try in order, each needs the 2-engine gate):
-1. At consolidation (`deepseek_v4.py:1535`): reshard each leaf to replicated `P()` BEFORE `jnp.stack`, then
-   device_put to e_spec — uniform shard-from-replicated for all 3. WATCH the memory contract (:1734, leaves+stack
-   coexist); leaves are fp4 ~4MB×256 — replicating may spike per-chip HBM. Lowest-conceptual-risk if memory holds.
-2. In `pick_partition_spec` (:508): make EXPERT leaves (w1/w2/w3) shard on a CONSISTENT axis (e.g. axis 0) so all
-   three take w2's clean path. Surgical risk: function is GENERAL — guard to expert leaves only, don't regress
-   attention/other weights (a wrong global change → launch-id desync or perf regression).
-3. Force a clean materialization of the stacked tensor (e.g. block_until_ready already there; try an explicit
-   zero-init copy or optimization_barrier on the device_put result) — weakest, uninit-reshard may survive it.
-GATE (validate the fix, TWICE on fresh engines): rerun `/tmp/s1_probe2.py 2` ×2 engines, `bash /tmp/s1_cke.sh LOG`
-⇒ **[ckSPLIT] W1 & W3 gsum+absmax BYTE-IDENTICAL ×2** (currently the only failing quantities). THEN decode FIB md5
-identical ×2 + correct Fibonacci (21,34,55,89,144,233,377,610,987,1597) + CLAUDE.md formal gate ×2 →
-`touch /tmp/s1_loop_stop`. Keep [ckSPLIT] in until confirmed; remove all diagnostics when S1 closes.
+WHY v1 faults is UNKNOWN: w2 already shards axis-0 and consolidates fine via the SAME axis→expert reshard;
+only the SHAPE differs (w1/w3 axis-0 = 64 rows/shard, 4096 cols; w2 = 128 rows/shard, 2048 cols). The axis-0
+leaf change for w1/w3 (now slice-aware read + axis-1→axis-0 stack reshard) hits a libtpu fault for this shape.
+Dequant scale-slicing was audited SAFE (axis-agnostic) — so the fault is in the device-side reshard/stack, not
+the host dequant. Logs: smoke 215410Z (v1 fail), 220051Z (revert pass-death-zone).
 
-## Ops (jax.debug.print LOSSY — SCALAR single-line prints; re-fire + sort -u to beat drops)
-* ONE engine. Cache warm ⇒ ~350s ready; FIRST decode req recompiles ~325s, re-fires ~120s. Probe:
-  `python3 /tmp/s1_probe2.py 2` (max_tokens=2 = 1 clean decode step, output '21,'). Extract: `bash /tmp/s1_cke.sh <log>`
-  (now greps [ckSPLIT] too). Re-fire ×3 to collect dropped lines (decode is within-process deterministic).
-* edit→`full_slice_v4_sync.sh`→verify md5 8/8 as **enyouki@** (NOT mark)→CLEAR xla_cache 8 hosts if .py changed→
-  `reset.sh`→`smoke.sh`→wait `Application startup complete`. ssh -i ~/.ssh/google_compute_engine enyouki@<ip>;
-  full_slice_v4_discover.sh for IPs. node_guardian UP (pid 497956); meta_guardian running (cluster HEALTHY).
-* SECOND-ENGINE GOTCHA: after engine-1 populates xla_cache, a warm engine-2 start hit a "different launch id"
-  Core-halt; fix = clear xla_cache 8 hosts + reset + re-smoke (engine 2 cold). Always cold-compile both engines.
-* PITFALL HIT THIS SESSION: `pkill -f s1_probe2.py` SELF-MATCHED my own shell (cmdline contained the string) →
-  killed the reset. Never pkill a pattern your own command line contains; reset.sh stops probes anyway.
-* CPU-validate a new shard_map cheaply: JAX_PLATFORMS=cpu + XLA_FLAGS=--xla_force_host_platform_device_count=32
-  (see /tmp/s1_cksplit_validate.py) BEFORE the TPU smoke — catches spec bugs without the cold compile.
+## NEXT ACTION — v2: eliminate the device-side consolidation reshard (do NOT repeat v1)
+Repo is back on WORKING baseline (S26 code, [ckSPLIT] intact, synced to 8 hosts). Slice idle & healthy. Try, in
+order, each gated by the S26 [ckSPLIT] 2-engine test:
+1. **v2a (recommended, most robust): host-gather consolidation.** In `_maybe_consolidate` (deepseek_v4.py:1535),
+   replace `jax.device_put(jnp.stack(weights), e_spec)` with: gather each leaf to host (`np.asarray`/
+   `jax.device_get`), `np.stack` on host, then `jax.make_array_from_callback(shape, e_spec_sharding, cb)` (cb
+   slices the expert-axis rows for each device). NO device-side reshard ⇒ no uninit read AND no fault. Hosts have
+   708GB; transient ~4GiB/group safe. RISK: device→host→device per group (~180 groups) may be slow — measure.
+2. **v2b: investigate the fault first.** Re-apply v1 on ONE smoke and read the dead-worker libtpu/HLO logs at the
+   600-tensor death (`/tmp/ray-vllm/session_latest/logs/worker-*.err` + gcs/raylet logs) to see WHY the axis-0
+   reshard faults — that may reveal a smaller fix (e.g. axis-0 only at consolidation, not at leaf placement).
+3. **v2c: place directly into the stacked [256,X,Y] e_spec-sharded buffer** (no per-leaf stack+reshard at all) —
+   bigger loader change; consider only if v2a is too slow.
+GATE (validate, TWICE on fresh engines): `python3 /tmp/s1_collect.sh <log> /tmp/s1_engN_s28.txt` ×2 engines,
+then `bash /tmp/s1_gate.sh <eng1> <eng2>` ⇒ **[ckSPLIT] W1 & W3 gsum+absmax byte-IDENTICAL ×2** + FIB md5
+identical ×2 + correct Fibonacci + CLAUDE.md formal gate ×2 → `touch /tmp/s1_loop_stop`.
 
-## DEAD (do not retry): all-reduce (per-rank local already diverges, S25); input/prefill cascade (moe_shared+
-routing byte-identical ×2); SUBLANE-PAD / gmm-kernel fix for DECODE (gmm prefill-only); bf16↔fp32 gmm dtype;
-zero_initialize; partial_out_ref; gmm_v2:518 OOB; GATE/ROUTING sharding; wsc(act,P()) token axis; the dense
-einsum MATMUL itself (gate/up/out diverge ONLY because W1/W3 inputs diverge — W2 clean ⇒ matmul faithful). The
-"matmul output buffer uninit / pad N→8" lead is now SECONDARY (weights are the proven cause; fix them first).
+## Ops (jax.debug.print LOSSY — SCALAR prints; re-fire + sort -u). Helpers in /tmp: s1_probe2.py, s1_collect.sh, s1_gate.sh, s1_cke.sh
+* ONE engine. Cache warm ⇒ ~350s ready; cold (after .py change + cache clear) ⇒ 10-30 min. FIRST decode req
+  recompiles ~325s. Probe: `python3 /tmp/s1_probe2.py 2` (max_tokens=2 = 1 decode step, output '21,').
+* edit→`full_slice_v4_sync.sh`→verify md5 8/8 as **enyouki@**→CLEAR xla_cache 8 hosts if .py changed→`reset.sh`→
+  `smoke.sh`→wait `Application startup complete`. IPs: head .192; workers .194 .202 .204 .193 .198 .195 .200.
+* MONITORING a smoke: watch logs/<log> for `Application startup complete` (ready) vs
+  `SLICE_FAILURE|ActorDiedError|Engine core initialization failed` (fail). To tell a CODE fault from infra: the
+  DRIVER (EngineCore) log only shows the symptom — read the WORKER logs `/tmp/ray-vllm/session_latest/logs/
+  worker-*.err` for `[deepseek_v4] placed N tensors` progress + any real traceback. A worker that dies with NO
+  Python traceback (SIGKILL/EOF) = device/libtpu fault or infra; a worker that gets PAST ~768 tensors (layer-0
+  experts) means the expert-load path works. Filter by mtime to find THIS smoke's worker logs.
+* INFRA was healthy this session (8/8 nodes, 32 TPU, 708GB RAM/host, GCS up since 13:41 = same session S26
+  used). meta_guardian spews `WrongClusterID` (stale connection, BENIGN — fresh ray.init sees 32 TPU fine);
+  ignore it. node_guardian UP (pid 497956). There were also **3 orphaned `claude` loop sessions** (pids
+  2605015/3031059/3284020) — flock serializes the slice so harmless, but they burn budget; consider whether the
+  loop wrapper is double-spawning.
+* PITFALL THIS SESSION: a cold smoke can hit `SLICE_FAILURE` during SPMD partition at ~60s (smoke 1) — that one
+  WAS a transient (retry), distinct from v1's deterministic 600-tensor load fault. Don't conflate the two.
+
+## DEAD (do not retry): all-reduce (S25); input/prefill cascade (S26 byte-identical ×2); SUBLANE-PAD/gmm-kernel
+for DECODE; bf16↔fp32 gmm dtype; zero_initialize; partial_out_ref; gmm_v2:518 OOB; GATE/ROUTING sharding;
+wsc(act,P()) token axis; the dense einsum MATMUL itself (W2 clean ⇒ matmul faithful). **NEW: S27 v1 — forcing
+expert leaves to shard axis-0 via `pick_partition_spec(prefer_axis0)` — FAULTS layer-0 consolidation (libtpu,
+deterministic at 600 tensors). The fix must NOT change w1/w3 LEAF sharding; fix the consolidation reshard itself.**
