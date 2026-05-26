@@ -5,13 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S17): **ROOT CAUSE = MoE ROUTED COLLECTIVE OP (all_gather/psum) reads uninit
-> HBM into REAL rows, input-independent.** `[ckR]` real-rows checksum on 4 fresh engines: `moe_input` +
-> `moe_shared` real-rows always byte-identical A==B, `moe_routed` real-rows ALWAYS DIFFER per-process (NOT
-> pad-row noise). Input-side pad mask (a3982a2b) = INSUFFICIENT (proven: pad INPUTS zeroed yet moe_routed
-> still differs A'5.66e1/B'5.14e1) ⇒ the uninit read is in the COLLECTIVE OP itself, not input values.
-> Decode path + seed re-audited CLEAN. **NEXT (HANDOFF_S1.md):** optimization_barrier(x_full) shot +
-> [ckG] x_full checksum to isolate all_gather-vs-psum; last resort = adopt fused_moe_gmm. Loop NOT stopped.
+> One-line status (2026-05-26 S17): **bug = MoE routed shard_map collective; narrowed to the EINSUM-or-PSUM
+> (NOT the all_gather).** `[ckR]` real-rows checksum (8 fresh engines): `moe_input`+`moe_shared` real-rows
+> always byte-identical A==B; `moe_routed` real-rows ALWAYS DIFFER per-process (>2x, gross uninit). Refuted:
+> input-side pad mask (a3982a2b) AND optimization_barrier (e1dcf39e) — both insufficient (KEPT, harmless).
+> `[ckG]` proved **x_full (all_gather OUTPUT) is BYTE-IDENTICAL across processes** ⇒ all_gather is NOT the
+> corruptor; variance enters in the expert EINSUM or the PSUM downstream. Decode+seed re-audited CLEAN.
+> **NEXT (HANDOFF_S1.md):** [ckL] local_gsum to isolate einsum-vs-psum, then fix / adopt fused_moe_gmm. Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
