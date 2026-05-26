@@ -5,13 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S25): **VERDICT — decode corruptor = the PER-RANK LOCAL dense einsum**
-> (moe.py:238-249). Decode = DENSE path (NOT gmm; gmm prefill-only ⇒ gmm/SUBLANE-PAD fixes DEAD for decode).
-> 2 fresh engines, decode step, identical code: moe_shared + moe_perexpw(routing) BYTE-IDENTICAL ×2 (input+routing
-> clean) but `[ckEtot]` pre_sqsum (per-rank LOCAL out_NEd via GATHER, not all-reduce) 34.21 vs 34.47 DIVERGES ⇒
-> local einsum computes divergent out_NEd from IDENTICAL input. **ALL-REDUCE + INPUT/cascade EXONERATED.** NEXT:
-> cross-engine checksum routed W1/2/3 (E-stacked, not yet verified) + split the einsum chain. gate = decode
-> moe_routed_y md5 ×2 + FIB ×2 + correct Fib. Loop NOT stopped. (jax.debug.print LOSSY ⇒ SCALAR prints + re-fire.)
+> One-line status (2026-05-26 S26): **VERDICT — decode corruptor = the routed W1 & W3 weight LOAD.**
+> [ckSPLIT] (moe.py ~250) checksummed routed W1/W2/W3 + every einsum stage on 2 FRESH engines: **W1 & W3
+> w*_stacked DIVERGE ×2** (gsum ~20%, absmax value-flips) while **W2 is BYTE-IDENTICAL** ⇒ gate/up/h/out all
+> diverge downstream. Mechanism: `pick_partition_spec` (deepseek_v4_loader.py:508) shards w1/w3 [2048,4096] on
+> axis-1 but w2 [4096,2048] on axis-0, so consolidation `device_put(stack, E_spec)` (deepseek_v4.py:1535) reshards
+> w1/w3 through a path that BAKES IN uninit HBM. NEXT: make w1/w3 consolidate via w2's clean reshard path; gate =
+> [ckSPLIT] W1&W3 byte-identical ×2 + FIB md5 ×2 + correct Fib. Loop NOT stopped. (jax.debug.print LOSSY ⇒ re-fire.)
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
