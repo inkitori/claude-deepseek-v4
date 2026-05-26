@@ -290,12 +290,17 @@ def moe_forward(
             token_idx_sorted = token_idx[argsort_idx]                        # [N*top_k]
             group_sizes = jax.nn.one_hot(idx_flat, E, dtype=jnp.int32).sum(0)  # [E]
             revert_idx = jnp.argsort(argsort_idx)
-            x_sorted = x_full[token_idx_sorted].astype(fp32)                 # [N*top_k,dim]
+            # S24: gmm lhs/rhs in bf16 `dtype` (NOT fp32). fp32 lhs is UNIQUE to V4
+            # among all gmm_v2 callers (prod fused_moe_gmm uses bf16) and selects an
+            # untested fp32 sublane/tile path (get_sublane_tiling(lhs.dtype) gmm_v2:951,
+            # tile_m gmm_v2:860) that drives the partial_out_ref carry. g1(fp32) is the
+            # non-det ORIGINATOR; g2 already bf16. Match the known-good prod path.
+            x_sorted = x_full[token_idx_sorted].astype(dtype)                # [N*top_k,dim]
             group_offset = jnp.asarray([r * EP], jnp.int32)
             # Local weights -> gmm rhs [EP,k,n]; transpose is rank-local (no comm).
             W13_l = jnp.concatenate(
                 [W1_l.transpose(0, 2, 1), W3_l.transpose(0, 2, 1)],
-                axis=2).astype(fp32)                          # [EP, dim, 2*inter]
+                axis=2).astype(dtype)                         # [EP, dim, 2*inter]
             g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
                         zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
@@ -306,8 +311,16 @@ def moe_forward(
                 _eid = idx_flat[argsort_idx]
                 _om = ((_eid >= r * EP) & (_eid < (r + 1) * EP))[:, None]
                 _g1o = jnp.where(_om, g1, 0.0)
-                jax.debug.print("[ckR2] r={r} g1own_gsum={s:.9e} g1own_absmax={m:.9e}",
-                                r=r, s=jnp.sum(_g1o), m=jnp.max(jnp.abs(_g1o)))
+                # [ckR1b] gmm INPUT (x_sorted) on owned rows. If this is byte-equal x2
+                # engines but [ckR2] g1own diverges x2 => kernel non-det given identical
+                # input (decisive); if xso itself diverges => input/gather is the source.
+                _xso = jnp.where(_om, x_sorted.astype(fp32), 0.0)
+                jax.debug.print("[ckR1b] r={r} xso_gsum={g:.9e} xso_sqsum={q:.9e} "
+                                "xso_absmax={m:.9e}", r=r, g=jnp.sum(_xso),
+                                q=jnp.sum(_xso * _xso), m=jnp.max(jnp.abs(_xso)))
+                jax.debug.print("[ckR2] r={r} g1own_gsum={s:.9e} g1own_sqsum={q:.9e} "
+                                "g1own_absmax={m:.9e}", r=r, s=jnp.sum(_g1o),
+                                q=jnp.sum(_g1o * _g1o), m=jnp.max(jnp.abs(_g1o)))
             gate, up = jnp.split(g1, 2, axis=-1)
             if swiglu_limit > 0:
                 up = jnp.clip(up, -swiglu_limit, swiglu_limit)
