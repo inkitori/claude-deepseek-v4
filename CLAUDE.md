@@ -1,17 +1,18 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 17)" is authoritative.**
+> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE (SESSION 18)" is authoritative.**
 > This file holds only durable operational knowledge (how to run the slice, validate,
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S17): **bug = MoE routed shard_map collective; narrowed to the EINSUM-or-PSUM
-> (NOT the all_gather).** `[ckR]` real-rows checksum (8 fresh engines): `moe_input`+`moe_shared` real-rows
-> always byte-identical A==B; `moe_routed` real-rows ALWAYS DIFFER per-process (>2x, gross uninit). Refuted:
-> input-side pad mask (a3982a2b) AND optimization_barrier (e1dcf39e) — both insufficient (KEPT, harmless).
-> `[ckG]` proved **x_full (all_gather OUTPUT) is BYTE-IDENTICAL across processes** ⇒ all_gather is NOT the
-> corruptor; variance enters in the expert EINSUM or the PSUM downstream. Decode+seed re-audited CLEAN.
-> **NEXT (HANDOFF_S1.md):** [ckL] local_gsum to isolate einsum-vs-psum, then fix / adopt fused_moe_gmm. Loop NOT stopped.
+> One-line status (2026-05-26 S18): **bug = the per-rank expert EINSUM in the MoE routed shard_map reads
+> uninit HBM (psum + all_gather EXONERATED).** Isolated via `[ckL]` pre-psum local-sum, engine B3 vs A3:
+> identical einsum INPUT (`[ckG]` x_full byte-identical) but the einsum OUTPUT sets share 0 values (lone ~1e5
+> outlier differs, 9.42e4 vs 8.50e4); `[ckR]` moe_routed REAL rows differ (91.5 vs 45.8) ⇒ the einsum hits
+> REAL rows, so pad/valid-row masking is REFUTED (per-element psum can't spread pad→real). Clean contrast: the
+> dense auto-SPMD einsum + moe_shared are deterministic. **NEXT (HANDOFF_S1.md):** find the uninit source
+> (weight/x_full physical padding the MXU reads) & fix, else port the fused_moe_gmm gmm kernel; validate on 2
+> fresh engines (single-engine [ckR] is globally reduced — can't see the bug). Loop NOT stopped.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
