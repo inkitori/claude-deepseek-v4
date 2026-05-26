@@ -53,17 +53,6 @@ from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
-# S1 (decode nondeterminism band-aid): force full-fp32 matmul accumulation for
-# every V4 dot_general/einsum that doesn't pin its own precision. The residual
-# decode bug is a tiny per-process logit perturbation (uninitialized-HBM jitter
-# on idle attn_dp ranks) that only flips the argmax because the bf16 matmul
-# error (~1e-2) is comparable to the derail-step logit gap. Computing in fp32
-# widens the correct-token margin so the perturbation no longer changes the
-# argmax -> coherent AND deterministic. Set as a hardcoded constant (NOT the
-# JAX_DEFAULT_MATMUL_PRECISION env var) so all 8 workers trace an identical
-# program (avoids the env-divergence launch-id halt; CLAUDE.md pitfall #0).
-jax.config.update("jax_default_matmul_precision", "highest")
-
 
 # ------------------------------------------------------------
 # Config
