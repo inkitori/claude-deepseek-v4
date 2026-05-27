@@ -154,9 +154,15 @@ trip pitfall #5.
   Flips wq_a/wkv/wo_b + compressor/indexer projections to axis-0; leaves already-axis-0 weights
   (wq_b/wo_a/idx.wq_b/expert.w2) unchanged; auto-replicates `hc_*_fn` (out=24). No weight has a
   size-1 output dim ⇒ no decode-token hazard.
-- **Validate (CPU, before the cold smoke):** `scripts/s1_cpu_repro_v4flash.py both` ("OK … match") +
-  `pytest tests/models/jax/test_deepseek_v4.py -k "shard or per_device_budget"` (forces cpu+32). Proves
-  math+shapes only; the collective-count drop + S1 are TPU-only (full gate). [CPU-validation status: TBD]
+- **CPU validation is WEAK (corrected diff applied+reverted this session):** the spec flip is CONFIRMED
+  SHAPE-SAFE — wq_a/wkv/wo_b/expert.w1/gate.weight→axis-0; wq_b/wo_a/expert.w2 unchanged; hc_attn_fn stays
+  axis-1 (out=24 indivisible, picks the 16384 dim); ALL sharded dims divide 32. BUT neither numerics tier
+  runs: `s1_cpu_repro_v4flash.py` is BROKEN since the kernel landed (Mosaic kernel is interpret-only on CPU
+  → full-model eager raises "Only interpret mode is supported on CPU backend" at `_sparse_attn_kernel_sharded`);
+  the `-k "shard or per_device_budget"` tests are FIXTURE-GATED (need real config+safetensors absent on the
+  dev host) → skip. ⇒ apply the diff and go straight to the cold smoke + S1 gate; the shape-flip check above
+  is the only CPU signal. (To restore the CPU oracle: make the `mesh.empty` branch of `_sparse_attn_kernel_sharded`
+  call the pure-JAX `sparse_attn` instead of the Mosaic kernel — TPU-neutral, also gives the dead `sparse_attn` a use.)
 - **LIMITS (don't over-claim):** the 25 % MoE (`multiply_reduce_fusion`) is governed by `_shard_e_mid`
   in `deepseek_v4_moe.py`, NOT this — so the win is the ATTENTION all-reduces only; `gate.weight`
   `[256,4096]` is sharded today (1M elems > `_MIN_SHARD_ELEMENTS`, NOT replicated); re-profile after
@@ -194,9 +200,10 @@ and/or fused with the S1 fix — all flagged unsafe).
 ## NEXT ACTION (for the session reading this)
 Phase 1 is CLOSED (re-profiled — kernel works, attention gather 0.2% of decode). **Decode is now
 ALL-REDUCE-bound (31.7%). NEXT = Phase 2: flip `pick_partition_spec` to OUTPUT-dim (axis-0) sharding.**
-1. **CPU-validate the corrected diff FIRST** (cheapest tier): the §Phase 2 diff prefers the FIRST
-   divisible dim (axis 0 = output) instead of the largest. Run the CPU oracle + shard tests (cmds in
-   §Phase 2); confirm numerics unchanged + every shape divides. [worktree CPU-validation status: see §Phase 2]
+1. **CPU shape-validation DONE** (this session): the §Phase 2 corrected diff (prefer the FIRST divisible
+   dim = axis-0/output) was applied+reverted; the spec flip is confirmed SHAPE-SAFE (all sharded dims divide
+   32). The CPU NUMERICS tier is now UNAVAILABLE (broken oracle + fixture-gated tests — see §Phase 2), so
+   apply the diff and go to the cold smoke + S1 gate directly.
 2. **Verify the collective trade is a WIN before the cold smoke if you can:** the flip turns each decode
    all-reduce into a downstream all-gather (a replicated activation needs the full feature vector after an
    output-sharded matmul). On TPU all-gather is usually cheaper than all-reduce for equal bytes, but the

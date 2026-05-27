@@ -6,14 +6,13 @@
 > REGRESSION GATE, not the goal (see below). S1 history: `HANDOFF_S1.md` / `CLAUDE.full.md`.
 > Per-iteration narrative goes in **commit messages**, not this file.
 >
-> **One-line status (2026-05-27):** Bottleneck = the sparse-attn KV gather
-> (`deepseek_v4_attention.py`), 99% of prefill / 66% of a decode step (profile VERIFIED).
-> Landed: Phase 0.* (microbench, bf16 gather, dead-code, killed dup prefill body) + **Phase 1
-> fused kernel `kernels/sparse_attn/kernel.py` WIRED (via the `_sparse_attn_kernel_sharded`
-> shard_map helper — a Mosaic custom-call can't be SPMD-auto-partitioned) + S1-GATED** (md5
-> `5bf42256` ×2 engines + correct Fib + smoke rc=0). ⚠️ Isolated op ~41× but end-to-end decode
-> only ~1.25× (≈10 vs ~8 tok/s) — Next = re-profile WHY + shard the prefill map, then Phase 2.
-> Detail in `HANDOFF_PERF.md`.
+> **One-line status (2026-05-27):** **Phase 1 CLOSED & GATED** — the fused sparse-attn kernel
+> (`kernels/sparse_attn/kernel.py`, wired via `_sparse_attn_kernel_sharded`) works: a re-profile shows
+> the attention KV gather went 65.8%→**0.2%** of decode (it was THE bottleneck). Decode is now
+> **ALL-REDUCE-bound (31.7%)**, then MoE 25% + indexer top_k 23%. **Next = Phase 2: flip
+> `pick_partition_spec` to OUTPUT-dim (axis-0) sharding** (NOT axis-1 — the old hypothesis was
+> backwards; the corrected diff is CPU-shape-validated + ready for a cold smoke). Decode breakdown +
+> the corrected diff + NEXT ACTION in `HANDOFF_PERF.md`.
 
 ## Goal
 
@@ -51,9 +50,12 @@ Escalate only as far up as the question needs:
 
 1. **CPU numerics (no slice, cheap):** the torch oracle. `PYTHONPATH=work/tpu-inference:work/vllm
    work/vllm_env/bin/python3 scripts/s1_cpu_repro_v4flash.py both` → "OK: both eager and jit
-   match" (regression-only). For attention math, the parity test
-   `tests/models/jax/test_deepseek_v4.py -k sparse_attn` vs `sparse_attn_torch`. CPU CANNOT
-   reproduce S1 (no sharding) — proves math, never proves a determinism fix.
+   match" (regression-only). ⚠️ **BROKEN since Phase 1 landed:** the wired Mosaic kernel is
+   interpret-only on CPU, so the full-model eager path raises "Only interpret mode is supported on
+   CPU backend" — `s1_cpu_repro` no longer runs the full model. Fix = make the `mesh.empty` branch
+   of `_sparse_attn_kernel_sharded` call pure-JAX `sparse_attn`. For attention math the parity test
+   `tests/models/jax/test_deepseek_v4.py -k sparse_attn` vs `sparse_attn_torch` still works (interpret).
+   CPU CANNOT reproduce S1 (no sharding) — proves math, never proves a determinism fix.
 2. **TPU MICRO-BENCHMARK (cheap slice, NO 543 GiB load):** jit + time a kernel/op in isolation
    on the real mesh with SYNTHETIC inputs — measures gather ms / bandwidth / kernel speedup in
    ~1 min vs a 25-45 min smoke. **BUILD this (Phase 0.0) if `scripts/perf_*bench*` doesn't
