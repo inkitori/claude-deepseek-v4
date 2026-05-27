@@ -52,6 +52,16 @@ if [[ "${_PERF_LAUNCH:-}" == "1" ]]; then
 fi
 
 # ---- ORCHESTRATE MODE: open the new window --------------------------------
+# Honour the same stop file the headless wrapper uses, so `touch /tmp/perf_loop_stop`
+# halts BOTH loop styles: a handing-off session calls this script, we see the stop
+# file, refuse to spawn a successor, and the chain ends cleanly.
+STOP_FILE="${PERF_LOOP_STOP_FILE:-/tmp/perf_loop_stop}"
+if [[ -e "$STOP_FILE" ]]; then
+  echo "[handoff] stop file $STOP_FILE present — NOT spawning a successor. Loop ends here."
+  echo "[handoff] (remove it to resume: rm -f $STOP_FILE)"
+  exit 0
+fi
+
 if [[ -z "${TMUX:-}" ]]; then
   echo "FATAL: not inside tmux (\$TMUX is empty). Start one (tmux new -s claude) or" >&2
   echo "       run a fresh session manually:" >&2
