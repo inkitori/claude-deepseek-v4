@@ -6,9 +6,11 @@
 > state, the roadmap, the ONE next action. Durable slice ops: `CLAUDE.md`. S1 history:
 > `HANDOFF_S1.md` / `CLAUDE.full.md`.
 >
-> **One-line status (2026-05-27, P0):** Profile VERIFIED (traces re-parsed independently);
-> roadmap below is fresh from a 14-agent investigation. **Nothing started yet.**
-> **NEXT ACTION → Phase 0.0: build the TPU micro-benchmark harness (§NEXT), then Phase 0.1.**
+> **One-line status (2026-05-27, P0):** Phase 0.0 DONE — TPU microbench harness built +
+> validated (`scripts/perf_microbench*`; decode_csa baseline 5.44 ms ≈ 0.025% HBM bw, matches
+> the profile). **0.2 (bf16 gather) + 0.3 (dead-code) are edited + CPU-gated (bit-identical),
+> NOT yet smoke-gated** — see §NEXT. **0.1 (dup prefill body) has a correctness CONFLICT to
+> resolve before touching it** — see §0.1-CONFLICT.
 
 ---
 
@@ -55,21 +57,27 @@ Every committed change MUST clear the §S1-GATE. Validate on the CHEAPEST tier t
 answer the question first (see `CLAUDE.md` "How to validate"). Reserve full smokes.
 
 ### Phase 0 — quick wins, no kernel (do first)
-- **0.0 Build the TPU micro-benchmark harness** (enabling work — do this FIRST, it unblocks
-  cheap iteration for everything else). A script that jits + times `sparse_attn` (and later
-  the new kernel) on the real slice mesh with SYNTHETIC q/kv/topk_idxs/attn_sink at realistic
-  shapes — **NO 543 GiB weight load, no full-model compile.** Lets you measure gather
-  ms/bandwidth and kernel speedups in ~1 min instead of a 25–45 min full smoke. Also wire a
-  CPU numerics check vs `sparse_attn_torch`. Commit it as `scripts/perf_*`.
-- **0.1 Eliminate the duplicate prefill body** — take `h` from Pass B, drop Pass A.
-  ~2× prefill (+ halves prefill MoE/collectives). Preserve the `state_init_ids`/n_real vs
-  padded-`input_ids` split (`deepseek_v4.py:835-840`). Refs: `:851` (Pass A) vs `:854`.
-- **0.2 bf16 gather** — drop `kvf = kv.astype(fp32)` at `:181`, gather bf16, upcast inside
-  the einsums (`:189`,`:199`). KV is already bf16; oracle starts from bf16 → numerically
-  neutral. ~2× prefill / ~1.45× decode on the bottleneck op. Validate: existing CPU test
-  `tests/models/jax/test_deepseek_v4.py -k sparse_attn`.
-- **0.3 Delete dead code:** `_consolidate_moe_after_load` (`deepseek_v4.py:1776-1830`, zero
-  callers, *and* it's the buggy device-reshard path S1 removed) + `_QUANT_SUFFIXES` (`:1269`).
+- **0.0 TPU microbench harness — ✅ DONE.** `scripts/perf_microbench.sh --all` (launcher:
+  pre-cleans every host, fans `perf_microbench_sparse_attn.py` across 8 hosts via mh_run,
+  `--distributed`). Times the REAL `sparse_attn` at decode/prefill shapes (3 layer flavors
+  swa/csa/hca) with synthetic inputs — NO weight load. Read **process-0's** tail for the
+  table. CPU numerics gate = `scripts/perf_microbench.sh --cpu-check` (existing pytest).
+  Baseline measured: **decode_csa 5.44 ms** to move 2.4 MB ⇒ ~0.4 GB/s (~0.025% HBM bw) —
+  reproduces the profile. ⚠️ **Slice ops:** a lone host CAN'T boot the v6e-32 TPU → MUST run
+  multi-host. `jax.distributed.initialize()` is a coin-flip + a failed run leaves JAX procs
+  stuck (ignore SIGTERM) that poison the next init — the launcher SIGKILLs `[p]erf_microbench`
+  + clears lockfiles first, but on a hang **retry** (clean is baked in). MUST sync the script
+  to all 8 hosts first (mh_run runs each host's clone).
+- **0.2 bf16 gather — EDITED + CPU-GATED, smoke-pending.** Done as the *bit-identical* variant:
+  killed `kvf = kv.astype(fp32)` at `:181` (it copied the whole KV → "doubled traffic"), gather
+  now reads bf16 `kv` and upcasts the *gathered result* to fp32 so the einsums stay fp32×fp32
+  (gather commutes with upcast ⇒ no numerics change ⇒ md5 unchanged). CPU test passes 2/2.
+  Bigger follow-up (keep `kv_gathered` bf16 + `preferred_element_type=fp32` in both einsums)
+  is numerics-shifting → separate gate. **PENDING: microbench before/after + full-smoke S1.**
+- **0.3 Delete dead code — DONE (61 lines), smoke-pending.** Removed `_consolidate_moe_after_load`
+  (`deepseek_v4.py`, zero callers, the buggy device-reshard S1 removed) + `_QUANT_SUFFIXES`.
+  Behavior-neutral. **PENDING: bundle into the 0.2 full-smoke S1 gate.**
+- **0.1 Eliminate the duplicate prefill body** — ⚠️ DEFERRED, see §0.1-CONFLICT below.
 
 ### Phase 1 — the fused sparse-attention kernel (the main prize: 50–100× prefill, 2–3× decode)
 Replace the materialized gather with a tiled Pallas kernel doing gather + online-softmax +
@@ -120,11 +128,28 @@ and/or fused with the S1 fix — all flagged unsafe).
 ---
 
 ## NEXT ACTION (for the session reading this)
-1. Read this doc + `CLAUDE.md` (slice ops, validation tiers, pitfalls).
-2. **Build Phase-0.0 (the TPU microbench harness)** — it unblocks cheap iteration for the
-   whole campaign and is itself a clean committable step. Then drive **0.1** (the free ~2×
-   prefill) and **0.2** (bf16 gather) — both gate-cheap.
-3. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
+1. **Full-smoke S1 gate for 0.2 + 0.3** (already committed, CPU-gated, synced). Expect the FIB
+   md5 to stay **`5bf42256`** (0.2 is bit-identical, 0.3 is dead-code) — confirm ×2 fresh
+   engines + correct Fibonacci + `smoke_check` rc=0, then mark 0.2/0.3 CLOSED. If md5 differs,
+   STOP — something's wrong (these must be neutral).
+2. *(cheap, optional first)* `scripts/perf_microbench.sh --all` on the new code to record the
+   0.2 before/after win (decode_csa baseline = 5.44 ms). Init is a coin-flip → retry on hang.
+3. **Resolve §0.1-CONFLICT**, then do 0.1 (the free ~2× prefill). Then Phase 1 (the kernel).
+4. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
+
+## <a name="0.1-CONFLICT"></a>Phase 0.1 conflict to resolve BEFORE implementing
+The roadmap assumed the two prefill passes produce a **byte-identical `h`** (so just take Pass
+B's `h`, drop Pass A). A code audit DISPUTES this: Pass A (`transformer_body_forward`, ~:851)
+runs on **padded** `input_ids`; Pass B (`transformer_body_init_state_to_buffer`, ~:854) is
+called with `state_ids = state_init_ids` which is **sliced to n_real** when `state_init_ids`
+is set (~:853, sourced ~:1928 as `ids_2d[:, :L_real]`), and its MoE path applies `n_real`
+masking — so Pass B's `h` could differ in shape/values from Pass A's. The trace's "84 gathers
+= 41 layers × 2" implies both passes ran the **same shape**, which only holds if
+`state_init_ids == input_ids` (no slicing) in the smoke. **RESOLVE FIRST** (cheap, CPU): use
+`scripts/s1_cpu_repro_v4flash.py`-style prefill to check whether `state_init_ids` is ever
+sliced (L_real < T) in the real serve path AND whether Pass A's `h` equals Pass B's `h`. If
+they match → safe to drop Pass A. If not → must thread padded ids for `h` + sliced ids for
+state-seeding separately (bigger refactor) — and it WILL shift the md5, so re-gate ×2 engines.
 
 ---
 
