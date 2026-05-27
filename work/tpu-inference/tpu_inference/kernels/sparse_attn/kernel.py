@@ -23,25 +23,33 @@ softmax over the gathered tile (matches the oracle exactly; no online-softmax
 accumulation-order drift). Output stays RoPE-rotated; the caller applies inverse
 RoPE — the kernel does not touch RoPE.
 
-GATHER MECHANISM (current = the bounded-N regime): each program handles one
-(b,m) query; it gathers its K kv rows with per-row dynamic `pl.ds` slices on a
-VMEM-resident kv block, then `concatenate`s to `[K,D]`. This is correct + lowers
-for N small enough that `kv[N,D]` fits VMEM (decode SWA/HCA, short prefill).
+GATHER MECHANISM = ONE-HOT MATMUL. Each program handles one (b,m) query; the K
+selected rows are gathered as `onehot[k,n] = (safe[k]==n)` (exact 0/1 in bf16)
+times the resident `kv[N,D]`, so `onehot @ kv` reproduces `kv[safe[k]]`
+BIT-IDENTICALLY (one nonzero term per row — correct even for duplicate indices,
+matching `take_along_axis`). Why not a dynamic per-row load: Mosaic cannot
+dynamically index the sublane-tiled (8,128) VMEM row axis at an arbitrary
+(non-8-aligned) offset (verified — `E2003 ...UnprovenMemoryAccessAlignment`), so
+`kv_ref[0, pl.ds(idx,1), :]` does NOT lower on v6e. The one-hot matmul is pure
+MXU work => lowers cleanly for BOTH call sites (microbench-confirmed).
 
-  *** For the LARGE-N regime (long-context decode-CSA, where reading all N would
-  dominate and kv may not fit VMEM) the production gather should use the proven
-  gen-6 idiom from ragged_paged_attention/v3 + mla/v2: scalar-prefetch the index
-  array into SMEM (`PrefetchScalarGridSpec(num_scalar_prefetch=...)`), keep kv as
-  an HBM operand (`pl.BlockSpec(memory_space=pltpu.HBM)`), and DMA each selected
-  row into a VMEM scratch via
+  *** The onehot READS ALL N. Fine for decode (latency-bound; microbench
+  decode_csa 5.44ms baseline -> 0.131ms kernel, ~41x) and prefill (bandwidth win
+  is from reusing kv across queries, not from skipping rows). For the LARGE-N
+  decode-CSA regime (msl huge => reading all N dominates), the production gather
+  should switch to the proven gen-6 DMA idiom (ragged_paged_attention/v3 +
+  mla/v2): SMEM scalar-prefetch the index array
+  (`PrefetchScalarGridSpec(num_scalar_prefetch=...)`), kv as an HBM operand
+  (`pl.BlockSpec(memory_space=pltpu.HBM)`), per-row
   `pltpu.make_async_copy(kv_hbm.at[pl.ds(idx_ref[j]*D, sz)], scratch.at[...], sem)`
-  in a statically-unrolled loop, double-buffered semaphores, size-0 copy for the
-  -1 sentinel. The SOFTMAX MATH below is identical for either gather — only the
-  `_gather_kv` step changes. ***
+  in a statically-unrolled loop, size-0 copy for the -1 sentinel. The SOFTMAX
+  MATH is identical for either gather — only the kvg-construction line changes. ***
 
-Status: MATH validated bit-parity vs `sparse_attn_torch` on CPU (`interpret=True`)
-— see `tests/.../test_deepseek_v4.py::TestSparseAttnKernel`. NOT yet wired into
-the model; TPU compile + microbench + the S1 gate are the next step.
+Status: MATH validated bit-parity vs `sparse_attn_torch` + the JAX `sparse_attn`
+on CPU (`interpret=True`, `tests/.../test_deepseek_v4.py::TestSparseAttnKernel`);
+TPU-COMPILES + runs for decode (M=1) and prefill (M=S) via the microbench
+(`scripts/perf_microbench.sh --kernel`). NOT yet wired into the model — wiring
+into both call sites + the full S1 smoke gate is the next step.
 """
 from __future__ import annotations
 
@@ -58,22 +66,29 @@ def _sparse_attn_kernel(
     q_ref,      # [1, 1, H, D]  bf16
     kv_ref,     # [1, N, D]     bf16  (single shared KV head; resident across the M grid)
     sink_ref,   # [H]           fp32
-    topk_ref,   # [1, 1, K]     int32  (-1 == ignore)
+    topk_ref,   # [1, 1, 1, K]  int32  (-1 == ignore)
     out_ref,    # [1, 1, H, D]  out dtype (== q.dtype, bf16)
     *,
     softmax_scale: float,
-    K: int,
 ):
-    idx = topk_ref[0, 0, :]                       # [K] int32
+    idx = topk_ref[0, 0, 0, :]                    # [K] int32
     safe = jnp.maximum(idx, 0)                    # [K]  clamp -1 -> 0 (oracle: clamp(min=0))
+    N = kv_ref.shape[1]
 
-    # Gather the K selected kv rows (bf16), then upcast to fp32 — bit-identical
-    # to upcasting kv first (gather is pure indexing). Per-row dynamic slice on
-    # the VMEM-resident kv block; `k` is static so `safe[k]` is a plain scalar
-    # value used as a dynamic slice START (the legal `pl.ds` dynamic-start form).
-    rows = [kv_ref[0, pl.ds(safe[k], 1), :]
-            for k in range(K)]                    # each [1, D] bf16
-    kvg = jnp.concatenate(rows, axis=0).astype(jnp.float32)   # [K, D] fp32
+    # Gather the K selected kv rows via a ONE-HOT MATMUL, not dynamic per-row
+    # loads: Mosaic cannot dynamically index the sublane-tiled (8,128) VMEM row
+    # axis at an arbitrary (non-8-aligned) offset (E2003). `onehot[k,n] =
+    # (safe[k] == n)` is exact 0/1 in bf16, so `onehot @ kv` reproduces
+    # kv[safe[k]] BIT-IDENTICALLY (exactly one nonzero term per row — correct
+    # even for duplicate indices, matching `take_along_axis`). Pure matmul =>
+    # lowers cleanly. Reads all N; for the large-N decode-CSA regime the DMA
+    # idiom in the module docstring avoids the full-N read (future optimization).
+    kv = kv_ref[0]                                # [N, D] bf16 (resident)
+    onehot = (safe[:, None]
+              == jnp.arange(N, dtype=jnp.int32)[None, :]).astype(kv.dtype)  # [K, N]
+    kvg = lax.dot_general(
+        onehot, kv, (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32)        # [K, D] fp32
 
     qf = q_ref[0, 0, :, :].astype(jnp.float32)    # [H, D]
     # logits[h,k] = (qf[h] . kvg[k]) * scale ; contract over D.
@@ -120,14 +135,18 @@ def sparse_attn_kernel(
     N = kv.shape[1]
     K = topk_idxs.shape[-1]
 
+    # topk_idxs reshaped [B,M,K] -> [B,M,1,K] so the grid-tiled M axis (block 1)
+    # leaves the sublane/lane-tiled last-two dims (Pallas requires those either
+    # equal the array dims or be divisible by (8,128)); q/kv/out are unaffected
+    # since M is not in their last-two dims.
     return pl.pallas_call(
-        functools.partial(_sparse_attn_kernel, softmax_scale=softmax_scale, K=K),
+        functools.partial(_sparse_attn_kernel, softmax_scale=softmax_scale),
         grid=(B, M),
         in_specs=[
             pl.BlockSpec((1, 1, H, D), lambda b, m: (b, m, 0, 0)),  # q
             pl.BlockSpec((1, N, D), lambda b, m: (b, 0, 0)),        # kv (resident)
             pl.BlockSpec((H,), lambda b, m: (0,)),                  # attn_sink
-            pl.BlockSpec((1, 1, K), lambda b, m: (b, m, 0)),        # topk_idxs
+            pl.BlockSpec((1, 1, 1, K), lambda b, m: (b, m, 0, 0)),  # topk_idxs [B,M,1,K]
         ],
         out_specs=pl.BlockSpec((1, 1, H, D), lambda b, m: (b, m, 0, 0)),
         out_shape=jax.ShapeDtypeStruct((B, M, H, D), q.dtype),
@@ -135,4 +154,4 @@ def sparse_attn_kernel(
             dimension_semantics=("parallel", "parallel"),
         ),
         interpret=interpret,
-    )(q, kv, attn_sink, topk_idxs)
+    )(q, kv, attn_sink, topk_idxs.reshape(B, M, 1, K))

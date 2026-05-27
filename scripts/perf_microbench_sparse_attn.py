@@ -38,6 +38,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_inference.layers.jax.attention.deepseek_v4_attention import sparse_attn
+from tpu_inference.kernels.sparse_attn.kernel import sparse_attn_kernel
 
 H, D = 64, 512
 SCALE = 1.0 / (D ** 0.5)
@@ -79,10 +80,13 @@ def bench(fn, args, warmup=5, iters=50):
     return ts
 
 
-def run_preset(name, seq, msl, dev):
+def run_preset(name, seq, msl, dev, use_kernel=False):
     B, M, K, N = PRESETS[name](seq, msl)
     args = make_inputs(B, M, K, N, dev)
-    fn = jax.jit(lambda q, kv, s, idx: sparse_attn(q, kv, s, idx, SCALE))
+    if use_kernel:  # the fused Pallas kernel (Phase 1) — TPU path (interpret=False)
+        fn = jax.jit(lambda q, kv, s, idx: sparse_attn_kernel(q, kv, s, idx, SCALE))
+    else:
+        fn = jax.jit(lambda q, kv, s, idx: sparse_attn(q, kv, s, idx, SCALE))
     ts = bench(fn, args)
     med, mn = statistics.median(ts), min(ts)
     # Gathered tensor kv_gathered[B,M,K,D]: the materialized intermediate. Report
@@ -91,7 +95,8 @@ def run_preset(name, seq, msl, dev):
     gathered_elems = B * M * K * D
     gathered_mb_fp32 = gathered_elems * 4 / 1e6
     bw_fp32 = gathered_elems * 4 / (med / 1e3) / 1e9  # GB/s (read of fp32 gather)
-    print(f"{name:13s} B={B} M={M:>5d} K={K:>5d} N={N:>5d} | "
+    impl = "KERNEL" if use_kernel else "baseln"
+    print(f"{impl} {name:13s} B={B} M={M:>5d} K={K:>5d} N={N:>5d} | "
           f"median {med:8.3f} ms  min {mn:8.3f} ms | "
           f"gathered {gathered_mb_fp32:8.1f} MB fp32  ~{bw_fp32:7.1f} GB/s")
     return name, med, mn, gathered_mb_fp32, bw_fp32
@@ -106,6 +111,9 @@ def main():
     ap.add_argument("--distributed", action="store_true",
                     help="jax.distributed.initialize() for the multi-host pod "
                          "(run under scripts/full_slice_v4_mh_run.sh)")
+    ap.add_argument("--kernel", action="store_true",
+                    help="benchmark the fused Pallas sparse_attn_kernel (Phase 1) "
+                         "instead of the baseline sparse_attn")
     args = ap.parse_args()
 
     if args.distributed:
@@ -120,7 +128,7 @@ def main():
           f"global_devices={jax.device_count()} | seq={args.seq} msl={args.msl}")
     names = list(PRESETS) if args.all else [args.preset or "decode_csa"]
     for n in names:
-        run_preset(n, args.seq, args.msl, dev)
+        run_preset(n, args.seq, args.msl, dev, use_kernel=args.kernel)
 
 
 if __name__ == "__main__":
