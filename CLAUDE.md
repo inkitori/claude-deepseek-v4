@@ -5,14 +5,13 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-26 S27): **ROOT CAUSE STANDS (routed W1/W3 weight LOAD); the obvious fix FAULTS the load.**
-> S26 verdict unrefuted: w1/w3 consolidation reshard (deepseek_v4.py:1535) bakes in uninit HBM, W2 clean. S27 fix
-> v1 (force expert leaves to shard axis-0 via `pick_partition_spec(prefer_axis0)`, commit 446950f3) was CPU-valid
-> but **deterministically faults layer-0 expert consolidation on TPU** — 3 fresh smokes died at exactly 600 tensors
-> (worker SIGKILL, no Python traceback); reverted code loaded past 6800 ⇒ slice HEALTHY, v1 is the culprit. v1
-> REVERTED. NEXT: v2 = fix the consolidation reshard WITHOUT changing w1/w3 LEAF sharding — recommended host-gather
-> (`np.stack` leaves on host → `make_array_from_callback` to e_spec, no device reshard). See HANDOFF_S1.md. Loop NOT
-> stopped. (jax.debug.print LOSSY ⇒ re-fire.)
+> One-line status (2026-05-27 S28): **✅ S1 FIXED — v2a host-gather w1/w3 consolidation (commit 5a3ed435),
+> gate passed ×2 fresh engines.** Root cause (S26) = routed W1/W3 stacked-weight LOAD: the device-side
+> consolidation reshard (deepseek_v4.py:1535, axis-1-leaf→expert) read uninit HBM. v2a rebuilds the stacked
+> tensor from the FULL per-expert host numpy via `make_array_from_callback` (no device reshard). Verified ×2:
+> [ckSPLIT] W1/W2/W3 + FIB md5 byte-IDENTICAL across engines, correct Fibonacci, smoke_check rc=0. REMAINING
+> (hygiene, see HANDOFF_S1.md): remove S1 debug instrumentation, final confirming smoke, then `touch
+> /tmp/s1_loop_stop`. (jax.debug.print LOSSY ⇒ re-fire.)
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
