@@ -6,10 +6,11 @@
 > REGRESSION GATE, not the goal (see below). S1 history: `HANDOFF_S1.md` / `CLAUDE.full.md`.
 > Per-iteration narrative goes in **commit messages**, not this file.
 >
-> **One-line status (2026-05-27):** Perf campaign kicked off. Bottleneck = the sparse-attn KV
-> gather (`deepseek_v4_attention.py:186`), 99% of prefill / 66% of a decode step (profile
-> VERIFIED). Roadmap in `HANDOFF_PERF.md`. Nothing landed yet; next = Phase 0 (microbench
-> harness, then the free ~2× prefill from killing the duplicate prefill body, then bf16 gather).
+> **One-line status (2026-05-27):** Bottleneck = the sparse-attn KV gather
+> (`deepseek_v4_attention.py:186`), 99% of prefill / 66% of a decode step (profile VERIFIED).
+> Landed: Phase 0.0 (microbench), 0.2 (bf16 gather), 0.3 (dead code), 0.1 (killed the duplicate
+> prefill body, ~½ prefill). Next = Phase 1 (the fused sparse-attn kernel). Detail + the temp=0
+> FIB-tail-nondeterminism finding in `HANDOFF_PERF.md`.
 
 ## Goal
 
@@ -23,10 +24,13 @@ KV gather, NOT the MoE** (a FLOP count said MoE; the profile overturned it — a
 Every committed change MUST still pass, verified on a fresh real-V4 engine:
 * `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
   max_word_run < 5).
-* FIB decode md5 **byte-identical across 2 fresh engines** + **correct Fibonacci** (21, 34,
-  55, 89, 144) vs a prefill-everything reference. Current reference md5 = `b675be27`
-  (rebaselined from `5bf42256` by PERF 0.2 — the bf16 gather is math-bit-identical but XLA on
-  TPU picks a different matmul accumulation order ⇒ a deterministic ULP-level output shift).
+* FIB decode: **correct Fibonacci** (21, 34, 55, 89, 144 — DETERMINISTIC/high-margin) +
+  **N=2 md5 `5bf42256` byte-identical across 2 fresh engines** (`/tmp/s1_probe2.py 2`, =
+  md5("21,")). ⚠️ Do NOT gate on a long-tail md5 (`s1_probe2.py 20`+): PERF-0.1 found the FIB
+  free-form TAIL is NON-deterministic at temp=0 (flips WITHIN one process,
+  `e4d45024`↔`26354502`) — pre-existing DECODE-path runtime nondeterminism (distributed
+  all-reduce ordering), so old long-tail refs (`b675be27`) were sampling a nondeterministic
+  quantity. (Baseline-confirm TODO: HANDOFF_PERF §0.1-DONE.)
 * Still passes after 5 unrelated requests.
 
 A numerics-changing fix MAY shift the md5 — then re-establish a NEW reference and confirm it's

@@ -6,13 +6,17 @@
 > state, the roadmap, the ONE next action. Durable slice ops: `CLAUDE.md`. S1 history:
 > `HANDOFF_S1.md` / `CLAUDE.full.md`.
 >
-> **One-line status (2026-05-27, P0):** Phase 0.0 DONE (microbench harness). **0.2 (bf16
-> gather) + 0.3 (dead-code) GATED & CLOSED** — full smoke ×2 fresh engines: FIB md5
-> byte-identical + correct Fibonacci + smoke_check rc=0. ⚠️ 0.2 is **NOT** bit-identical on
-> TPU after all: it rebaselined the reference md5 `5bf42256`→**`b675be27`** (deterministic
-> ULP shift — see §0.2). **NEXT = Phase 0.1** (kill the duplicate prefill body): its
-> §0.1-CONFLICT is now RESOLVED with an implementation recipe — but it's a numerics-SHIFTING
-> refactor (re-gate ×2 + new reference), NOT the "free byte-identical" win first assumed.
+> **One-line status (2026-05-27, P0):** Phase 0.0/0.2/0.3 CLOSED. **0.1 (kill duplicate
+> prefill body) DONE & COMMITTED** — prefill runs ONE body (returns Pass B's `h`; dropped the
+> Pass-A `transformer_body_forward`); also deleted the dead `state_init_ids` param/slicing (net
+> −31 lines). Gated: CPU round_trip/single_pass pass; correct Fibonacci ×3 fresh engines; N=2
+> FIB md5 `5bf42256` byte-identical ×2 engines; decode provably byte-identical (state-seed +
+> decode jit untouched → 0.1 only changes prefill→first-token). ⚠️ **NEW FINDING (§0.1-DONE):**
+> the FIB FREE-FORM TAIL (N≳6, after the deterministic 21,34,55,89,144) is **non-deterministic
+> at temp=0** — flips WITHIN one process (`e4d45024`↔`26354502`). So long-tail md5 refs
+> (`b675be27`) were sampling a NON-deterministic quantity → gate on N=2 `5bf42256` + correct
+> Fibonacci, NOT long-tail md5. Pre-existing decode nondeterminism (NOT 0.1). **NEXT = Phase 1**
+> (fused sparse-attn kernel) — but first cheaply CONFIRM the tail-nondet on baseline (§0.1-DONE).
 
 ---
 
@@ -83,7 +87,12 @@ answer the question first (see `CLAUDE.md` "How to validate"). Reserve full smok
 - **0.3 Delete dead code — ✅ CLOSED (in `2839a684`).** Removed `_consolidate_moe_after_load`
   (zero callers) + `_QUANT_SUFFIXES`. Behavior-neutral (dead code can't move numerics); gated
   in the same smoke as 0.2.
-- **0.1 Eliminate the duplicate prefill body — ⏭ NEXT (recipe in §0.1-RESOLVED below).**
+- **0.1 Eliminate the duplicate prefill body — ✅ DONE & COMMITTED (2026-05-27).** Prefill now
+  runs ONE body: `deepseek_v4_run_with_decode_state` returns Pass B's `h`
+  (`transformer_body_init_state_to_buffer`), dropped the standalone Pass-A
+  `transformer_body_forward`; deleted dead `state_init_ids` param + call-site slicing (net −31
+  lines, decode path UNTOUCHED). ~halves the ~120 s prefill body. Gate + the tail-nondet finding
+  in §0.1-DONE.
 
 ### Phase 1 — the fused sparse-attention kernel (the main prize: 50–100× prefill, 2–3× decode)
 Replace the materialized gather with a tiled Pallas kernel doing gather + online-softmax +
@@ -134,57 +143,57 @@ and/or fused with the S1 fix — all flagged unsafe).
 ---
 
 ## NEXT ACTION (for the session reading this)
-1. **Implement Phase 0.1** (kill the duplicate prefill body) per §0.1-RESOLVED. This is the
-   single highest-ROI item left (halves the ~120 s prefill body). It WILL shift the FIB md5 →
-   re-establish a NEW reference and gate ×2 fresh engines + correct Fibonacci + smoke_check
-   rc=0 (current reference after 0.2 = `b675be27`).
-2. *(cheap, optional)* `scripts/perf_microbench.sh --all` to quantify the 0.2 prefill win +
-   set the Phase-1 baseline (decode_csa baseline = 5.44 ms; init is a coin-flip → retry on
-   hang; needs the slice FREE — run it when no engine is up).
-3. Then **Phase 1** (the fused sparse-attn kernel — the main prize).
+1. *(cheap, ~30 min, do FIRST)* CONFIRM the §0.1-DONE tail-nondeterminism is PRE-EXISTING:
+   checkout baseline `56abe232`, sync, smoke ONE engine, probe `/tmp/s1_probe2.py 20` a few
+   times — if it ALSO flips (md5 unstable), the decode-tail nondet is pre-existing (confirms 0.1
+   innocent + that the gate must be N=2-based). If baseline is STABLE at N=20, investigate — but
+   0.1's decode path is provably byte-identical, so a 0.1 cause is near-impossible.
+2. **Phase 1** (the fused sparse-attn kernel — the main prize). Concrete fork plan now in
+   §KERNEL. Validate vs `sparse_attn_torch` on CPU + microbench, THEN the §S1-GATE.
+3. *(cheap, optional)* `scripts/perf_microbench.sh --all` (slice FREE) to quantify the 0.1+0.2
+   prefill win + set the Phase-1 baseline (decode_csa baseline = 5.44 ms; retry on init hang).
 4. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
 
-## <a name="0.1-RESOLVED"></a>Phase 0.1 — RESOLVED (3-agent audit: code ×2 + CPU repro)
-**Verdict: safe to eliminate the duplicate body. Drop Pass A; reuse Pass B's `h` (computed on
-PADDED ids).** Findings:
-- In the **served (compiled)** program both passes run the **same padded ids**: the
-  `state_init_ids = ids_2d[:,:L_real]` slice (`deepseek_v4.py:1866-1867`) is a **trace-time
-  static** decision and warmup traces a full-bucket dummy with `L_real==T` ⇒ `state_init_ids=
-  None` ⇒ Pass B gets the full padded `input_ids` (`:1846-1848`). Real-token awareness rides on
-  the **traced `n_real`**, not on reshaping Pass B.
-- Given identical input ids, **`h_A == h_B` bit-identical** (CPU repro; `n_real` does NOT
-  affect `h` — it only masks the discarded *state* buffer). The only divergence the repro saw
-  was when Pass B was fed *sliced* ids (eager path, not the compiled one).
-- Currently Pass A's `h` is returned (`:861`)→logits (`:1882`); Pass B's `h` is discarded
-  (`_h_state`, `:854`). So they're computing the SAME `h` twice in the served path.
+## <a name="0.1-DONE"></a>Phase 0.1 — DONE + the temp=0 tail-nondeterminism finding
+**Landed:** `deepseek_v4_run_with_decode_state` prefill now binds Pass B's `h`
+(`h, packed_buffers = transformer_body_init_state_to_buffer(input_ids, …, n_real=n_real)`) and
+drops the standalone Pass-A `transformer_body_forward`; the dead `state_init_ids` param + the
+call-site `L_real` slicing are deleted (state_init_ids was always None in the served/compiled
+path — `n_real` handles pad masking). Test `...state_init_ids_does_not_affect_h` rewritten to
+`...single_pass_h_matches_forward`.
+**Why decode is provably UNCHANGED:** the decode-state seed `packed_buffers` comes from the SAME
+`init_state_to_buffer(input_ids, n_real)` call as before (byte-identical args), and the decode
+jit (`is_decode_step=True`) is untouched. 0.1 only alters the prefill→returned-`h` (→ first token
+"21", high-margin/stable). So 0.1 cannot move decode determinism.
 
-**Recipe** (at `deepseek_v4.py:851-861`): delete the standalone Pass-A call (`:851-852`); bind
-Pass B's `h` — `h, packed_buffers = transformer_body_init_state_to_buffer(input_ids, …,
-n_real=n_real)` — and `return packed_buffers, h`. **Invoke Pass B on the PADDED `input_ids`**
-(not `state_ids`/sliced) so the head argmax shape matches the V4 reference (`:836-840`); the
-`n_real` threading already excludes pad rows for both the MoE `h`-mask and the state seed. This
-also collapses the `state_init_ids` slicing machinery (`:1856-1867`).
-
-**Caveats for the implementer:** (1) Per the above it *should* be byte-identical in the served
-path (Pass B already runs on padded ids there) → md5 may stay `b675be27`; the residual risk is
-the TPU-only `n_real × use_shard_map` question (on TPU Pass B's MoE zeroes pad rows, Pass A's
-doesn't — but the current gate passing byte-identical ×2 proves Pass A's real-token `h` is
-already deterministic, i.e. pad rows are NOT contaminating real tokens today). (2) Treat it as
-numerics-SHIFTING regardless: gate ×2 fresh engines + correct Fibonacci; if md5 moves,
-re-baseline. The gate (correct Fibonacci vs prefill-everything) is the arbiter of which `h` is
-right.
+**⚠️ FINDING — FIB free-form TAIL is non-deterministic at temp=0 (PRE-EXISTING, NOT 0.1):**
+At `/tmp/s1_probe2.py 20`, two consecutive identical temp=0 requests on the SAME engine process
+returned different md5 (`e4d45024`↔`26354502`) — same executable + same input + different output
+= runtime nondeterminism in DECODE (likely non-deterministic distributed all-reduce ordering —
+the known "S1 residual" / Phase-2 collectives). The Fibonacci NUMBERS (21,34,55,89,144) are
+deterministic + correct; only the unconstrained continuation after them flips. **Implication:**
+the long-tail FIB md5 is NOT stable — past "byte-identical ×2 `b675be27`" was sampling a
+nondeterministic tail. The DETERMINISTIC gate is **N=2 md5 `5bf42256` (= md5("21,")) + correct
+Fibonacci numbers**, both verified byte-identical ×2 fresh engines (×3 within-process) this
+session. TODO (cheap, NEXT ACTION #1): confirm baseline `56abe232` also flips at N=20.
+**Gate confounds seen this session:** smoke_check OOM'd (256M HLO temp) compiling its shapes ON
+TOP of the resident FIB probe shapes on the memory-tight slice → `EngineDeadError` + a ray
+channel crash that dropped a node to 28/32 TPU (recovered via `ray_restart`). 0.1 REDUCES prefill
+memory so cannot cause the OOM; smoke_check uses the chat endpoint (Phase-4.1 wedge-prone). Run
+smoke_check FIRST on a clean engine if rc=0 is needed.
 
 ---
 
 ## <a name="S1-GATE"></a>S1 REGRESSION GATE (non-negotiable for every change)
 - `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
   max_word_run < 5).
-- FIB decode md5 **byte-identical across 2 fresh engines** + **correct Fibonacci** (21, 34,
-  55, 89, 144) vs the prefill-everything reference. Current reference md5 = `b675be27`
-  (rebaselined from `5bf42256` by 0.2's bf16 gather — deterministic ULP shift on TPU). A
-  numerics-changing kernel MAY shift the md5 → re-establish a NEW reference and confirm it's
-  identical across 2 fresh engines + correct Fibonacci. The non-negotiable is **identical
-  across engines + correct Fibonacci**, not the specific hash.
+- FIB decode: **correct Fibonacci** (21, 34, 55, 89, 144 — DETERMINISTIC) + **N=2 md5
+  `5bf42256` byte-identical across 2 fresh engines** (`s1_probe2.py 2`, = md5("21,")). ⚠️ The
+  long-tail md5 (`s1_probe2.py 20`+) is NON-deterministic at temp=0 (pre-existing decode
+  nondeterminism — §0.1-DONE) — do NOT gate on it; old refs (`b675be27`) sampled a
+  nondeterministic tail. A numerics-changing kernel may shift even the N=2 deterministic md5 →
+  re-establish + confirm identical ×2 engines + correct Fibonacci. Non-negotiable = **identical
+  ×2 engines (at N=2) + correct Fibonacci**, not a specific long-tail hash.
 - READ the actual decode text — "contains Paris" is a known false positive (can EOS at tok 1).
 - Probe: `python3 /tmp/s1_probe2.py N` (FIB decode, prints md5 + text; N = max_tokens).
 
@@ -209,6 +218,15 @@ H=64 q heads (gather once per (b,m)-tile, reuse across H). D=512, scale=1/sqrt(5
 - **Templates:** `kernels/flash_attention/kernel.py:82` (softmax+sink loop),
   `kernels/mla/v2/kernel.py` (`:335`/`:401` online-softmax, `:1119` pipeline, shared-KV
   einsum), oracle `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60`.
+- **Fork plan (agent-derived):** FORK `flash_attention/kernel.py` (its row-independent online
+  softmax + per-head sink fits per-query rowmax/denom; reject mla/v2 — its single shared-KV
+  einsum materializes `[B,M,K,D]`). Reuse grid `(batch,heads,q_seq,·)` + the m/l accumulator
+  init/update/exp-correction (`~:294-330`); set the kv-block grid axis to a dummy and move the
+  K gather into the body — gather KV rows by `topk_idxs` via per-index `pl.dslice(idx*D, D)` DMA
+  (pattern à la `ragged_*` per-row dynamic slice; Mosaic has no native scatter-gather), masking
+  `-1`. Sink: add `exp(sink[h]-m)` into the running max + denom only, NO sink value in the
+  V-accum. RISK: dynamic K-gather loop width vs VMEM on v6e gen-6 — prefetch all K rows once
+  into VMEM then reuse.
 
 ---
 

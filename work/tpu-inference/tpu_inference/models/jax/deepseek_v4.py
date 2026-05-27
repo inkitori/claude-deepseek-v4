@@ -820,7 +820,6 @@ def deepseek_v4_run_with_decode_state(
     state_max_seq_len: int,
     is_decode_step: bool,
     start_pos,
-    state_init_ids: "jnp.ndarray | None" = None,
     n_real=None,
 ) -> Tuple[List[jnp.ndarray], jnp.ndarray]:
     """Run one prefill or one decode step, threading per-layer
@@ -832,12 +831,12 @@ def deepseek_v4_run_with_decode_state(
     and returns updated buffers. Returns `(updated_kv_caches, h)` so the
     caller can pass `kv_caches` as a donated JIT argument.
 
-    `state_init_ids` (prefill only): when set, state is seeded from this
-    sliced-to-real-length tensor while `h` is still computed on the
-    padded `input_ids`. State init is positional — encoding pad tokens
-    into SWA / compressor / indexer slots yields wrong decode reads — but
-    `transformer_body_forward` must run on the padded shape so the SPMD
-    compile and `h` argmax match the real-V4 reference.
+    Prefill runs ONE transformer body
+    (`transformer_body_init_state_to_buffer`) yielding both `h` and the
+    packed state. `n_real` (the traced real prompt length) masks pad rows
+    in the MoE + state seed so padding never pollutes the SWA / compressor
+    / indexer kv slots; `h` at the real rows is bit-equivalent to a plain
+    `transformer_body_forward` on the padded ids.
     """
     if is_decode_step:
         h, new_buffers = transformer_body_decode_step_from_buffer(
@@ -848,11 +847,8 @@ def deepseek_v4_run_with_decode_state(
         new_buffers = _v4_anchor_output_buffers(new_buffers)
         new_buffers = _v4_constrain_packed_replicated(new_buffers)
         return new_buffers, h
-    h = transformer_body_forward(
-        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg)
-    state_ids = state_init_ids if state_init_ids is not None else input_ids
-    _h_state, packed_buffers = transformer_body_init_state_to_buffer(
-        state_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
+    h, packed_buffers = transformer_body_init_state_to_buffer(
+        input_ids, params, freqs_cis_swa, freqs_cis_compressed, cfg,
         state_max_seq_len=state_max_seq_len,
         n_real=n_real,
     )
@@ -1829,42 +1825,22 @@ def _build_class():
                     start_pos = (
                         attention_metadata.seq_lens[0] - 1).astype(jnp.int32)
                     ids_for_orchestrator = ids_2d[:, 0:1]
-                    state_init_ids = None
                     n_real = None
                 else:
                     start_pos = jnp.int32(0)
                     # Prefill `h` runs on the padded ids — slicing the body's
                     # input shape changes the SPMD compile and the argmax at
-                    # L_real-1 drifts from the real-V4 reference. State init
-                    # runs on ids sliced to the real prompt length: SWA /
-                    # compressor / indexer state construction is positional,
-                    # so feeding T_pad ids encodes padding tokens into kv
-                    # slots that decode steps then attend to.
+                    # L_real-1 drifts from the real-V4 reference. `n_real`
+                    # (= seq_lens[0], a TRACED per-request value) masks pad
+                    # rows in the MoE + state seed so padding never pollutes
+                    # the SWA / compressor / indexer kv slots.
                     ids_for_orchestrator = ids_2d
-                    # S1 FIX (SESSION 5): real prompt length as a TRACED value so
-                    # the SWA seed windows over REAL tokens, not the padded bucket.
-                    # The static state_init_ids slice below is decided at TRACE
-                    # time (warmup traces full-bucket dummy => L_real==T => it never
-                    # slices), so it cannot fix the pad-in-seed bug; n_real
-                    # (= seq_lens[0]) is correct per-request at runtime.
                     n_real = (
                         attention_metadata.seq_lens[0]
                         if (attention_metadata is not None
                             and getattr(attention_metadata, "seq_lens", None)
                             is not None)
                         else None)
-                    L_real = T
-                    qsl_cpu = getattr(
-                        attention_metadata, "query_start_loc_cpu", None)
-                    if qsl_cpu is not None:
-                        try:
-                            import numpy as _np
-                            L_real = int(_np.asarray(qsl_cpu)[1])
-                        except Exception:  # noqa: BLE001
-                            L_real = T
-                    L_real = max(1, min(L_real, T))
-                    state_init_ids = (
-                        ids_2d[:, :L_real] if L_real < T else None)
                 kv_caches, h = deepseek_v4_run_with_decode_state(
                     kv_caches, ids_for_orchestrator, params,
                     freqs_swa, freqs_comp,
@@ -1872,7 +1848,6 @@ def _build_class():
                     state_max_seq_len=state_max_seq_len,
                     is_decode_step=is_decode,
                     start_pos=start_pos,
-                    state_init_ids=state_init_ids,
                     n_real=n_real,
                 )
                 if is_decode and T > 1:
