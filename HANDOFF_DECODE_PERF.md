@@ -243,7 +243,16 @@ parse the Chrome trace (group "XLA Ops" events on the `/device:TPU:0` process by
   larger `max-model-len` and (b) fixing that shape fault. The `vllm chat` REPL is
   `work/vllm_env/bin/vllm chat --url http://localhost:18081/v1 --model deepseek-ai/DeepSeek-V4-Flash`
   but it will trip this on the 2nd–3rd turn.
-- **Smoke config is minimal**, not a serving config (256 ctx, 1 seq, `--enforce-eager`).
+- **Single-turn, short-input `/chat/completions` WORKS** (verified S29: a one-message
+  "write a poem" request returned a clean 142-word instruct-quality poem, no wedge). This is
+  the way to test instruct behavior — the proper template is applied server-side
+  (encode_messages). Long OUTPUT is fine; only long/multi-turn INPUT trips the wedge.
+- **`seed` + sampling = HTTP 400** on this TPU backend: a request with `temperature>0` AND a
+  `seed` field → `"JAX does not support per-request seed."` (greedy temp=0 ignores seed, so
+  it's fine there). For sampled generation, OMIT `seed`.
+- **Smoke config is minimal**, not a serving config (256 ctx, 1 seq, `--enforce-eager`) —
+  caps total tokens at 256, so long generations hit `finish=length`. For longer output,
+  relaunch with `MAX_LEN=<bigger> bash scripts/full_slice_v4_smoke.sh` (cold compile, ~15-30 min).
 
 ---
 
