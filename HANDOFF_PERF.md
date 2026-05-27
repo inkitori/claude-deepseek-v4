@@ -6,17 +6,17 @@
 > state, the roadmap, the ONE next action. Durable slice ops: `CLAUDE.md`. S1 history:
 > `HANDOFF_S1.md` / `CLAUDE.full.md`.
 >
-> **One-line status (2026-05-27, P0):** Phase 0.0/0.2/0.3 CLOSED. **0.1 (kill duplicate
-> prefill body) DONE & COMMITTED** — prefill runs ONE body (returns Pass B's `h`; dropped the
-> Pass-A `transformer_body_forward`); also deleted the dead `state_init_ids` param/slicing (net
-> −31 lines). Gated: CPU round_trip/single_pass pass; correct Fibonacci ×3 fresh engines; N=2
-> FIB md5 `5bf42256` byte-identical ×2 engines; decode provably byte-identical (state-seed +
-> decode jit untouched → 0.1 only changes prefill→first-token). ⚠️ **NEW FINDING (§0.1-DONE):**
-> the FIB FREE-FORM TAIL (N≳6, after the deterministic 21,34,55,89,144) is **non-deterministic
-> at temp=0** — flips WITHIN one process (`e4d45024`↔`26354502`). So long-tail md5 refs
-> (`b675be27`) were sampling a NON-deterministic quantity → gate on N=2 `5bf42256` + correct
-> Fibonacci, NOT long-tail md5. Pre-existing decode nondeterminism (NOT 0.1). **NEXT = Phase 1**
-> (fused sparse-attn kernel) — but first cheaply CONFIRM the tail-nondet on baseline (§0.1-DONE).
+> **One-line status (2026-05-27, P0):** Phase 0.* CLOSED; **Phase 1 kernel AUTHORED &
+> TPU-COMPILING (1.A+1.B committed `f170a55d`/`ace9d576`).**
+> `kernels/sparse_attn/kernel.py::sparse_attn_kernel` — fused gather + fp32 single-pass softmax
+> + per-head sink + `-1` mask, bf16 in/out, DROP-IN signature for `sparse_attn`. Gather = ONE-HOT
+> MATMUL (`onehot[k,n]=(safe[k]==n) @ kv`, bit-identical to `take_along_axis`) — a dynamic per-row
+> VMEM `pl.ds` load does NOT lower on v6e (E2003 sublane-8 alignment; why RPA/MLA gather via HBM
+> DMA). Validated: CPU bit-parity **4/4** (`TestSparseAttnKernel`, vs oracle + jax `sparse_attn`)
+> + TPU compiles/runs BOTH call sites via `perf_microbench.sh --kernel`; **decode_csa
+> 5.436ms→0.131ms ≈41×** (decode_swa 0.129; prefill_swa seq512 0.680). NOT yet wired into the
+> model → S1 served-path gate trivially safe. **NEXT = wire into both call sites (decode :815,
+> prefill :908) + full S1 SMOKE gate** (md5 may ULP-shift like 0.2 → re-baseline per §S1-GATE).
 
 ---
 
@@ -94,16 +94,20 @@ answer the question first (see `CLAUDE.md` "How to validate"). Reserve full smok
   lines, decode path UNTOUCHED). ~halves the ~120 s prefill body. Gate + the tail-nondet finding
   in §0.1-DONE.
 
-### Phase 1 — the fused sparse-attention kernel (the main prize: 50–100× prefill, 2–3× decode)
-Replace the materialized gather with a tiled Pallas kernel doing gather + online-softmax +
-sink, never materializing `[B,M,K,D]`. ONE kernel serves both call sites (decode `:812` M=1,
-prefill `:905` M=S) — prefill/decode differences are entirely in `topk_idxs` (the kernel just
-honors the `-1` mask). **Base decision (agents converged):** flash_attention's online-softmax
-+ sink loop × mla/v2's single-shared-KV / q-head-collapse einsum × an index-driven VMEM
-gather modeled on mla/v2 `_fetch_bkv`. **Skip `sparse_core/`** (gen-7-gated, v6e is gen-6,
-falls back to plain gather) and `ragged_paged_attention/v3` (non-MLA/paged). No drop-in
-exists. See §KERNEL for the full contract. Validate vs `sparse_attn_torch` on CPU + the
-microbench (0.0), THEN the §S1-GATE.
+### Phase 1 — the fused sparse-attention kernel (the main prize) — KERNEL AUTHORED, WIRING NEXT
+`kernels/sparse_attn/kernel.py::sparse_attn_kernel` (drop-in signature for `sparse_attn`). One
+Pallas program per (b,m): gather the K rows via a ONE-HOT MATMUL (`onehot[k,n]=(safe[k]==n)` @
+resident `kv[N,D]` — bit-identical to `take_along_axis`, duplicates included; a dynamic per-row
+VMEM `pl.ds` load does NOT lower — E2003 sublane(8) alignment, which is why RPA/MLA gather via
+HBM DMA), then fp32 SINGLE-PASS softmax + per-head sink (denom only) + `-1` mask, bf16 in/out.
+Single shared KV reused across H=64. **DONE + gated:** CPU parity 4/4 (`TestSparseAttnKernel`),
+TPU compiles/runs decode+prefill via `perf_microbench.sh --kernel` (decode_csa ≈41×:
+5.436→0.131ms; decode_swa 0.129; prefill_swa seq512 0.680). topk_idxs reshaped `[B,M,1,K]` in
+the wrapper (M can't be the block-1 tiled second-to-last dim). **NEXT: wire into both call sites
++ S1 SMOKE gate** (see NEXT ACTION).
+- The onehot READS ALL N → for the large-decode-msl regime, switch the gather to the DMA idiom
+  (kernel docstring + §KERNEL). Untested on bench: prefill real seq=2048, csa/hca flavors (same
+  code path as the tested swa/csa).
 
 ### Phase 2 — collectives (~17 % decode)
 The 2176 all-reduces = replicated decode activation (`_v4_decode_replicate`, the S1 fix —
@@ -143,47 +147,37 @@ and/or fused with the S1 fix — all flagged unsafe).
 ---
 
 ## NEXT ACTION (for the session reading this)
-1. *(cheap, ~30 min, do FIRST)* CONFIRM the §0.1-DONE tail-nondeterminism is PRE-EXISTING:
-   checkout baseline `56abe232`, sync, smoke ONE engine, probe `/tmp/s1_probe2.py 20` a few
-   times — if it ALSO flips (md5 unstable), the decode-tail nondet is pre-existing (confirms 0.1
-   innocent + that the gate must be N=2-based). If baseline is STABLE at N=20, investigate — but
-   0.1's decode path is provably byte-identical, so a 0.1 cause is near-impossible.
-2. **Phase 1** (the fused sparse-attn kernel — the main prize). Concrete fork plan now in
-   §KERNEL. Validate vs `sparse_attn_torch` on CPU + microbench, THEN the §S1-GATE.
-3. *(cheap, optional)* `scripts/perf_microbench.sh --all` (slice FREE) to quantify the 0.1+0.2
-   prefill win + set the Phase-1 baseline (decode_csa baseline = 5.44 ms; retry on init hang).
+1. **WIRE `sparse_attn_kernel` into the two call sites** in `deepseek_v4_attention.py`: decode
+   `:815` and prefill `:908` — replace `sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)`
+   with `sparse_attn_kernel(...)` (identical signature; `interpret=False` is the default → TPU).
+   `import` it from `tpu_inference.kernels.sparse_attn.kernel`. Then sync (new file + the edit),
+   clear `~/.cache/vllm/xla_cache/*` on all 8 hosts, and run the **full S1 SMOKE gate** (§S1-GATE:
+   `smoke_check` rc=0 + FIB md5 byte-identical ×2 fresh engines + correct Fibonacci). The kernel
+   is CPU bit-parity with `sparse_attn` (4/4), but MXU matmul accumulation order MAY shift the FIB
+   md5 (deterministic ULP, like Phase 0.2) — if it shifts, re-establish the reference + confirm
+   identical ×2 engines + correct Fibonacci. Commit. ⚠️ See §0.1-DONE for `smoke_check` OOM /
+   node_guardian confounds the wiring will hit.
+2. *(after wired+gated)* Quantify the END-TO-END win (the bench says ≈41× on the decode_csa op;
+   the profile said the gather was 99% prefill / 66% decode → expect a large wall-time drop).
+3. *(optimization, later)* Large decode msl: swap the onehot (reads all N) for the DMA gather
+   (§KERNEL). Then **Phase 2** (collectives, ~17% decode) is the next big roadmap item.
 4. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
 
-## <a name="0.1-DONE"></a>Phase 0.1 — DONE + the temp=0 tail-nondeterminism finding
-**Landed:** `deepseek_v4_run_with_decode_state` prefill now binds Pass B's `h`
-(`h, packed_buffers = transformer_body_init_state_to_buffer(input_ids, …, n_real=n_real)`) and
-drops the standalone Pass-A `transformer_body_forward`; the dead `state_init_ids` param + the
-call-site `L_real` slicing are deleted (state_init_ids was always None in the served/compiled
-path — `n_real` handles pad masking). Test `...state_init_ids_does_not_affect_h` rewritten to
-`...single_pass_h_matches_forward`.
-**Why decode is provably UNCHANGED:** the decode-state seed `packed_buffers` comes from the SAME
-`init_state_to_buffer(input_ids, n_real)` call as before (byte-identical args), and the decode
-jit (`is_decode_step=True`) is untouched. 0.1 only alters the prefill→returned-`h` (→ first token
-"21", high-margin/stable). So 0.1 cannot move decode determinism.
+## <a name="0.1-DONE"></a>Phase 0.1 — DONE (history) + smoke confounds the WIRING session will hit
+0.1 (`d22df61a`): prefill runs ONE body (`deepseek_v4_run_with_decode_state` returns Pass B's `h`
+from `transformer_body_init_state_to_buffer`; dropped the dup Pass-A `transformer_body_forward` +
+dead `state_init_ids`). Decode provably byte-identical (same seed args + decode jit untouched).
+The temp=0 FIB free-form-TAIL nondeterminism finding is folded into §S1-GATE (gate on N=2
+`5bf42256`, NOT a long-tail md5 — the tail flips `e4d45024`↔`26354502` within one process;
+pre-existing decode nondeterminism, = the Phase-2 collective-ordering residual).
 
-**⚠️ FINDING — FIB free-form TAIL is non-deterministic at temp=0 (PRE-EXISTING, NOT 0.1):**
-At `/tmp/s1_probe2.py 20`, two consecutive identical temp=0 requests on the SAME engine process
-returned different md5 (`e4d45024`↔`26354502`) — same executable + same input + different output
-= runtime nondeterminism in DECODE (likely non-deterministic distributed all-reduce ordering —
-the known "S1 residual" / Phase-2 collectives). The Fibonacci NUMBERS (21,34,55,89,144) are
-deterministic + correct; only the unconstrained continuation after them flips. **Implication:**
-the long-tail FIB md5 is NOT stable — past "byte-identical ×2 `b675be27`" was sampling a
-nondeterministic tail. The DETERMINISTIC gate is **N=2 md5 `5bf42256` (= md5("21,")) + correct
-Fibonacci numbers**, both verified byte-identical ×2 fresh engines (×3 within-process) this
-session. TODO (cheap, NEXT ACTION #1): confirm baseline `56abe232` also flips at N=20.
-**Gate confounds seen this session:** smoke_check OOM'd (256M HLO temp) compiling its shapes ON
-TOP of the resident FIB probe shapes on the memory-tight slice → `EngineDeadError` + a ray
-channel crash that dropped a node to 28/32 TPU (recovered via `ray_restart`). 0.1 REDUCES prefill
-memory so cannot cause the OOM; smoke_check uses the chat endpoint (Phase-4.1 wedge-prone). Run
-smoke_check FIRST on a clean engine if rc=0 is needed. Also: after the `ray_restart`,
-`node_guardian` proliferated to ~18 instances (was 1) — benign (idempotent 'node' occupation),
-but do NOT `pkill node_guardian` (the loop-prompt claude argv self-matches); kill by PID if it
-grows problematic.
+**⚠️ Smoke ops for the wiring session (Phase 1 needs the full smoke):** (a) `smoke_check` can OOM
+(256M HLO temp) compiling its shapes ON TOP of resident FIB-probe shapes on the memory-tight
+slice → `EngineDeadError` + a ray-channel crash that can drop a node (recover via
+`scripts/full_slice_v4_ray_restart.sh`). Run `smoke_check` FIRST on a clean engine if you need
+rc=0; it uses the chat endpoint (Phase-4.1 wedge-prone). (b) After a `ray_restart`, `node_guardian`
+can proliferate (~18 instances) — benign (idempotent 'node' occupation); do NOT `pkill
+node_guardian` (the loop-prompt claude argv self-matches) — kill by PID only if problematic.
 
 ---
 

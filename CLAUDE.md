@@ -8,9 +8,10 @@
 >
 > **One-line status (2026-05-27):** Bottleneck = the sparse-attn KV gather
 > (`deepseek_v4_attention.py:186`), 99% of prefill / 66% of a decode step (profile VERIFIED).
-> Landed: Phase 0.0 (microbench), 0.2 (bf16 gather), 0.3 (dead code), 0.1 (killed the duplicate
-> prefill body, ~½ prefill). Next = Phase 1 (the fused sparse-attn kernel). Detail + the temp=0
-> FIB-tail-nondeterminism finding in `HANDOFF_PERF.md`.
+> Landed: Phase 0.* (microbench, bf16 gather, dead-code, killed dup prefill body) + **Phase 1
+> kernel `kernels/sparse_attn/kernel.py` — authored, TPU-compiles both paths, CPU bit-parity
+> 4/4, ≈41× decode on the microbench, NOT yet wired.** Next = wire `sparse_attn_kernel` into both
+> call sites + the full S1 SMOKE gate. Detail in `HANDOFF_PERF.md`.
 
 ## Goal
 
