@@ -1,9 +1,9 @@
 # claude-deepseek-v4 — S1 runbook
 
-> **⇒ START HERE: read `HANDOFF_S1.md` — its top "STATE" section is authoritative.**
-> This file holds only durable operational knowledge (how to run the slice, validate,
-> pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
-> History: `CLAUDE.full.md`.
+> **⇒ S1 is CLOSED. Current phase = PERFORMANCE — START HERE: `HANDOFF_DECODE_PERF.md`**
+> (full decode/prefill profile + fix plan: the bottleneck is the sparse-attn KV gather at
+> `deepseek_v4_attention.py:186`, not the MoE). S1 correctness history: `HANDOFF_S1.md`.
+> This file holds durable slice ops (how to run, validate, pitfalls). History: `CLAUDE.full.md`.
 >
 > One-line status (2026-05-27 S29): **✅ S1 CLOSED — loop stopped.** Fix = routed w1/w3
 > host-gather consolidation (commit 5a3ed435: rebuild the stacked tensor from FULL per-expert
