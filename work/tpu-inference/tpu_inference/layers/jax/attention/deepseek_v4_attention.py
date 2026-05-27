@@ -222,7 +222,10 @@ def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale):
     `mesh.empty` gate in deepseek_v4_moe.py."""
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
-        return sparse_attn_kernel(q, kv, attn_sink, topk_idxs, softmax_scale)
+        # No real mesh (CPU/interpret oracle): the Mosaic kernel is interpret-
+        # only on CPU → use the math-identical pure-JAX ref (parity-proven by
+        # test_kernel_matches_jax_sparse_attn). TPU path (below) is unchanged.
+        return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
     return jax.shard_map(
         functools.partial(sparse_attn_kernel, softmax_scale=softmax_scale),
         mesh=mesh,
