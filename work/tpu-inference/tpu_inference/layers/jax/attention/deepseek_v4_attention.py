@@ -23,6 +23,7 @@ See V3_TO_V4_DIFF.md and INVARIANTS.md (I5–I12) for shape conventions.
 """
 from __future__ import annotations
 
+import functools
 import math
 import os
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as P
+
+from tpu_inference.kernels.sparse_attn import sparse_attn_kernel
 
 
 _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
@@ -201,6 +204,32 @@ def sparse_attn(
     p = p / denom
     out = jnp.einsum("bmhk,bmkd->bmhd", p, kv_gathered)
     return out.astype(q.dtype)
+
+
+def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale):
+    """Run the fused `sparse_attn_kernel` (a Mosaic custom call) under shard_map.
+
+    A Pallas/Mosaic kernel cannot be auto-partitioned by XLA's SPMD partitioner
+    ("Mosaic kernels cannot be automatically partitioned. Please wrap the call in
+    a shard_map."), so it must execute inside a shard_map whenever the model runs
+    on a real mesh. The kernel is independent per (b, m) query, so a fully-
+    REPLICATED map — every device runs the whole kernel on the full inputs — is
+    correct: decode activations are already replicated (the _v4_decode_replicate
+    S1 fix), so this is also OPTIMAL there; prefill inputs are all-gathered to
+    replicated first (a cost only at large prefill — a future optimization is to
+    shard the map over the prefill token axis). No mesh (CPU / interpret=True for
+    the parity test + microbench) → call the kernel directly, mirroring the MoE's
+    `mesh.empty` gate in deepseek_v4_moe.py."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return sparse_attn_kernel(q, kv, attn_sink, topk_idxs, softmax_scale)
+    return jax.shard_map(
+        functools.partial(sparse_attn_kernel, softmax_scale=softmax_scale),
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )(q, kv, attn_sink, topk_idxs)
 
 
 # mHC sinkhorn.
@@ -812,7 +841,7 @@ def attention_decode_step(
     topk_idxs = topk_idxs.astype(jnp.int32)
     _v4_nan_tripwire("kv_cache_post_write", new_kv_cache, layer_idx, start_pos)
 
-    o = sparse_attn(q, new_kv_cache, params.attn_sink, topk_idxs, params.softmax_scale)
+    o = _sparse_attn_kernel_sharded(q, new_kv_cache, params.attn_sink, topk_idxs, params.softmax_scale)
     _v4_nan_tripwire("sparse_attn_o", o, layer_idx, start_pos)
     o = splice_rope(o, rd, fc, inverse=True)
     _v4_nan_tripwire("o_post_inv_rope", o, layer_idx, start_pos)
@@ -905,7 +934,7 @@ def attention_prefill(
     else:
         kv_full = kv
 
-    o = sparse_attn(q, kv_full, params.attn_sink, topk_idxs, params.softmax_scale)
+    o = _sparse_attn_kernel_sharded(q, kv_full, params.attn_sink, topk_idxs, params.softmax_scale)
 
     # inverse RoPE on rope dims of o
     o = splice_rope(o, rd, fc, inverse=True)

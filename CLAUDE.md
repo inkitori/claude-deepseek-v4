@@ -7,11 +7,13 @@
 > Per-iteration narrative goes in **commit messages**, not this file.
 >
 > **One-line status (2026-05-27):** Bottleneck = the sparse-attn KV gather
-> (`deepseek_v4_attention.py:186`), 99% of prefill / 66% of a decode step (profile VERIFIED).
+> (`deepseek_v4_attention.py`), 99% of prefill / 66% of a decode step (profile VERIFIED).
 > Landed: Phase 0.* (microbench, bf16 gather, dead-code, killed dup prefill body) + **Phase 1
-> kernel `kernels/sparse_attn/kernel.py` — authored, TPU-compiles both paths, CPU bit-parity
-> 4/4, ≈41× decode on the microbench, NOT yet wired.** Next = wire `sparse_attn_kernel` into both
-> call sites + the full S1 SMOKE gate. Detail in `HANDOFF_PERF.md`.
+> fused kernel `kernels/sparse_attn/kernel.py` WIRED (via the `_sparse_attn_kernel_sharded`
+> shard_map helper — a Mosaic custom-call can't be SPMD-auto-partitioned) + S1-GATED** (md5
+> `5bf42256` ×2 engines + correct Fib + smoke rc=0). ⚠️ Isolated op ~41× but end-to-end decode
+> only ~1.25× (≈10 vs ~8 tok/s) — Next = re-profile WHY + shard the prefill map, then Phase 2.
+> Detail in `HANDOFF_PERF.md`.
 
 ## Goal
 
