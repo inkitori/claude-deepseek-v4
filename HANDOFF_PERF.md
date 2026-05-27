@@ -180,7 +180,10 @@ session. TODO (cheap, NEXT ACTION #1): confirm baseline `56abe232` also flips at
 TOP of the resident FIB probe shapes on the memory-tight slice → `EngineDeadError` + a ray
 channel crash that dropped a node to 28/32 TPU (recovered via `ray_restart`). 0.1 REDUCES prefill
 memory so cannot cause the OOM; smoke_check uses the chat endpoint (Phase-4.1 wedge-prone). Run
-smoke_check FIRST on a clean engine if rc=0 is needed.
+smoke_check FIRST on a clean engine if rc=0 is needed. Also: after the `ray_restart`,
+`node_guardian` proliferated to ~18 instances (was 1) — benign (idempotent 'node' occupation),
+but do NOT `pkill node_guardian` (the loop-prompt claude argv self-matches); kill by PID if it
+grows problematic.
 
 ---
 
