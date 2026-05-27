@@ -178,12 +178,15 @@ def sparse_attn(
     B, M, H, D = q.shape
     K = topk_idxs.shape[-1]
     qf = q.astype(jnp.float32)
-    kvf = kv.astype(jnp.float32)
+    # Gather from bf16 kv directly: the old `kv.astype(fp32)` materialized a
+    # full-KV fp32 copy and made the gather move fp32 (the profiled prefill
+    # bottleneck — "doubles traffic"). Upcasting the *gathered* result to fp32
+    # is bit-identical (gather is pure indexing; upcast commutes with it).
     safe_idx = jnp.maximum(topk_idxs, 0).astype(jnp.int32)
     # Gather: kv[b, safe_idx[b,m,k]] -> [B, M, K, D]
     idx_expanded = jnp.broadcast_to(
         safe_idx.reshape(B, M * K, 1), (B, M * K, D))
-    kv_gathered = jnp.take_along_axis(kvf, idx_expanded, axis=1)
+    kv_gathered = jnp.take_along_axis(kv, idx_expanded, axis=1).astype(jnp.float32)
     kv_gathered = kv_gathered.reshape(B, M, K, D)
     valid = (topk_idxs != -1)  # [B, M, K]
     logits = jnp.einsum("bmhd,bmkd->bmhk", qf, kv_gathered) * softmax_scale

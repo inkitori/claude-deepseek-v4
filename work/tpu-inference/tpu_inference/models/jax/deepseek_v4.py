@@ -1266,11 +1266,6 @@ _HF_TO_JAX_RULES = [
     (re.compile(r"^mtp\.(?P<M>\d+)\.hc_head_scale$"), "mtp[{M}].hc_head_scale"),
 ]
 
-# Suffixes that indicate FP4/FP8 quantization scales — present alongside .weight
-# in the HF checkpoint. The weight loader needs them paired with their .weight
-# counterpart for dequantization. For Tier 4 we just verify they are recognized.
-_QUANT_SUFFIXES = {".scale"}
-
 
 # vLLM model registry wrapper. Math is in the functional core above; this
 # class exists so vLLM dispatch on `DeepseekV4ForCausalLM` finds something
@@ -1772,62 +1767,6 @@ def _build_class():
 
             self.params_v = nnx.Param(current)
             self.initialize_cache()
-
-        def _consolidate_moe_after_load(self, tree):
-            """Merge per-expert MoE weights into a single E-sharded stacked
-            tensor per layer. Returns the rewritten param tree.
-
-            Memory contract: the per-expert leaves and the stacked tensor
-            have the same per-chip resident bytes (~128 MiB / 3 stacks /
-            layer). During the `jnp.stack` we briefly hold both, then drop
-            the per-leaf references by setting `experts=[]`. Worst-case
-            transient peak per chip is 2× that single-layer cost (~256 MiB),
-            negligible relative to the 17 GiB resident weight budget.
-            """
-            from jax.sharding import NamedSharding, PartitionSpec as P
-            from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams
-            mesh = self.mesh
-            E_spec = NamedSharding(mesh, P('attn_dp', None, None))
-
-            def consolidate(moe):
-                if not moe.experts or moe.w1_stacked is not None:
-                    return moe
-                w1 = jax.device_put(
-                    jnp.stack([e.w1 for e in moe.experts]), E_spec)
-                w2 = jax.device_put(
-                    jnp.stack([e.w2 for e in moe.experts]), E_spec)
-                w3 = jax.device_put(
-                    jnp.stack([e.w3 for e in moe.experts]), E_spec)
-                # Block on placement so the per-leaf source arrays have no
-                # outstanding readers and can be GC'd when we drop the list.
-                w1.block_until_ready()
-                w2.block_until_ready()
-                w3.block_until_ready()
-                swiglu_limit = float(moe.experts[0].swiglu_limit)
-                return MoEParams(
-                    gate=moe.gate,
-                    experts=[],  # released
-                    shared_expert=moe.shared_expert,
-                    n_routed_experts=moe.n_routed_experts,
-                    dim=moe.dim,
-                    w1_stacked=w1,
-                    w2_stacked=w2,
-                    w3_stacked=w3,
-                    swiglu_limit=swiglu_limit,
-                )
-
-            new_layers = []
-            for layer in tree.layers:
-                new_moe = consolidate(layer.moe)
-                new_layers.append(dataclasses.replace(layer, moe=new_moe))
-
-            new_mtp = []
-            for mtp_block in tree.mtp:
-                new_block_moe = consolidate(mtp_block.block.moe)
-                new_inner = dataclasses.replace(mtp_block.block, moe=new_block_moe)
-                new_mtp.append(dataclasses.replace(mtp_block, block=new_inner))
-
-            return dataclasses.replace(tree, layers=new_layers, mtp=new_mtp)
 
         def forward_prefill(self, input_ids: jnp.ndarray) -> jnp.ndarray:
             """Functional prefill helper — returns logits [B, S, vocab]."""
