@@ -215,13 +215,14 @@ def moe_forward(
         per_expert_weight = _shard_e_last(per_expert_weight)
 
     if not use_shard_map:
-        # Dense einsum path (CPU/no-mesh + replicated decode): bit-for-bit
-        # unchanged from the original implementation.
-        x_fp32 = flat_x.astype(fp32)
-        W1_fp32 = W1.astype(fp32)
-        W3_fp32 = W3.astype(fp32)
-        gate_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W1_fp32))
-        up_NEi = _shard_e_mid(jnp.einsum('nd,eid->nei', x_fp32, W3_fp32))
+        # Dense einsum path (CPU/no-mesh + replicated decode). bf16 operands
+        # (half the W1/W3 HBM streaming + native bf16 MXU vs the emulated fp32
+        # path), fp32 accumulate/output so silu/swiglu stay fp32 — matches the
+        # prefill gmm_v2 path (preferred_element_type=fp32, S24). PERF 3.1.
+        gate_NEi = _shard_e_mid(
+            jnp.einsum('nd,eid->nei', flat_x, W1, preferred_element_type=fp32))
+        up_NEi = _shard_e_mid(
+            jnp.einsum('nd,eid->nei', flat_x, W3, preferred_element_type=fp32))
         if swiglu_limit > 0:
             up_NEi = jnp.clip(up_NEi, -swiglu_limit, swiglu_limit)
             gate_NEi = jnp.minimum(gate_NEi, swiglu_limit)
