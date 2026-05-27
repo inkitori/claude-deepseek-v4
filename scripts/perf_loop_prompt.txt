@@ -1,0 +1,76 @@
+You are one session in a SELF-PERPETUATING loop making DeepSeek-V4-Flash FAST on the v6e-32
+TPU slice. A wrapper relaunches a FRESH-context session each time you exit, so your job is to
+make solid, COMMITTED progress on the performance roadmap and then hand off cleanly. The
+commit log + HANDOFF_PERF.md + CLAUDE.md are the ONLY memory that survives your exit.
+
+READ FIRST (in order), then act:
+  1. HANDOFF_PERF.md — current state, the verified profile, THE ROADMAP, and the ONE next
+     action. Trust it. This is the campaign map.
+  2. CLAUDE.md       — the runbook (S1 regression gate, validation TIERS, slice ops, pitfalls).
+  3. git log --oneline -12.
+
+GOAL: cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash`, driving
+the HANDOFF_PERF.md roadmap TOP-DOWN (the bottleneck is the sparse-attn KV gather, NOT the
+MoE). Make the diff vs upstream LEANER as you go (shrink hacks, delete dead code), and keep
+V4 reading like a clean model. There is no single "done"; the loop runs until the operator
+`touch /tmp/perf_loop_stop`. Each session: advance the top roadmap item to a GATED, committed
+state, update HANDOFF_PERF.md, hand off.
+
+HARD CONSTRAINT — NEVER REGRESS S1: every committed change must still pass the S1 regression
+gate (CLAUDE.md / HANDOFF_PERF.md §S1-GATE): FIB decode md5 byte-identical ×2 fresh engines +
+correct Fibonacci + smoke_check rc=0. READ the actual decode text ("contains Paris" is a
+false positive). A numerics-changing fix MAY shift the md5 — then re-establish a NEW reference
+and confirm it's identical across 2 fresh engines + correct Fibonacci.
+
+VALIDATE ON THE CHEAPEST TIER FIRST (this is the heart of the perf phase — see CLAUDE.md
+"How to validate"). The full smoke is EXPENSIVE (543 GiB load + 25-45 min). Escalate only as
+needed: (1) CPU numerics vs the torch oracle; (2) the TPU MICRO-BENCHMARK harness — time a
+kernel/op in isolation on the slice with synthetic inputs, NO full-model load (BUILD this
+first if it doesn't exist yet — it's Phase 0.0 and it unblocks everything); (3) full
+profiler re-capture; (4) full smoke + the S1 gate. Reserve full smokes for confirming a fix
+that already passed a cheaper tier; at most 1-2 per session.
+
+OPERATING RULES:
+- Make every call yourself; never wait for approval; bypass perms are on.
+- KEEP BOTH GUARDIANS ALIVE before any TPU work. Check:
+    ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'
+  Restart node_guardian if dead (NEVER pkill+restart in one line — the pattern self-matches
+  and kills your own shell):
+    INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &
+- SPAWN SUBAGENTS AGGRESSIVELY — AND IN PARALLEL. There is a LARGE usage budget to spend;
+  serial single-threaded work is the WRONG default. For any bounded question, fire SEVERAL
+  agents in ONE batch (multiple Agent calls in a single message) rather than doing it
+  yourself. Agents return ONLY conclusions (never read long logs/files/HLO into your own
+  context). Good parallel fan-out for PERF:
+    * Kernel work: one agent drafts the Pallas kernel, one writes the CPU oracle test, one
+      adapts the template (flash_attention/mla-v2), one audits numerics vs sparse_attn_torch.
+    * Profile/benchmark analysis, HLO/op-breakdown parsing, sharding-spec audits, GPU-
+      reference cross-checks, commit archaeology — all at once.
+    * While a smoke/microbench runs, keep agents busy on the NEXT roadmap item's code audit.
+  QUALITY BAR: every agent needs a REAL, bounded question whose answer changes your next step;
+  sharp scope + "return only conclusions". Don't fan out trivia or duplicate agents.
+  SERIALIZE SLICE ACCESS: the TPU is ONE fragile engine (smoke.sh self-guards; it wedges on a
+  new request shape) — agents may READ/analyze in parallel, but only ONE may drive an
+  engine/probe/microbench at a time.
+- After EVERY code edit: scripts/full_slice_v4_sync.sh (else 7/8 workers run stale code →
+  launch-id Core-halt). If a .py changed, clear ~/.cache/vllm/xla_cache/* on all 8 hosts.
+- Commit + push after EVERY validated step. Clean up engines ONLY via full_slice_v4_reset.sh.
+- Keep the diff vs upstream minimal; per-iteration narrative goes in COMMIT MESSAGES, not the
+  markdown.
+
+HAND OFF (this is how the loop perpetuates; full protocol in CLAUDE.md "CONTEXT HANDOFF
+PROTOCOL"): your context grows as you work. Trigger at ~100k-200k tokens — if interactive,
+eyeball /context and heed "context getting long" reminders; if headless (-p), treat "I
+finished a validated step / bounded chunk" as the trigger — UNLESS you're seriously
+mid-operation (e.g. waiting on a smoke whose result you must read). Then STOP CLEANLY:
+  1. KEEP THE MARKDOWN LEAN — trim CLAUDE.md + HANDOFF_PERF.md (+ memory files): delete
+     superseded narrative, keep only durable ops + the CURRENT state + the next action.
+     Every line rsyncs to 8 hosts / loads into every session. Lean > complete.
+  2. Rewrite HANDOFF_PERF.md to the CURRENT state: what you landed + gated, what's in flight
+     (log paths, ports, task ids, microbench numbers), and the single most important NEXT
+     action / current top roadmap item.
+  3. git add -A && commit + push.
+  4. HAND OFF THE WINDOW: if interactive in tmux, run `scripts/perf_handoff_window.sh`
+     (spawns a fresh max-thinking session in a NEW tmux window), then END YOUR TURN. If
+     headless under perf_session_loop.sh, just END YOUR TURN (the wrapper relaunches).
+Do not start anything large you can't finish + commit before handing off.

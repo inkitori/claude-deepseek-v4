@@ -1,177 +1,158 @@
-# claude-deepseek-v4 — S1 runbook
+# claude-deepseek-v4 — PERFORMANCE runbook
 
-> **⇒ S1 is CLOSED. Current phase = PERFORMANCE — START HERE: `HANDOFF_DECODE_PERF.md`**
-> (full decode/prefill profile + fix plan: the bottleneck is the sparse-attn KV gather at
-> `deepseek_v4_attention.py:186`, not the MoE). S1 correctness history: `HANDOFF_S1.md`.
-> This file holds durable slice ops (how to run, validate, pitfalls). History: `CLAUDE.full.md`.
+> **Phase = PERFORMANCE. START HERE: `HANDOFF_PERF.md`** (current state + the verified profile
+> + THE ROADMAP + the ONE next action). This file holds durable slice ops (how to run,
+> validate, pitfalls). S1 (decode *correctness*/determinism) is **CLOSED** — it is now a HARD
+> REGRESSION GATE, not the goal (see below). S1 history: `HANDOFF_S1.md` / `CLAUDE.full.md`.
+> Per-iteration narrative goes in **commit messages**, not this file.
 >
-> One-line status (2026-05-27 S29): **✅ S1 CLOSED — loop stopped.** Fix = routed w1/w3
-> host-gather consolidation (commit 5a3ed435: rebuild the stacked tensor from FULL per-expert
-> host numpy via `make_array_from_callback`, no device reshard ⇒ no uninit-HBM read; root cause
-> S26 = the device-side axis-1-leaf→expert consolidation reshard read uninit HBM). S1 debug
-> instrumentation then removed (commit 2d3e0c45, 165 deletions; KEPT env-gated `_v4_nan_tripwire`
-> + compute_logits nan_to_num clamp). Gate re-verified ×2 fresh engines on the cleaned build:
-> FIB decode md5=5bf42256 BYTE-IDENTICAL across both, correct Fibonacci (21,34,55,89,144),
-> smoke_check rc=0 (LONG_GEN visible_words=45 max_word_run=2). Below = durable slice ops for
-> any future work on this slice; S1 narrative history in commit log + `CLAUDE.full.md`.
-
-## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
-
-Sessions are disposable; the commit log + `HANDOFF_S1.md` + this file are the only
-memory that survives. When your context reaches **~100k–200k tokens** (interactive:
-check `/context`; also heed the harness's "context getting long" reminders) AND you
-are NOT seriously mid-operation (e.g. waiting on a smoke whose result you must read, or
-a few calls from finishing a committed step) — HAND OFF to a fresh session:
-
-1. **Keep the markdown LEAN** — trim `CLAUDE.md`, `HANDOFF_S1.md` (and your memory
-   files): delete superseded narrative, keep only durable ops + the CURRENT lead + the
-   single next action. Every line here rsyncs to 8 hosts / loads into every session;
-   bloat is a real cost. Lean > complete.
-2. Rewrite `HANDOFF_S1.md` to the CURRENT state: what you verified, what's in flight
-   (log paths, ports, task ids), and the ONE most important next action.
-3. `git add -A && git commit && git push`.
-4. Run **`scripts/s1_handoff_window.sh`** — opens a NEW tmux window in this session and
-   launches a fresh `claude --dangerously-skip-permissions --effort max` (empty context,
-   auto-loads this file + `scripts/s1_loop_prompt.txt`). Not in tmux → it prints the
-   exact command to run by hand.
-5. **END YOUR TURN** so the fresh session takes over. Don't start anything you can't
-   finish + commit before handing off.
-
-(Headless alternative: `scripts/s1_session_loop.sh` relaunches `claude -p` in-place; it
-can't read `/context` so it hands off per finished-chunk. The new-window protocol above
-is preferred — the fresh session CAN budget by `/context`.)
+> **One-line status (2026-05-27):** Perf campaign kicked off. Bottleneck = the sparse-attn KV
+> gather (`deepseek_v4_attention.py:186`), 99% of prefill / 66% of a decode step (profile
+> VERIFIED). Roadmap in `HANDOFF_PERF.md`. Nothing landed yet; next = Phase 0 (microbench
+> harness, then the free ~2× prefill from killing the duplicate prefill body, then bf16 gather).
 
 ## Goal
 
-Make `vllm serve deepseek-ai/DeepSeek-V4-Flash` produce coherent, deterministic
-decode output on the **v6e-32 TPU slice** (TP=32, 8 hosts × 4 chips). Decode
-collapses into a degenerate attractor after the first token or two. That bug is
-S1. Fixing it is the whole job.
+Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the v6e-32
+TPU slice (TP=32, 8 hosts × 4 chips), driving the `HANDOFF_PERF.md` roadmap top-down. Shrink
+the diff vs upstream `tpu-inference` and de-hack as you go. **The bottleneck is the attention
+KV gather, NOT the MoE** (a FLOP count said MoE; the profile overturned it — always profile).
 
-## The bug (precise)
+## S1 REGRESSION GATE — NON-NEGOTIABLE for every change
 
-**NOT a hard collapse** — the model emits coherent-LOOKING decode output even WITH the
-bug present (it has produced increasing Fibonacci-ish sequences for many sessions), so
-**coherent output is NOT proof of a fix.** The "degenerate attractor / collapse" framing
-in older notes is misleading. The two REAL, observable symptoms are:
-1. **Cross-process NON-DETERMINISM** — two fresh engines produce DIFFERENT decode md5 at
-   temp=0 (e.g. A3 `bb5adb1b` ≠ B3 `26d81071`). Within ONE process it IS deterministic
-   (re-runs match): the uninit-HBM garbage is fixed per-process-lifetime. So determinism
-   only shows up as a CROSS-ENGINE md5 difference — single-engine probes can't see it.
-2. **Slight model-QUALITY DEGRADATION** — decode drifts from the correct answer vs a
-   healthy/prefill-everything reference (e.g. Fibonacci tracks correctly for ~7 terms
-   then errs: 570≠610, 1584≠1597). The drift is a SYMPTOM, not "the model being dumb."
-First decode token is correct (prefill-forward argmax). Tiny-config + CPU tests pass —
-only reproduces on the real model on the sharded TPU slice. DONE = both symptoms gone:
-byte-identical md5 across 2 fresh engines AND full quality (correct Fibonacci) vs reference.
-
-## Success gate (the only definition of done)
-
-Verified **twice** on a fresh real-V4 engine:
-* `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` exits 0
-  — `visible_words >= 10` AND `max_word_run < 5`.
-* 3 Paris probes at temp=0 are **byte-identical** (determinism).
+Every committed change MUST still pass, verified on a fresh real-V4 engine:
+* `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
+  max_word_run < 5).
+* FIB decode md5 **byte-identical across 2 fresh engines** + **correct Fibonacci** (21, 34,
+  55, 89, 144) vs a prefill-everything reference. Current reference md5 = `5bf42256`.
 * Still passes after 5 unrelated requests.
 
-The basic "PASS: … contains 'Paris'" line is a **false positive** — `"capital of
-France"` can hit EOS at token 1, so no decode steps run. Don't trust it, nor
-`usage.completion_tokens` / `max_word_run` / `ends_clean` — all read healthy on
-corrupted output. **Read the actual response text** AND compare 2 fresh engines.
-Fibonacci is the probe because its CORRECT continuation is unambiguous: judge
-(a) determinism = same md5 across 2 engines, and (b) quality = terms are the
-CORRECT Fibonacci numbers (not merely increasing) vs the prefill-everything
-reference. "Coherent-looking but slightly wrong + differs across engines" is the
-bug, not a pass. Greedy poem repetition is a red herring (decode loops too).
+A numerics-changing fix MAY shift the md5 — then re-establish a NEW reference and confirm it's
+identical across 2 fresh engines + correct Fibonacci. The non-negotiable is **identical across
+engines + correct Fibonacci**, not the specific hash. The basic "PASS: contains 'Paris'" line
+is a **false positive** (`capital of France` can EOS at token 1, so no decode runs) — and
+`completion_tokens`/`max_word_run`/`ends_clean` all read healthy on corrupted output. **READ
+the actual response text** AND compare 2 fresh engines. (Why this is sacred: the S1 bug was a
+per-process uninit-HBM coin flip — coherent-looking output is NOT proof. Detail in `HANDOFF_S1.md`.)
+
+## How to validate (CHEAPEST signal first — this is the heart of the perf phase)
+
+The full smoke is the expensive thing (543 GiB load + 25-45 min cold compile). Reserve it.
+Escalate only as far up as the question needs:
+
+1. **CPU numerics (no slice, cheap):** the torch oracle. `PYTHONPATH=work/tpu-inference:work/vllm
+   work/vllm_env/bin/python3 scripts/s1_cpu_repro_v4flash.py both` → "OK: both eager and jit
+   match" (regression-only). For attention math, the parity test
+   `tests/models/jax/test_deepseek_v4.py -k sparse_attn` vs `sparse_attn_torch`. CPU CANNOT
+   reproduce S1 (no sharding) — proves math, never proves a determinism fix.
+2. **TPU MICRO-BENCHMARK (cheap slice, NO 543 GiB load):** jit + time a kernel/op in isolation
+   on the real mesh with SYNTHETIC inputs — measures gather ms / bandwidth / kernel speedup in
+   ~1 min vs a 25-45 min smoke. **BUILD this (Phase 0.0) if `scripts/perf_*bench*` doesn't
+   exist yet** — it unblocks cheap iteration for the whole kernel campaign.
+3. **Profiler re-capture (full smoke + profiler):** the structural op-breakdown truth.
+   Recipe in `HANDOFF_PERF.md`. Reserve.
+4. **Full smoke + the S1 GATE above:** the per-change closure gate; at most 1-2 per session.
 
 ## Slice-serving protocol (marginal slice — do this EVERY smoke)
 
-1. Edit code → `scripts/full_slice_v4_sync.sh` (MANDATORY: 8 hosts, each own clone;
-   `git push` does NOT sync them). Verify md5 of edited .py matches head==workers —
-   a mismatch causes "different launch id" Core-halts (CODE DESYNC, **not** a slice
-   wedge; do NOT reboot — sync fixes it).
+1. Edit code → `scripts/full_slice_v4_sync.sh` (MANDATORY: 8 hosts, each own clone; `git push`
+   does NOT sync them). Verify md5 of edited .py matches head==workers — a mismatch causes
+   "different launch id" Core-halts (CODE DESYNC, **not** a slice wedge; do NOT reboot — sync
+   fixes it).
 2. Clear `~/.cache/vllm/xla_cache/*` on all 8 hosts (stale/mixed cache also → launch-id halt).
 3. `scripts/full_slice_v4_reset.sh` (stops any engine, cleans lockfiles).
-4. `scripts/full_slice_v4_smoke.sh` (backgrounds vllm serve; prints log path). Self-guards now:
+4. `scripts/full_slice_v4_smoke.sh` (backgrounds vllm serve; prints log path). Self-guards:
    flock single-instance (REFUSES if an engine is up/starting — `SMOKE_NO_GUARD=1` escapes) +
    `VLLM_ENGINE_READY_TIMEOUT_S=2400` so a cold compile doesn't die at vllm's 600s default.
-5. Wait for `Application startup complete` (~6 min when xla cache warm; cold compile
-   10-30 min). Then probe with curls; **fire critical probes first** (engine can crash
-   on internal NaN after a few requests; the `compute_logits` nan_to_num clamp keeps it
-   alive). Init is a coin-flip (intermittent worker SYSTEM_ERROR) — just retry.
+   Bigger config: `MAX_LEN=<n> bash scripts/full_slice_v4_smoke.sh`.
+5. Wait for `Application startup complete` (~6 min when xla cache warm; cold compile 10-30
+   min; first decode request recompiles ~325s unless cache warm). Then probe with curls; fire
+   critical probes first (engine can crash on internal NaN after a few requests; the
+   `compute_logits` nan_to_num clamp keeps it alive). Init is a coin-flip (intermittent worker
+   SYSTEM_ERROR) — just retry. Probe helper: `/tmp/s1_probe2.py N` (FIB decode, md5 + text).
 
-Slice is HEALTHY when code is synced (served 4 smokes clean on 2026-05-25, no halts).
+Slice is HEALTHY when code is synced. Keep both guardians alive before TPU work:
+`ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'` (restart node_guardian per the
+loop prompt if dead — never `pkill` a pattern your own command line contains).
 
-## How to validate (fastest signal first)
+## Plumbing (read before touching — perf priority order)
 
-The expensive thing is the full smoke (543 GiB load + 10-30 min cold compile). CPU
-is cheap but **CPU passes — it cannot reproduce S1** (no sharding). Budget: at most
-1-2 full smokes per session; reserve them for a fix that already has a hypothesis.
-
-1. **CPU repros (regression-only):** `PYTHONPATH=work/tpu-inference:work/vllm
-   work/vllm_env/bin/python3 scripts/s1_cpu_repro_v4flash.py both` — should end "OK:
-   both eager and jit match". Proves no regression, never proves a fix works.
-2. **Live-engine probes (faithful, no code change):** curl :18081. Compare the
-   decode path (`max_tokens=2`, token2) vs prefill-everything (chained `max_tokens=1`,
-   coherent reference). Helpers: `/tmp/s1_seedstep_probe.py LOG PROMPT TOK1`,
-   `/tmp/s1_prefill_gen.py`, `/tmp/s1_decode_only.py`. Always-on diagnostics print
-   `[fwdL]`/`[decL]` (per-layer last-pos), `[fwdS]`/`[decS]` (embed/attnout/moeout
-   L0-2), `[moeRS]` (MoE routed-vs-shared). jax.debug.print drops/reorders under high
-   volume — re-fire to collect missing lines.
-3. Full V4-Flash smoke — the closure gate (only end-to-end S1 repro).
-4. MH repro `scripts/full_slice_v4_mh_run.sh scripts/s1_mh_repro.py sharded 8 12 4`
-   exists but its launcher runs each host's local clone (desync risk) and it places
-   inputs replicated (can't test the real sharding). Prefer the live engine.
-
-## Plumbing (read before touching)
-
-* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — **the current S1 suspect.** Dense
-  bespoke MoE (einsum + `out_NEd.sum(axis=1)` over attn_dp-sharded experts), NOT the
-  production `fused_moe_gmm` qwen3/v3 use. Routed experts are dead in decode.
-* `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry),
-  `transformer_body_forward` / `transformer_body_decode_step`, `block_forward` /
-  `block_decode_step`, `hc_pre`/`hc_post` (hyper-connection residual mix). All the
-  always-on `[fwd*]`/`[dec*]` diagnostics live here.
-* `runner/tpu_runner.py::_prepare_inputs_dp` — the V4-only metadata-replicate decode
-  fix (`_v4_decode_replicate`); makes decode activation P() instead of ATTN_DATA.
-* `layers/jax/attention/deepseek_v4_attention.py` — attention decode/prefill + seed
-  build (`attention_init_state_from_prefill` etc). Attention is HEALTHY in decode.
-* `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`,
-  `_pick_spec` (weights prefer attn_dp sharding).
+* `layers/jax/attention/deepseek_v4_attention.py` — **the bottleneck.** `sparse_attn` (:160,
+  gather :186, fp32 cast :181) + call sites (decode :812, prefill :905); the indexer
+  (`indexer_prefill` :366 / `indexer_decode_step` :562, the `lax.top_k` `while` loop);
+  compressor; seed-from-prefill. Attention is HEALTHY/correct — the work is making it fast.
+* `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
+  `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
+  DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
+  `compute_logits` (:2042, nan_to_num clamp :2055). Dead code: `_consolidate_moe_after_load`
+  (:1776). The w1/w3 host-gather load (~:1492) IS the S1 fix — do not touch.
+* `runner/tpu_runner.py::_prepare_inputs_dp` — `_v4_decode_replicate` (:1359): replicated
+  decode activation (the S1 fix). Drives the ~17% collective cost (Phase 2) — but DO NOT
+  remove; mind pitfall #5.
+* `models/jax/deepseek_v4_loader.py::pick_partition_spec` (:497) — weight sharding heuristic;
+  flipping contracting→output dim is the Phase-2 all-reduce win.
+* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense all-256 decode path (:217) vs
+  sharded `gmm_v2` prefill path (:233); the `use_shard_map` gate (:211) is the chat-wedge
+  trigger (Phase 4.1). ~10% of decode — SECONDARY despite 97% of FLOPs.
+* `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
+* Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
+  `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).
+  Invariants: `work/tpu-inference/INVARIANTS.md`.
 
 ## Pitfalls (these cost real time)
 
-0. **`different launch id` / `Core halted` / `SLICE_FAILURE` BEFORE startup = CODE
-   DESYNC, not a slice wedge.** Run `full_slice_v4_sync.sh` + clear xla_cache; do NOT
-   reboot (the old runbook's "reboot 7 workers" misdiagnoses this). Also keep env-var
-   reads consistent across workers — env-gated module-level reads race across ray
-   workers → divergent programs → launch-id halt. That's why all S1 diagnostics are
-   ALWAYS-ON (no env gate). Infra: the old `node` contention is SOLVED (`DenyUsers mark`
-   on all 8 hosts; two guardians run); don't re-fight it.
-1. **Shut down only via `scripts/full_slice_v4_reset.sh`** — never broad `pkill -f`
-   (kills raylet, loses nodes). Escalate to `full_slice_v4_ray_restart.sh` if reset fails.
+0. **`different launch id` / `Core halted` / `SLICE_FAILURE` BEFORE startup = CODE DESYNC**,
+   not a slice wedge. Run `full_slice_v4_sync.sh` + clear xla_cache; do NOT reboot. Keep
+   env-var reads consistent across workers — env-gated module-level reads race across ray
+   workers → divergent programs → launch-id halt (this is why S1 diagnostics were always-on).
+   Infra: old `node` contention is SOLVED (`DenyUsers mark` + two guardians); don't re-fight it.
+1. **Shut down only via `scripts/full_slice_v4_reset.sh`** — never broad `pkill -f` (kills
+   raylet, loses nodes). Escalate to `full_slice_v4_ray_restart.sh` if reset fails.
 2. **`/tmp/libtpu_lockfile` survives SIGKILL** → next init SIGSEGVs. reset.sh handles it.
 3. **`--enforce-eager` does NOT skip XLA compile** — the TPU forward is JAX, always jits.
 4. **No unverified XLA flags** — smoke.sh ignores parent-shell `XLA_FLAGS`; opt in via
    `V4_XLA_FLAGS` and validate with `python -c "import jax; jax.devices()"` first.
 5. **`with_sharding_constraint(activation, P())` that GATHERS a size-1 decode token axis
-   Core-halts the slice** (proven ~8x). A wsc on a POST-reduction `[N,dim]` quantity is
-   safe (doesn't gather the token axis). Don't gather the activation to replicated.
-6. **A live engine WEDGES on a new request shape** (HTTP500 → connection-refused; process stays
-   alive but stops serving), esp. the chat-path resharding. Raw `/completions` SAME shape survived
-   3 fires. When probing: pick ONE shape, fire critical probes first, reset+re-smoke if wedged.
+   Core-halts the slice** (proven ~8×). A wsc on a POST-reduction `[N,dim]` quantity is safe.
+   Any sharding change in Phase 2 must avoid gathering the decode token axis (do it at the
+   jit input/output boundary or via load-time weight placement, never an in-trace token gather).
+6. **A live engine WEDGES on a new request shape** (HTTP500 → connection-refused; process
+   alive but stops serving), esp. the chat/longer-prefill path (Phase 4.1). Raw `/completions`
+   SAME shape survived 3 fires. When probing: pick ONE shape, fire critical probes first,
+   reset+re-smoke if wedged.
 
 ## Slice bootstrap
 
-The slice (`v6spoteu721`, v6e-32, zone `europe-west4-a`, project `prm-research`) is
-already bootstrapped: venv, GCS mount, ray up. IPs auto-discover —
-`scripts/full_slice_v4_discover.sh`. If a fresh VM needs setup,
-`./scripts/full_slice_v4_bootstrap.sh` + see `CLAUDE.full.md`. Weights load auth-free
-from the GCS mount (`HF_TOKEN` intentionally unset). venv python is 3.12.
+The slice (`v6spoteu721`, v6e-32, zone `europe-west4-a`, project `prm-research`) is already
+bootstrapped: venv, GCS mount, ray up. Head = `10.164.0.192`; workers auto-discover via
+`scripts/full_slice_v4_discover.sh`. ssh: `ssh enyouki@<ip> -i ~/.ssh/google_compute_engine`.
+Weights load auth-free from the GCS mount (`HF_TOKEN` intentionally unset). venv python 3.12.
+Fresh-VM setup: `./scripts/full_slice_v4_bootstrap.sh` + `CLAUDE.full.md`.
+
+## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow
+
+Sessions are disposable; the commit log + `HANDOFF_PERF.md` + this file are the only memory
+that survives. When context reaches **~100k–200k tokens** (interactive: check `/context`; heed
+"context getting long" reminders) AND you are NOT seriously mid-operation (waiting on a smoke
+whose result you must read, or a few calls from finishing a committed step) — HAND OFF:
+
+1. **Keep the markdown LEAN** — trim `CLAUDE.md` + `HANDOFF_PERF.md` (and memory files):
+   delete superseded narrative, keep only durable ops + the CURRENT state + the next action.
+   Every line rsyncs to 8 hosts / loads into every session. Lean > complete.
+2. Rewrite `HANDOFF_PERF.md` to the CURRENT state: what you landed + gated, what's in flight
+   (log paths, ports, microbench numbers), and the ONE most important next action.
+3. `git add -A && git commit && git push`.
+4. **HAND OFF THE WINDOW:** interactive in tmux → run `scripts/perf_handoff_window.sh` (opens a
+   NEW tmux window with a fresh `claude --dangerously-skip-permissions --effort max`, empty
+   context, auto-loads this file + `scripts/perf_loop_prompt.txt`), then **END YOUR TURN**.
+   Headless under `scripts/perf_session_loop.sh` → just END YOUR TURN (the wrapper relaunches).
+   Stop the whole loop with `touch /tmp/perf_loop_stop`. Don't start anything you can't finish
+   + commit before handing off.
 
 ## Discipline
 
-Keep the diff against upstream `tpu-inference` minimal — every line rsyncs to 8 hosts.
-No new files when an existing one fits. V4 source should read like `qwen3.py` /
-`deepseek_v3.py`. Per-iteration narrative goes in **commit messages**, not this file.
-Commit a checkpoint after every validated step. Remove the S1 diagnostic prints when
-S1 closes.
+Keep the diff against upstream `tpu-inference` minimal — every line rsyncs to 8 hosts. No new
+files when an existing one fits (perf scripts are the exception — name them `scripts/perf_*`).
+V4 source should read like `qwen3.py` / `deepseek_v3.py`, but the loader/MoE/seed paths are
+fused with the S1 fix — do not "make idiomatic" the parts flagged unsafe in `HANDOFF_PERF.md`
+§Phase 5. Commit a checkpoint after every validated step.
