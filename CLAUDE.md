@@ -6,13 +6,13 @@
 > REGRESSION GATE, not the goal (see below). S1 history: `HANDOFF_S1.md` / `CLAUDE.full.md`.
 > Per-iteration narrative goes in **commit messages**, not this file.
 >
-> **One-line status (2026-05-27):** **Phase 1 CLOSED & GATED** — the fused sparse-attn kernel
-> (`kernels/sparse_attn/kernel.py`, wired via `_sparse_attn_kernel_sharded`) works: a re-profile shows
-> the attention KV gather went 65.8%→**0.2%** of decode (it was THE bottleneck). Decode is now
-> **ALL-REDUCE-bound (31.7%)**, then MoE 25% + indexer top_k 23%. **Next = Phase 2: flip
-> `pick_partition_spec` to OUTPUT-dim (axis-0) sharding** (NOT axis-1 — the old hypothesis was
-> backwards; the corrected diff is CPU-shape-validated + ready for a cold smoke). Decode breakdown +
-> the corrected diff + NEXT ACTION in `HANDOFF_PERF.md`.
+> **One-line status (2026-05-27):** **Phase 1 + 3.1 CLOSED & GATED.** Fused sparse-attn kernel
+> (`kernels/sparse_attn/kernel.py`) killed the attn KV gather (65.8%→**0.2%** of decode); Phase 3.1
+> (`c78ecb96`) made MoE dense-decode gate/up bf16-in/fp32-accumulate (`preferred_element_type=fp32`;
+> md5 unchanged 5bf42256). **Phase 2 (`pick_partition_spec` axis-0 flip) DEPRIORITIZED** (launch-bound
+> at N=1; marginal). Cheap wins exhausted — remaining decode levers (all-reduce 31.7%, indexer top_k
+> 23.3%) are all HARD/design. **Next = re-profile post-3.1, then Phase 3.2 (indexer top_k, jit-blocked).**
+> Full state + roadmap + NEXT ACTION in `HANDOFF_PERF.md`.
 
 ## Goal
 
