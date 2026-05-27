@@ -5,13 +5,15 @@
 > pitfalls) + the handoff protocol below. Live state + current lead live in the handoff.
 > History: `CLAUDE.full.md`.
 >
-> One-line status (2026-05-27 S28): **✅ S1 FIXED — v2a host-gather w1/w3 consolidation (commit 5a3ed435),
-> gate passed ×2 fresh engines.** Root cause (S26) = routed W1/W3 stacked-weight LOAD: the device-side
-> consolidation reshard (deepseek_v4.py:1535, axis-1-leaf→expert) read uninit HBM. v2a rebuilds the stacked
-> tensor from the FULL per-expert host numpy via `make_array_from_callback` (no device reshard). Verified ×2:
-> [ckSPLIT] W1/W2/W3 + FIB md5 byte-IDENTICAL across engines, correct Fibonacci, smoke_check rc=0. REMAINING
-> (hygiene, see HANDOFF_S1.md): remove S1 debug instrumentation, final confirming smoke, then `touch
-> /tmp/s1_loop_stop`. (jax.debug.print LOSSY ⇒ re-fire.)
+> One-line status (2026-05-27 S29): **✅ S1 CLOSED — loop stopped.** Fix = routed w1/w3
+> host-gather consolidation (commit 5a3ed435: rebuild the stacked tensor from FULL per-expert
+> host numpy via `make_array_from_callback`, no device reshard ⇒ no uninit-HBM read; root cause
+> S26 = the device-side axis-1-leaf→expert consolidation reshard read uninit HBM). S1 debug
+> instrumentation then removed (commit 2d3e0c45, 165 deletions; KEPT env-gated `_v4_nan_tripwire`
+> + compute_logits nan_to_num clamp). Gate re-verified ×2 fresh engines on the cleaned build:
+> FIB decode md5=5bf42256 BYTE-IDENTICAL across both, correct Fibonacci (21,34,55,89,144),
+> smoke_check rc=0 (LONG_GEN visible_words=45 max_word_run=2). Below = durable slice ops for
+> any future work on this slice; S1 narrative history in commit log + `CLAUDE.full.md`.
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow this
 
