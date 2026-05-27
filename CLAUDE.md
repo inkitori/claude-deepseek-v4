@@ -50,12 +50,13 @@ Escalate only as far up as the question needs:
 
 1. **CPU numerics (no slice, cheap):** the torch oracle. `PYTHONPATH=work/tpu-inference:work/vllm
    work/vllm_env/bin/python3 scripts/s1_cpu_repro_v4flash.py both` → "OK: both eager and jit
-   match" (regression-only). ⚠️ **BROKEN since Phase 1 landed:** the wired Mosaic kernel is
-   interpret-only on CPU, so the full-model eager path raises "Only interpret mode is supported on
-   CPU backend" — `s1_cpu_repro` no longer runs the full model. Fix = make the `mesh.empty` branch
-   of `_sparse_attn_kernel_sharded` call pure-JAX `sparse_attn`. For attention math the parity test
-   `tests/models/jax/test_deepseek_v4.py -k sparse_attn` vs `sparse_attn_torch` still works (interpret).
-   CPU CANNOT reproduce S1 (no sharding) — proves math, never proves a determinism fix.
+   match" (regression-only). ✅ **RESTORED (90e7c520):** the `mesh.empty` (CPU/interpret) branch of
+   `_sparse_attn_kernel_sharded` now calls pure-JAX `sparse_attn` (the Mosaic kernel is interpret-
+   only on CPU, which used to crash the full-model eager path). A numerics SHIFT (e.g. a bf16 cast)
+   still passes this oracle — eager+jit shift together; it catches breakage/NaN, not md5 drift.
+   Attention-math parity tests `tests/models/jax/test_deepseek_v4.py -k sparse_attn` exist but are
+   interpret-mode SLOW (>540s on CPU, often times out — not a practical quick check; the e2e oracle
+   above is the CPU tier). CPU CANNOT reproduce S1 (no sharding) — proves math, never a determinism fix.
 2. **TPU MICRO-BENCHMARK (cheap slice, NO 543 GiB load):** jit + time a kernel/op in isolation
    on the real mesh with SYNTHETIC inputs — measures gather ms / bandwidth / kernel speedup in
    ~1 min vs a 25-45 min smoke. **BUILD this (Phase 0.0) if `scripts/perf_*bench*` doesn't
