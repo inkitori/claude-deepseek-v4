@@ -24,7 +24,9 @@ Every committed change MUST still pass, verified on a fresh real-V4 engine:
 * `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
   max_word_run < 5).
 * FIB decode md5 **byte-identical across 2 fresh engines** + **correct Fibonacci** (21, 34,
-  55, 89, 144) vs a prefill-everything reference. Current reference md5 = `5bf42256`.
+  55, 89, 144) vs a prefill-everything reference. Current reference md5 = `b675be27`
+  (rebaselined from `5bf42256` by PERF 0.2 — the bf16 gather is math-bit-identical but XLA on
+  TPU picks a different matmul accumulation order ⇒ a deterministic ULP-level output shift).
 * Still passes after 5 unrelated requests.
 
 A numerics-changing fix MAY shift the md5 — then re-establish a NEW reference and confirm it's
