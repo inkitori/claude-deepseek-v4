@@ -88,6 +88,7 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     get_window_topk_idxs_decode, get_compress_topk_idxs_decode,
     attention_init_state_from_prefill,
 )
+from tpu_inference.kernels.sparse_attn.kernel import sparse_attn_kernel
 from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
     gate_forward, expert_forward, moe_forward,
     GateParams, ExpertParams, MoEParams,
@@ -235,6 +236,77 @@ class TestSparseAttnComponent:
         out_j = sparse_attn(t2j(q), t2j(kv), t2j(sink), t2j(idxs), 1.0 / D ** 0.5)
         assert np.all(np.isfinite(np.asarray(out_j).astype(np.float32)))
         assert maxabs(out_j, out_t) <= 1e-2
+
+
+class TestSparseAttnKernel:
+    """Parity for the fused Pallas `sparse_attn_kernel` (Phase 1). Validated in
+    `interpret=True` mode (CPU) against the torch oracle AND the JAX `sparse_attn`
+    it replaces. Kernel + oracle are both single-pass fp32 softmax, so parity is
+    tight (same 1e-2 bf16 tolerance as the function-level test)."""
+
+    def test_kernel_matches_torch(self):
+        torch.manual_seed(0)
+        B, M, H, D = 2, 6, 4, 32
+        N, K = 12, 5
+        q = torch.randn(B, M, H, D, dtype=torch.bfloat16)
+        kv = torch.randn(B, N, D, dtype=torch.bfloat16)
+        sink = torch.randn(H, dtype=torch.float32)
+        idxs = torch.randint(0, N, (B, M, K), dtype=torch.int32)
+        idxs[0, 0, 0] = -1
+        idxs[1, 2, :2] = -1
+        out_t = sparse_attn_torch(q, kv, sink, idxs, 1.0 / D ** 0.5)
+        out_k = sparse_attn_kernel(t2j(q), t2j(kv), t2j(sink), t2j(idxs),
+                                   1.0 / D ** 0.5, interpret=True)
+        assert maxabs(out_k, out_t) <= 1e-2
+
+    def test_kernel_matches_jax_sparse_attn(self):
+        """The kernel must match the exact JAX function it drops in for."""
+        torch.manual_seed(0)
+        B, M, H, D = 1, 4, 8, 64
+        N, K = 20, 8
+        q = torch.randn(B, M, H, D, dtype=torch.bfloat16)
+        kv = torch.randn(B, N, D, dtype=torch.bfloat16)
+        sink = torch.randn(H, dtype=torch.float32)
+        idxs = torch.randint(0, N, (B, M, K), dtype=torch.int32)
+        idxs[0, 1, 3] = -1
+        idxs[0, 3, :4] = -1  # a row where most slots are masked
+        scale = 1.0 / D ** 0.5
+        qj, kvj, sj, ij = t2j(q), t2j(kv), t2j(sink), t2j(idxs)
+        out_ref = sparse_attn(qj, kvj, sj, ij, scale)
+        out_k = sparse_attn_kernel(qj, kvj, sj, ij, scale, interpret=True)
+        # Same algorithm (single-pass fp32) -> expect near-exact bf16 agreement.
+        assert float(jnp.abs(out_k.astype(jnp.float32)
+                             - out_ref.astype(jnp.float32)).max()) <= 5e-3
+
+    def test_kernel_all_invalid(self):
+        """Every slot -1: output must be finite (sink saves it) and match."""
+        torch.manual_seed(0)
+        B, M, H, D, K = 1, 1, 4, 32, 4
+        q = torch.randn(B, M, H, D, dtype=torch.bfloat16)
+        kv = torch.randn(B, 8, D, dtype=torch.bfloat16)
+        sink = torch.randn(H, dtype=torch.float32)
+        idxs = torch.full((B, M, K), -1, dtype=torch.int32)
+        out_t = sparse_attn_torch(q, kv, sink, idxs, 1.0 / D ** 0.5)
+        out_k = sparse_attn_kernel(t2j(q), t2j(kv), t2j(sink), t2j(idxs),
+                                   1.0 / D ** 0.5, interpret=True)
+        assert np.all(np.isfinite(np.asarray(out_k).astype(np.float32)))
+        assert maxabs(out_k, out_t) <= 1e-2
+
+    def test_kernel_decode_shape(self):
+        """Decode-flavored single-query case (M=1) with a realistic -1 tail
+        (top-k padded with -1 sentinels, as the decode CSA/HCA paths produce)."""
+        torch.manual_seed(1)
+        B, M, H, D = 1, 1, 8, 64
+        N, K = 48, 16
+        q = torch.randn(B, M, H, D, dtype=torch.bfloat16)
+        kv = torch.randn(B, N, D, dtype=torch.bfloat16)
+        sink = torch.randn(H, dtype=torch.float32)
+        idxs = torch.randint(0, N, (B, M, K), dtype=torch.int32)
+        idxs[0, 0, 10:] = -1  # only first 10 slots valid (typical short-context decode)
+        out_t = sparse_attn_torch(q, kv, sink, idxs, 1.0 / D ** 0.5)
+        out_k = sparse_attn_kernel(t2j(q), t2j(kv), t2j(sink), t2j(idxs),
+                                   1.0 / D ** 0.5, interpret=True)
+        assert maxabs(out_k, out_t) <= 1e-2
 
 
 # =============================================================
