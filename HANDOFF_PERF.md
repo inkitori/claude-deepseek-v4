@@ -6,18 +6,17 @@
 > state, the roadmap, the ONE next action. Durable slice ops: `CLAUDE.md`. S1 history:
 > `HANDOFF_S1.md` / `CLAUDE.full.md`.
 >
-> **One-line status (2026-05-27, P1 WIRED + S1-GATED):** Phase 0.* CLOSED; **Phase 1 fused kernel
-> `kernels/sparse_attn/kernel.py::sparse_attn_kernel` is WIRED into both attention call sites and
-> PASSES the full S1 gate.** A Mosaic custom-call CANNOT be SPMD-auto-partitioned inside the
-> sharded model jit (`NotImplementedError: Mosaic kernels cannot be automatically partitioned`),
-> so the call now goes through a fully-REPLICATED `shard_map` helper `_sparse_attn_kernel_sharded`
-> (`deepseek_v4_attention.py`; in/out specs all `P()`, `check_vma=False`, `mesh.empty`→call kernel
-> directly for CPU/interpret — mirrors the MoE `use_shard_map` gate). Correct because the kernel is
-> independent per (b,m); OPTIMAL for decode (already replicated by the S1 fix), prefill all-gathers
-> to replicated first. **S1 GATE PASSED:** FIB N=2 md5 `5bf42256` byte-identical ×2 fresh engines
-> + correct Fibonacci (21,34,55,89,144) + smoke_check rc=0 (visible_words=42); no md5 rebaseline
-> needed. ⚠️ **The isolated-op ~41× does NOT translate end-to-end yet: decode ≈10 tok/s vs ~8
-> baseline (~1.25×).** NEXT = profile/quantify WHY + optimize (see NEXT ACTION).
+> **One-line status (2026-05-27, P1 CLOSED — re-profiled):** Phase 0.* + **Phase 1 CLOSED & GATED.**
+> Fused kernel `kernels/sparse_attn/kernel.py::sparse_attn_kernel` WIRED into both call sites via the
+> fully-REPLICATED `_sparse_attn_kernel_sharded` shard_map (a Mosaic custom-call can't be
+> SPMD-auto-partitioned; in/out specs all `P()`, `check_vma=False`, `mesh.empty`→direct for CPU/interpret).
+> S1-GATED: FIB N=2 md5 `5bf42256` ×2 engines + correct Fib + smoke rc=0. **Re-profile this session
+> (clean decode-only trace) CONFIRMS the kernel worked: sparse-attn gather 65.8%→0.2% of decode — attention
+> is NO LONGER a decode bottleneck.** Isolated ~41× gave only ~1.25× e2e because the gather was one part and
+> the onehot has NO bandwidth win at short ctx (reads same bytes as take_along; fusion/launch win only). **Decode
+> is now ALL-REDUCE-bound (31.7%)** — breakdown below. NEXT = **Phase 2: flip `pick_partition_spec` to OUTPUT-dim
+> (axis-0) sharding** (the doc's old "axis-1" was BACKWARDS — corrected in §Phase 2). Tools landed: parser
+> `scripts/perf_parse_trace.py` (`--bucket-ops`); profiler wired via `V4_PROFILER_ARGS` in smoke.sh.
 
 ---
 
@@ -40,6 +39,24 @@ Bottleneck = the **sparse-attention KV gather**, `jnp.take_along_axis` at
   (805 MB fp32 tensors; the `:181` whole-KV fp32 cast doubles traffic) → win = kill the
   materialization + fp32 cast.
 - The old "0.31 tok/s" headline was prefill-dominated; steady-state decode is ~8 tok/s.
+
+**POST-KERNEL decode breakdown (this session, clean decode-only step isolated by ts from the
+`2026_05_27_08_46_30` trace; `scripts/perf_parse_trace.py --bucket-ops`):** attention gather is GONE.
+
+| decode op (one step, ~50 ms busy) | % | roadmap |
+|---|---|---|
+| **all-reduce (+psum)** (2176/step) | **31.7 %** | **Phase 2 (next)** |
+| MoE dense `multiply_reduce_fusion` | 25.2 % | Phase 3 (riskier — chat-wedge gate) |
+| **indexer top_k `lax.top_k` `while` loop** | **23.3 %** | Phase 3.2 (high-conf, the loop not the op) |
+| all-gather | 7.1 % | (decode residual; the BIG all-gather is PREFILL-only, 57 ms — see §prefill-map) |
+| collective-permute | 4.9 % | Phase 2 |
+| **`sparse_attn_kernel` (fused attn)** | **0.2 %** | ✅ Phase 1 done — negligible now |
+| non-attn gather (MoE/compressor/seed) | ~0 % decode | — |
+
+⚠️ **Capture caveats:** tiny ctx (~30-tok FIB) ⇒ MoE share inflated / attention deflated vs long ctx;
+all-reduce + top_k are context-ROBUST, MoE 25% will fall at longer ctx. Only ~2 decode steps captured
+(profiler window closed ~603 ms) but the 2 steps agree. `multiply_reduce_fusion`→MoE is med-high conf
+(XLA fused the label; could include some norm/softmax reduces).
 
 **🔑 Major finding the original handoff missed:** the serve-time prefill runs the ENTIRE
 transformer body TWICE — `transformer_body_forward` (`deepseek_v4.py:851`, produces `h`) +
@@ -111,21 +128,39 @@ the win, not the kernel).
   §KERNEL). Prefill currently all-gathers to replicated (shard_map `P()`) → shard the map over the
   prefill token axis to avoid the all-gather + 32× redundant prefill compute (perf follow-up).
 
-### Phase 2 — collectives (~17 % decode)
-The 2176 all-reduces = replicated decode activation (`_v4_decode_replicate`, the S1 fix —
-DO NOT remove) × `attn_dp`-sharded weights on their CONTRACTING dim. **Highest-leverage/
-lowest-risk:** flip `pick_partition_spec` (`deepseek_v4_loader.py:468-519`) so weights shard on
-their OUTPUT dim (`wq_a`, `wkv`, shared-expert `w1`/`w3`, compressor/indexer
-`wkv`/`wgate`/`weights_proj`) + replicate the tiny gate → eliminates ~6–8 of ~10
-all-reduces/layer. It's a load-time placement (`make_array_from_callback`, `:560-569`; no in-jit
-`wsc`) → cannot trip pitfall #5.
-- **Audited mechanism (groundwork):** `pick_partition_spec` shards the LARGEST divisible dim of
-  each weight along the first matching mesh axis (preference list `attn_dp,model,expert,…`, `:497`).
-  V4 weights are `[out/contracting, dim]` with `out>dim` ⇒ it picks axis 0 = the CONTRACTING dim ⇒
-  matmul makes partial sums ⇒ all-reduce. The flip = make it prefer **axis 1** (the `dim`/feature
-  axis) for these weights so the matmul output is already sharded (no psum). Gate `[n_experts,dim]`
-  is tiny ⇒ already replicated by `_MIN_SHARD_ELEMENTS`; no V4 weight has a size-1 output dim, so
-  no decode-token-axis hazard. Verify on the CPU oracle (`force_host_device_count=32`) before a smoke.
+### Phase 2 — collectives: decode all-reduce (31.7 % — the re-profiled #1 decode cost)
+The 2176 all-reduces/step = replicated decode activation (`_v4_decode_replicate`, the S1 fix — DO
+NOT remove) × `attn_dp`-sharded weights on their CONTRACTING dim. **Highest-leverage/lowest-risk:**
+flip `pick_partition_spec` (`deepseek_v4_loader.py:468-519`) so attention weights shard on their
+OUTPUT dim. Load-time placement (`make_array_from_callback`, `:560-569`; no in-jit `wsc`) → cannot
+trip pitfall #5.
+- **CORRECTED mechanism (the old doc had the axes BACKWARDS):** weights are stored `[out, in]` and
+  consumed as `x @ W.T` (`_linear`, `deepseek_v4_attention.py:489/:502`), so **axis 0 = OUTPUT, axis
+  1 = CONTRACTING**. Current code picks the LARGEST divisible dim; the wide attn weights have
+  `in=4096 > out`, so it picks **axis 1 = CONTRACTING ⇒ partial sums ⇒ all-reduce**. Fix = prefer
+  **axis 0 (output)** = the FIRST divisible dim, so the matmul output is already sharded (a downstream
+  all-gather replaces the all-reduce). NOT "axis 1".
+- **The diff** (`:508-518`, replace the largest-dim loop):
+  ```python
+  best_dim = -1
+  for i, d in enumerate(shape):
+      if d % chosen_size == 0 and d >= chosen_size:
+          best_dim = i; break   # axis 0 (output) preferred; later dim only if axis 0 can't carry it
+  if best_dim == -1:
+      return P()                # replicate (e.g. hc_*_fn out=24, indivisible by 32)
+  spec = [None] * len(shape); spec[best_dim] = chosen_axis
+  return P(*spec)
+  ```
+  Flips wq_a/wkv/wo_b + compressor/indexer projections to axis-0; leaves already-axis-0 weights
+  (wq_b/wo_a/idx.wq_b/expert.w2) unchanged; auto-replicates `hc_*_fn` (out=24). No weight has a
+  size-1 output dim ⇒ no decode-token hazard.
+- **Validate (CPU, before the cold smoke):** `scripts/s1_cpu_repro_v4flash.py both` ("OK … match") +
+  `pytest tests/models/jax/test_deepseek_v4.py -k "shard or per_device_budget"` (forces cpu+32). Proves
+  math+shapes only; the collective-count drop + S1 are TPU-only (full gate). [CPU-validation status: TBD]
+- **LIMITS (don't over-claim):** the 25 % MoE (`multiply_reduce_fusion`) is governed by `_shard_e_mid`
+  in `deepseek_v4_moe.py`, NOT this — so the win is the ATTENTION all-reduces only; `gate.weight`
+  `[256,4096]` is sharded today (1M elems > `_MIN_SHARD_ELEMENTS`, NOT replicated); re-profile after
+  to confirm the % actually fell (the all-reduce→all-gather trade isn't guaranteed net-positive).
 
 ### Phase 3 — MoE + indexer top-k (secondary; profile says ~10 %/~9 %, NOT the 97 % FLOPs implied)
 - 3.1 Drop the fp32 cast in the dense decode MoE (`deepseek_v4_moe.py:220-222`). Low risk.
@@ -157,23 +192,25 @@ and/or fused with the S1 fix — all flagged unsafe).
 ---
 
 ## NEXT ACTION (for the session reading this)
-Phase-1 kernel is WIRED + S1-GATED. But **the win is not realized end-to-end** — decode ≈10 tok/s
-vs ~8 baseline (~1.25×), despite the isolated gather op being ~41×. The remaining Phase-1 work is
-to FIND and FIX that gap:
-1. **RE-PROFILE a decode step with the kernel wired** (recipe at the bottom of this file) and re-parse
-   the op-breakdown. Is the `take_along_axis` gather gone from the trace? What now dominates — the
-   per-layer `shard_map`/custom-call launch overhead (×41 attn layers/step), the all-reduces (Phase
-   2, ~17%), the MoE, the indexer top-k? This tells you whether the kernel helps end-to-end and where
-   the new bottleneck is. (The microbench already isolates the op as ~41×; the gap is an IN-MODEL /
-   sharding effect, so the profiler is the right tier.)
-2. **Shard the prefill `shard_map` over the token axis** instead of all-replicating
-   (`_sparse_attn_kernel_sharded` uses `in_specs=P()` everywhere → prefill all-gathers q/kv/topk to
-   every device + 32× redundant compute). Decode is replicated by design (leave it). Match the prefill
-   activation's real token sharding — the audit was inconclusive (B=1 in the smoke, token count <32 ⇒
-   effectively replicated there, so this only bites at larger prefill). Re-gate.
-3. *(later)* Large decode msl: swap the onehot (reads all N) for the DMA gather (§KERNEL).
-4. Then **Phase 2** (collectives, ~17% decode) — groundwork mapped in the Phase 2 section.
-5. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
+Phase 1 is CLOSED (re-profiled — kernel works, attention gather 0.2% of decode). **Decode is now
+ALL-REDUCE-bound (31.7%). NEXT = Phase 2: flip `pick_partition_spec` to OUTPUT-dim (axis-0) sharding.**
+1. **CPU-validate the corrected diff FIRST** (cheapest tier): the §Phase 2 diff prefers the FIRST
+   divisible dim (axis 0 = output) instead of the largest. Run the CPU oracle + shard tests (cmds in
+   §Phase 2); confirm numerics unchanged + every shape divides. [worktree CPU-validation status: see §Phase 2]
+2. **Verify the collective trade is a WIN before the cold smoke if you can:** the flip turns each decode
+   all-reduce into a downstream all-gather (a replicated activation needs the full feature vector after an
+   output-sharded matmul). On TPU all-gather is usually cheaper than all-reduce for equal bytes, but the
+   MAGNITUDE IS UNVERIFIED — if a cheap multi-host HLO op-count check exists (s1_mh_repro-style), count
+   all-reduce vs all-gather on the real mesh (no 543 GiB load) first.
+3. **Then the smoke** (COLD: a `.py` change invalidates the xla_cache → 25-45 min compile) + the full S1
+   gate. A numerics-orientation change MAY shift the md5 → rebaseline ×2 engines + correct Fib.
+4. KNOWN LIMITS of the flip (audited): MoE collectives are governed by `_shard_e_mid` (NOT
+   `pick_partition_spec`) so the win is concentrated in the ATTENTION chain, not the 25% MoE; `gate.weight`
+   `[256,4096]` is NOT auto-replicated by `_MIN_SHARD_ELEMENTS` (1M elems — handoff was wrong); the change
+   touches ALL leaves (embeddings/lm_head/MTP) so confirm no non-attn regression via the budget test.
+5. After Phase 2: indexer top_k `while` loop (23.3%, Phase 3.2) is the next high-confidence target;
+   prefill all-gather (57 ms) = shard the prefill map over the token axis (only bites at large prefill).
+6. Commit + push after each validated step. Hand off when context grows (see CLAUDE.md).
 
 ## <a name="0.1-DONE"></a>Phase 0.1 — DONE (history) + smoke confounds the WIRING session will hit
 0.1 (`d22df61a`): prefill runs ONE body (`deepseek_v4_run_with_decode_state` returns Pass B's `h`

@@ -124,6 +124,7 @@ echo "[smoke]   xla_flags=$XLA_FLAGS  ray_cgraph_timeout=${RAY_CGRAPH_get_timeou
     --enable-auto-tool-choice \
     --tool-call-parser deepseek_v4 \
     --additional_config '{"sharding":{"sharding_strategy":{"enable_dp_attention":true}}}' \
+    ${V4_PROFILER_ARGS:-} \
     > "$LOG" 2>&1 &
 
 SERVE_PID=$!
