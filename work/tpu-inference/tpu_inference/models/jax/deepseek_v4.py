@@ -42,7 +42,7 @@ from jax import lax
 
 from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     AttentionDecodeState, AttentionParams, CompressorParams, IndexerParams,
-    _v4_checksum, _v4_nan_tripwire, attention_decode_step, attention_init_state_from_prefill,
+    _v4_nan_tripwire, attention_decode_step, attention_init_state_from_prefill,
     attention_prefill, hc_split_sinkhorn, precompute_freqs_cis, rms_norm,
     splice_rope,
 )
@@ -324,11 +324,7 @@ def block_init_state_and_forward(
         n_real=n_real,
     )
     y = attention_prefill(y, params.attn, freqs_cis_full, layer_idx=layer_idx)
-    if layer_idx < 2:
-        _v4_checksum("blk_attn_out", y, layer_idx)
     x = hc_post(y, residual, post, comb)
-    if layer_idx < 2:
-        _v4_checksum("blk_post_attn_x", x, layer_idx)
 
     residual = x
     y, post, comb = hc_pre(
@@ -337,11 +333,7 @@ def block_init_state_and_forward(
     )
     y = rms_norm(y, params.ffn_norm_w, params.norm_eps)
     y = moe_forward(y, input_ids, params.moe, layer_idx=layer_idx, n_real=n_real)
-    if layer_idx < 2:
-        _v4_checksum("blk_moe_out", y, layer_idx)
     out = hc_post(y, residual, post, comb)
-    if layer_idx < 2:
-        _v4_checksum("blk_L_out", out, layer_idx)
     return decode_state, out
 
 
@@ -2058,27 +2050,8 @@ def _build_class():
             )
             x = rms_norm(hidden_states, params.final_norm_w, self.config.rms_norm_eps)
             logits = x.astype(jnp.float32) @ params.head_w.T
-            # [ckD] S16: per-sample decode-logit fingerprint to localize the
-            # cross-process divergence ONSET. Engines agree first ~15 tokens then
-            # diverge => a tiny per-process logit perturbation eventually flips a
-            # near-tie argmax. prelmh_sum: is the hidden divergent? lsum/labsmax:
-            # sub-argmax drift. argmax/top1/top2: the emitted token + how close
-            # the runner-up is (a shrinking top1-top2 gap predicts the flip).
-            _lg = logits.astype(jnp.float32)
-            _l0 = _lg[-1]                       # last selected pos = token to emit
-            _t2 = jax.lax.top_k(_l0, 2)[0]
-            jax.debug.print(
-                "[ckD] T={t} prelmh_sum={p:.9e} lsum={s:.9e} labsmax={m:.9e} "
-                "argmax={a} top1={t1:.9e} top2={t2:.9e}",
-                t=logits.shape[0], p=jnp.sum(x.astype(jnp.float32)),
-                s=jnp.sum(_lg), m=jnp.max(jnp.abs(_lg)),
-                a=jnp.argmax(_l0), t1=_t2[0], t2=_t2[1])
-            # S1 DIAGNOSTIC SCAFFOLD: the decode collapse produces NaN/inf logits
-            # that fatally halt the TPU sampling kernel (jit_sample) -> the engine
-            # dies before the collapse can be observed. Sanitize so the engine
-            # survives any request: NaN -> very negative (never the argmax), inf
-            # clamped finite. No-op for healthy finite logits. (Does NOT fix S1 —
-            # it only makes the collapse observable instead of crash-on-NaN.)
+            # Defensive: clamp any NaN/inf logits so a non-finite value cannot
+            # halt the TPU sampling kernel (jit_sample). No-op for finite logits.
             logits = jnp.nan_to_num(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
             return logits
 

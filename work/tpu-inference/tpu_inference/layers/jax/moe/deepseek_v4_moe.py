@@ -169,19 +169,6 @@ def moe_forward(
     flat_x = x.reshape(-1, params.dim)             # [N, dim]
     flat_ids = input_ids.reshape(-1)
 
-    def _ckR(name, q):
-        # S16: REAL-ROWS-ONLY (global rows < n_real) checksum. The global [ckS]
-        # sums include per-process-CONSTANT idle/pad-row uninit-HBM garbage from
-        # the shard_map collective, so a raw cross-engine A!=B on [ckS] is NOT
-        # proof of a real-row bug. This masks rows>=n_real to disambiguate.
-        if layer_idx == 0 and n_real is not None:
-            mask = (jnp.arange(q.shape[0]) < jnp.asarray(n_real, jnp.int32))[:, None]
-            qm = mask * q.astype(jnp.float32)
-            jax.debug.print("[ckR] L{l} {n}: rsum={s:.9e} rabsmax={a:.9e}",
-                            l=layer_idx, n=name, s=jnp.sum(qm),
-                            a=jnp.max(jnp.abs(qm)))
-    _ckR("moe_input", flat_x)
-
     weights, indices = gate_forward(
         flat_x.astype(jnp.float32), flat_ids, params.gate)
     # weights: [N, top_k] fp32, indices: [N, top_k] int32
@@ -226,11 +213,6 @@ def moe_forward(
     # token-sharded so each rank carries its tokens' full [N/axis, E] weights.
     if not use_shard_map:
         per_expert_weight = _shard_e_last(per_expert_weight)
-    if layer_idx == 0:
-        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
-                        l=layer_idx, n="moe_perexpw",
-                        s=jnp.sum(per_expert_weight),
-                        m=jnp.max(jnp.abs(per_expert_weight)))
 
     if not use_shard_map:
         # Dense einsum path (CPU/no-mesh + replicated decode): bit-for-bit
@@ -247,60 +229,14 @@ def moe_forward(
         h_NEi = _shard_e_mid(h_NEi * per_expert_weight[..., None])
         out_NEd = _shard_e_mid(jnp.einsum(
             'nei,edi->ned', h_NEi.astype(dtype), W2.astype(dtype)))  # [N, E, dim]
-        # [ckSPLIT] S26: out_NEd diverges x2 engines from BYTE-IDENTICAL x+routing
-        # (S25 [ckEtot] verdict). S18 PREFILL had the IDENTICAL signature = the bespoke
-        # einsum's matmul output buffer read uninit HBM (identical input, divergent
-        # output, weights deductively-but-never-measured clean). Localize WHICH stage
-        # first diverges: per-rank LOCAL [gsum,sqsum,absmax] (NO collective) of the
-        # routed weights + every einsum stage, gathered (tiny, post-reduction, safe) +
-        # summed reorder-immune. sqsum is per-rank-sensitive (squares can't cancel) =>
-        # the FIRST quantity whose sqsum differs x2 pins it: W* => routed weight-load
-        # uninit (NEVER measured cross-engine); gate/up => the x@W1/W3 matmul; h => the
-        # silu*weight elementwise; out only => the h@W2 matmul. 'out' sqsum continues
-        # the old [ckEtot] anchor (34.21 eng1 / 34.47 eng2). [ckEY] below = post-all-
-        # reduce y (already exonerated: faithfully reduces divergent locals).
-        if layer_idx == 0 and not mesh.empty:
-            def _ck_all(*ts):
-                def s(t):
-                    tf = t.astype(fp32)
-                    return jnp.stack([jnp.sum(tf), jnp.sum(tf * tf),
-                                      jnp.max(jnp.abs(tf))])              # [3]
-                return jnp.stack([s(t) for t in ts])[None]               # [1,7,3]
-            stats = jax.shard_map(
-                _ck_all, mesh=mesh,
-                in_specs=(P('attn_dp', None, None), P('attn_dp', None, None),
-                          P('attn_dp', None, None), P(None, 'attn_dp', None),
-                          P(None, 'attn_dp', None), P(None, 'attn_dp', None),
-                          P(None, 'attn_dp', None)),
-                out_specs=P('attn_dp', None, None), check_vma=False)(
-                    W1_fp32, W2, W3_fp32, gate_NEi, up_NEi, h_NEi, out_NEd)  # [axis,7,3]
-            stats = jax.lax.with_sharding_constraint(stats, P())         # replicate
-            sq = jnp.sum(stats[:, :, 1], axis=0)   # [7] reorder-immune pre-reduce sqsum
-            gs = jnp.sum(stats[:, :, 0], axis=0)   # [7] pre-reduce gsum
-            am = jnp.max(stats[:, :, 2], axis=0)   # [7] absmax
-            jax.debug.print("[ckSPLIT] sqsum W1={a:.6e} W2={b:.6e} W3={c:.6e} "
-                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
-                            a=sq[0], b=sq[1], c=sq[2], d=sq[3], e=sq[4],
-                            f=sq[5], g=sq[6])
-            jax.debug.print("[ckSPLIT] gsum W1={a:.6e} W2={b:.6e} W3={c:.6e} "
-                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
-                            a=gs[0], b=gs[1], c=gs[2], d=gs[3], e=gs[4],
-                            f=gs[5], g=gs[6])
-            jax.debug.print("[ckSPLIT] absmax W1={a:.6e} W2={b:.6e} W3={c:.6e} "
-                            "gate={d:.6e} up={e:.6e} h={f:.6e} out={g:.6e}",
-                            a=am[0], b=am[1], c=am[2], d=am[3], e=am[4],
-                            f=am[5], g=am[6])
         y = out_NEd.astype(fp32).sum(axis=1)                # [N, dim] fp32 routed sum
-        if layer_idx == 0:                                  # [ckEY] post-all-reduce y
-            jax.debug.print("[ckEY] y_gsum={s:.9e} y_sqsum={q:.9e} y_absmax={m:.9e}",
-                            s=jnp.sum(y), q=jnp.sum(y * y), m=jnp.max(jnp.abs(y)))
     else:
         # Sharded PREFILL path. Explicit shard_map over 'attn_dp' that dispatches
         # each token to its top_k experts and runs the per-rank expert FFN through
         # the production grouped-matmul kernel gmm_v2 with zero_initialize=True.
         # S18: the prior bespoke dense per-rank einsum here read UNINITIALISED HBM
-        # in its matmul output buffer (identical [ckG] x_full input but divergent
-        # [ckL] output across processes, real rows hit; weights + all_gather both
+        # in its matmul output buffer (identical x_full input but divergent
+        # output across processes, real rows hit; weights + all_gather both
         # exonerated). gmm_v2 DMA-zeroes its unvisited output rows — that is the
         # determinism lever: tokens NOT routed to a rank's experts produce a
         # deterministic 0 instead of garbage. Dispatch mirrors fused_moe_gmm.py
@@ -317,17 +253,6 @@ def moe_forward(
                                           tiled=True)                        # [N,top_k]
             r = jax.lax.axis_index('attn_dp')
             Nf = x_full.shape[0]
-            if layer_idx == 0:
-                # [ckR0] routing determinism + [ckR1] gmm-input baseline. If idx/w
-                # gsum DIFFER across 2 fresh engines, the corruptor is the GATE
-                # (sharded-contraction router all-reduce), not the gmm.
-                jax.debug.print("[ckR0] r={r} idx_gsum={i:.9e} w_gsum={w:.9e} "
-                                "w_absmax={wm:.9e} xfull_gsum={x:.9e} xfull_absmax={xm:.9e}",
-                                r=r, i=jnp.sum(idx_full.astype(jnp.float32)),
-                                w=jnp.sum(w_full.astype(jnp.float32)),
-                                wm=jnp.max(jnp.abs(w_full.astype(jnp.float32))),
-                                x=jnp.sum(x_full.astype(jnp.float32)),
-                                xm=jnp.max(jnp.abs(x_full.astype(jnp.float32))))
             # Dispatch: sort the (token, slot) pairs by global expert id; gmm then
             # processes THIS rank's EP experts via group_offset (megablox pattern).
             idx_flat = idx_full.reshape(-1)                                  # [N*top_k]
@@ -350,23 +275,6 @@ def moe_forward(
             g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
                         zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
-            if layer_idx == 0:
-                # [ckR2] g1 (gate/up) masked to THIS rank's OWNED sorted rows. Owned
-                # rows = clean x_sorted @ owned W -> MUST be deterministic. Divergence
-                # here ==> gmm computes owned rows non-deterministically (uninit read).
-                _eid = idx_flat[argsort_idx]
-                _om = ((_eid >= r * EP) & (_eid < (r + 1) * EP))[:, None]
-                _g1o = jnp.where(_om, g1, 0.0)
-                # [ckR1b] gmm INPUT (x_sorted) on owned rows. If this is byte-equal x2
-                # engines but [ckR2] g1own diverges x2 => kernel non-det given identical
-                # input (decisive); if xso itself diverges => input/gather is the source.
-                _xso = jnp.where(_om, x_sorted.astype(fp32), 0.0)
-                jax.debug.print("[ckR1b] r={r} xso_gsum={g:.9e} xso_sqsum={q:.9e} "
-                                "xso_absmax={m:.9e}", r=r, g=jnp.sum(_xso),
-                                q=jnp.sum(_xso * _xso), m=jnp.max(jnp.abs(_xso)))
-                jax.debug.print("[ckR2] r={r} g1own_gsum={s:.9e} g1own_sqsum={q:.9e} "
-                                "g1own_absmax={m:.9e}", r=r, s=jnp.sum(_g1o),
-                                q=jnp.sum(_g1o * _g1o), m=jnp.max(jnp.abs(_g1o)))
             gate, up = jnp.split(g1, 2, axis=-1)
             if swiglu_limit > 0:
                 up = jnp.clip(up, -swiglu_limit, swiglu_limit)
@@ -376,14 +284,6 @@ def moe_forward(
             g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
                         zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, dim]
-            if layer_idx == 0:
-                # [ckR3] g2 (down) masked to OWNED sorted rows, BEFORE revert/mask.
-                # ckR2 clean & ckR3 divergent ==> g2 gmm; both divergent ==> g1 gmm.
-                _eid3 = idx_flat[argsort_idx]
-                _om3 = ((_eid3 >= r * EP) & (_eid3 < (r + 1) * EP))[:, None]
-                _g2o = jnp.where(_om3, g2, 0.0)
-                jax.debug.print("[ckR3] r={r} g2own_gsum={s:.9e} g2own_absmax={m:.9e}",
-                                r=r, s=jnp.sum(_g2o), m=jnp.max(jnp.abs(_g2o)))
             # Revert to (token, slot) order. Each (token,slot) has exactly one
             # expert, owned by exactly one rank, so weight-combine + psum must give
             # each token its exact routed sum with no double count -- PROVIDED every
@@ -400,9 +300,6 @@ def moe_forward(
             token_hidden = jnp.where(_owned[:, None], token_hidden, 0)
             token_topk = token_hidden.reshape(Nf, top_k, -1) * w_full[..., None]
             local = token_topk.sum(axis=1)                    # [N, dim] fp32
-            if layer_idx == 0:
-                jax.debug.print("[ckL] r={r} local_gsum={s:.9e} local_absmax={m:.9e}",
-                                r=r, s=jnp.sum(local), m=jnp.max(jnp.abs(local)))
             y_full = jax.lax.psum(local, 'attn_dp')           # [N, dim] full sum
             NP = Nf // axis
             return jax.lax.dynamic_slice_in_dim(y_full, r * NP, NP, axis=0)
@@ -424,18 +321,7 @@ def moe_forward(
                       P('attn_dp', None, None)),
             out_specs=P('attn_dp', None), check_vma=False,
         )(flat_x_sm, weights_sm, indices_sm, W1, W3, W2)     # [N, dim] fp32 routed sum
-    if layer_idx == 0:
-        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
-                        l=layer_idx, n="moe_routed_y",
-                        s=jnp.sum(y), m=jnp.max(jnp.abs(y)))
-    _ckR("moe_routed", y)
     shared = expert_forward(flat_x, None, params.shared_expert)
-    if layer_idx == 0:
-        jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
-                        l=layer_idx, n="moe_shared",
-                        s=jnp.sum(shared.astype(fp32)),
-                        m=jnp.max(jnp.abs(shared.astype(fp32))))
-    _ckR("moe_shared", shared)
     y = y + shared.astype(fp32)
     # NOTE: the S22 owned-expert mask inside _routed_local IS the "idle-rank mask
     # before the psum" deferred here. S13's post-gather y>=n_real mask was REFUTED

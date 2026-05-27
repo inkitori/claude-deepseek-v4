@@ -67,21 +67,6 @@ def _v4_nan_tripwire(name: str, x: jnp.ndarray, layer_idx, position) -> None:
     )
 
 
-def _v4_checksum(name: str, x: jnp.ndarray, layer_idx) -> None:
-    """S1 LOCALIZATION (always-on, NOT env-gated so all 8 workers trace an
-    identical program -> no launch-id race; remove when S1 closes). Prints a
-    global checksum (sum) + absmax of an already-live seed/decode buffer so two
-    engine PROCESSES can be diffed: the FIRST [ckS] line whose sum differs
-    across processes localizes where the per-process uninit-HBM residual enters.
-    Only sum already-materialized values (inputs / returned fields) to avoid
-    perturbing XLA dead-buffer materialization (heisenbug)."""
-    xf = x.astype(jnp.float32)
-    s = jnp.sum(xf)
-    m = jnp.max(jnp.abs(xf)) if x.size > 0 else jnp.float32(0.0)
-    jax.debug.print("[ckS] L{l} {n}: sum={s:.9e} absmax={m:.9e}",
-                    l=layer_idx, n=name, s=s, m=m)
-
-
 def _replicate(x: jnp.ndarray) -> jnp.ndarray:
     """Replicate small constant tables to avoid 32-way reshard at every
     broadcast site (loader heuristically shards along attn_dp). No-op
@@ -1139,14 +1124,12 @@ def attention_init_state_from_prefill(
         x = jnp.where(_keep.reshape(1, T, 1), x, jnp.zeros_like(x))
 
     _v4_nan_tripwire("init_x_in", x, layer_idx, -1)
-    _v4_checksum("seed_x_in", x, layer_idx)
     # SWA kv (matches attention_prefill's kv computation).
     # S1 DIAG: is the seed's wkv finite? (init_x_in is globally finite yet the
     # matmul overflows -> either wkv is huge here, or a deeper matmul issue.)
     _v4_nan_tripwire("init_wkv", params.wkv, layer_idx, -1)
     kv = _linear(x, params.wkv)
     _v4_nan_tripwire("init_kv_postlinear", kv, layer_idx, -1)
-    _v4_checksum("seed_kv_postlinear", kv, layer_idx)
     kv = rms_norm(kv, params.kv_norm_w, eps)
     _v4_nan_tripwire("init_kv_postnorm", kv, layer_idx, -1)
     fc = freqs_cis_full[:T] if T > 0 else freqs_cis_full[:0]
@@ -1181,8 +1164,6 @@ def attention_init_state_from_prefill(
         c_kv = jnp.zeros((B, 0, 0), dtype=jnp.float32)
         c_sc = jnp.full((B, 0, 0), -jnp.inf, dtype=jnp.float32)
     _v4_nan_tripwire("init_kv_cache_post_swa_set", kv_cache, layer_idx, -1)
-    _v4_checksum("seed_kv_cache", kv_cache, layer_idx)
-    _v4_checksum("seed_c_kv", c_kv, layer_idx)
 
     if ratio == 4 and params.indexer is not None:
         # Indexer state: same compressor logic on params.indexer.compressor.
