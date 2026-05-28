@@ -154,11 +154,18 @@ idle; serialize slice access. Hand off when context grows (`scripts/quant_handof
   `gcloud compute tpus tpu-vm ssh`; venvs built (`setup.sh` fan-out); GCS weights mounted
   (`gs://personal-mark-eu/vllm/hub` → `~/.cache/huggingface/hub`); `.env` written (tokens omitted —
   weights are auth-free, `claude` uses `~/.claude` creds).
-- ⚠️ **Ray-version-corruption fix (DONE, don't re-fight):** the bootstrap's `uv` install left an
-  internally-inconsistent ray (Python 2.55.1 metadata but a stale 2.54.1 artifact → `ray.init`
-  "version mismatch"). FIX = `uv pip install --reinstall --no-cache 'ray[default,data]==2.55.1'`
-  on every host. Already applied; cluster verified `ray.init OK, 16 TPU, [4,4,4,4]`.
+- ⚠️ **Ray `ray.init` "version mismatch" = mark's rogue ray-2.54.1 `node` docker container poisoning
+  the GCS `CLUSTER_METADATA` — NOT a corrupt venv.** It rejoins our GCS every few seconds, stamps
+  2.54.1, then crashes — breaking `ray.init` for our 2.55.1 clients (and can Core-halt the slice).
+  **THE FIX IS THE TWO GUARDIANS, which MUST stay alive during ALL TPU work** (started this session;
+  cluster verified `ray.init OK, 16 TPU, [4,4,4,4]` only AFTER starting them):
+  - `node_guardian` occupies the `node` container name on every host (blocks mark's container at the source);
+  - `meta_guardian` re-stamps `CLUSTER_METADATA`→2.55.1 within ~0.5s.
+  Check: `ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`. Restart if dead:
+  `INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &`
+  and `setsid work/vllm_env/bin/python scripts/full_slice_v4_meta_guardian.py 10.164.0.15:6379 >logs/meta_guardian.log 2>&1 </dev/null &`
+  (⚠️ meta_guardian's default IP is the stale v6e-32 head — ALWAYS pass `10.164.0.15:6379`). A clean
+  ray `--reinstall --no-cache` was also done for venv hygiene but is NOT the fix.
 - To (re)start ray: `scripts/full_slice_v4_ray_restart.sh` (now verifies `0.0/16.0 TPU`).
 - To smoke: `bash scripts/full_slice_v4_smoke.sh` (TP=16; self-guards single-instance). After any
   `.py` edit: `scripts/full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on all 4 hosts.
-- Guardians: keep `node_guardian`/`meta_guardian` alive before TPU work (CLAUDE.md).

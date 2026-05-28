@@ -150,8 +150,10 @@ project `prm-research`) is bootstrapped: venv on all 4 hosts, GCS weights mounte
 `scripts/full_slice_v4_discover.sh`. ssh: `ssh enyouki@<ip> -i ~/.ssh/google_compute_engine`.
 Weights load auth-free from the GCS mount (`HF_TOKEN` intentionally unset). venv python 3.12.
 Smoke = TP=16 (`full_slice_v4_smoke.sh`); ray = `full_slice_v4_ray_restart.sh` (verifies 16 TPU).
-⚠️ If `ray.init` errors "version mismatch", the venv ray is corrupt — fix on EVERY host:
-`uv pip install --reinstall --no-cache 'ray[default,data]==2.55.1'` (already applied this bringup).
+⚠️ `ray.init` "version mismatch" = mark's rogue ray-2.54.1 `node` container poisoning the GCS
+`CLUSTER_METADATA` (NOT a corrupt venv). FIX = keep BOTH guardians alive: `node_guardian` (occupies
+the `node` container name) + `meta_guardian` (re-stamps metadata→2.55.1, needs head-IP arg
+`10.164.0.15:6379`). Start/restart per the loop prompt + Pitfall #0. Started this bringup.
 Fresh-VM setup: `./scripts/full_slice_v4_bootstrap.sh` — needs `uv` + the
 `~/.ssh/google_compute_engine` key on all hosts (generate/propagate via
 `gcloud compute tpus tpu-vm ssh <node> --zone europe-west4-a --worker=0`).

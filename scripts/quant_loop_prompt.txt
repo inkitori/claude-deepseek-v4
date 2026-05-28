@@ -36,11 +36,14 @@ Reserve full smokes for confirming a change that already passed a cheaper tier; 
 
 OPERATING RULES:
 - Make every call yourself; never wait for approval; bypass perms are on.
-- KEEP BOTH GUARDIANS ALIVE before any TPU work. Check:
-    ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'
-  Restart node_guardian if dead (NEVER pkill+restart in one line — the pattern self-matches and
-  kills your own shell):
+- KEEP BOTH GUARDIANS ALIVE before any TPU work — they are LOAD-BEARING: mark's rogue ray-2.54.1
+  `node` container poisons our GCS (-> ray.init "version mismatch") and can Core-halt the slice.
+  Check:  ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'
+  Restart EITHER if dead (NEVER pkill+restart in one line — the pattern self-matches and kills
+  your own shell):
     INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &
+    setsid work/vllm_env/bin/python scripts/full_slice_v4_meta_guardian.py 10.164.0.15:6379 >logs/meta_guardian.log 2>&1 </dev/null &
+  (⚠️ meta_guardian's default IP is the stale v6e-32 head — ALWAYS pass 10.164.0.15:6379.)
 - SPAWN SUBAGENTS AGGRESSIVELY — AND IN PARALLEL. Large usage budget; serial single-threaded work
   is the WRONG default. For any bounded question fire SEVERAL agents in ONE batch (multiple Agent
   calls in a single message). Agents return ONLY conclusions (never read long logs/HLO/safetensors
