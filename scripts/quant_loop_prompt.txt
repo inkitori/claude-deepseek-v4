@@ -1,0 +1,74 @@
+You are one session in a SELF-PERPETUATING loop making DeepSeek-V4-Flash LOAD AND SERVE
+CORRECTLY on the v6e-16 TPU slice by NOT dequantizing its native quantized weights to full bf16.
+A wrapper relaunches a FRESH-context session each time you exit, so your job is to make solid,
+COMMITTED progress and then hand off cleanly. The commit log + HANDOFF_QUANT.md + CLAUDE.md are
+the ONLY memory that survives your exit.
+
+READ FIRST (in order), then act:
+  1. HANDOFF_QUANT.md — current state, the HBM math, the strategy, THE ROADMAP, the GATE, and the
+     ONE next action. Trust it. This is the campaign map.
+  2. CLAUDE.md       — the runbook (validation TIERS, slice ops, pitfalls, v6e-16 bringup notes).
+  3. git log --oneline -12.
+
+GOAL: V4-Flash ships natively quantized — dense linears FP8, the 256 routed experts FP4 (= MXFP4,
+bit-identical to jnp.float4_e2m1fn). The loader currently dequantizes EVERYTHING to bf16, which
+blows the checkpoint up to ~542 GiB and CANNOT fit the v6e-16's 512 GiB HBM (it OOMs). The experts
+are 92-95% of the footprint, so the win is keeping the FP4 experts COMPRESSED in HBM and feeding
+them to the MoE matmul (`gmm_v2` already accepts a per-block `rhs_scale`; study
+models/jax/gpt_oss.py::_load_mxfp4 as the blueprint). Drive Strategy C in HANDOFF_QUANT.md
+top-down. There is no single "done"; the loop runs until the operator `touch /tmp/quant_loop_stop`.
+Each session: advance the top roadmap item to a GATED, committed state, update HANDOFF_QUANT.md,
+hand off.
+
+HARD CONSTRAINT — CORRECTNESS GATE (HANDOFF_QUANT.md §GATE): every committed change must pass FIB
+decode = correct Fibonacci (21,34,55,89,144) + N=2 md5 byte-identical across 2 fresh engines +
+smoke_check rc=0. READ the actual decode text ("contains Paris" is a false positive). Because the
+bf16 path can't even load on v6e-16, the FIRST milestone — "it loads, FITS, serves, correct +
+deterministic" — IS the first gate-pass. Keeping experts fp4 WILL change numerics vs the old
+v6e-32 bf16 md5 (5bf42256) — that hash is dead here; establish a NEW v6e-16 baseline and confirm
+it's identical across 2 fresh engines + correct Fibonacci.
+
+VALIDATE ON THE CHEAPEST TIER FIRST (the heart of the work — see CLAUDE.md "How to validate"). The
+full smoke is EXPENSIVE (543 GiB-class load + 10-30 min cold compile). Escalate only as needed:
+(1) CPU torch oracle (scripts/s1_cpu_repro_v4flash.py both) for shapes/math/no-NaN; (2) TPU
+microbench (scripts/perf_microbench*) for a kernel/op in isolation; (3) full smoke + the GATE.
+Reserve full smokes for confirming a change that already passed a cheaper tier; ≤1-2 per session.
+
+OPERATING RULES:
+- Make every call yourself; never wait for approval; bypass perms are on.
+- KEEP BOTH GUARDIANS ALIVE before any TPU work. Check:
+    ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'
+  Restart node_guardian if dead (NEVER pkill+restart in one line — the pattern self-matches and
+  kills your own shell):
+    INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &
+- SPAWN SUBAGENTS AGGRESSIVELY — AND IN PARALLEL. Large usage budget; serial single-threaded work
+  is the WRONG default. For any bounded question fire SEVERAL agents in ONE batch (multiple Agent
+  calls in a single message). Agents return ONLY conclusions (never read long logs/HLO/safetensors
+  headers into your own context). Good parallel fan-out HERE:
+    * One agent maps gpt_oss._load_mxfp4 + mxfp4.py; one maps gmm_v2 rhs_scale signature + tiling;
+      one audits the MoE param-tree / S1 shard_map path that must be preserved; one drafts the
+      loader fp4-emit change; one writes/extends the CPU oracle for the fp4 path.
+    * Profile/HBM/sharding/quant-math cross-checks, commit archaeology — all at once.
+  QUALITY BAR: every agent needs a REAL, bounded question whose answer changes your next step.
+  SERIALIZE SLICE ACCESS: the TPU is ONE fragile engine (smoke.sh self-guards; it wedges on a new
+  request shape) — agents may READ/analyze in parallel, but only ONE may drive an engine at a time.
+- After EVERY code edit: scripts/full_slice_v4_sync.sh (else 3/4 workers run stale code →
+  launch-id Core-halt). If a .py changed, clear ~/.cache/vllm/xla_cache/* on all 4 hosts.
+- Commit + push after EVERY validated step. Clean up engines ONLY via full_slice_v4_reset.sh.
+- Keep the diff vs upstream minimal (CLAUDE.md discipline); per-iteration narrative goes in COMMIT
+  MESSAGES, not the markdown. Do NOT "make idiomatic" the loader/MoE/seed paths fused with the S1 fix.
+
+HAND OFF (this is how the loop perpetuates; full protocol in CLAUDE.md "CONTEXT HANDOFF PROTOCOL"):
+your context grows as you work. Trigger at ~100k-200k tokens — if interactive, eyeball /context and
+heed "context getting long" reminders; if headless (-p), treat "I finished a validated step /
+bounded chunk" as the trigger — UNLESS you're seriously mid-operation (e.g. waiting on a smoke whose
+result you must read). Then STOP CLEANLY:
+  1. KEEP THE MARKDOWN LEAN — trim CLAUDE.md + HANDOFF_QUANT.md: delete superseded narrative, keep
+     only durable ops + the CURRENT state + the next action. Every line rsyncs to 4 hosts.
+  2. Rewrite HANDOFF_QUANT.md to the CURRENT state: what you landed + gated, what's in flight (log
+     paths, ports, microbench numbers), and the single most important NEXT action.
+  3. git add -A && commit + push.
+  4. HAND OFF THE WINDOW: if interactive in tmux, run scripts/quant_handoff_window.sh (spawns a
+     fresh max-thinking session in a NEW tmux window), then END YOUR TURN. If headless under
+     quant_session_loop.sh, just END YOUR TURN (the wrapper relaunches).
+Do not start anything large you can't finish + commit before handing off.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch vllm serve DeepSeek-V4-Flash on the full v6e-32 slice. Run on
-# worker 0 (the head). Assumes Ray is up + repo/venv synced to all 8
+# Launch vllm serve DeepSeek-V4-Flash on the full v6e-16 slice. Run on
+# worker 0 (the head). Assumes Ray is up + repo/venv synced to all 4
 # workers + GCS-mounted V4-Flash checkpoint visible on every host.
 
 set -euo pipefail
@@ -44,13 +44,15 @@ export PATH="$VENV/bin:$PATH"
 export VIRTUAL_ENV="$VENV"
 export PYTHONPATH="$REPO_ROOT/work/vllm:$REPO_ROOT/work/tpu-inference:$VENV/lib/python3.12/site-packages"
 
-# Multi-host TPU bounds: form the 32-chip distributed mesh.
+# Multi-host TPU bounds: form the 16-chip distributed mesh (v6e-16, topology
+# 4x4 = 4 hosts x 4 chips). Matches GCP metadata HOST_BOUNDS/PROCESS_BOUNDS=2,2,1.
+# (v6e-32 was 2,4,1 = 8 hosts; the chips-per-host/process 2,2,1 are unchanged.)
 export TPU_MULTIHOST_BACKEND=ray
 export RAY_ADDRESS="${RAY_ADDRESS:-$("$REPO_ROOT/scripts/full_slice_v4_discover.sh" head):6379}"
 export JAX_PLATFORMS=
-export TPU_HOST_BOUNDS=2,4,1
+export TPU_HOST_BOUNDS=2,2,1
 export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
-export TPU_PROCESS_BOUNDS=2,4,1
+export TPU_PROCESS_BOUNDS=2,2,1
 export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
 
 # HF offline — checkpoint is mounted via gcsfuse, no internet.
@@ -61,7 +63,7 @@ export TRANSFORMERS_OFFLINE=1
 export NEW_MODEL_DESIGN=1
 
 export V4_LOADER_SLICE_AWARE="${V4_LOADER_SLICE_AWARE:-1}"
-export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-8}"
+export V4_LOADER_PLACE_WORKERS="${V4_LOADER_PLACE_WORKERS:-4}"
 export V4_LOADER_PREFETCH_WORKERS="${V4_LOADER_PREFETCH_WORKERS:-0}"
 # Per-decode-step NaN-localization tripwire. Off by default; set
 # V4_DECODE_NAN_TRIPWIRE=1 to emit per-sub-block NaN counts to the log
@@ -111,7 +113,7 @@ echo "[smoke]   slice_aware=$V4_LOADER_SLICE_AWARE place_workers=$V4_LOADER_PLAC
 echo "[smoke]   xla_flags=$XLA_FLAGS  ray_cgraph_timeout=${RAY_CGRAPH_get_timeout}s"
 "$VENV/bin/vllm" serve deepseek-ai/DeepSeek-V4-Flash \
     --distributed-executor-backend ray \
-    --tensor-parallel-size 32 \
+    --tensor-parallel-size 16 \
     --max-model-len "$MAX_LEN" \
     --max-num-seqs "$MAX_SEQS" \
     --port "$PORT" \

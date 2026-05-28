@@ -1,27 +1,36 @@
-# claude-deepseek-v4 — PERFORMANCE runbook
+# claude-deepseek-v4 — QUANT / FIT-ON-v6e-16 runbook
 
-> **Phase = PERFORMANCE. START HERE: `HANDOFF_PERF.md`** (current state + the verified profile
-> + THE ROADMAP + the ONE next action). This file holds durable slice ops (how to run,
-> validate, pitfalls). S1 (decode *correctness*/determinism) is **CLOSED** — it is now a HARD
-> REGRESSION GATE, not the goal (see below). S1 history: `HANDOFF_S1.md` / `CLAUDE.full.md`.
-> Per-iteration narrative goes in **commit messages**, not this file.
+> **Phase = QUANT. START HERE: `HANDOFF_QUANT.md`** (current state + the HBM math + THE ROADMAP +
+> the GATE + the ONE next action). This file holds durable slice ops (how to run, validate,
+> pitfalls). The job: make `vllm serve DeepSeek-V4-Flash` LOAD AND SERVE CORRECTLY on the
+> **v6e-16** slice by NOT dequantizing its native FP8/FP4 weights to full bf16 at load. Prior
+> campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
+> (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-27):** **Phase 1 + 3.1 CLOSED & GATED.** Fused sparse-attn kernel
-> (`kernels/sparse_attn/kernel.py`) killed the attn KV gather (65.8%→**0.2%** of decode); Phase 3.1
-> (`c78ecb96`) made MoE dense-decode gate/up bf16-in/fp32-accumulate (`preferred_element_type=fp32`;
-> md5 unchanged 5bf42256). **Phase 2 (`pick_partition_spec` axis-0 flip) DEPRIORITIZED** (launch-bound
-> at N=1; marginal). Cheap wins exhausted — remaining decode levers (all-reduce 31.7%, indexer top_k
-> 23.3%) are all HARD/design. **Next = re-profile post-3.1, then Phase 3.2 (indexer top_k, jit-blocked).**
-> Full state + roadmap + NEXT ACTION in `HANDOFF_PERF.md`.
+> **One-line status (2026-05-28):** **Infra bootstrapped & verified on `v6spoteu719` (v6e-16,
+> 4×4, 16 chips, 4 hosts).** venv on all hosts, GCS weights mounted, Ray healthy (16 TPU,
+> `ray.init` OK). The model is FP8 (dense) + FP4 (256 experts, = MXFP4); the loader dequantizes
+> all of it to bf16 (~542 GiB) which CANNOT fit 512 GiB HBM → OOM. **Goal = keep the FP4 experts
+> compressed in HBM (Strategy C); `gmm_v2` already takes a per-block `rhs_scale`.** No real-V4
+> smoke yet. Full state + roadmap + NEXT ACTION in `HANDOFF_QUANT.md`.
 
 ## Goal
 
-Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the v6e-32
-TPU slice (TP=32, 8 hosts × 4 chips), driving the `HANDOFF_PERF.md` roadmap top-down. Shrink
-the diff vs upstream `tpu-inference` and de-hack as you go. **The bottleneck is the attention
-KV gather, NOT the MoE** (a FLOP count said MoE; the profile overturned it — always profile).
+Make `vllm serve deepseek-ai/DeepSeek-V4-Flash` LOAD AND SERVE CORRECTLY on the **v6e-16** slice
+(TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_QUANT.md` roadmap top-down. The
+model ships natively quantized (FP8 dense + FP4 experts); the loader dequantizes everything to
+bf16, which does NOT fit the v6e-16's 512 GiB HBM (~542 GiB → OOM). **Keep the FP4 experts
+compressed in HBM** (they're 92–95% of the footprint) instead of expanding to bf16, while keeping
+correctness (the GATE below). Shrink the diff vs upstream `tpu-inference`; reuse the existing
+`gmm_v2` `rhs_scale` / `float4_e2m1fn` / MXFP4 (`gpt_oss._load_mxfp4`) machinery — don't rebuild.
 
-## S1 REGRESSION GATE — NON-NEGOTIABLE for every change
+## CORRECTNESS GATE — NON-NEGOTIABLE for every change
+
+⚠️ **v6e-16 / QUANT note:** the md5 `5bf42256` below was set on **v6e-32 + bf16** and is **DEAD
+here** — bf16 can't load on v6e-16, and keeping experts FP4 changes the numerics. The live bar is
+in **`HANDOFF_QUANT.md` §GATE**: correct Fibonacci + N=2 md5 identical ×2 fresh engines (a NEW
+baseline established once the model fits) + smoke_check rc=0. The mechanics below still apply (how
+to probe, the false-positive warnings); only the specific hash is re-established.
 
 Every committed change MUST still pass, verified on a fresh real-V4 engine:
 * `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
@@ -67,11 +76,11 @@ Escalate only as far up as the question needs:
 
 ## Slice-serving protocol (marginal slice — do this EVERY smoke)
 
-1. Edit code → `scripts/full_slice_v4_sync.sh` (MANDATORY: 8 hosts, each own clone; `git push`
+1. Edit code → `scripts/full_slice_v4_sync.sh` (MANDATORY: 4 hosts, each own clone; `git push`
    does NOT sync them). Verify md5 of edited .py matches head==workers — a mismatch causes
    "different launch id" Core-halts (CODE DESYNC, **not** a slice wedge; do NOT reboot — sync
    fixes it).
-2. Clear `~/.cache/vllm/xla_cache/*` on all 8 hosts (stale/mixed cache also → launch-id halt).
+2. Clear `~/.cache/vllm/xla_cache/*` on all 4 hosts (stale/mixed cache also → launch-id halt).
 3. `scripts/full_slice_v4_reset.sh` (stops any engine, cleans lockfiles).
 4. `scripts/full_slice_v4_smoke.sh` (backgrounds vllm serve; prints log path). Self-guards:
    flock single-instance (REFUSES if an engine is up/starting — `SMOKE_NO_GUARD=1` escapes) +
@@ -135,11 +144,17 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 
 ## Slice bootstrap
 
-The slice (`v6spoteu721`, v6e-32, zone `europe-west4-a`, project `prm-research`) is already
-bootstrapped: venv, GCS mount, ray up. Head = `10.164.0.192`; workers auto-discover via
+The slice (`v6spoteu719`, **v6e-16**, topology 4×4 = 16 chips / 4 hosts, zone `europe-west4-a`,
+project `prm-research`) is bootstrapped: venv on all 4 hosts, GCS weights mounted, **Ray healthy
+(16 TPU, `ray.init` verified)**. Head = `10.164.0.15`; workers (`.8`/`.17`/`.16`) auto-discover via
 `scripts/full_slice_v4_discover.sh`. ssh: `ssh enyouki@<ip> -i ~/.ssh/google_compute_engine`.
 Weights load auth-free from the GCS mount (`HF_TOKEN` intentionally unset). venv python 3.12.
-Fresh-VM setup: `./scripts/full_slice_v4_bootstrap.sh` + `CLAUDE.full.md`.
+Smoke = TP=16 (`full_slice_v4_smoke.sh`); ray = `full_slice_v4_ray_restart.sh` (verifies 16 TPU).
+⚠️ If `ray.init` errors "version mismatch", the venv ray is corrupt — fix on EVERY host:
+`uv pip install --reinstall --no-cache 'ray[default,data]==2.55.1'` (already applied this bringup).
+Fresh-VM setup: `./scripts/full_slice_v4_bootstrap.sh` — needs `uv` + the
+`~/.ssh/google_compute_engine` key on all hosts (generate/propagate via
+`gcloud compute tpus tpu-vm ssh <node> --zone europe-west4-a --worker=0`).
 
 ## ⇒ CONTEXT HANDOFF PROTOCOL — every session MUST follow
 
@@ -150,7 +165,7 @@ whose result you must read, or a few calls from finishing a committed step) — 
 
 1. **Keep the markdown LEAN** — trim `CLAUDE.md` + `HANDOFF_PERF.md` (and memory files):
    delete superseded narrative, keep only durable ops + the CURRENT state + the next action.
-   Every line rsyncs to 8 hosts / loads into every session. Lean > complete.
+   Every line rsyncs to 4 hosts / loads into every session. Lean > complete.
 2. Rewrite `HANDOFF_PERF.md` to the CURRENT state: what you landed + gated, what's in flight
    (log paths, ports, microbench numbers), and the ONE most important next action.
 3. `git add -A && git commit && git push`.
@@ -163,7 +178,7 @@ whose result you must read, or a few calls from finishing a committed step) — 
 
 ## Discipline
 
-Keep the diff against upstream `tpu-inference` minimal — every line rsyncs to 8 hosts. No new
+Keep the diff against upstream `tpu-inference` minimal — every line rsyncs to 4 hosts. No new
 files when an existing one fits (perf scripts are the exception — name them `scripts/perf_*`).
 V4 source should read like `qwen3.py` / `deepseek_v3.py`, but the loader/MoE/seed paths are
 fused with the S1 fix — do not "make idiomatic" the parts flagged unsafe in `HANDOFF_PERF.md`

@@ -51,7 +51,7 @@ log "starting ray head on $HEAD_IP"
 "$ray_bin" start --head \
     --node-ip-address="$HEAD_IP" \
     --port=6379 \
-    --resources='{"TPU":4,"TPU-v6e-32-head":1}' \
+    --resources='{"TPU":4,"TPU-v6e-16-head":1}' \
     --temp-dir=/tmp/ray-vllm \
     2>&1 | tail -8 | sed 's/^/  /'
 
@@ -75,10 +75,10 @@ sleep 5
 log "verifying cluster"
 RAY_ADDRESS="$HEAD_IP:6379" "$ray_bin" status 2>&1 | grep -E "node_|TPU|nodes" | sed 's/^/  /'
 
-# Pass criterion: 32.0/32.0 TPU available
+# Pass criterion: 16.0/16.0 TPU available (v6e-16 = 4 hosts x 4 chips)
 got=$(RAY_ADDRESS="$HEAD_IP:6379" "$ray_bin" status 2>&1 | grep -oE '0\.0/[0-9]+\.0 TPU\b' | head -1)
 log "TPU line: $got"
 case "$got" in
-    "0.0/32.0 TPU") log "OK: cluster up with 32 TPU"; exit 0 ;;
-    *) log "FAIL: expected '0.0/32.0 TPU'"; exit 1 ;;
+    "0.0/16.0 TPU") log "OK: cluster up with 16 TPU"; exit 0 ;;
+    *) log "FAIL: expected '0.0/16.0 TPU'"; exit 1 ;;
 esac
