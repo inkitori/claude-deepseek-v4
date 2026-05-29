@@ -10,16 +10,17 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.7): the ATTENTION-side decode levers are REFUTED — not the cost.**
-> Decode wall stays at P.5's **146 ms** (P.7 changed NO production code — a measurement/analysis commit;
-> GATE md5 `3069e80b` UNCHANGED). New tool `perf_microbench_attn_decode.py` (16-chip, amortized) proved:
-> the Mosaic `sparse_attn_kernel` is OPTIMAL (5× > pure-JAX, parity-identical, launch-bound ~0.008 ms/layer)
-> and the CSA indexer `top_k`/score is NEGLIGIBLE (~0.3 ms/step) — together only ~0.6 ms of the ~33 ms
-> non-MoE. So BOTH the MoE (~106 ms, P.6 lossless floor) AND the attention kernel/indexer are floor/optimal;
-> the **~32 ms balance = Q/KV/O projections + MoE gate + HC-sinkhorn + per-op launch overhead** (decode is
-> launch-bound at N=1), and is the ONLY unattributed lossless frontier. **NEXT = attribute that ~32 ms**
-> (extend the attn microbench to a full-per-layer block, and/or a clean multi-step profiler). The one risky
-> MoE lever left = scaled-fp8-resident (fits, 0.75/layer, but LOSSY → GATE risk). See `HANDOFF_PERF.md`.
+> **One-line status (2026-05-29 — P.8): the ~30 ms non-MoE balance is ATTRIBUTED — roadmap #1 CLOSED.**
+> Decode wall stays at P.5's **146 ms** (P.8 changed NO production code — a measurement commit; GATE md5
+> `3069e80b` UNCHANGED). New `--block` mode on `perf_microbench_attn_decode.py` measured every named non-MoE
+> suspect (collectives included): Q/KV/O projections **4.13**, MoE gate **0.75**, hc_pre+19-iter sinkhorn
+> **2.99** = **7.87 ms/step** (+ P.7 attn 0.6 ⇒ ~8.5 ms). The split is self-consistent: device_wait 138.9 =
+> MoE 105.8 (P.6 floor) + attn 0.6 + proj/gate/hc 7.87 + **~24 ms per-op LAUNCH overhead** (per-op floor
+> ~5 µs; ~1760 ops/step). ⇒ decode at N=1 is LAUNCH-bound, as premised; the only lossless lever for the
+> ~24 ms (op-count↓ via a layer `lax.scan`) re-opens S1, so a LARGE lossless decode win likely doesn't exist.
+> **The decode lossless frontier is exhausted-or-marginal.** NEXT = a fork (see `HANDOFF_PERF.md`): (A) a
+> clean multi-step profiler to confirm ~24 ms + decide if any op-count lever survives [recommended]; (B)
+> PIVOT to PREFILL (the untapped half); (C) the risky LOSSY scaled-fp8-resident MoE (~106→32, GATE risk).
 > GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal

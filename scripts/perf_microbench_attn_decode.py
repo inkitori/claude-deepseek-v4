@@ -136,10 +136,141 @@ def amortized_ms(op, primary, others, iters, R=64):
     return m / R, n / R
 
 
+# ---------------------------------------------------------------------------
+# roadmap #1: the ~30 ms NON-MoE balance = Q/KV/O projections + MoE gate +
+# HC-sinkhorn + per-op launch overhead. P.7 closed sparse_attn (~0.3 ms/step)
+# and the indexer (~0.3 ms/step); this `--block` mode attributes the rest.
+# ---------------------------------------------------------------------------
+QLR = 1024        # q_lora_rank        wq_a[1024,4096]  wq_b[32768,1024]
+KVLR = 512        # kv_lora_rank       wkv[512,4096]
+OLR = 1024        # o_lora_rank
+O_GROUPS = 8      # o_groups  -> o low-rank flat = O_GROUPS*OLR = 8192
+HC = 4            # hc_mult            hc_fn[(2+HC)*HC, HC*DIM] = [24,16384]
+N_LAYERS = 43     # = N_CSA(21)+N_HCA(20)+N_DENSE(2); all run the 5 attn projections
+N_MOE_GATE = 40   # standard-router layers (first 3 are hash_moe -> NO gate matmul)
+GATE_E = 256      # n_routed_experts
+TOP_K = 6         # num_experts_per_tok
+
+
+def make_sharded(shape, spec, seed, mesh, dtype=jnp.bfloat16):
+    """Synthetic weight with the loader's PartitionSpec on the 'attn_dp' axis
+    (pick_partition_spec shards the LARGEST divisible dim)."""
+    sh = NamedSharding(mesh, spec)
+    rng = np.random.default_rng(seed)
+    base = (rng.standard_normal(shape) * 0.02).astype(np.float32)
+    return jax.make_array_from_callback(shape, sh,
+                                        lambda idx, _b=base: _b[idx]).astype(dtype)
+
+
+def amortized_full(op, primary, others, iters, R=64):
+    """Like amortized_ms, but the loop carry SUMS the FULL output each iter (not
+    just elem [0]) so XLA cannot prune a forced with_sharding_constraint collective
+    down to a 1-element gather. Returns (median_per_call_ms, min_per_call_ms)."""
+    def loop(primary, *others):
+        def body(i, acc):
+            pp = primary + (acc * 1e-9).astype(primary.dtype)
+            o = op(pp, *others)
+            return acc + jnp.sum(o.astype(jnp.float32))
+        return lax.fori_loop(0, R, body, jnp.float32(0.0))
+    f = jax.jit(loop)
+    m, n = measure(lambda: f(primary, *others), iters)
+    return m / R, n / R
+
+
+def proj_repl(x, w):
+    """x[...,i] @ w[o,i] -> [...,o], forced back to REPLICATED -- includes the
+    collective the decode path pays to feed the next op (all-reduce when w shards
+    the contracting dim; all-gather when w shards the output dim)."""
+    out = jnp.einsum('...i,oi->...o', x, w)
+    return jax.lax.with_sharding_constraint(out, P())
+
+
+def gate_op(x, gw):
+    """MoE gate/router (NOT in the MoE microbench, which took a pre-routed pew)."""
+    scores = jnp.einsum('...d,ed->...e', x, gw)               # [1,1,4096]@[256,4096]
+    scores = jax.lax.with_sharding_constraint(scores, P())    # all-reduce (4096 sharded)
+    scores = jnp.sqrt(jax.nn.softplus(scores))                # sqrtsoftplus score_func
+    v, idx = lax.top_k(scores, TOP_K)
+    oh = jax.nn.one_hot(idx, GATE_E, dtype=jnp.float32)        # [1,1,6,256]
+    return jnp.einsum('...ke,...k->...e', oh, v)              # per-expert weight [1,1,256]
+
+
+def hc_op(x, hc_fn):
+    """hc_pre (norm + mix matmul) + 19-iter sinkhorn. Runs 2x/layer (attn+ffn)."""
+    xf = x.reshape(x.shape[:2] + (HC * DIM,)).astype(jnp.float32)
+    xf = xf * jax.lax.rsqrt(jnp.mean(xf * xf, -1, keepdims=True) + 1e-6)
+    mixes = jnp.einsum('...d,md->...m', xf, hc_fn.astype(jnp.float32))  # [1,1,24]
+    mixes = jax.lax.with_sharding_constraint(mixes, P())      # all-reduce (16384 sharded)
+    comb = mixes[..., 2 * HC:].reshape(mixes.shape[:-1] + (HC, HC))
+    comb = jax.nn.softmax(comb, axis=-1) + 1e-6
+    comb = comb / (comb.sum(-2, keepdims=True) + 1e-6)
+    def body(i, c):
+        c = c / (c.sum(-1, keepdims=True) + 1e-6)
+        return c / (c.sum(-2, keepdims=True) + 1e-6)
+    comb = lax.fori_loop(0, 19, body, comb)
+    return comb.reshape(mixes.shape[:-1] + (HC * HC,))
+
+
+def bench_block(mesh, iters, p0):
+    repl = lambda shape, seed, dt=jnp.bfloat16: make_replicated(shape, seed, mesh, dt)
+    # decode activations: REPLICATED across all 16 chips (the S1 fix).
+    x = repl((1, 1, DIM), 1)                       # attn/gate/hc input
+    qr = repl((1, 1, QLR), 2)                      # q after wq_a -> wq_b input
+    o_flat = repl((1, 1, O_GROUPS * OLR), 3)       # 8192, wo_b input
+    xhc = repl((1, 1, HC, DIM), 4)
+    # projection weights sharded as pick_partition_spec assigns (largest dim):
+    wq_a = make_sharded((QLR, DIM), P(None, 'attn_dp'), 11, mesh)        # 4096 contract -> all-reduce
+    wq_b = make_sharded((H * DH, QLR), P('attn_dp', None), 12, mesh)     # 32768 out     -> all-gather
+    wkv  = make_sharded((KVLR, DIM), P(None, 'attn_dp'), 13, mesh)       # 4096 contract -> all-reduce
+    wo_a = make_sharded((O_GROUPS * OLR, DIM), P('attn_dp', None), 14, mesh)  # 8192 out (byte-modeled)
+    wo_b = make_sharded((DIM, O_GROUPS * OLR), P(None, 'attn_dp'), 15, mesh)  # 8192 contract -> all-reduce
+    gw   = make_sharded((GATE_E, DIM), P(None, 'attn_dp'), 16, mesh, dtype=jnp.float32)
+    hc_fn = make_sharded(((2 + HC) * HC, HC * DIM), P(None, 'attn_dp'), 17, mesh, dtype=jnp.float32)
+    # launch-floor probes (replicated, no collective):
+    wtiny = repl((KVLR, KVLR), 20)
+    xtiny = repl((1, 1, KVLR), 21)
+
+    pj = {}
+    pj['wq_a'] = amortized_full(proj_repl, x, (wq_a,), iters)[0]
+    pj['wq_b'] = amortized_full(proj_repl, qr, (wq_b,), iters)[0]
+    pj['wkv'] = amortized_full(proj_repl, x, (wkv,), iters)[0]
+    pj['wo_a'] = amortized_full(proj_repl, x, (wo_a,), iters)[0]
+    pj['wo_b'] = amortized_full(proj_repl, o_flat, (wo_b,), iters)[0]
+    t_gate = amortized_full(gate_op, x, (gw,), iters)[0]
+    t_hc = amortized_full(hc_op, xhc, (hc_fn,), iters)[0]
+    t_add = amortized_full(lambda a, _w: a + 1.0, x, (x,), iters)[0]
+    t_mm = amortized_full(lambda a, w: jnp.einsum('...i,oi->...o', a, w), xtiny, (wtiny,), iters)[0]
+
+    if not p0:
+        return
+    proj_sum = sum(pj.values())
+    proj_step = N_LAYERS * proj_sum
+    gate_step = N_MOE_GATE * t_gate
+    hc_step = 2 * N_LAYERS * t_hc
+    total = proj_step + gate_step + hc_step
+    print("\n=== V4 DECODE non-MoE BLOCK microbench (16-chip, N=1, x REPLICATED) ===")
+    print(f"dims: dim={DIM} q_lora={QLR} kv_lora={KVLR} heads*qk={H*DH} o_flat={O_GROUPS*OLR} "
+          f"experts={GATE_E} top_k={TOP_K} hc={HC}")
+    print("AMORTIZED device-ms/call (fori_loop R=64, host dispatch removed). proj outputs forced")
+    print("to REPLICATED via with_sharding_constraint, so each matmul's collective is INCLUDED.\n")
+    print("  per-layer attention projections (each runs x43 layers):")
+    for k in ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b'):
+        print(f"    {k:5s} {pj[k]:8.4f} ms")
+    print(f"    SUM   {proj_sum:8.4f} ms/layer  =>  {proj_step:6.2f} ms/step  (x43)")
+    print(f"  MoE gate matmul+sqrtsoftplus+top_k+one_hot: {t_gate:8.4f} ms/layer => {gate_step:6.2f} ms/step (x40)")
+    print(f"  hc_pre + 19-iter sinkhorn (x2/layer):       {t_hc:8.4f} ms/layer => {hc_step:6.2f} ms/step (x86)")
+    print(f"\n  => projections + gate + hc-sinkhorn = {total:6.2f} ms/step of the ~30 ms non-MoE balance")
+    print(f"  per-op launch floor: trivial add [1,1,{DIM}] = {t_add*1e3:6.2f} us | "
+          f"tiny mm [1,1,{KVLR}]x[{KVLR},{KVLR}] = {t_mm*1e3:6.2f} us")
+    print("  (the floor x op-count bounds pure inter-op launch overhead; exact op-count needs the profiler)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--distributed", action="store_true")
+    ap.add_argument("--block", action="store_true",
+                    help="roadmap #1: time the non-MoE block (projections+gate+hc) instead of sparse_attn")
     a = ap.parse_args()
     if a.distributed:
         jax.distributed.initialize()
@@ -147,6 +278,11 @@ def main():
     p0 = (not a.distributed) or jax.process_index() == 0
     devices = np.array(jax.devices()).reshape(nd)
     mesh = jax.sharding.Mesh(devices, ('attn_dp',))
+
+    if a.block:
+        with jax.set_mesh(mesh):
+            bench_block(mesh, a.iters, p0)
+        return
 
     rows = []  # (label, med, min) for sparse_attn shapes (kernel + jax)
     with jax.set_mesh(mesh):
