@@ -1513,15 +1513,13 @@ def _build_class():
             def _is_stash_leaf(jax_path: str) -> bool:
                 m = (_expert_path_re.match(jax_path)
                      or _mtp_expert_path_re.match(jax_path))
-                # w1/w3 + ALL scale leaves host-gather (full-read host numpy ->
-                # make_array_from_callback, NO device_put reshard collective);
-                # only w2 keeps the byte-clean device_put. This restores the
-                # proven bf16 consolidation (1 collective/layer). uint8 packing
-                # made w1/w3 SQUARE [2048,2048] -> pick_partition_spec axis-0 ->
-                # device_put, and 6 device_put reshards/layer desync the SPMD
-                # launch group across hosts (scheckne). See HANDOFF_QUANT.
-                return m is not None and (
-                    m.group(3) in ("w1", "w3") or m.group(3).endswith("_scale"))
+                # ALL routed/mtp expert leaves (w1/w2/w3 + scales) host-gather
+                # (full-read host numpy -> make_array_from_callback, NO device_put
+                # reshard collective) — eliminates EVERY consolidation collective.
+                # uint8 packing made w1/w3 SQUARE -> pick_partition_spec axis-0 ->
+                # device_put; the device_put reshards desync the multi-host SPMD
+                # launch group (scheckne). See HANDOFF_QUANT.
+                return m is not None
 
             def _maybe_consolidate(jax_path: str):
                 # Identify group key, increment counter; if we hit 256,
@@ -1557,9 +1555,8 @@ def _build_class():
                 e_spec = NamedSharding(self.mesh, _P('attn_dp', None, None))
                 n_e = self.config.n_routed_experts
                 stash_keys = [f"{path_prefix}[{e}].{wname}" for e in range(n_e)]
-                use_host_gather = (
-                    (wname in ("w1", "w3") or wname.endswith("_scale"))
-                    and all(k in _expert_host_np for k in stash_keys))
+                use_host_gather = all(
+                    k in _expert_host_np for k in stash_keys)
                 if use_host_gather:
                     # Host-gather: stack the captured full per-expert host numpy
                     # and scatter straight into the expert-sharded layout. No
