@@ -7,17 +7,15 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** **LOADS + FITS; post-load `scheckne` persists. BARRIERS RULED OUT
-> — pivot to the freqs-fix pattern (eliminate divergent eager dispatches).** Root pattern (proven): the
-> rank-0 worker (co-located w/ the driver on .15) finishes the collective-free load FIRST and races into
-> post-load eager programs while remote workers still place weights → launch-id mismatch. **FIXED #1
-> (`fb54237b`): RoPE freqs → NUMPY (host)** removed the 16-partition freqs ops from the racing rank;
-> load progressed to the next dispatch. **THIS SESSION (reverted, CPU-clean):** `sync_global_devices`
-> BECOMES the divergent collective itself; host-side `wait_at_barrier` is a NO-OP (`distributed.global_state.client
-> is None` — no `jax.distributed.initialize()`, `coord=NONE` proven). Workers are BYTE-IDENTICAL (no XLA
-> non-det). Divergent post-load programs = host-side `jit_create_jit_model` + `jit__threefry_fold_in` +
-> `jit_add` (RNG @ `tpu_runner.py:581`). **NEXT = move the RNG to HOST/numpy like freqs**, then
-> create_jit_model. Full state + worker-to-worker HLO recipe in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** **The post-load `scheckne` saga is RESOLVED** — Q.8 (sampling RNG
+> → host) + Q.9 (eager `create_jit_model`) eliminated the last racing eager dispatches; the model LOADS
+> + FITS (`hbm=9.75/31.25 GiB/chip`) and the HEAD reaches the real forward. The wedge that surfaced next
+> was a **divergent weight load** (py-spy: the 3 workers couldn't read the GCS-mounted weights → silent
+> `jnp.zeros` dummy fallback while the head loaded real weights; the bucket is enyouki-owned only on the
+> head). **Q.10 fixes it** (`scripts/full_slice_v4_mount_weights.sh` — enyouki gcsfuse mount on the
+> workers; smoke pre-flight). **NEXT = run the validating smoke** → expect the FIRST cluster-wide real
+> load into the FIRST real forward, then debug the genuine forward, then the GATE. Full state +
+> py-spy/HLO recipes in `HANDOFF_QUANT.md`.
 
 ## Goal
 
@@ -151,7 +149,12 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 
 The slice (`v6spoteu719`, **v6e-16**, topology 4×4 = 16 chips / 4 hosts, zone `europe-west4-a`,
 project `prm-research`) is bootstrapped: venv on all 4 hosts, GCS weights mounted, **Ray healthy
-(16 TPU, `ray.init` verified)**. Head = `10.164.0.15`; workers (`.8`/`.17`/`.16`) auto-discover via
+(16 TPU, `ray.init` verified)**.
+⚠️ **WEIGHTS readable by enyouki on ALL 4 hosts** — run `scripts/full_slice_v4_mount_weights.sh`
+once per bringup (idempotent; smoke pre-flight runs it; mounts die on reboot). The bringup mounts the
+GCS bucket enyouki-owned ONLY on the head; workers get a root-only mount → enyouki EACCES → the worker
+serve proc silently loads `jnp.zeros` (dummy fallback) → engine wedges. Verify `config.json` readable
+on .8/.17/.16. Head = `10.164.0.15`; workers (`.8`/`.17`/`.16`) auto-discover via
 `scripts/full_slice_v4_discover.sh`. ssh: `ssh enyouki@<ip> -i ~/.ssh/google_compute_engine`.
 Weights load auth-free from the GCS mount (`HF_TOKEN` intentionally unset). venv python 3.12.
 ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashing the smoke's

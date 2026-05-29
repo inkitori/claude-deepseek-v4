@@ -5,24 +5,15 @@
 > Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`,
 > `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29):** **LOADS + FITS; post-load launch-id `scheckne` persists. BOTH
-> barrier approaches RULED OUT this session — PIVOT to the FREQS-FIX pattern: eliminate the divergent
-> eager TPU dispatches, don't try to barrier them.** Race (proven): the rank-0 worker (co-located with
-> the EngineCore driver on head .15, lowest RPC latency) finishes the collective-free load FIRST and
-> races into post-load eager programs while the 3 remote workers still place weights → launch-id
-> mismatch → `scheckne`. **LANDED precedent `fb54237b`:** RoPE freqs precompute → NUMPY (host) removed
-> the 16-partition `jit_iota/outer/exp` from the racing rank; load progressed (3→113 modules) to the
-> NEXT eager dispatch. **THIS SESSION (all reverted to baseline, CPU-clean):**
-> (1) `sync_global_devices` barrier → BECOMES the divergent 16-partition `identity_fn` collective itself
-> (crashes AT the barrier, earlier). (2) host-side `wait_at_barrier` → SILENT NO-OP:
-> `jax._src.distributed.global_state.client is None` here (no `jax.distributed.initialize()`; the TPU
-> handshake is libtpu-env-var-based) — instrumentation logged `coord=NONE`; `jax.process_count()` still
-> returns 4 so the guard passed misleadingly. ⇒ NO coord-service barrier exists. (3) PROVEN: the 4
-> workers are BYTE-IDENTICAL (no XLA non-determinism); the divergent post-load programs are
-> `jit_create_jit_model` + `jit__threefry_fold_in` + `jit_add`, ALL host-side (0 collectives), run in
-> every worker. **NEXT = apply the freqs-fix pattern to the RNG** (`nnx.Rngs(jax.random.key(seed)).params()`
-> @ `tpu_runner.py:581` → host/numpy) then create_jit_model; see ROADMAP. Last smokes:
-> `…045525Z` (HLO dump → worker-diff), `…051036Z` (barrier instrumented → coord=NONE). Crash ~60-90s (cheap).
+> **One-line status (2026-05-29):** **The post-load `scheckne` saga is RESOLVED** (Q.8 RNG→host +
+> Q.9 eager create_jit_model eliminated the last racing eager dispatches; the HEAD now loads + fits
+> + reaches the real forward). The wedge that appeared next was **NOT a forward bug** — py-spy proved
+> it was a **divergent weight load**: the 3 worker actors couldn't read the GCS-mounted weights (root-
+> only mount) and silently fell into the `jnp.zeros` dummy fallback while the head loaded real weights.
+> **Q.10 fixes it** (enyouki gcsfuse mount on the workers; `config.json` now readable on all 4 hosts).
+> **NEXT = run the validating smoke** — expect the FIRST cluster-wide real load into the FIRST real
+> forward; then debug whatever the genuine forward surfaces, then the GATE. Last smoke: `…055008Z`
+> (head reached forward; workers dummy-wedged — pre-Q.10).
 
 ---
 
@@ -35,114 +26,74 @@ V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, 
 | scheme | HBM | fits v6e-16 (512 GiB)? |
 |---|---:|---|
 | bf16 (old load path) | ~542 GiB | **NO** (OOM) |
-| **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes** — and now LOADS (68812 tensors) |
+| **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes** — confirmed: `Init model | hbm=9.75/31.25 GiB/chip` |
 
 ---
 
-## WHAT LANDED (committed, CPU-gated) — Strategy C loader + the FIT FIX
-- `26e4023d` Q.1 + MoE consumer: routed experts declared FP4, dequant-in-trace (`_dequant_fp4_experts`).
-- `26318abf` Q.2 loader: emit FP4 experts COMPRESSED (uint8 weight + scale leaves), no bf16 dequant.
-- `580b1f83` scales stored as **uint8** (not on-device `float8_e8m0fnu`) — REFUTED the e8m0-halt theory
-  (crash was byte-identical with uint8). Kept: it's correct (matches gpt_oss/qwix/the consumer).
-- `6eb5241f` un-swallow loader exception (`deepseek_v4.py:2026` re-raises unless
-  `V4_ALLOW_DUMMY_FALLBACK=1`) — REFUTED the swallowed-exception theory (re-raise never fired ⇒ no
-  exception). Correctness win: never silently serve zero-weighted garbage. + host-gather w1/w3/scales
-  (left w2 on device_put) — STILL crashed, proving even ONE consolidation device_put diverges here.
-- **`e1b434f8` THE FIT FIX:** host-gather **EVERY** routed/mtp expert leaf (w1/w2/w3 + all scales) ⇒
-  ZERO consolidation `device_put` reshard collectives. Edits in `deepseek_v4.py`: `_is_stash_leaf`
-  (`return m is not None`) + `use_host_gather` (`all(k in _expert_host_np ...)`) match all routed
-  leaves; `deepseek_v4_loader.py:981` `place_spec_as_jax_sharded` full-reads + returns host_np when
-  `return_host_np=True` even for axis-0 leaves (so host-gather has the data).
-  - **WHY it was needed:** uint8 packing makes w1/w3 SQUARE `[2048,2048]` → `pick_partition_spec`
-    strict-`>` tie-break (`deepseek_v4_loader.py:~513`) picks **axis-0** → slice-aware path → host_np
-    was None → host-gather DORMANT → `device_put` reshard. Those reshards are cross-host collectives;
-    on the v6e-16 4×4 topology they desync the SPMD launch group (HLO diff proved: HEAD launched a
-    real-data consolidation stack while the 3 WORKERS launched whole-tree scalar-fills). bf16's lone
-    w2 device_put worked on v6e-32 but NOT here — only ZERO consolidation collectives passes. (This is
-    the same axis-0 consolidation S1's S27 tried + reverted — see `HANDOFF_S1.md`.)
-  - host-gather = `make_array_from_callback` from full per-expert host numpy; collective-free + byte-
-    clean (no uninit-HBM reshard), so S1-safe. Load is now fully collective-free → completes.
+## WHAT LANDED (committed) — the loader + the load-path race fixes
+**Loader (Strategy C — keep FP4 experts compressed):** `26e4023d` declare routed experts FP4 +
+dequant-in-trace; `26318abf` emit FP4 experts compressed (uint8 weight + uint8 scale leaves, no bf16
+dequant); `580b1f83` scales as uint8; `6eb5241f` un-swallow loader exception (re-raise unless
+`V4_ALLOW_DUMMY_FALLBACK=1`); **`e1b434f8`** host-gather EVERY routed/mtp expert leaf ⇒ ZERO
+consolidation `device_put` reshards (the FIT FIX). CPU-gated throughout.
+
+**The post-load `scheckne` race — RESOLVED (the "freqs-fix pattern" = eliminate divergent eager TPU
+dispatches from the rank-0 worker that races ahead of the laggards):**
+- `fb54237b` **RoPE freqs → numpy/host** (removed the 16-partition freqs ops).
+- `0d8d57fe` **Q.8: sampling RNG key → host (CPU)** — `nnx.Rngs(jax.random.key(seed)).params()` @
+  `tpu_runner.py:581` wrapped in `with jax.default_device(cpu)` (that site is NOT under set_mesh, so
+  default_device is honored, unlike the freqs site). Killed `jit__threefry_fold_in` + `jit_add`.
+  Value byte-identical (threefry platform-deterministic; GATE samples at temp=0 = argmax = RNG-
+  independent anyway). Confirmed via HLO-module diff; blocker advanced to create_jit_model.
+- `83a18839` **Q.9: eager create_jit_model** (env `V4_EAGER_CREATE_JIT_MODEL`, default OFF in shared
+  infra, ON in the smoke). `create_jit_model` (`model_loader.py:126`, the only remaining racing
+  dispatch) is a `@nnx.jit` whose body (`nnx.state`→`nnx.update`→qwix-noop) is a no-op on the already-
+  concrete, host-gathered model AND is sharding-neutral (no `with_sharding_constraint`/
+  `get_partition_spec`), so running it eagerly hands the forward an IDENTICAL model with ZERO TPU
+  dispatch. The re-jit is only a forward PjitFunction-overhead optimization ("the created model can
+  already work"). RESULT: `jit_create_jit_model` no longer compiles, no scheckne, **`load_model`
+  completes** (`Init model | hbm=9.75/31.25`), progresses into the **real lockstep forward** (first time ever).
+
+**The divergent weight load — `ca016156` Q.10 (THE CURRENT FRONTIER):** after Q.9, the engine WEDGED
+(not a forward deadlock as first guessed — **py-spy of the 4 live workers** proved it): the head loaded
+real weights (`placed=68812`) while workers **.8/.17/.16 were stuck in `jnp.zeros` @ `deepseek_v4.py:2063`
+(dummy fallback)** because `is_local_dir` was False on them; EngineCore blocked forever in
+`collective_rpc` ray.get. ROOT (infra, longstanding, masked until Q.9 removed the scheckne): the GCS
+bucket `personal-mark-eu` (subdir `vllm/hub`) is mounted **enyouki-owned on the head** (`~/.cache/
+huggingface/hub`) but **root-only on the workers** (`/tmp/gcs/bucket`, EACCES for enyouki) → the worker
+serve proc can't read the weights. So "load completes (placed=68812)" was ALWAYS only the head. FIX =
+`scripts/full_slice_v4_mount_weights.sh` gives each worker its own enyouki gcsfuse mount at `~/.cache/
+huggingface/hub` (verified: `config.json` readable on all 4 hosts); wired as a hard-fail pre-flight in
+the smoke. **Mechanism-verified, NOT yet smoke-validated end-to-end.**
 
 ---
 
-- **`fb54237b` FIX #1 (RoPE freqs):** HLO-diff (head h15 vs workers h8/17/16) proved the post-load
-  scheckne was the eager freqs precompute: under `set_mesh(mesh)` `precompute_freqs_cis`'s jnp
-  arange/outer/exp compiled `num_partitions=16` (`jit_iota/outer/exp/power`, `T(1024)` tiling) and the
-  driver launched them while workers still ran `broadcast_in_dim` weight fills. `jax.default_device(cpu)`
-  was a NO-OP (set_mesh overrides it — dump byte-identical, still 16-partition). FIX = `precompute_freqs_cis`
-  now NUMPY (host; also honors the float64 complex-exp TPU truncates); `make_freqs_cis` returns the numpy
-  UNCOMMITTED (device_put-cpu is rejected by create_jit_model's jit mesh: "Received incompatible devices").
-  CPU oracle OK ×2; smoke: freqs ops GONE from head, load → real TPU compile (head 3→113 modules).
+## ⚠️ NEXT ACTION (do first) — run the validating smoke
+The slice is RESET + clean (16/16 TPU free), guardians alive, weights mounted on all 4 hosts.
+1. (if reboot happened) `scripts/full_slice_v4_mount_weights.sh` — re-mount weights (the smoke pre-flight
+   also runs it). Mounts do NOT survive a reboot.
+2. `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump bash scripts/full_slice_v4_smoke.sh` (V4_EAGER_CREATE_JIT_MODEL
+   defaults to 1 in the smoke). Watch the LOAD phase (~90s): you should now see **all 4 hosts load real
+   weights** (no `jnp.zeros` dummy fallback, no EngineCore ray.get wedge) → into the **first cluster-wide
+   real forward** (cold compile 10-30 min; `VLLM_ENGINE_READY_TIMEOUT_S=2400` already set).
+3. **The forward is the next UNKNOWN** — it was never reached with real weights on all 4 hosts. If it
+   hangs/crashes, that's a genuine forward blocker (NOT the dummy-load wedge — distinguish via py-spy:
+   `sudo env "PATH=$PATH" work/vllm_env/bin/py-spy dump --pid <PID>`; worker PIDs via
+   `ssh … 'ps -eo pid,cmd|grep RayWorker'`). For a launch-id scheckne, use the worker-to-worker HLO diff
+   (recipe below). For a hang, py-spy the 4 workers and compare stacks.
+4. On `Application startup complete` → run the **GATE** below (establish the v6e-16 baseline md5).
 
----
+Optional defensive follow-up: make `load_weights` honor `V4_ALLOW_DUMMY_FALLBACK` on the
+`is_local_dir=False` route too (`deepseek_v4.py:2060`) so a future mount gap RAISES loudly instead of
+silently dummy-zeroing into a wedge.
 
-## ⚠️ CURRENT BLOCKER — post-load `scheckne` (barrier approach RULED OUT; pivot to freqs-fix pattern)
-On the collective-free host-gather load that LOADS + FITS: load completes (`placed=68812`, ~40s) then
-`scheckne` at `TensorCoreSequencer` (tpu17) ~60-90s in. Now well-characterized (this session's agents +
-worker-to-worker HLO diff + barrier instrumentation):
-- **Race:** the rank-0 worker (co-located with the EngineCore driver on head .15; lowest RPC latency)
-  finishes the collective-free, HLO-free `make_array_from_callback` load FIRST and races into the
-  post-load eager programs while the 3 remote workers (.8/.17/.16) still place weights → fast rank
-  launches a program the laggards don't have at the same launch slot → launch-id mismatch.
-- **Workers are BYTE-IDENTICAL** (worker-to-worker diff: .8≡.17≡.16, every module's normalized md5
-  matches) → NO XLA compiler non-determinism. ⚠️ **Diff WORKER-to-WORKER (.8/.17/.16), NOT
-  head-vs-worker:** head .15's `/tmp/hlo_dump` MIXES the EngineCore driver (few modules) + the
-  co-located rank-0 worker (full set) → the OLD head-vs-worker diffs were apples-to-oranges
-  (they mistook the driver's small dump for "head-only divergent modules").
-- **Divergent post-load programs** (on the racing rank): `jit_create_jit_model` (the `@nnx.jit` @
-  `model_loader.py:126`, called `:274` inside get_model) + `jit__threefry_fold_in` + `jit_add` (the RNG
-  `nnx.Rngs(jax.random.key(seed)).params()` @ `tpu_runner.py:581`). ALL host-side (**0 collectives, 0
-  all-reduce** — confirmed in the HLO): model-state layout + seed-only RNG. They run in ALL 4 workers
-  (identical), just at different wall-clock times. (create_jit_model + RNG run in the worker actors,
-  NOT the driver — RayDistributedExecutor dispatches `load_model` via `collective_rpc` to 4 actors.)
-
-### Why BARRIERS are ruled out (both tried + REVERTED this session)
-- **Device-collective `sync_global_devices`** (`jax.experimental.multihost_utils`): compiles to a
-  16-partition `jit__identity_fn` collective that ITSELF needs lockstep launch → it BECOMES the new
-  divergent module (the fast rank launches it while laggards place weights) → crashes AT the barrier,
-  EARLIER than baseline. HLO-diff confirmed `identity_fn` as the divergent module_0012.
-- **Host-side `wait_at_barrier`** (`jax._src.distributed.global_state.client.wait_at_barrier(id, ms)` —
-  the coord-service barrier jax's OWN checkpoint mgr uses, signature verified): is a **SILENT NO-OP
-  here** — the client is `None` because this libtpu-env-var-based Ray setup never calls
-  `jax.distributed.initialize()`, so there is no coordination service. Instrumentation logged
-  `rank=0 ... PASSED ... coord=NONE`. (`jax.process_count()` returns 4 from the TPU topology, so a
-  `process_count()>1` guard passes MISLEADINGLY.) ⇒ No host-side barrier exists without first standing
-  up a coordination service. Verified-correct call (for reuse if a coord svc is set up later):
-  `from jax._src import distributed; distributed.global_state.client.wait_at_barrier("id", 600000)`.
-
-### ROADMAP / NEXT ACTIONS (do in order) — eliminate divergent dispatches, the proven lever
-1. **Apply the FREQS-FIX PATTERN to the RNG** (proven; `fb54237b` did exactly this for freqs).
-   `nnx.Rngs(jax.random.key(self.model_config.seed)).params()` @ `tpu_runner.py:581` compiles
-   `jit__threefry_fold_in`+`jit_add` on-device. The key is seed-only/host-deterministic → compute it on
-   HOST (numpy / `jax.default_device(cpu)`) and feed the result to `device_array(...)` (the `:582`
-   device_array is already host-side make_array_from_callback under Ray). Removes 2 of the 3 divergent
-   dispatches from the racing rank. Validate: CPU oracle (no-op for this, confirms no break) + smoke.
-   Each removal historically PROGRESSES to the next eager dispatch (freqs: 3→113 modules).
-2. **Then create_jit_model** (`@nnx.jit` @ `model_loader.py:126`, donate_argnums=(0,)): host-side
-   model-state realization (1492 sharding annots, 0 collectives). If removing the RNG alone doesn't get
-   past it, investigate making it NOT dispatch a divergent 16-partition program (run eagerly / outside
-   `set_mesh`, or guarantee lockstep launch). Shared infra — keep the diff minimal.
-3. **(Deprioritized) a WORKING barrier**, only if 1-2 don't suffice: (a) call `jax.distributed.initialize()`
-   early to populate `global_state.client` (RISK: conflict with the libtpu handshake / already-init
-   devices), or (b) a non-jax rendezvous (Ray `collective_rpc` barrier, or shared-FS barrier). Barriers
-   have NOT helped — try dispatch-elimination first.
-4. After it gets past create_jit_model: repeat the WORKER-to-WORKER HLO-diff for the next eager dispatch;
-   then the first real forward collective + cold compile (10-30 min, `VLLM_ENGINE_READY_TIMEOUT_S=2400`
-   already set) → **GATE** below (establish the v6e-16 baseline md5).
-
-OPEN QUESTION (does NOT block step 1): is the TPU launch-id collective-gated (only cross-core collectives
-must match) or per-program (every dispatch counts)? Evidence is mixed, BUT the freqs fix EMPIRICALLY
-worked by removing host-side eager dispatches → "eliminate the divergent dispatch from the racing rank"
-is the working lever regardless of the exact mechanism.
-
-HLO-diff helper (proven this session):
+HLO-diff helper (for a forward scheckne):
 ```
 for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude='*' \
   -e "ssh -i ~/.ssh/google_compute_engine" enyouki@10.164.0.$ip:/tmp/hlo_dump/ /tmp/hlo_cmp/h$ip/; done
-# then per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
-# ⚠️ COMPARE WORKER-to-WORKER: h8 vs h17 vs h16 (3 pure workers). DO NOT use h15 — its /tmp/hlo_dump
-# MIXES the EngineCore driver (few modules) + the co-located rank-0 worker, so h15-vs-workers is
-# apples-to-oranges. For content non-determinism: normalized-md5 each shared module across h8/h17/h16.
+# per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
+# ⚠️ COMPARE WORKER-to-WORKER (h8/h17/h16). NOT h15 — its dump MIXES the driver + the co-located rank-0
+# worker. For content non-det: normalized-md5 each shared module across h8/h17/h16.
 ```
 
 ---
@@ -150,41 +101,39 @@ for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude
 ## <a name="GATE"></a>GATE (non-negotiable) — for v6e-16
 Old v6e-32 md5 `5bf42256` is DEAD. Bar:
 - `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (port 18081; visible_words ≥ 10,
-  max_word_run < 5). (smoke_check uses prompt 'The capital of France is', temp=0.)
+  max_word_run < 5).
 - FIB decode: **correct Fibonacci (21,34,55,89,144)** in a longer decode + **N=2 md5 byte-identical
-  across 2 fresh engines** via `python3 /tmp/s1_probe2.py N` (RECREATED this session — prompt "Here is
-  the start of the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13,", temp=0 seed=0, auto-discovers model id;
-  ⚠️ /tmp is ephemeral — the file may be gone next session, the prompt above reproduces it). Establish
-  the NEW baseline hash once; confirm identical ×2 engines. READ the actual text ("contains Paris" is a
-  false positive). Do NOT gate on a long-tail md5 (nondeterministic at temp=0).
+  across 2 fresh engines** via `python3 /tmp/s1_probe2.py N` (RECREATED + verified present this session;
+  prompt "Here is the start of the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13,", temp=0 seed=0, port
+  18081, auto-discovers model id; ⚠️ /tmp is ephemeral). Establish the NEW baseline hash once; confirm
+  identical ×2 engines. READ the actual text ("contains Paris" is a false positive). Do NOT gate on a
+  long-tail md5 (nondeterministic at temp=0).
 
 ---
 
 ## VALIDATION TIERS (cheapest first)
-1. **CPU loader fp4 check** (~40s, no slice): `JAX_PLATFORMS=cpu PYTHONPATH=work/tpu-inference:work/vllm
-   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py` → "OK …". (Needs `work/scratch/tiny_v4_quant`
-   + `tiny_v4_groundtruth` fixtures.) **All CPU gates currently PASS.**
-1b. **CPU oracle** `scripts/s1_cpu_repro_v4flash.py both` (eager==jit, bad=0/12) + **fp4 dequant**
-   `scripts/quant_fp4_dequant_check.py` (max|Δ|=0). NOTE: CPU has mesh=None ⇒ consolidation/host-gather
-   is SKIPPED, so CPU CANNOT validate the host-gather or forward-compile paths — those need a smoke.
+1. **CPU loader fp4 check** (~40s): `JAX_PLATFORMS=cpu PYTHONPATH=work/tpu-inference:work/vllm
+   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py`. + CPU oracle `s1_cpu_repro_v4flash.py
+   both` + `quant_fp4_dequant_check.py`. NOTE: CPU has mesh=None ⇒ host-gather/forward-compile/the
+   multihost load are NOT exercised on CPU — those need a smoke. Runner-only changes (e.g. Q.8) aren't
+   exercised by the oracle either; validate those by snippet + smoke.
 2. **TPU microbench** (`scripts/perf_microbench*`).
-3. **Full smoke + GATE** — load completes (`placed=68812`, ~40s) then hits the create_jit_model/RNG
-   `scheckne` ~90s in. Cheap to iterate the blocker (crashes ~90s). HLO-dump recipe + cross-host diff
-   (helper above) is the tool: clear xla_cache+/tmp/hlo_dump on all 4, smoke with
-   `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`, then per-host opname-multiset diff WORKER-to-WORKER
-   (h8/h17/h16 — NOT h15, see helper caveat below) → divergent module = the culprit eager program.
+3. **Full smoke + GATE.** Load now ~40s/host; cold forward compile 10-30 min. HLO-dump recipe above.
 
 ---
 
 ## INFRA STATUS / v6e-16
 - Slice `v6spoteu719`, zone `europe-west4-a`, project `prm-research`. **v6e-16, topology 4×4**, 16
   chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16`. Ray healthy (16 TPU). TP=16.
-- ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashes the APIServer
-  before any TPU work. venv has no pip (uv): `~/.local/bin/uv pip install --python work/vllm_env/bin/python3
-  'numpy==2.3.5'` per host. Pre-smoke: `python3 -c "import numba"` per host.
+- ⚠️ **WEIGHTS MUST be readable by enyouki on ALL 4 hosts** (Q.10). The bringup mounts the GCS bucket
+  enyouki-owned only on the HEAD; the workers get a root-only mount → enyouki EACCES → silent dummy-
+  zeros load → wedge. **Run `scripts/full_slice_v4_mount_weights.sh` once per bringup** (idempotent;
+  the smoke pre-flight runs it; mounts do NOT survive reboot). Verify: `config.json` readable on .8/.17/.16.
+- ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashes the APIServer.
+  `~/.local/bin/uv pip install --python work/vllm_env/bin/python3 'numpy==2.3.5'` per host.
 - ⚠️ Ray "version mismatch" = mark's rogue ray container; **FIX = keep BOTH guardians alive**
   (`ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`; restart per the loop prompt,
   meta_guardian needs `10.164.0.15:6379`). Ray (re)start: `scripts/full_slice_v4_ray_restart.sh`.
 - After ANY code edit: `full_slice_v4_sync.sh` (rsync to 4 hosts; `git push` does NOT sync them) +
-  clear `~/.cache/vllm/xla_cache/*` on all 4 + verify md5 head==workers (mismatch → launch-id halt).
-  Shut down ONLY via `full_slice_v4_reset.sh`. HLO dump propagates to workers via the ray env (XLA_FLAGS).
+  clear `~/.cache/vllm/xla_cache/*` on all 4 + verify md5 head==workers. Shut down ONLY via
+  `full_slice_v4_reset.sh`. HLO dump propagates to workers via the ray env (XLA_FLAGS).
