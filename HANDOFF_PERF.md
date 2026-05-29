@@ -5,21 +5,21 @@
 > milestone (256 routed experts kept FP4-compressed; `MAX_SEQS=1`) is DONE and is a GIVEN — history in
 > `HANDOFF_QUANT.md`. S1 determinism history: `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29 — P.6): MoE decode lever CHARACTERIZED + roadmap #1 (mostly) CLOSED — the
-> dequant materialization is the cost, but it is NOT removable losslessly.** Decode wall stays at P.5's
-> **146 ms** (no production change this session — this is a measurement/analysis commit, GATE md5
-> `3069e80b` UNCHANGED). Extended `scripts/perf_microbench_moe_decode.py` with fp8-floor + a real
-> drafted-kernel variant (`scripts/perf_dense_fp8_moe_kernel.py`, CPU-validated 4.1e-7) and ran both on
-> the live 16-chip mesh. Findings: **(1)** at N=1 **fp8 read is NOT faster than bf16** (einsum-fp8w 0.75 ≈
-> einsum-only 0.78 /layer) — the matmul is NOT weight-bandwidth-bound, so reading fp8 codes buys nothing.
-> **(2)** EVERY in-trace decode kernel LOSES to XLA's materialize+matmul (production lean-noWSC **2.46**
-> /layer): naive Pallas matvec **11.60** (does the contraction on the VECTOR unit, not the MXU — interpret
-> can't catch this), gmm_v2 **5.48**. **(3)** The 2.46→0.78 gap (1.68 ms/layer ≈ 72 ms/step) is the
-> dequant materialization, but eliminating it losslessly needs **bf16-resident experts = 34.3 GiB/chip**
-> (8.57 GiB fp4 × 4) > the 31.25 GiB budget → does NOT fit (this is WHY QUANT kept experts FP4). The only
-> sub-2.46 path that FITS is **scaled-fp8-resident** (17.1 GiB) but it is LOSSY (rel ~3e-3/layer → compounds
-> over 43 layers → HIGH GATE risk). **⇒ The MoE is at its lossless floor (2.46/layer); the lossless win
-> frontier is now the OTHER ~33 ms (attn / indexer top_k / collectives) — roadmap #2.**
+> **One-line status (2026-05-29 — P.7): the ATTENTION-SIDE decode levers are REFUTED — they are NOT the
+> cost.** New tool `scripts/perf_microbench_attn_decode.py` (faithful, 16-chip, amortized) measured the
+> prime non-MoE suspects in isolation at real decode shapes. Findings: **(1)** the Mosaic
+> `sparse_attn_kernel` is OPTIMAL — **5× faster than the math-identical pure-JAX `sparse_attn`** even
+> amortized (parity bit-identical, max|Δ|=0) AND launch-bound (~**0.008 ms/layer** true device, CONSTANT
+> across kv_len 128→1152) ⇒ the pure-JAX swap is DEAD (DO-NOT-RETRY #15). **(2)** the CSA indexer is
+> NEGLIGIBLE — `lax.top_k([1,1,1024],512)`=**0.009 ms**, score einsum=**0.004 ms** ⇒ the roadmap-flagged
+> "indexer top_k lever" is REFUTED (#16). **(3)** sparse_attn + indexer together = **~0.6 ms** of the
+> ~33 ms non-MoE; the **~32 ms balance = Q/KV/O projections + MoE GATE + HC-sinkhorn + the many small
+> per-layer ops** — i.e. decode at N=1 is **on-device LAUNCH-bound** (~700 tiny ops × 43 layers), exactly
+> the campaign premise. **METHOD NOTE:** a single jitted call has a ~0.18 ms host dispatch+sync floor that
+> swamps these small ops (the naive rollup read 9 ms; amortizing R=64 in a `fori_loop` gave the true 0.3 ms)
+> — always amortize at N=1. No production code changed ⇒ GATE md5 `3069e80b` UNCHANGED, wall stays 146 ms.
+> **⇒ Both the MoE (106 ms, P.6) and the attention kernel/indexer are floor/optimal; the ONLY unattributed
+> lossless frontier is the ~32 ms projections+gate+launch-overhead — roadmap #1.**
 
 ---
 
@@ -34,32 +34,43 @@
 
 ---
 
-## ⇒ NEXT ACTION — the MoE is lossless-floor-bound; PIVOT to the other ~33 ms (roadmap #2)
-P.6 closed the "MoE kernel" line of attack: **every in-trace decode kernel loses to XLA's
-materialize+matmul (2.46 /layer)** — naive Pallas matvec 11.6 (vector-unit, not MXU), gmm_v2 5.48 — and
-the lossless way to skip the materialization (bf16-resident experts) does NOT fit (34.3 GiB/chip > 31.25
-budget). So the MoE expert-FFN is at its **lossless floor ≈ 106 ms** and the decode kernel idea is DEAD
-(DO-NOT-RETRY #12,13). **NEXT = the fresh decode-only device breakdown of the 33 ms NON-MoE** (was the
-"cheaper parallel step"; now the main event): attribute attention `sparse_attn` / the indexer `lax.top_k`
-over a STATIC `T` (scales with ctx) / collectives / `compute_logits`, and find the LOSSLESS wins there.
-Cheap (microbench tiers + 1 profiler re-capture; recipe below). The items dismissed as <1% when the MoE
-was ~100% deserve a re-rank now the MoE is 76%.
+## ⇒ NEXT ACTION — attribute the ~32 ms balance (projections + gate + launch overhead)
+P.7 closed the attention-side suspects: `sparse_attn_kernel` is optimal (DO-NOT-RETRY #15) and the indexer
+is negligible (#16) — together only ~0.6 ms. So the ~32 ms balance of the non-MoE is **everything else
+per decode step**: the Q/KV/O projections (`_linear` ×43: `wq_a[1024,4096]`, `wq_b[32768,1024]`,
+`wkv[512,4096]`, `wo_a` grouped, `wo_b[4096,8192]`), the MoE GATE/router (NOT in the 105.8 ms MoE
+microbench — that took pre-routed `pew`), the HC-sinkhorn (`hc_split_sinkhorn`, 20 iters ×43), the
+rms_norms / splice_rope / kv_cache `.at[].set()` writes, and the per-op on-device launch overhead.
+First-principles, none of those is compute/bandwidth-heavy (projections sharded read <1 ms total, logits
+already vocab-sharded ~0.15 ms — see DO-NOT-RETRY #17), so the ~32 ms is most likely **on-device launch
+overhead** (decode is launch-bound at N=1). **NEXT = attribute it**, two cheap tiers:
+  (a) EXTEND `perf_microbench_attn_decode.py` to time a full per-layer block (all projections + gate +
+      hc) amortized, ×43 — if it sums to ~32 ms the cost is those ops; if it's tiny, the cost is the
+      inter-op launch overhead a single repeated op can't capture (→ op-count is the lever).
+  (b) a CLEAN multi-step profiler re-capture (the only on-disk trace has just 1 first-exec step). Window a
+      steady 2nd+ step with a NEW `--decode-step` flag on `perf_parse_trace.py` (recipe: read the
+      `XLA Modules` lane, take the 2nd `jit_run_model` event's start, walk `XLA Ops` until a >2 ms gap).
+If it IS launch overhead, the lossless lever = op-count reduction (fusion / a layer `lax.scan`), but
+`lax.scan` over layers re-opens S1 (DO-NOT-RETRY #10) — so a lossless win may not exist and the campaign
+then pivots to the risky MoE lever below or declares the decode floor.
 
-The ONE remaining MoE lever, documented but HIGH-RISK (decide deliberately, don't default into it):
+The ONE remaining MoE lever, documented but HIGH-RISK (deliberate, don't default into it):
 **scaled-fp8-resident experts** — bake `(fp4_code × e8m0_scale) → fp8 e4m3` at LOAD time (fits: 17.1
-GiB/chip), so decode reads fp8 directly (einsum-fp8w floor **0.75 /layer**, ~106→~32 ms, NO in-trace
-dequant, NO kernel). But it is **LOSSY** (rel ~3e-3 per matmul, compounds over 43 layers → likely breaks
-the GATE) AND touches the S1-fused load path. Only attempt if decode latency is paramount and you accept
-re-baselining the md5 + a real smoke that may fail. *L · risk HIGH.*
+GiB/chip), decode reads fp8 directly (einsum-fp8w floor **0.75 /layer**, ~106→~32 ms, NO in-trace dequant).
+But **LOSSY** (rel ~3e-3/matmul, compounds ×43 → likely breaks GATE) AND touches the S1-fused load path.
+Only if decode latency is paramount and you accept re-baselining the md5 + a smoke that may fail. *L · risk HIGH.*
 
 ---
 
-## THE ROADMAP (re-ranked P.6 — every item clears the GATE)
-1. **[re-profile / 33 ms]** The NEXT ACTION: decode-only device breakdown of the ~33 ms NON-MoE
-   (attn `sparse_attn` / indexer `lax.top_k` over static `T` / collectives / `compute_logits`); find the
-   LOSSLESS wins now the MoE is floor-bound. Cheap (microbench tiers + 1 profiler re-capture). *S.* ← TOP.
+## THE ROADMAP (re-ranked P.7 — every item clears the GATE)
+1. **[attribute the ~32 ms]** The NEXT ACTION (above): attention kernel + indexer are CLOSED (~0.6 ms);
+   attribute the ~32 ms balance = projections + MoE gate + HC-sinkhorn + per-op launch overhead. Cheap
+   (extend `perf_microbench_attn_decode.py` to a full-per-layer amortized block, and/or a clean multi-step
+   profiler + a `--decode-step` windowing flag). Determines whether ANY lossless decode lever remains
+   or it's S1-blocked launch overhead. *S.* ← TOP.
 2. **[dtype]** attention `_linear` `deepseek_v4_attention.py:514` bf16-in/fp32-acc (KEEP `|r|<1e8` clamp).
-   Small; likely folds into #1's findings. *S.*
+   The projections ARE in the implicated ~32 ms now — but this is numerics-SHIFTING (not lossless), so it
+   needs a re-baselined md5 + smoke, not a free win. *S · risk MED (md5 shift).*
 3. **[5-cleanup]** Phase 5 diff-shrink — remove `_v4_nan_tripwire` (37 sites + def + `smoke.sh:81/116`).
    Edit `.py` AND `.sh` TOGETHER (Pitfall #0). KEEP `_linear` clamp + `compute_logits` nan_to_num.
    Cosmetic; the documented fallback when levers stall. *S · risk low.*
@@ -100,13 +111,32 @@ re-baselining the md5 + a real smoke that may fail. *L · risk HIGH.*
 14. ★ **bf16-resident (pre-materialized) experts — does NOT FIT (P.6).** 8.57 GiB/chip fp4 × 4 = 34.3
     GiB > the 31.25 GiB budget. This is WHY QUANT keeps experts FP4 — do not re-litigate. (scaled-fp8
     resident = 17.1 GiB DOES fit but is lossy; roadmap #4.)
+15. ★ **Swapping the Mosaic `sparse_attn_kernel` for pure-JAX `sparse_attn` on decode — REFUTED (P.7).**
+    The kernel is **5× FASTER** even amortized (CSA 0.008 vs jax 0.051 ms/layer; HCA/dense 0.007 vs 0.015)
+    and launch-bound (CONSTANT ~0.008 ms across kv_len 128→1152, i.e. the N=1 attention compute is ~nil).
+    Parity bit-identical (max|Δ|=0). The kernel is optimal; do NOT revisit. (`perf_microbench_attn_decode.py`.)
+16. ★ **The CSA indexer `lax.top_k` / score einsum as a decode lever — REFUTED (P.7).** `top_k([1,1,1024],
+    512)`=0.009 ms, score einsum=0.004 ms (×21 CSA layers = 0.27 ms/step). The "indexer top_k scales with
+    ctx" worry is real but the absolute cost is negligible at MAX_LEN=4096. Reducing `index_topk` is also
+    NOT lossless (changes which KV the sparse attn sees). Drop it from the suspect list.
+17. ★ **compute_logits head_w vocab sharding — ALREADY DONE (P.7).** `head_w[129280,4096]` fp32 is already
+    column-sharded `P('attn_dp', None)` 16-way (`pick_partition_spec` → largest dim; mesh attn_dp=16); each
+    chip reads only ~0.13 GB and computes its 1/16 logit slice with ZERO all-reduce/all-gather on the head.
+    No replicated-2.1GB lever to capture — it's captured. (loader :469-520, model_loader :344/:398.)
 
 ---
 
 ## VERIFIED FACTS / cheap tiers (don't re-derive)
 - **Decode per-step split (P.5 — V4_DECODE_TIMERS, 96 steady steps, MAX_SEQS=1 MAX_LEN=4096):**
   device_wait **138.9** / wall **145.6 ms** (was 207.9 / 216.3 at P.4). Of device_wait, MoE expert-FFN
-  ≈ 106 ms (76%), matmul-floor ≈ 34 ms, other (attn/logits/gate/collectives) ≈ 33 ms.
+  ≈ 106 ms (76%); the **~33 ms balance** is NON-MoE — P.7 showed sparse_attn+indexer is only ~0.6 ms of
+  it, so the ~32 ms is projections + MoE gate + HC-sinkhorn + per-op launch overhead (unattributed; #1).
+- **`perf_microbench_attn_decode.py` (16-chip, N=1, replicated; P.7) — AMORTIZED device-ms/call** (fori_loop
+  R=64, dispatch removed): sparse_attn KERNEL CSA **0.008** HCA 0.007 dense 0.006 (→0.32 ms/step ×layers);
+  pure-JAX sparse_attn CSA 0.051 (kernel 5× faster, parity max|Δ|=0); indexer `top_k([1,1,1024],512)`
+  **0.009**, score einsum **0.004** (→0.27 ms/step ×21 CSA). ⚠️ the SINGLE-call med is ~0.18 ms
+  dispatch-inflated — at N=1 ALWAYS amortize. Run: sync then `MH_TIMEOUT=900 …mh_run.sh
+  scripts/perf_microbench_attn_decode.py --distributed`. EXTEND it next for the projections+gate (roadmap #1).
 - **`perf_microbench_moe_decode.py` (16-chip, N=1, real dims dim=4096 inter=2048 E=256/16 local, top_k=6) —
   ms/layer (P.6 re-run):** baseline **3.70** / lean **3.69** / lean-noWSC **2.46** (production) / gmm **5.48** /
   KERNEL (drafted dense fp8 in-reg dequant) **11.60** / dequant-only **5.15** / einsum-only **0.78** (matmul

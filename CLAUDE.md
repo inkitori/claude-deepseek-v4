@@ -10,17 +10,17 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.6): decode MoE lever CHARACTERIZED → roadmap #1 (mostly) CLOSED; PIVOT
-> to the other ~33 ms.** Decode wall stays at P.5's **146 ms** (P.6 changed NO production code — a
-> measurement/analysis commit; GATE md5 `3069e80b` UNCHANGED). Microbench (`perf_microbench_moe_decode.py`,
-> live 16-chip) + a drafted kernel (`perf_dense_fp8_moe_kernel.py`, CPU 4.1e-7) proved: at N=1 **fp8 read
-> is NOT faster than bf16** (0.75≈0.78/layer — not bandwidth-bound), EVERY in-trace decode kernel LOSES to
-> XLA's materialize+matmul (production lean-noWSC **2.46**/layer; naive Pallas matvec **11.6** = vector-unit
-> not MXU; gmm 5.48), and the lossless skip (bf16-resident experts) does NOT fit (34.3>31.25 GiB — WHY QUANT
-> kept FP4). So the MoE is at its lossless floor ≈106 ms. **NEXT = decode-only breakdown of the ~33 ms
-> NON-MoE** (attn / indexer `top_k` / collectives) for lossless wins. The one risky MoE lever left =
-> scaled-fp8-resident (fits, 0.75/layer, but LOSSY → GATE risk). See `HANDOFF_PERF.md`. GATE (non-negotiable):
-> FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.7): the ATTENTION-side decode levers are REFUTED — not the cost.**
+> Decode wall stays at P.5's **146 ms** (P.7 changed NO production code — a measurement/analysis commit;
+> GATE md5 `3069e80b` UNCHANGED). New tool `perf_microbench_attn_decode.py` (16-chip, amortized) proved:
+> the Mosaic `sparse_attn_kernel` is OPTIMAL (5× > pure-JAX, parity-identical, launch-bound ~0.008 ms/layer)
+> and the CSA indexer `top_k`/score is NEGLIGIBLE (~0.3 ms/step) — together only ~0.6 ms of the ~33 ms
+> non-MoE. So BOTH the MoE (~106 ms, P.6 lossless floor) AND the attention kernel/indexer are floor/optimal;
+> the **~32 ms balance = Q/KV/O projections + MoE gate + HC-sinkhorn + per-op launch overhead** (decode is
+> launch-bound at N=1), and is the ONLY unattributed lossless frontier. **NEXT = attribute that ~32 ms**
+> (extend the attn microbench to a full-per-layer block, and/or a clean multi-step profiler). The one risky
+> MoE lever left = scaled-fp8-resident (fits, 0.75/layer, but LOSSY → GATE risk). See `HANDOFF_PERF.md`.
+> GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
@@ -30,9 +30,10 @@ ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pin
 target** (now ~146 ms/step / 0.146 s/tok after P.5 lean-dequant; 277 → 220 → 146 — V4_DECODE_TIMERS, TRUSTED).
 The per-step SPLIT (P.5, worker timers): device_wait ~139 ms + host-dispatch ~8 ms + aDAG; the MoE
 expert-FFN is ~106 ms (76% of device_wait). P.6 showed that ~106 ms is the MoE's LOSSLESS FLOOR (every
-in-trace decode kernel loses to XLA's materialize+matmul; bf16-resident experts don't fit). NEXT = the
-decode-only breakdown of the ~33 ms NON-MoE (attn / indexer `top_k` / collectives) for lossless wins; the
-one risky MoE lever left is scaled-fp8-resident (lossy — see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+in-trace decode kernel loses to XLA's materialize+matmul; bf16-resident experts don't fit). P.7 then
+REFUTED the attention-side suspects (sparse_attn kernel OPTIMAL, indexer NEGLIGIBLE, ~0.6 ms together).
+NEXT = attribute the ~32 ms non-MoE balance (Q/KV/O projections / MoE gate / HC-sinkhorn / per-op launch
+overhead); the one risky MoE lever left is scaled-fp8-resident (lossy — see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
 campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
 as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
 with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
@@ -108,11 +109,12 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 
 ## Plumbing (read before touching — perf priority order)
 
-* `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (:160, gather :186, fp32 cast
-  :181; the KV gather is FIXED by the Phase-1 fused kernel → 0.2% of decode) + call sites (decode
-  :812, prefill :905); the indexer (`indexer_prefill` :366 / `indexer_decode_step` :562, the
-  `lax.top_k` over a STATIC `T` buffer — the remaining attention-side decode lever, scales with
-  ctx). compressor; seed-from-prefill. Attention is HEALTHY/correct — the work is making it fast.
+* `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (:173 pure-JAX ref / Mosaic kernel via
+  `_sparse_attn_kernel_sharded` :219) + call sites (decode :857, prefill :950); the indexer
+  (`indexer_prefill` :366 / `indexer_decode_step` :607, the `lax.top_k` :659 over a STATIC `T`). ⚠️ P.7
+  REFUTED both as decode levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the indexer is NEGLIGIBLE
+  (~0.3 ms/step) — see DO-NOT-RETRY #15,16. Attention is HEALTHY/correct AND fast; the non-MoE cost is the
+  projections+gate+launch overhead, NOT here. compressor; seed-from-prefill.
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
