@@ -1490,10 +1490,10 @@ def _build_class():
             import numpy as _np
             from jax.sharding import NamedSharding, PartitionSpec as _P
             from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams as _MoEParams
-            # `(?:_scale)?` so the e8m0 block-scale leaves (FP4 experts,
-            # Strategy C) consolidate into `wN_scale_stacked` via the same
-            # device-reshard as wN. `_is_stash_leaf` still matches only w1/w3
-            # (group 3 exact), so scales skip the host-gather (tiny, axis-0).
+            # `(?:_scale)?` so the block-scale leaves (FP4 experts, Strategy C)
+            # consolidate into `wN_scale_stacked` like wN. `_is_stash_leaf` (and
+            # `use_host_gather`) match w1/w3 AND the scales, so they host-gather
+            # (no device_put reshard collective); only w2 keeps the device_put.
             _expert_path_re = _re.compile(
                 r'^layers\[(\d+)\]\.moe\.experts\[(\d+)\]\.(w[123](?:_scale)?)$')
             _mtp_expert_path_re = _re.compile(
@@ -1513,7 +1513,15 @@ def _build_class():
             def _is_stash_leaf(jax_path: str) -> bool:
                 m = (_expert_path_re.match(jax_path)
                      or _mtp_expert_path_re.match(jax_path))
-                return m is not None and m.group(3) in ("w1", "w3")
+                # w1/w3 + ALL scale leaves host-gather (full-read host numpy ->
+                # make_array_from_callback, NO device_put reshard collective);
+                # only w2 keeps the byte-clean device_put. This restores the
+                # proven bf16 consolidation (1 collective/layer). uint8 packing
+                # made w1/w3 SQUARE [2048,2048] -> pick_partition_spec axis-0 ->
+                # device_put, and 6 device_put reshards/layer desync the SPMD
+                # launch group across hosts (scheckne). See HANDOFF_QUANT.
+                return m is not None and (
+                    m.group(3) in ("w1", "w3") or m.group(3).endswith("_scale"))
 
             def _maybe_consolidate(jax_path: str):
                 # Identify group key, increment counter; if we hit 256,
@@ -1550,7 +1558,7 @@ def _build_class():
                 n_e = self.config.n_routed_experts
                 stash_keys = [f"{path_prefix}[{e}].{wname}" for e in range(n_e)]
                 use_host_gather = (
-                    wname in ("w1", "w3")
+                    (wname in ("w1", "w3") or wname.endswith("_scale"))
                     and all(k in _expert_host_np for k in stash_keys))
                 if use_host_gather:
                     # Host-gather: stack the captured full per-expert host numpy
@@ -2024,16 +2032,23 @@ def _build_class():
                     self.load_weights_from_dir(model_path)
                     return set()
                 except Exception as e:
-                    # Don't crash engine init — fall back to dummy load
-                    # and surface the error in logs. The forward pass
-                    # will still produce defined (zero-weighted) output.
                     import traceback
                     print(
                         f"[deepseek_v4] load_weights_from_dir({model_path!r}) "
-                        f"failed: {e!r}; falling back to dummy zero-fill.\n"
-                        f"{traceback.format_exc()}",
+                        f"failed: {e!r}\n{traceback.format_exc()}",
                         flush=True,
                     )
+                    # A real local-dir load that RAISES must NOT silently serve
+                    # zero-weighted garbage: it can pass a weak smoke with
+                    # coherent-looking-but-wrong output (the GATE false-positive),
+                    # and on a multi-host slice the failing host drops into the
+                    # whole-tree jnp.zeros fallback below while the others keep
+                    # doing the real consolidation device_put -> the SPMD launch
+                    # groups diverge -> `scheckne` core-halt. Crash LOUDLY with
+                    # the real traceback unless the dummy fallback is explicitly
+                    # opted into (profiling / shape-only runs).
+                    if os.environ.get("V4_ALLOW_DUMMY_FALLBACK", "0") != "1":
+                        raise
 
             # Dummy fallback: materialize all leaves as zeros.
             def _materialize(leaf):

@@ -978,8 +978,14 @@ def place_spec_as_jax_sharded(
     sharding = NamedSharding(mesh, spec_p)
     sharded_axis = next((i for i, ax in enumerate(spec_p) if ax is not None), None)
 
-    if sharded_axis != 0:
-        # Replicated or non-axis-0 sharded: read full, slice in callback.
+    if sharded_axis != 0 or return_host_np:
+        # Replicated / non-axis-0 sharded, OR a host-gather stash leaf
+        # (return_host_np=True): read the FULL tensor and slice in the callback,
+        # so we can hand back the full per-expert host numpy. Host-gather
+        # consolidation (make_array_from_callback) then builds the E-sharded
+        # stack with NO device_put reshard collective. Critical for the square
+        # uint8 FP4 expert leaves: their pick_partition_spec axis-0 device_put
+        # reshard desyncs the multi-host SPMD launch group (scheckne core-halt).
         t = _full()
         np_arr = _torch_to_numpy_preserve(t)
         if np_arr.dtype != target:
