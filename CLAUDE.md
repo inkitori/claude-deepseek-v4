@@ -1,55 +1,48 @@
-# claude-deepseek-v4 — QUANT / FIT-ON-v6e-16 runbook
+# claude-deepseek-v4 — PERFORMANCE runbook (v6e-16)
 
-> **Phase = QUANT. START HERE: `HANDOFF_QUANT.md`** (current state + the HBM math + THE ROADMAP +
-> the GATE + the ONE next action). This file holds durable slice ops (how to run, validate,
-> pitfalls). The job: make `vllm serve DeepSeek-V4-Flash` LOAD AND SERVE CORRECTLY on the
-> **v6e-16** slice by NOT dequantizing its native FP8/FP4 weights to full bf16 at load. Prior
-> campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
-> (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
+> **Phase = PERFORMANCE. START HERE: `HANDOFF_PERF.md`** (current state + THE ROADMAP + the GATE +
+> the ONE next action). This file holds durable slice ops (how to run, validate, pitfalls). The job:
+> make `vllm serve DeepSeek-V4-Flash` **DECODE + PREFILL FAST** on the **v6e-16** slice WITHOUT
+> breaking the correctness GATE. **The FIT milestone is DONE** (QUANT campaign): V4-Flash loads + fits
+> + serves + decodes correctly + deterministically on v6e-16 with the 256 routed experts kept
+> **FP4-compressed** (fed to `gmm_v2` as fp8 codes + per-block `rhs_scale`), **`MAX_SEQS=1` pinned**.
+> That is the GIVEN foundation perf builds on — do NOT re-litigate or rebuild it (history:
+> `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
+> `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** 🎯 **MILESTONE — GATE PASSED.** V4-Flash LOADS + FITS + SERVES +
-> DECODES CORRECTLY + DETERMINISTICALLY on v6e-16 with the FP4 experts kept compressed — the campaign's
-> core goal is MET. The MoE feeds the FP4 experts to `gmm_v2` as **fp8 codes + per-block `rhs_scale`**
-> (Q.13 `0d24d6af`): the fp4 codes cast LOSSLESSLY to fp8 e4m3 (v6e Mosaic CANNOT compile the native
-> fp4 kernel unpack — fp4 MXU needs TPU v7), avoiding both the in-trace bf16 dequant OOM (Q.11) and the
-> fp4 MosaicError (Q.12). GATE ✅: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical
-> ×2 fresh engines + `smoke_check` rc=0 — re-confirmed at **MAX_LEN=4096** (full context, 16× the prior
-> 256) in Q.14 incl. a 445-tok long-prefill stress probe. **Q.15 tested the LAST open config, MAX_SEQS>1
-> (concurrent decode) → CONFIRMED BROKEN** (S1-class corruption: 3/4 concurrent requests silently garbage;
-> `_v4_decode_replicate` covers num_reqs==1 only — NOT a quant bug; MAX_SEQS=1 is the validated config &
-> already the pinned constraint; `scripts/quant_concurrent_probe.py` detects it). **QUANT AXIS DONE** — every
-> config gated-working or characterized-and-scoped-out. **NEXT = PERF (~0.43 tok/s) or concurrent-decode
-> determinism — BOTH SEPARATE non-quant loops; operator should `touch /tmp/quant_loop_stop`.** The decode
-> bf16 dequant is NOT a fit risk (~10 GiB/chip residency, ~21 GiB headroom; N-independent). See `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** 🏁 **PERF phase (re)opened on v6e-16.** Decode ≈ **0.43 tok/s**
+> (~2.3 s/token) is the primary target; at N=1 it is launch-/collective-/HBM-bound, NOT compute-bound.
+> ⚠️ **The decode profile in `HANDOFF_PERF.md` is STALE** — captured on v6e-32, PRE-Phase-3.1, with
+> bf16 experts; we now run v6e-16 + FP4→fp8 experts + MAX_SEQS=1, so the lever ranking has almost
+> certainly shifted — **RE-PROFILE before chasing any lever** (see `HANDOFF_PERF.md` for THE ROADMAP +
+> the ONE next action). GATE (regression, non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5
+> `3069e80b` byte-identical ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
-Make `vllm serve deepseek-ai/DeepSeek-V4-Flash` LOAD AND SERVE CORRECTLY on the **v6e-16** slice
-(TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_QUANT.md` roadmap top-down. The
-model ships natively quantized (FP8 dense + FP4 experts); the loader dequantizes everything to
-bf16, which does NOT fit the v6e-16's 512 GiB HBM (~542 GiB → OOM). **Keep the FP4 experts
-compressed in HBM** (they're 92–95% of the footprint) instead of expanding to bf16, while keeping
-correctness (the GATE below). Shrink the diff vs upstream `tpu-inference`; reuse the existing
-`gmm_v2` `rhs_scale` / `float4_e2m1fn` / MXFP4 (`gpt_oss._load_mxfp4`) machinery — don't rebuild.
+Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the **v6e-16** slice
+(TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_PERF.md` roadmap top-down — without
+ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pinned) is the primary
+target** (~0.43 tok/s); it is launch-/collective-/HBM-bound, NOT compute-bound, so the levers are
+collectives (all-reduce), dispatch/launch overhead, the indexer `top_k`, and weight streaming —
+re-profile to confirm the ranking on the current (v6e-16 + FP4-experts) config before committing to
+one. The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
+as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
+with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
 
 ## CORRECTNESS GATE — NON-NEGOTIABLE for every change
 
-⚠️ **v6e-16 / QUANT note:** the md5 `5bf42256` below was set on **v6e-32 + bf16** and is **DEAD
-here** — bf16 can't load on v6e-16, and keeping experts FP4 changes the numerics. The live bar is
-in **`HANDOFF_QUANT.md` §GATE**: correct Fibonacci + N=2 md5 identical ×2 fresh engines (a NEW
-baseline established once the model fits) + smoke_check rc=0. The mechanics below still apply (how
-to probe, the false-positive warnings); only the specific hash is re-established.
-
+This is the **v6e-16 baseline** established by the QUANT campaign (the old v6e-32 + bf16 md5
+`5bf42256` is **DEAD** — bf16 can't even load here, and keeping experts FP4 changed the numerics).
 Every committed change MUST still pass, verified on a fresh real-V4 engine:
 * `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10,
   max_word_run < 5).
-* FIB decode: **correct Fibonacci** (21, 34, 55, 89, 144 — DETERMINISTIC/high-margin) +
-  **N=2 md5 `5bf42256` byte-identical across 2 fresh engines** (`/tmp/s1_probe2.py 2`, =
-  md5("21,")). ⚠️ Do NOT gate on a long-tail md5 (`s1_probe2.py 20`+): PERF-0.1 found the FIB
-  free-form TAIL is NON-deterministic at temp=0 (flips WITHIN one process,
-  `e4d45024`↔`26354502`) — pre-existing DECODE-path runtime nondeterminism (distributed
-  all-reduce ordering), so old long-tail refs (`b675be27`) were sampling a nondeterministic
-  quantity. (Baseline-confirm TODO: HANDOFF_PERF §0.1-DONE.)
+* FIB decode: **correct Fibonacci** (`21, 34, 55, 89, 144, 233, 377, 610` — DETERMINISTIC/high-
+  margin) + **N=2 md5 `3069e80b` byte-identical across 2 fresh engines** (`scripts/s1_probe2.py 2`,
+  text `' 21'`). ⚠️ Do NOT gate on a long-tail md5 (`s1_probe2.py 20`+): the FIB free-form TAIL is
+  NON-deterministic at temp=0 (pre-existing DECODE-path runtime nondeterminism — distributed
+  all-reduce ordering), so a long-tail ref samples a nondeterministic quantity.
 * Still passes after 5 unrelated requests.
 
 A numerics-changing fix MAY shift the md5 — then re-establish a NEW reference and confirm it's
@@ -62,7 +55,7 @@ per-process uninit-HBM coin flip — coherent-looking output is NOT proof. Detai
 
 ## How to validate (CHEAPEST signal first — this is the heart of the perf phase)
 
-The full smoke is the expensive thing (543 GiB load + 25-45 min cold compile). Reserve it.
+The full smoke is the expensive thing (full-model load + 25-45 min cold compile). Reserve it.
 Escalate only as far up as the question needs:
 
 1. **CPU numerics (no slice, cheap):** the torch oracle. `PYTHONPATH=work/tpu-inference:work/vllm
@@ -74,10 +67,10 @@ Escalate only as far up as the question needs:
    Attention-math parity tests `tests/models/jax/test_deepseek_v4.py -k sparse_attn` exist but are
    interpret-mode SLOW (>540s on CPU, often times out — not a practical quick check; the e2e oracle
    above is the CPU tier). CPU CANNOT reproduce S1 (no sharding) — proves math, never a determinism fix.
-2. **TPU MICRO-BENCHMARK (cheap slice, NO 543 GiB load):** jit + time a kernel/op in isolation
-   on the real mesh with SYNTHETIC inputs — measures gather ms / bandwidth / kernel speedup in
-   ~1 min vs a 25-45 min smoke. **BUILD this (Phase 0.0) if `scripts/perf_*bench*` doesn't
-   exist yet** — it unblocks cheap iteration for the whole kernel campaign.
+2. **TPU MICRO-BENCHMARK (cheap slice, NO full-model load):** jit + time a kernel/op in isolation
+   on the real mesh with SYNTHETIC inputs — measures op ms / bandwidth / kernel speedup in
+   ~1 min vs a 25-45 min smoke. `scripts/perf_microbench*` exists (sparse-attn) — **EXTEND it**
+   for the op you're chasing (all-reduce on 4×4, `lax.top_k` over `T`, gmm_v2 fp8 vs dense bf16).
 3. **Profiler re-capture (full smoke + profiler):** the structural op-breakdown truth.
    Recipe in `HANDOFF_PERF.md`. Reserve.
 4. **Full smoke + the S1 GATE above:** the per-change closure gate; at most 1-2 per session.
@@ -106,10 +99,11 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 
 ## Plumbing (read before touching — perf priority order)
 
-* `layers/jax/attention/deepseek_v4_attention.py` — **the bottleneck.** `sparse_attn` (:160,
-  gather :186, fp32 cast :181) + call sites (decode :812, prefill :905); the indexer
-  (`indexer_prefill` :366 / `indexer_decode_step` :562, the `lax.top_k` `while` loop);
-  compressor; seed-from-prefill. Attention is HEALTHY/correct — the work is making it fast.
+* `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (:160, gather :186, fp32 cast
+  :181; the KV gather is FIXED by the Phase-1 fused kernel → 0.2% of decode) + call sites (decode
+  :812, prefill :905); the indexer (`indexer_prefill` :366 / `indexer_decode_step` :562, the
+  `lax.top_k` over a STATIC `T` buffer — the remaining attention-side decode lever, scales with
+  ctx). compressor; seed-from-prefill. Attention is HEALTHY/correct — the work is making it fast.
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
@@ -120,9 +114,10 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   remove; mind pitfall #5.
 * `models/jax/deepseek_v4_loader.py::pick_partition_spec` (:497) — weight sharding heuristic;
   flipping contracting→output dim is the Phase-2 all-reduce win.
-* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense all-256 decode path (:217) vs
-  sharded `gmm_v2` prefill path (:233); the `use_shard_map` gate (:211) is the chat-wedge
-  trigger (Phase 4.1). ~10% of decode — SECONDARY despite 97% of FLOPs.
+* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense decode path (:217, bf16-dequants the
+  16 local FP4 experts per step) vs sharded `gmm_v2` prefill path (:233, FP4 codes → fp8 +
+  `rhs_scale`, the QUANT fix); the `use_shard_map` gate (:211) is the chat-wedge trigger (Phase 4.1).
+  ~10% of decode — SECONDARY despite 97% of FLOPs (HBM-bound weight streaming at N=1).
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).

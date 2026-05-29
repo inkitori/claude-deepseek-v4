@@ -1,8 +1,14 @@
 # Handoff — DeepSeek-V4-Flash QUANTIZED-WEIGHT-LOADING campaign (v6e-16)
 
-> **Phase = QUANT / FIT-ON-v6e-16.** Make `vllm serve DeepSeek-V4-Flash` LOAD AND SERVE CORRECTLY on
-> **v6e-16** by **NOT dequantizing the FP4 experts to bf16**. Durable slice ops + pitfalls: `CLAUDE.md`.
-> Prior campaigns (history): `HANDOFF_PERF.md`, `HANDOFF_S1.md`. This doc = the loop's memory.
+> **⛔ CAMPAIGN CLOSED — THIS DOC IS HISTORY (kept for reference, like `HANDOFF_S1.md`).** The QUANT
+> axis is DONE: V4-Flash loads + fits + serves + decodes correctly + deterministically on v6e-16 with
+> the FP4 experts kept compressed (`MAX_SEQS=1`), gate md5 `3069e80b`. The **live phase is PERFORMANCE —
+> see `HANDOFF_PERF.md`** (and `CLAUDE.md` for the runbook). The FP4-compressed serving path described
+> below is now a GIVEN foundation; do not rebuild or re-litigate it.
+>
+> **Phase = QUANT / FIT-ON-v6e-16 (CLOSED).** Make `vllm serve DeepSeek-V4-Flash` LOAD AND SERVE
+> CORRECTLY on **v6e-16** by **NOT dequantizing the FP4 experts to bf16**. Durable slice ops + pitfalls:
+> `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`, `HANDOFF_S1.md`. This doc = the loop's memory.
 >
 > **One-line status (2026-05-29):** 🎯 **GATE PASSED + HARDENED + QUANT AXIS EXHAUSTED.** V4-Flash LOADS +
 > FITS + SERVES + DECODES CORRECTLY + DETERMINISTICALLY on v6e-16 (MAX_SEQS=1) with the FP4 experts kept
