@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Any, Optional
 
 import jax
@@ -271,9 +272,29 @@ def _get_nnx_model(
                 del vllm_config.model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)
-            jit_model = create_jit_model(
-                model,
-                use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
+            if os.environ.get("V4_EAGER_CREATE_JIT_MODEL", "0") == "1":
+                # v6e-16 multihost scheckne fix: create_jit_model's @nnx.jit
+                # compiles a 16-partition SPMD program that the fast rank-0 worker
+                # (co-located with the driver) launches AHEAD of the laggard workers
+                # still in model.load_weights -> launch-id desync. After load_weights
+                # the model is already concrete + on-mesh, so the re-jit body (state
+                # extract/update + qwix) is a no-op that runs eagerly with ZERO TPU
+                # dispatch. The re-jit is only a forward PjitFunction-overhead
+                # optimization (comment above) -- perf, not correctness ("the created
+                # model can already work"). Eager = the dispatch-elimination lever
+                # (cf. the RoPE-freqs and sampling-RNG ->host fixes). Off by default
+                # (shared infra); the v6e-16 smoke opts in.
+                state = nnx.state(model)
+                nnx.update(model, state)
+                if not should_apply_qwix_on_abstract_model:
+                    model = apply_qwix_quantization(
+                        vllm_config, model, rng, mesh,
+                        apply_to_abstract_model=False)
+                jit_model = model
+            else:
+                jit_model = create_jit_model(
+                    model,
+                    use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
     return jit_model
 
 

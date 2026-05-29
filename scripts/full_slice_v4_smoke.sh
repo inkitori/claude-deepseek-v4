@@ -69,6 +69,11 @@ export V4_LOADER_PREFETCH_WORKERS="${V4_LOADER_PREFETCH_WORKERS:-0}"
 # V4_DECODE_NAN_TRIPWIRE=1 to emit per-sub-block NaN counts to the log
 # (the silent-callback path runs always — see `_v4_nan_tripwire`).
 export V4_DECODE_NAN_TRIPWIRE="${V4_DECODE_NAN_TRIPWIRE:-0}"
+# v6e-16 scheckne fix: run create_jit_model's state re-wrap EAGERLY (no @nnx.jit
+# dispatch) so the fast rank-0 worker doesn't launch a 16-partition SPMD program
+# ahead of the laggard workers (launch-id desync). On by default for this slice;
+# model_loader defaults it OFF (shared infra). See model_loader.py:_get_nnx_model.
+export V4_EAGER_CREATE_JIT_MODEL="${V4_EAGER_CREATE_JIT_MODEL:-1}"
 
 # Don't inherit parent-shell XLA_FLAGS (stale value SIGSEGVs workers; see
 # CLAUDE.md pitfall #4). Opt-in via V4_XLA_FLAGS.
@@ -98,7 +103,7 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,V4_EAGER_CREATE_JIT_MODEL,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
