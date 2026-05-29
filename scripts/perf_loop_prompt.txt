@@ -85,7 +85,11 @@ mid-operation (e.g. waiting on a smoke whose result you must read). Then STOP CL
      (log paths, ports, task ids, microbench numbers), and the single most important NEXT
      action / current top roadmap item.
   3. git add -A && commit + push.
-  4. HAND OFF THE WINDOW: if interactive in tmux, run scripts/perf_handoff_window.sh (spawns a
-     fresh max-thinking session in a NEW tmux window), then END YOUR TURN. If headless under
-     perf_session_loop.sh, just END YOUR TURN (the wrapper relaunches).
+  4. HAND OFF THE WINDOW -- this is THE mechanism that perpetuates the loop, and the loop now runs
+     as an INTERACTIVE chain: run scripts/perf_handoff_window.sh, then END YOUR TURN. It spawns a
+     FRESH interactive max-effort session in a NEW tmux window (auto-loads CLAUDE.md + this prompt)
+     that continues the campaign. WARNING: do NOT just end your turn expecting a wrapper to relaunch
+     you -- the headless perf_session_loop.sh wrapper is RETIRED, so if you end WITHOUT running
+     perf_handoff_window.sh the loop DIES with no successor. To stop the loop on purpose: touch
+     /tmp/perf_loop_stop (perf_handoff_window.sh honors it and cleanly declines to spawn a successor).
 Do not start anything large you can't finish + commit before handing off.

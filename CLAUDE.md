@@ -183,12 +183,14 @@ whose result you must read, or a few calls from finishing a committed step) — 
 2. Rewrite `HANDOFF_PERF.md` to the CURRENT state: what you landed + gated, what's in flight
    (log paths, ports, microbench numbers), and the ONE most important next action.
 3. `git add -A && git commit && git push`.
-4. **HAND OFF THE WINDOW:** interactive in tmux → run `scripts/perf_handoff_window.sh` (opens a
-   NEW tmux window with a fresh `claude --dangerously-skip-permissions --effort max`, empty
-   context, auto-loads this file + `scripts/perf_loop_prompt.txt`), then **END YOUR TURN**.
-   Headless under `scripts/perf_session_loop.sh` → just END YOUR TURN (the wrapper relaunches).
-   Stop the whole loop with `touch /tmp/perf_loop_stop`. Don't start anything you can't finish
-   + commit before handing off.
+4. **HAND OFF THE WINDOW:** the loop runs as an INTERACTIVE chain — run
+   `scripts/perf_handoff_window.sh`, then **END YOUR TURN**. It opens a NEW tmux window with a
+   fresh `claude --dangerously-skip-permissions --effort max` (empty context, auto-loads this file +
+   `scripts/perf_loop_prompt.txt`) that continues the campaign. ⚠️ Do NOT end your turn WITHOUT
+   running it expecting a wrapper to relaunch you — the headless `perf_session_loop.sh` wrapper is
+   RETIRED, so skipping the script KILLS the loop (no successor). Stop the loop on purpose with
+   `touch /tmp/perf_loop_stop` (the script honors it). Don't start anything you can't finish + commit
+   before handing off.
 
 ## Discipline
 
