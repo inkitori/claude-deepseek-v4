@@ -5,122 +5,129 @@
 > Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`,
 > `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29):** **Q.2 (the LOADER) LANDED + CPU-GATED + COMMITTED (`26318abf`).**
-> The loader now emits FP4 experts COMPRESSED (packed uint8 weight + e8m0 scale leaves) instead of
-> dequantizing to bf16. **First real smoke (Q.5) RAN and the FIT LOOKS GOOD** (loads to 1400
-> tensors, **zero OOM**) — but hits a **deterministic TPU `scheckne` core-halt at the first
-> layer-0 consolidation `device_put`** (NOT my loader logic, which CPU-passes; NOT OOM; NOT
-> ordering). **NEXT = diagnose the divergent collective (HLO dump) / try uint8 scales.** Details below.
+> **One-line status (2026-05-29):** **THE FULL MODEL NOW LOADS + FITS.** Host-gathering ALL routed
+> expert leaves (commit `e1b434f8`) eliminated the layer-0 consolidation `device_put` collectives
+> that core-halted every prior smoke — load completes: **`placed=68812 skipped=0 elapsed=233.1s,
+> host_gather_groups=264`, ZERO scheckne during load.** **NEW BLOCKER: a SECOND, distinct `scheckne`
+> launch-id halt fires ~4 min later during POST-LOAD FORWARD/warmup COMPILE** (log
+> `logs/full-slice-v4-smoke-20260529T025539Z.log`). Same assertion pc, now in the forward path, not
+> consolidation. **NEXT = confirm it's deterministic (1 retry; runbook says init can be flaky), then
+> HLO-dump the post-load compile + diff across the 4 hosts** (the technique that nailed the
+> consolidation), prime suspect = a host-divergent forward program (env-gated trace-time branch?).
 
 ---
 
 ## THE PROBLEM (one table)
-V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, codebook
-`[0,.5,1,1.5,2,3,4,6]` ≡ `jnp.float4_e2m1fn`, e8m0 block scale, block 32)**. On-disk (confirmed by
-reading the real ckpt): routed `layers.{L}.ffn.experts.{0-255}.{w1,w2,w3}.weight` = **I8** packed +
-`.scale` = **F8_E8M0**; shared `ffn.shared_experts` = **F8_E4M3** (FP8, NOT fp4); 43 layers,
-hidden=4096, moe_inter=2048. Old loader dequantized everything → ~542 GiB > 512 GiB HBM → OOM.
+V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, codebook ≡
+`jnp.float4_e2m1fn`, e8m0 block scale, block 32)**. On-disk: routed `layers.{L}.ffn.experts.{0-255}.{w1,w2,w3}.weight`
+= **I8** packed + `.scale` = **F8_E8M0**; shared `ffn.shared_experts` = FP8 (E4M3); 43 layers +
+1 MTP, hidden=4096, moe_inter=2048. Old loader dequantized everything → ~542 GiB > 512 GiB → OOM.
 
 | scheme | HBM | fits v6e-16 (512 GiB)? |
 |---|---:|---|
 | bf16 (old load path) | ~542 GiB | **NO** (OOM) |
-| **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes, ~350 GiB free** |
+| **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes** — and now LOADS (68812 tensors) |
 
 ---
 
-## WHAT LANDED — Q.1 + consumer (prior) + Q.2 LOADER (`26318abf`, this session)
-Strategy C, all CPU-gated. Per-expert routed leaves: weight `uint8 [out,in/2]`, scale
-`e8m0 [out,in/32]`; consolidated E-sharded (`P('attn_dp',None,None)`) into `w*_stacked` +
-`w*_scale_stacked`; `moe_forward` dequants uint8+e8m0→bf16 in-trace (`_dequant_fp4_experts`).
-- **Q.2 loader edits** (`deepseek_v4_loader.py` + `deepseek_v4.py`): `read_dequant_slice` fp4→raw
-  uint8 (no dequant) + new `kind=="e8m0"` (raw scale); `iter_v4_safetensors_specs` yields the e8m0
-  scale as its own spec; `map_hf_name_to_jax_path` `.scale`→`_scale` leaf (was dropped as
-  `<scale>`); consolidation regex widened `(w[123](?:_scale)?)` → scales stack like w2;
-  `_torch_to_numpy_preserve` bitcasts torch e8m0→ml_dtypes (not a numeric cast); `_kind_of`
-  `"experts"`→`".experts."` (excludes FP8 shared_experts).
-- **Sharding note (matters for the bug below):** uint8 packing makes w1/w3 square `[2048,2048]` →
-  `pick_partition_spec` strict-`>` tie-break picks **axis-0**, so w1/w3 flip from bf16's axis-1
-  (host-gather) to **axis-0 → device_put reshard** (joining w2). Net: ALL routed weight+scale leaves
-  now consolidate via `device_put` collectives; the bf16 w1/w3 host-gather path is now dormant.
-- **CPU GATES ALL PASS:** `scripts/quant_loader_fp4_check.py` (NEW, on `tiny_v4_quant` fixture: 168
-  experts emit uint8+e8m0, route to wN/wN_scale, dequant byte-identical to groundtruth, fp8 still
-  bf16); `quant_fp4_dequant_check.py` max|Δ|=0; CPU oracle eager==jit bad=0/12.
+## WHAT LANDED (committed, CPU-gated) — Strategy C loader + the FIT FIX
+- `26e4023d` Q.1 + MoE consumer: routed experts declared FP4, dequant-in-trace (`_dequant_fp4_experts`).
+- `26318abf` Q.2 loader: emit FP4 experts COMPRESSED (uint8 weight + scale leaves), no bf16 dequant.
+- `580b1f83` scales stored as **uint8** (not on-device `float8_e8m0fnu`) — REFUTED the e8m0-halt theory
+  (crash was byte-identical with uint8). Kept: it's correct (matches gpt_oss/qwix/the consumer).
+- `6eb5241f` un-swallow loader exception (`deepseek_v4.py:2026` re-raises unless
+  `V4_ALLOW_DUMMY_FALLBACK=1`) — REFUTED the swallowed-exception theory (re-raise never fired ⇒ no
+  exception). Correctness win: never silently serve zero-weighted garbage. + host-gather w1/w3/scales
+  (left w2 on device_put) — STILL crashed, proving even ONE consolidation device_put diverges here.
+- **`e1b434f8` THE FIT FIX:** host-gather **EVERY** routed/mtp expert leaf (w1/w2/w3 + all scales) ⇒
+  ZERO consolidation `device_put` reshard collectives. Edits in `deepseek_v4.py`: `_is_stash_leaf`
+  (`return m is not None`) + `use_host_gather` (`all(k in _expert_host_np ...)`) match all routed
+  leaves; `deepseek_v4_loader.py:981` `place_spec_as_jax_sharded` full-reads + returns host_np when
+  `return_host_np=True` even for axis-0 leaves (so host-gather has the data).
+  - **WHY it was needed:** uint8 packing makes w1/w3 SQUARE `[2048,2048]` → `pick_partition_spec`
+    strict-`>` tie-break (`deepseek_v4_loader.py:~513`) picks **axis-0** → slice-aware path → host_np
+    was None → host-gather DORMANT → `device_put` reshard. Those reshards are cross-host collectives;
+    on the v6e-16 4×4 topology they desync the SPMD launch group (HLO diff proved: HEAD launched a
+    real-data consolidation stack while the 3 WORKERS launched whole-tree scalar-fills). bf16's lone
+    w2 device_put worked on v6e-32 but NOT here — only ZERO consolidation collectives passes. (This is
+    the same axis-0 consolidation S1's S27 tried + reverted — see `HANDOFF_S1.md`.)
+  - host-gather = `make_array_from_callback` from full per-expert host numpy; collective-free + byte-
+    clean (no uninit-HBM reshard), so S1-safe. Load is now fully collective-free → completes.
 
 ---
 
-## ⚠️ Q.5 FIRST SMOKE — RAN, FIT OK, but DETERMINISTIC TPU CORE-HALT (the blocker)
-Three smokes (logs `logs/full-slice-v4-smoke-20260529T01{4014,4437,5204}Z.log`). Every one:
-- **Loads cleanly to "placed 1400 tensors" (layer 0), placing BOTH .weight and .scale leaves, NO
-  OOM, no Python/XLA/dtype error** — the loader works and **the FP4-compressed model is FITTING**.
-- Then a **`Core halted unexpectedly … scheckne` at the SAME pc `TensorCoreSequencer:1:0xba`**
-  across MULTIPLE cores (tpu17 pe2/pe4, tpu21) + `different launch id`. Engine init fails.
-- **Coincides with `jit_broadcast_in_dim` compiles** → it's the **first layer-0 consolidation
-  `device_put`** (a reshard collective), not the model forward.
+## ⚠️ THE NEW BLOCKER — SECOND scheckne in the POST-LOAD FORWARD COMPILE
+Smoke `025539Z`: load done at 02:56:14 (`placed=68812 … host_gather_groups=264`). Then ~4 min of
+forward/warmup jit compiles (`jit_broadcast_in_dim` fingerprints, `jit_exp/multiply/outer/iota`,
+`make_freqs_cis`-looking ops). At 03:00:16 → **`Core halted … scheckne` at `TensorCoreSequencer:1:0xba`**
+(SAME pc as the consolidation halt) → worker on `.17`/`.8` dies (`SLICE_FAILURE_SW_INJECT_ERROR` →
+SYSTEM_ERROR "connection error code 2"). Engine init fails. This is a DISTINCT divergence from the
+(now-fixed) consolidation — it's in the forward path, post-load.
 
-**Ruled out:** (a) **multi-thread ordering** — `V4_LOADER_PLACE_WORKERS=1` (deterministic
-cross-worker drain order) crashes IDENTICALLY at 1400. (b) **flaky hardware** — same assertion pc
-across many cores ⇒ deterministic compiled-program assertion, not one bad core. (c) **OOM**. (d)
-**loader logic** — all CPU gates pass.
-**Diagnosis:** a launch-group **collective-consistency assertion** (`scheckne`) fires ⇒ workers
-diverge on the consolidation `device_put` collective. The reshard PATTERN is proven (bf16 w2 did
-exactly axis-0→E-shard `device_put`), so the new variable is **dtype**: scales are **e8m0** (the only
-new dtype in a consolidation collective; w1/w3/w2 are uint8, same byte-reshard as proven bf16 w2).
+**ROADMAP / NEXT ACTIONS (do in order):**
+1. **Re-smoke once, plain.** The runbook notes init is sometimes a flaky worker SYSTEM_ERROR "just
+   retry". This crash is a `scheckne` (looks deterministic, like the consolidation), but confirm: if a
+   clean retry reaches `Application startup complete`, it was flaky → go straight to the GATE.
+2. **If deterministic → HLO-dump the POST-LOAD compile + diff across the 4 hosts** (the decisive
+   technique that nailed consolidation). `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump` (validates clean;
+   propagates to workers via ray env), clear xla_cache+/tmp/hlo_dump on all 4 first. After crash:
+   rsync each host's `/tmp/hlo_dump/*optimizations.txt` to head, compare the module **opname multiset
+   + ENTRY signatures** head-vs-worker (helper recipe below). The op that differs across hosts is the
+   divergence.
+3. **Prime suspect = a host-divergent FORWARD program.** The forward is SPMD-jitted so it SHOULD be
+   identical; a launch-id split usually means a **trace-time host-dependent branch**. Check (CLAUDE.md
+   pitfall #0): any env-var read or `process_index`/device-ownership branch reached during forward
+   trace. Specifically: `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — the `use_shard_map` gate
+   (~:211) choosing dense-all-256 (decode) vs sharded `gmm_v2` (prefill), and the in-trace
+   `_dequant_fp4_experts` (uint8+e8m0→bf16) over the E-sharded experts. Also `make_freqs_cis`.
+4. After it serves: **GATE** below (establish the v6e-16 baseline md5).
 
----
-
-## ROADMAP / NEXT ACTIONS (do in order; smokes crash ~90s in at 1400 tensors → cheap to iterate)
-1. **HLO-DUMP DIFF (the error's own prescribed diagnostic, DECISIVE).** Re-smoke with
-   `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump` (opt in via `V4_XLA_FLAGS`, validate per CLAUDE.md
-   pitfall #4), collect per-worker `before_optimizations.txt`, diff across the 4 hosts. If they
-   differ → that op is the divergence (almost certainly the consolidation/scale path) → fixes it.
-2. **e8m0-reshard hypothesis → store scales as plain uint8** (consumer `e8m0_to_fp32` wants uint8
-   anyway; gpt_oss uses uint8 scales). Edits: `deepseek_v4.py:1032-1034` scale leaves `e8m0`→`u8`;
-   `read_dequant_slice` `kind=="e8m0"` → `return w.view(torch.uint8)`. **WRINKLE:** the CPU oracle
-   `make_random_params` (`s1_cpu_repro_v4flash.py:87-91`) and `quant_loader_fp4_check.py` use the
-   **e8m0 dtype as a weight-vs-scale TYPE TAG** to synthesize SMALL stable scale bytes (118-121) vs
-   full-range weight bytes — switch them to disambiguate by leaf NAME/shape (`*_scale`), else uint8
-   scales get full-range bytes → NaN. Then re-run CPU gates + smoke.
-3. **Bisect the 3 changes** if 1-2 inconclusive: temporarily skip scale consolidation (does it crash
-   on weights alone?) vs revert w1/w3 to axis-1 host-gather. Isolates scales vs the axis-0 flip.
-4. After it loads+serves: **Q.5 GATE** below (correct Fibonacci + md5; establish v6e-16 baseline).
+HLO-diff helper (proven this session):
+```
+for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude='*' \
+  -e "ssh -i ~/.ssh/google_compute_engine" enyouki@10.164.0.$ip:/tmp/hlo_dump/ /tmp/hlo_cmp/h$ip/; done
+# head (15) is local: cp /tmp/hlo_dump/*.before_optimizations.txt /tmp/hlo_cmp/h15/
+# then per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
+# divergent count/signature between h15 and h8/h17/h16 = the culprit op.
+```
 
 ---
 
 ## <a name="GATE"></a>GATE (non-negotiable) — for v6e-16
-Old v6e-32 md5 `5bf42256` is DEAD (bf16 OOMs; fp4 changes numerics). Bar:
-- `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10, max_run < 5).
-- FIB decode: **correct Fibonacci (21,34,55,89,144)** + **N=2 md5 byte-identical across 2 fresh
-  engines** (`python3 /tmp/s1_probe2.py 2`). Establish the NEW baseline hash once; confirm identical
-  ×2 engines. READ the actual decode text ("contains Paris" is a false positive). Do NOT gate on a
-  long-tail md5 (nondeterministic at temp=0). First milestone "loads, fits, serves, correct +
-  deterministic" IS the first gate-pass.
+Old v6e-32 md5 `5bf42256` is DEAD. Bar:
+- `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (port 18081; visible_words ≥ 10,
+  max_word_run < 5). (smoke_check uses prompt 'The capital of France is', temp=0.)
+- FIB decode: **correct Fibonacci (21,34,55,89,144)** in a longer decode + **N=2 md5 byte-identical
+  across 2 fresh engines** via `python3 /tmp/s1_probe2.py N` (RECREATED this session — prompt "Here is
+  the start of the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13,", temp=0 seed=0, auto-discovers model id;
+  ⚠️ /tmp is ephemeral — the file may be gone next session, the prompt above reproduces it). Establish
+  the NEW baseline hash once; confirm identical ×2 engines. READ the actual text ("contains Paris" is a
+  false positive). Do NOT gate on a long-tail md5 (nondeterministic at temp=0).
 
 ---
 
 ## VALIDATION TIERS (cheapest first)
-1. **CPU loader fp4 check** (NEW, no slice, ~40s): `JAX_PLATFORMS=cpu PYTHONPATH=work/tpu-inference:work/vllm
-   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py` → "OK …". Needs the
-   `work/scratch/tiny_v4_quant`+`tiny_v4_groundtruth` fixtures (rebuild with
-   `V4_REAL_FLASH=<gcs snapshot dir> V4_SCRATCH_DIR=work/scratch …python3 scripts/make_tiny_v4_checkpoint.py`;
-   gcs snapshot = `~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/<hash>`).
-1b. **CPU oracle** (`scripts/s1_cpu_repro_v4flash.py both`) + **fp4 dequant check**
-   (`scripts/quant_fp4_dequant_check.py`). All three currently PASS.
+1. **CPU loader fp4 check** (~40s, no slice): `JAX_PLATFORMS=cpu PYTHONPATH=work/tpu-inference:work/vllm
+   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py` → "OK …". (Needs `work/scratch/tiny_v4_quant`
+   + `tiny_v4_groundtruth` fixtures.) **All CPU gates currently PASS.**
+1b. **CPU oracle** `scripts/s1_cpu_repro_v4flash.py both` (eager==jit, bad=0/12) + **fp4 dequant**
+   `scripts/quant_fp4_dequant_check.py` (max|Δ|=0). NOTE: CPU has mesh=None ⇒ consolidation/host-gather
+   is SKIPPED, so CPU CANNOT validate the host-gather or forward-compile paths — those need a smoke.
 2. **TPU microbench** (`scripts/perf_microbench*`).
-3. **Full smoke + GATE** — RESERVE. Crashes ~90s in right now (cheap to iterate while debugging).
+3. **Full smoke + GATE** — now reaches `placed=68812` (~233s load) then the forward-compile crash
+   ~4 min later. Cheap to iterate the forward-compile blocker (crashes ~5-6 min in).
 
 ---
 
 ## INFRA STATUS / v6e-16
 - Slice `v6spoteu719`, zone `europe-west4-a`, project `prm-research`. **v6e-16, topology 4×4**, 16
-  chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16`. Ray healthy (16 TPU).
-  Smoke = TP=16. Per-host venvs (NOT shared).
-- ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba` (needs ≤2.3) and the
-  vllm-serve import chain crashes the APIServer **before any TPU work** with an unrelated-looking
-  stack. Something installed 2.4.6 (2026-05-28); fixed this session on all 4 hosts. venv has **no
-  pip** (uv): `~/.local/bin/uv pip install --python work/vllm_env/bin/python3 'numpy==2.3.5'` per
-  host. Quick check before a smoke: `python3 -c "import numba"` on each host.
+  chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16`. Ray healthy (16 TPU). TP=16.
+- ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashes the APIServer
+  before any TPU work. venv has no pip (uv): `~/.local/bin/uv pip install --python work/vllm_env/bin/python3
+  'numpy==2.3.5'` per host. Pre-smoke: `python3 -c "import numba"` per host.
 - ⚠️ Ray "version mismatch" = mark's rogue ray container; **FIX = keep BOTH guardians alive**
-  (`ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`). Restart per the loop prompt
-  (meta_guardian needs `10.164.0.15:6379`). Ray (re)start: `scripts/full_slice_v4_ray_restart.sh`.
-- After ANY code edit: `full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on all 4 hosts +
-  verify md5 head==workers (mismatch → launch-id halt). Shut down ONLY via `full_slice_v4_reset.sh`.
+  (`ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`; restart per the loop prompt,
+  meta_guardian needs `10.164.0.15:6379`). Ray (re)start: `scripts/full_slice_v4_ray_restart.sh`.
+- After ANY code edit: `full_slice_v4_sync.sh` (rsync to 4 hosts; `git push` does NOT sync them) +
+  clear `~/.cache/vllm/xla_cache/*` on all 4 + verify md5 head==workers (mismatch → launch-id halt).
+  Shut down ONLY via `full_slice_v4_reset.sh`. HLO dump propagates to workers via the ray env (XLA_FLAGS).

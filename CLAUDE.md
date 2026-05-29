@@ -7,13 +7,13 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** **Q.2 LOADER LANDED + CPU-GATED + COMMITTED (`26318abf`)** — the
-> loader now emits FP4 experts COMPRESSED (uint8 weight + e8m0 scale leaves), no bf16 dequant. First
-> real smoke (Q.5): **FIT LOOKS GOOD (loads to 1400 tensors, ZERO OOM)** but hits a **deterministic
-> TPU `scheckne` core-halt at the first layer-0 consolidation `device_put`** (NOT loader logic — CPU
-> gates all pass; NOT OOM; NOT multi-thread ordering — `PLACE_WORKERS=1` crashes same; NOT flaky HW —
-> same assert pc on many cores). **NEXT = HLO-dump diff to find the divergent collective / try uint8
-> scales.** Full diagnosis + ranked next actions in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** **THE FULL MODEL NOW LOADS + FITS** (`e1b434f8`). Host-gathering
+> ALL routed expert leaves (w1/w2/w3 + scales) killed the layer-0 consolidation `device_put`
+> collectives that core-halted every prior smoke → load completes (`placed=68812, host_gather_groups=264,
+> 233s, ZERO scheckne`). **NEW BLOCKER: a SECOND `scheckne` ~4 min later in the POST-LOAD FORWARD
+> compile** (not consolidation). **NEXT = retry once (rule out flaky init), then HLO-dump the post-load
+> compile + diff across hosts; suspect a host-divergent forward branch.** Full state + the HLO-diff
+> recipe in `HANDOFF_QUANT.md`.
 
 ## Goal
 
