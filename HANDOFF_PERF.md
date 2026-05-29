@@ -5,21 +5,20 @@
 > milestone (256 routed experts kept FP4-compressed; `MAX_SEQS=1`) is DONE and is a GIVEN — history in
 > `HANDOFF_QUANT.md`. S1 determinism history: `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29 — P.13): prefill DISPATCH owned-gather lever REFUTED/BLOCKED (scripts-only ⇒ GATE intact).**
-> The dispatch microbench had a DCE bug (the lumped `dispatch_local.sum()` folded the order-invariant gather→reduce
-> and DCE'd the argsort, mis-attributing cost). Rewrote it (shard_map + array-returns) for the FIRST trustworthy
-> decomposition: **real dispatch = 36/40/64/95 ms/fwd @N=512/1024/2048/4096** (sortFwd+invArg+gathFu+revtFu). The SORT
-> (sortFwd+invArg, ~25 ms/fwd @N=4096) is UNAVOIDABLE (production sorts identically); the GATHERS (gathFu+revtFu,
-> 19→70 ms/fwd) are the only attackable part, **DOMINATED by the fp32 REVERT gather (revtFu 55 ms/fwd @N=4096)**. The
-> roadmap-#1 fix (owned-only `ragged_gather`/`ragged_scatter` = 16× less DMA, mirror prod fused_moe_gmm EP) is **BLOCKED
-> on v6e**: SparseCore IS LIVE (`SparseCoreInfo(num_cores=2,num_subcores=16,num_lanes=8)` — V4's "ragged_* fall back"
-> comment is STALE/wrong) but the kernels FAIL TO COMPILE — the SC pipeline grid is derived from the DYNAMIC `(end-start)`,
-> XLA can't prove it tile(8)-aligned, and they lack `tpu.assume_multiple` (only the v7-gated `gather_reduce` has it);
-> `fused_moe_gmm` has NO v6e guard (its EP ragged path is v7-targeted). Unblocking needs an upstream Mosaic patch
-> (out-of-scope diff on a shared kernel). Also REFUTED: the 2nd-argsort→O(M)-scatter inverse (scatter ≥ argsort).
-> P.13 touched only `scripts/perf_microbench_moe_prefill.py` ⇒ GATE trivially intact (P.11 md5 `3069e80b` is the live
-> code). NEXT: roadmap #1 tapped — pivot to roadmap #2 (rhs-prep dual-residency HBM smoke) or the contained bf16-gmm-
-> output revert-halving (lossy ~27 ms/fwd @N=4096).
+> **One-line status (2026-05-29 — P.15): prefill rhs-prep DUAL-RESIDENCY REFUTED on the REAL model — OOM (impl reverted ⇒ GATE intact).**
+> P.14 (committed): a tier-2 microbench (`perf_microbench_dual_residency.py`) confirmed the RESIDENT copy fits — fp4 8.57
+> + fp8 weights 16.13 + non-expert 1.6 = **26.29 GiB/chip, 4.95 free**, MoE-gmm transient ≤0.62 GiB even @N=4096; prize
+> 224.8 ms/fwd. P.15 IMPLEMENTED it (loader post-build of the fp8 rhs + a `params.w13_fp8_stacked`-gated prefill read +
+> pytree registration + `V4_MOE_FP8_RESIDENT` env flag) and SMOKED it (`MAX_LEN=256 GPU_MEM_UTIL=0.95`): the model **LOADS,
+> the fp8 pre-build runs for 44 layers, +16 GiB resident fits, KV cache (670k tok) allocates, `Application startup
+> complete`** — BUT the first request DIES: `jit_run_model` needs **19.56 GiB** new reservation and only **4.70 GiB** is
+> reservable (26.29 resident) ⇒ `RESOURCE_EXHAUSTED` (OOM) on a 1-token DECODE step. The unified forward's ~19.56 GiB peak
+> (the compiled 256-tok prefill activations) CANNOT coexist with +16 GiB resident. The microbench was over-optimistic
+> (measured MoE-gmm transient ONLY, missed the full-program live-buffer footprint). **roadmap #2 is REFUTED** (keep-fp4+fp8
+> OOMs; evict-fp4 = the already-refuted P.9b fp8-for-all, DO-NOT-RETRY #20). Production edits REVERTED (lean diff); only the
+> microbench (P.14) + this refutation remain. md5 `3069e80b` intact (reverted to the P.11/P.13 GATED code, synced ×4 hosts).
+> ⚠️ ONE OPEN QUESTION worth a cheap check (see NEXT ACTION): is the 19.56 a GENUINE forward peak, or the 16 GiB fp8 weights
+> NOT aliased as a jit input (double-count)? A flag-OFF smoke's `jit_run_model` program-HBM line disambiguates.
 
 ---
 
@@ -34,42 +33,46 @@
   check rc=0. P.6–P.10 changed only `scripts/perf_*`. The bit-identical md5 across this change proves intact.
 - P.12/P.13 changed only `scripts/perf_*` (unpack bench / dispatch decomp) — no production `.py` touched ⇒ no smoke
   needed, the P.11 GATED state (md5 `3069e80b`) is the live model code, trivially intact.
+- P.14 added only `scripts/perf_microbench_dual_residency.py` (scripts-only ⇒ GATE intact). P.15 IMPLEMENTED dual-residency
+  in production code, SMOKED it (it OOM'd — see status), then REVERTED all production edits (`deepseek_v4_moe.py`,
+  `deepseek_v4.py`, `smoke.sh`) back to the P.11/P.13 GATED code (md5-verified clean ×4 hosts). No production change is
+  committed ⇒ md5 `3069e80b` is live + intact, no smoke needed.
 
 ---
 
-## ⇒ NEXT ACTION — roadmap #1 is TAPPED (P.13). Pick: roadmap #2 (rhs-prep dual-residency) or bf16-gmm-output
-P.13 REFUTED the dispatch owned-gather lever (the 16× DMA win is BLOCKED on v6e — see one-liner + DO-NOT-RETRY #24).
-What's LEFT of the dispatch is small/risky (none is the obvious next step): the fp32 revert (revtFu, 55 ms/fwd @N=4096)
-could be HALVED by **bf16 gmm output** (gmm `preferred_element_type=bf16`, keep `acc_dtype=fp32`) so g2 + the revert
-are bf16 — but LOSSY (md5 shift; decode's DENSE path ALREADY uses bf16 expert outputs, so plausibly fine) and the S24
-note flags the gmm fp32-output path as determinism-sensitive (the fp32 `partial_out_ref` carry was the non-det
-ORIGINATOR — so bf16 output may be SAFER, but VERIFY on 2 engines). Other dispatch options are worse: full-range SC
-gather (no DMA win, likely also fails to compile), segment-sum revert (scatter-add, S1-risky), upstream kernel patch
-(out-of-scope diff).
+## ⇒ NEXT ACTION — roadmap #2 REFUTED (P.15). Decode CLOSED. Prefill levers are nearly exhausted; HBM is the wall.
+The prefill picture after P.9–P.15: rhs-prep (225 ms/fwd) can't be made FASTER (P.12, VPU floor) NOR ELIMINATED via
+dual-residency (P.15, OOM); dispatch owned-gather BLOCKED on v6e (P.13); attention-sharding LANDED (P.11). The binding
+constraint is now HBM: the unified `jit_run_model` reserves ~**19.56 GiB** beyond resident weights, so the model already
+runs near the 31.25 ceiling — that's why dual (+16 GiB) OOMs AND why roadmap #4 (token-sharded o) is blocked (#21).
 
-**Recommended NEXT = roadmap #2 (the biggest remaining prize): rhs-prep dual-residency.** Run an HBM-FEASIBILITY smoke
-for keeping the experts BOTH fp4-resident (decode) AND fp8-resident (prefill): pre-unpack the FP4 codes → fp8 at LOAD,
-store alongside, and have the PREFILL path read the fp8-resident weights (skip the 194 ms/fwd in-trace `_fp4_rhs_and_scale`
-unpack) while DECODE keeps reading fp4 (UNCHANGED ⇒ decode-neutral). Prize = **194 ms/fwd, ALL N** (the single biggest
-prefill lever). Risk = **+17.1 GiB resident on top of fp4's 8.57 ⇒ ~27 GiB / ~4 free, HBM-MARGINAL** — so the FIRST
-step is a feasibility smoke at small MAX_LEN (does it even load+serve?), then measure the prefill-wall delta. ⚠️ a
-loader change (`deepseek_v4_loader.py` / `moe_weights.py`) + tension with the FIT foundation. *Smoke-gated; the md5
-should be UNCHANGED (fp8 codes are lossless — e2m1⊂e4m3, CPU-confirmed P.9b).*
+**STEP 1 (cheap, DECISIVE — do this on the next routine flag-OFF smoke, no extra work):** grep the log for
+`jit_run_model` + `program HBM usage` and RECORD the baseline number. This disambiguates P.15's open question:
+  • baseline `jit_run_model` ≈ **19.56 GiB** ⇒ the forward peak is GENUINE ⇒ dual-residency is truly DEAD, and the
+    19.56 GiB prefill-forward peak is itself the #1 lever (shrinking it unblocks #4 AND would make a future residency
+    play conceivable). Characterize what dominates it (the prefill MoE buffers are tiny @256 tok — suspect attention /
+    the all-gather-to-replicated `x_full[N,dim]` / cross-layer activation liveness in the compiled 256-tok program).
+  • baseline `jit_run_model` ≈ **3–4 GiB** ⇒ the 19.56 was the 16 GiB fp8 weights NOT aliased as a jit input
+    (double-count) ⇒ dual-residency is SALVAGEABLE: build the fp8 rhs the loader's way (host-gather /
+    `make_array_from_callback` like `w1_stacked`, NOT my separate `jax.jit(_build_fp8_rhs)`) so it aliases as a forward
+    input + is donated, then re-smoke. (P.15's impl was REVERTED, not committed — re-apply from DO-NOT-RETRY #25's
+    4-component recipe, which lists every edit site, then change ONLY the fp8 build to alias.)
 
-  Then: #3 (non-MoE launch floor, hard — op-count↓ re-opens S1), #4 (attention token-sharded OUTPUT, blocked on #2's HBM).
+**STEP 2 (the lever, gated on Step 1):** if dual is dead, characterize+shrink the ~19.56 GiB prefill-forward HBM peak
+(a `perf_microbench`-style HBM probe of the full prefill forward, OR `memory_stats` peak per sub-region) — it's the new
+top lever (unblocks #4). If the campaign's lossless frontier is genuinely exhausted, say so plainly in the next handoff.
 
 ---
 
-## THE ROADMAP (re-ranked P.13 — dispatch owned-gather BLOCKED; rhs-prep dual-residency now leads)
+## THE ROADMAP (re-ranked P.15 — dual-residency REFUTED; prefill levers nearly exhausted, HBM is the wall)
 1. ~~**[prefill DISPATCH fuse]**~~ **TAPPED (P.13).** Clean decomp: dispatch = 36/40/64/95 ms/fwd @N=512/1024/2048/4096;
    the SORT (~25 ms/fwd) is unavoidable, the GATHERS (19→70) are attackable but the owned-only 16×-DMA win is BLOCKED
    on v6e (DO-NOT-RETRY #24) and the inverse-scatter is REFUTED (#23). Only scrap left = bf16-gmm-output (lossy,
    ~27 ms/fwd @N=4096; see NEXT ACTION) — small + risky, not a clear lever.
-2. **[prefill MoE rhs-prep KILL — dual-residency, HBM gamble]** ← TOP / NEXT ACTION. the 194 ms/fwd FP4→fp8 unpack can't be made
-   FASTER (P.12: XLA native convert is the VPU floor — DO-NOT-RETRY #22), only ELIMINATED by keeping fp8-resident-
-   for-PREFILL alongside fp4-resident-for-DECODE (decode UNCHANGED, so DECODE-NEUTRAL). Prize HUGE (194 ms/fwd,
-   all N) but +17.1 GiB resident on top of fp4's 8.57 ⇒ ~27 GiB resident / ~4 free ⇒ HBM-MARGINAL + a loader
-   change + tension w/ the FIT foundation. *L · needs an HBM-feasibility smoke FIRST; likely fits only short prefill.*
+2. ~~**[prefill MoE rhs-prep KILL — dual-residency]**~~ **REFUTED (P.15, DO-NOT-RETRY #25).** Resident fits (26.29 GiB,
+   loads+serves startup at MAX_LEN=256) but the unified `jit_run_model` reserves ~19.56 GiB beyond resident ⇒ +16 GiB
+   fp8 OOMs the first forward. Possibly SALVAGEABLE if the 19.56 is an un-aliased fp8-input double-count (NEXT ACTION
+   Step 1 disambiguates); else dead. The P.14 microbench mis-predicted (MoE-gmm transient only, not the program peak).
 3. **[prefill non-MoE LAUNCH floor ~117 ms]** PROJ 42 + NORM 31 + HC 17–23 + GATE 11 + CMP 10 + IDX 5, seq-
    INDEP, launch-bound at tiny per-chip n. Lossless cut = op-count↓ (layer scan / fuse the ~215 per-fwd
    matmuls) but that re-opens S1 (DO-NOT-RETRY #10). *M · hard.*
@@ -131,6 +134,27 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
    reads only the owned absolute `[cumsum[r·EP], cumsum[(r+1)·EP])` rows, the matmul is row-independent, and the
    `_owned` jnp.where forces non-owned to 0 — so it's purely a COMPILE-TIME block, not a correctness issue. Revisit if
    libtpu/the kernel gains v6e dynamic-range support.)
+25. **Prefill rhs-prep DUAL-RESIDENCY (keep experts fp4-resident for decode + fp8-resident for prefill) — REFUTED (P.15).**
+   IMPLEMENTED end-to-end (loader pre-builds the fp8 gmm rhs `W13`/`W2t` post-load; prefill `_routed_local` reads them
+   when `params.w13_fp8_stacked is not None`, rebuilding only the cheap e8m0 scale in-trace; registered as MoEParams
+   pytree CHILDREN so they thread as jit args (the FIRST attempt closed them over → "non-addressable" RuntimeError);
+   `V4_MOE_FP8_RESIDENT=1` env flag forwarded to workers). The model LOADS, the fp8 pre-build runs (44 layers), +16 GiB
+   resident (26.29 total) FITS, KV cache (670k tok) allocates, `Application startup complete`. But the FIRST request OOMs:
+   `jit_run_model` needs **19.56 GiB** new reservation, only 4.70 reservable (26.29 resident) ⇒ RESOURCE_EXHAUSTED on a
+   1-token DECODE. The unified forward's ~19.56 GiB peak can't coexist with +16 GiB resident — at MAX_LEN=256/
+   `max_num_batched_tokens=256` (already minimal), so no config saves `26.29+19.56=46 ≫ 31.25`. The P.14 microbench
+   (`perf_microbench_dual_residency.py`, KEPT) measured the MoE-gmm transient ONLY (≤0.62 GiB) and missed the
+   full-program live-buffer footprint — so resident-fits ≠ forward-fits. Prod edits REVERTED (NOT committed; the recipe
+   to re-apply is exactly: (a) MoEParams fields `w13_fp8_stacked`/`w2t_fp8_stacked` + register them as pytree CHILDREN at
+   `deepseek_v4.py:_register_pytree(MoEParams,...)`; (b) a post-load pass after `load_weights_from_dir done` that, gated on
+   `V4_MOE_FP8_RESIDENT`, unpacks each layer's `w{1,3,2}_stacked`→fp8 `W13`=concat[unpack(w1),unpack(w3)] + `W2t`=unpack(w2)
+   and sets them on the moe; (c) `_routed_local` reads them when `params.w13_fp8_stacked is not None`, rebuilding only the
+   e8m0 scale in-trace via a `_fp4_scale_only` helper; (d) `V4_MOE_FP8_RESIDENT` exported + added to smoke.sh's
+   `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. THE FIX TO TRY: build (b) so the fp8 ALIASES as a forward input — mirror how
+   `w1_stacked` is built (host-gather/`make_array_from_callback` + donation), NOT a standalone `jax.jit`.) ⚠️ ONE open
+   question (NEXT ACTION Step 1): is 19.56 GENUINE forward activation (dual truly dead) or the 16 GiB
+   fp8 weights NOT aliased as a jit input (salvageable — build them the loader's host-gather way, donate them, re-smoke)?
+   (The impl was REVERTED, NOT committed — the 4-component recipe below is the spec to re-apply.)
 
 ---
 
@@ -187,6 +211,14 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
   float4→f8 cast, DO-NOT-RETRY #8) — resolve before trusting fp8-on-v6e numerics; it doesn't change P.9b timing.
 - **HBM:** fp4 experts 8.57 GiB/chip (×43); fp8 codes resident = 17.1 GiB (FITS, ~21 free); bf16-resident
   34.3 (does NOT fit). N=1 decode HBM floor ~5.5 ms/step.
+- ★ **P.14/P.15 dual-residency HBM (real-model smoke, MAX_LEN=256):** keeping BOTH fp4 (8.57) + fp8-weights (16.13,
+  scales kept e8m0) + non-expert (~1.6) = **26.29 GiB/chip RESIDENT** — loads, fp8 pre-build runs (44 layers), KV
+  cache (670k tok ≈ MLA is byte-tiny) allocates, startup completes. BUT `jit_run_model` reserves **~19.56 GiB beyond
+  resident** ⇒ 26.29+19.56=46 > 31.25 ⇒ OOM (DO-NOT-RETRY #25). KEY NEW FACT: the unified prefill-forward program peak
+  is ~19.56 GiB (vs the MoE-gmm transient's 0.62) — the model runs near the 31.25 ceiling, which is ALSO why #4 (token-
+  sharded o) is HBM-blocked (#21). The `perf_microbench_dual_residency.py` resident allocation (26.29) is accurate; its
+  transient projection is NOT (MoE-only). `GPU_MEM_UTIL`/`--gpu-memory-utilization` doesn't help (program reservation is
+  separate from the KV budget; even 0 KV leaves 46>31.25).
 - **CPU torch oracle** `scripts/s1_cpu_repro_v4flash.py both` = Tier-1 math/NaN check (a bit-identical change keeps "OK both match").
 - **THE PROFILE re-capture recipe:** profiled smoke (`V4_PROFILER_ARGS=…torch`), `/start_profile` →
   `s1_probe2.py 20` → `/stop_profile`. Parser `scripts/perf_parse_trace.py <trace> --bucket-ops`. Read the
