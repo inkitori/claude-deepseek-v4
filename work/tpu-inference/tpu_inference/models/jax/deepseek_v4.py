@@ -46,6 +46,7 @@ from tpu_inference.layers.jax.attention.deepseek_v4_attention import (
     attention_prefill, hc_split_sinkhorn, precompute_freqs_cis, rms_norm,
     splice_rope,
 )
+from tpu_inference.layers.common.quantization import MXFP4_BLOCK_SIZE
 from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
     ExpertParams, GateParams, MoEParams, gate_forward, moe_forward,
 )
@@ -1016,15 +1017,30 @@ def make_abstract_moe_params(cfg: DeepseekV4Config, layer_id: int) -> MoEParams:
         route_scale=cfg.routed_scaling_factor,
         top_k=cfg.num_experts_per_tok,
     )
-    expert_dtype = bf16  # See DECISIONS.md D2 — we treat all experts as bf16 (real V4 is fp4, dequantized at load).
-    expert_template = lambda: ExpertParams(
-        w1=_shape_struct((cfg.moe_intermediate_size, cfg.hidden_size), expert_dtype),
-        w2=_shape_struct((cfg.hidden_size, cfg.moe_intermediate_size), expert_dtype),
-        w3=_shape_struct((cfg.moe_intermediate_size, cfg.hidden_size), expert_dtype),
+    # QUANT / Strategy C: the 256 ROUTED experts ship as FP4 (= MXFP4) and are
+    # kept COMPRESSED in HBM — packed uint8 [out, in/2] (2 e2m1/byte) + e8m0
+    # block scale [out, in/block] (float8_e8m0fnu, matches the on-disk format) —
+    # dequanted to bf16 in `moe_forward`. The SHARED/dense expert stays bf16
+    # (it's tiny; dense weights remain bf16 in Strategy C).
+    H, I, blk = cfg.hidden_size, cfg.moe_intermediate_size, MXFP4_BLOCK_SIZE
+    u8, e8m0 = jnp.uint8, jnp.float8_e8m0fnu
+    routed_template = lambda: ExpertParams(
+        w1=_shape_struct((I, H // 2), u8),   # gate: [inter, dim/2] packed fp4
+        w2=_shape_struct((H, I // 2), u8),   # down: [dim, inter/2]
+        w3=_shape_struct((I, H // 2), u8),   # up:   [inter, dim/2]
+        swiglu_limit=cfg.swiglu_limit,
+        w1_scale=_shape_struct((I, H // blk), e8m0),  # e8m0 [inter, dim/block]
+        w2_scale=_shape_struct((H, I // blk), e8m0),  # e8m0 [dim, inter/block]
+        w3_scale=_shape_struct((I, H // blk), e8m0),
+    )
+    shared_template = lambda: ExpertParams(
+        w1=_shape_struct((I, H), bf16),
+        w2=_shape_struct((H, I), bf16),
+        w3=_shape_struct((I, H), bf16),
         swiglu_limit=cfg.swiglu_limit,
     )
-    experts = [expert_template() for _ in range(cfg.n_routed_experts)]
-    shared = expert_template()
+    experts = [routed_template() for _ in range(cfg.n_routed_experts)]
+    shared = shared_template()
     return MoEParams(
         gate=gate,
         experts=experts,
@@ -1153,10 +1169,11 @@ _register_pytree(AttentionParams,
 _register_pytree(GateParams,
                  ("weight", "bias", "tid2eid"))
 _register_pytree(ExpertParams,
-                 ("w1", "w2", "w3"))
+                 ("w1", "w2", "w3", "w1_scale", "w2_scale", "w3_scale"))
 _register_pytree(MoEParams,
                  ("gate", "experts", "shared_expert",
-                  "w1_stacked", "w2_stacked", "w3_stacked"))
+                  "w1_stacked", "w2_stacked", "w3_stacked",
+                  "w1_scale_stacked", "w2_scale_stacked", "w3_scale_stacked"))
 _register_pytree(BlockParams,
                  ("attn", "moe", "attn_norm_w", "ffn_norm_w",
                   "hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base",

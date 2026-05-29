@@ -1,171 +1,139 @@
 # Handoff — DeepSeek-V4-Flash QUANTIZED-WEIGHT-LOADING campaign (v6e-16)
 
-> **Phase = QUANT / FIT-ON-v6e-16.** The job: make `vllm serve deepseek-ai/DeepSeek-V4-Flash`
-> LOAD AND SERVE CORRECTLY on the **v6e-16** slice by **NOT dequantizing the model's native
-> quantized weights to full bf16 at load time**. Durable slice ops + pitfalls: `CLAUDE.md`.
-> Prior campaigns (history, not the goal): `HANDOFF_PERF.md` (perf), `HANDOFF_S1.md` (decode
-> determinism). This doc is the loop's memory — current state, the math, the roadmap, the ONE
-> next action.
+> **Phase = QUANT / FIT-ON-v6e-16.** Make `vllm serve deepseek-ai/DeepSeek-V4-Flash`
+> LOAD AND SERVE CORRECTLY on the **v6e-16** slice by **NOT dequantizing the native FP4
+> experts to full bf16 at load**. Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns
+> (history): `HANDOFF_PERF.md`, `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-28):** **Infra fully bootstrapped & verified on `v6spoteu719`
-> (v6e-16, 4×4, 16 chips, 4 hosts).** venv on all 4 hosts, GCS weights mounted, vllm+tpu_inference
-> import clean, **Ray cluster healthy (16 TPU, `ray.init` OK, [4,4,4,4]/host)**. v6e-16 topology
-> wired into `full_slice_v4_smoke.sh` (TP=16, bounds 2,2,1, place_workers=4) + `full_slice_v4_ray_restart.sh`
-> (16-TPU verify). **No real-V4 smoke run yet** — the current bf16 load path is expected to OOM
-> (see math). **NEXT = implement the loader change so the fp4 experts stay compressed in HBM
-> (Strategy C), CPU-oracle it, then the first real smoke = the first gate-pass.**
+> **One-line status (2026-05-29):** **Q.1 (param tree = FP4 leaves) + the MoE consumer
+> (dequant-in-trace) are DONE and CPU-GATED.** The 256 routed experts are now declared in the
+> param tree as packed FP4 (uint8 `[E,out,in/2]`) + e8m0 scale (`float8_e8m0fnu [E,out,in/32]`),
+> and `moe_forward` dequants them to bf16 in-trace per layer. Two cheap gates pass: the dequant
+> is **bit-identical** to the trusted host torch dequant (`scripts/quant_fp4_dequant_check.py`,
+> max|Δ|=0 over the full codebook+e8m0 range) and the CPU oracle is **clean** (eager==jit==prefill
+> 0/12). **NEXT = Q.2: the LOADER** — emit the two FP4 leaves instead of dequantizing (real load
+> is intentionally inert until then). Then Q.5 = first real smoke = first gate-pass.
 
 ---
 
-## THE PROBLEM (the whole campaign in one table)
+## THE PROBLEM (one table)
+V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, codebook
+`[0,.5,1,1.5,2,3,4,6]` ≡ `jnp.float4_e2m1fn`, e8m0 block scale, block 32)**. The loader
+**dequantizes everything to bf16** → ~542 GiB > 512 GiB HBM → OOM.
 
-DeepSeek-V4-Flash ships **natively quantized**: dense linears = **FP8** (e4m3, e8m0 block scale,
-128×128); the 256 routed experts = **FP4** (`expert_dtype=fp4`, e8m0 block scale, block 32) —
-and V4's FP4 codebook `[0,0.5,1,1.5,2,3,4,6]` is **bit-identical to `jnp.float4_e2m1fn` (MXFP4)**.
-The loader (`deepseek_v4_loader.py`) currently **dequantizes EVERYTHING to bf16 at load**. That
-blows the checkpoint up from compressed to full bf16:
-
-| scheme | weights in HBM | fits v6e-16 (512 GiB)? |
+| scheme | HBM | fits v6e-16 (512 GiB)? |
 |---|---:|---|
-| **bf16 (current load path)** | **~542 GiB** | **NO — exceeds 512 by ~30 GiB before any KV/activations/XLA scratch** |
-| fp8-everywhere (experts fp4→fp8) | ~272 GiB | yes (~240 GiB free) |
+| bf16 (old load path) | ~542 GiB | **NO** (OOM) |
 | **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes, ~350 GiB free** |
-| native (fp8 dense + fp4 experts) | ~149 GiB | yes (~363 GiB free) |
 
-- **v6e-16 = 16 chips × 32 GiB = 512 GiB HBM.** bf16 542 GiB > 512 → OOM on every chip
-  (542/16 ≈ 34 GiB/chip > 32). This is exactly why V4 ran on v6e-32 (1 TiB) but not here.
-- **Routed experts are 92–95% of the footprint** (137 GiB fp4 → 516 GiB bf16). Everything else
-  (attn, embed, lm_head, shared expert, MTP) sums to ~11.6 GiB native / ~26 GiB bf16.
-- KV cache is **negligible** (MLA-compressed: <0.2 GiB at max-model-len ≤ 2048, max-num-seqs=1).
-- So the ONLY thing that must stay compressed to fit is **the experts**. Keep them FP4 and the
-  model fits trivially. (Footprint numbers: measured from all 46 safetensors shard headers; the
-  on-disk native ckpt is **148.65 GiB** — the `gsutil du` "297 GiB" double-counts blobs/+snapshots.)
+Experts = 92–95% of footprint (137 GiB fp4 → 516 GiB bf16). KV negligible. **Keep experts FP4 ⇒ fits.**
 
 ---
 
-## THE PLAN — Strategy C (keep FP4 experts compressed; dense stays bf16)
-
-Smallest diff, biggest win. The experts are ~all the footprint; V4's FP4 is MXFP4; and the MoE
-matmul kernel **already supports** quantized weights. Reuse, don't build:
-
-- **`kernels/megablox/gmm_v2.py::gmm_v2`** (the grouped matmul V4's MoE prefill already calls)
-  accepts **`rhs_scale`** for blockwise-quantized weights, on-the-fly LHS quant, and unpacks
-  sub-byte-packed RHS (fp4/int4) in-kernel. `common.py:51` lists `jnp.float4_e2m1fn` as supported.
-- **`kernels/quantized_matmul/tuned_block_sizes.py`** ships tuned tiles for
-  `('float8_e4m3fn','float4_e2m1fn')` → fp8-act × fp4-weight is a first-class TPU path.
-- **Closest blueprint:** `layers/vllm/quantization/mxfp4.py` + `models/jax/gpt_oss.py::_load_mxfp4`
-  — GPT-OSS already loads packed-fp4 + e8m0-block-scale experts as `jnp.float4_e2m1fn`. STUDY THIS.
-- Dense FP8 (if ever kept): `layers/jax/quantization/fp8.py::Fp8BlockwiseLinearMethod`.
-
-Alternatives **(B) fp8-everywhere** and **(A) full-native** buy HBM headroom we don't need at
-max-num-seqs=1, at the cost of a much larger, more correctness-risky diff. Do **C** first.
-
----
-
-## PLUMBING — the change sites (verified)
-
-**Loader (`models/jax/deepseek_v4_loader.py`) — the production real-weight path is**
-`iter_v4_safetensors_specs` (:754, metadata only) → `place_spec_as_jax_sharded` (:918) →
-`read_dequant_slice` (:847) → **`dequant_weight` (:226, THE bf16 choke point)**:
-- `dequant_fp8_to_bf16` :115, `dequant_fp4_to_bf16` :142 → both return **bf16**.
-- `place_spec_as_jax_sharded` casts host np to `target_dtype` (the abstract param tree's leaf
-  dtype) at **:993**. Today every leaf is bf16/fp32 → forces bf16.
-- **Change:** for `kind=="fp4"` (experts), STOP dequantizing — emit a `jnp.float4_e2m1fn` weight
-  leaf + a separate e8m0/fp32 `rhs_scale` leaf. fp4 scale is `[out, in/block]`, row-aligned, so
-  `read_dequant_slice`/`place_spec_as_jax_sharded` slice cleanly on axis-0 (mind the 2-fp4/byte
-  packing — don't split a byte). This requires the **abstract param tree** (model definition) to
-  declare expert leaves as fp4 + scale, not bf16 — i.e. touches the MoE param structure, not just
-  the loader.
-
-**Consumer (`layers/jax/moe/deepseek_v4_moe.py`):**
-- **Prefill = sharded `gmm_v2`** (:234–:324; calls at :276/:285) — currently passes NO `rhs_scale`.
-  Threading `rhs_scale=` here is the key, ~small change (reshape scale to `[G,num_blocks,1,n]`).
-- **Decode = dense-all-256 `jnp.einsum`** (:217–:233; gate/up :223/:225, down :231) — can't take a
-  packed fp4 array. Either (a) dequant the stacked W to bf16 INSIDE the trace at decode (weights
-  still stored fp4 in HBM; the dequant is transient VMEM, not HBM — low-risk start), or (b) route
-  decode through `gmm_v2` too. **(a) first.**
-- ⚠️ The **S1 fix** lives in the MoE `use_shard_map`/`_routed_local` path (owned-expert mask /
-  zero-init) — preserve it EXACTLY through any rhs_scale change.
-
-**Attention / dense linears** (`deepseek_v4_attention.py` `_linear` :492; `deepseek_v4.py` MTP/lm_head):
-every weight is `.astype(fp32)` at use — they never depend on bf16 *specifically*. Strategy C
-leaves these bf16, so no change needed; only relevant if you later extend to fp8 dense (Strategy A).
+## THE PLAN — Strategy C (DONE on the device side; loader remains)
+Keep the routed experts compressed; dense stays bf16. **Representation (LOCKED, CPU-validated):**
+- **Weight leaf**: packed `uint8` `[E, out, in/2]` (2 e2m1/byte, low nibble first along IN).
+- **Scale leaf**: `float8_e8m0fnu` `[E, out, in/MXFP4_BLOCK_SIZE]` (one e8m0 per 32 IN elems).
+- **Sharded on E (axis-0, `attn_dp`)** — never splits a packed byte or a scale block, and keeps
+  the **host-side `np.stack` consolidation (the S1 fix) working** (numpy holds uint8; it cannot
+  hold float4 — this is why we store uint8, not `float4_e2m1fn`).
+- **`moe_forward` dequants uint8+e8m0 → bf16 in-trace** (`_dequant_fp4_experts`, reuses shared
+  `u8_unpack_e2m1`/`e8m0_to_fp32`), feeding bf16 into BOTH paths (dense einsum + gmm_v2 shard_map)
+  **byte-identically to the old bf16 path → S1 fix preserved exactly.** The dequant is per-LAYER
+  transient (~one layer's local experts ≈ 0.8 GiB/chip); stored fp4 ≈ 8.6 + scale ≈ 2 GiB/chip ≪ 32.
+- Shared/dense expert stays **bf16** (separate template; tiny; `expert_forward` untouched).
+- **Feeding FP4 straight into `gmm_v2` via its `rhs_scale=[G,K/32,1,N]` arg (unpack-in-VMEM, no
+  bf16 transient) is a FUTURE PERF optimization — NOT needed for fit/correctness.** Contract is
+  mapped (gmm_v2 wants logically-UNPACKED `float4_e2m1fn[G,K,N]` + fp32/e8m0 `rhs_scale`; touches
+  the `_routed_local` shard_map `in_specs` — the S1-fused path, so do it carefully + TPU-validated).
 
 ---
 
-## ROADMAP (drive top-down; each step clears the GATE; cheapest validation tier first)
-
-1. **Q.0 — confirm/quantify the baseline (optional, ≤1 smoke).** Current bf16 path should OOM
-   during weight load. A smoke confirms the v6e-16 serving path (ray/mesh/sharding/loader) is wired
-   and shows exactly where HBM runs out. SKIP if you'd rather spend the smoke budget on the fix.
-2. **Q.1 — model param tree: declare expert weights as fp4 + e8m0 scale leaves** (MoE definition).
-   CPU-oracle the shapes/dtypes (`scripts/s1_cpu_repro_v4flash.py both` must still construct).
-3. **Q.2 — loader: emit fp4 weight + scale for `kind=="fp4"`** instead of dequantizing
-   (`dequant_weight`/`read_dequant_slice`/`place_spec_as_jax_sharded` target_dtype). CPU-oracle.
-4. **Q.3 — MoE prefill: thread `rhs_scale` into the two `gmm_v2` calls.** CPU-oracle vs the torch
-   reference (the kernel is interpret-mode on CPU but proves math/no-NaN).
-5. **Q.4 — MoE decode: dequant-in-trace (a) or gmm route (b).** CPU-oracle.
-6. **Q.5 — FIRST REAL SMOKE = first gate-pass:** model LOADS (fits!), serves, **correct Fibonacci
-   + md5 identical ×2 fresh engines**. Establish the NEW v6e-16 md5 baseline here.
-7. **Q.6 (only if more headroom needed) — extend to fp8 dense** (Strategy A); otherwise stop.
+## WHAT LANDED THIS SESSION (commit: see git log) — Q.1 + consumer, CPU-GATED
+- `models/jax/deepseek_v4.py`: `make_abstract_moe_params` splits **routed** (FP4: uint8 w* +
+  e8m0 w*_scale) vs **shared** (bf16) templates; pytree registration adds `w*_scale` /
+  `w*_scale_stacked`; imports `MXFP4_BLOCK_SIZE`.
+- `layers/jax/moe/deepseek_v4_moe.py`: `ExpertParams`/`MoEParams` gain optional `w*_scale[_stacked]`
+  leaves; new `_dequant_fp4_experts`; `moe_forward` binds scales + dequants uint8→bf16 (guarded by
+  `W1.dtype==uint8`). **Downstream unchanged.**
+- `scripts/s1_cpu_repro_v4flash.py`: `make_random_params` synthesizes valid fp4 leaves (full-range
+  weight bytes; small e8m0 scales 2^-9..2^-6 so the model stays in the stable bf16-baseline regime).
+- `scripts/quant_fp4_dequant_check.py` (NEW): standalone bit-faithful cross-check.
 
 ---
 
-## <a name="GATE"></a>GATE (non-negotiable for every committed change) — REDEFINED for v6e-16
+## ROADMAP (drive top-down; cheapest validation tier first)
+1. ~~**Q.1** — param tree: experts = fp4 + e8m0 leaves.~~ **DONE + CPU-GATED.**
+2. ~~**Q.3/Q.4** — MoE consumer: dequant-in-trace (both paths), S1-preserving.~~ **DONE + CPU-GATED.**
+   (rhs_scale-into-gmm = future perf, not on the path to smoke.)
+3. **Q.2 — LOADER (THE NEXT BIG PIECE; TPU-only validation).** For `kind=="fp4"` experts, STOP
+   dequantizing — emit the packed `uint8` weight leaf + the `e8m0` scale leaf. The abstract tree
+   already declares both (Q.1). Five coordinated edits in `models/jax/deepseek_v4_loader.py` +
+   `deepseek_v4.py` (verified by the loader-mapping audit):
+   - `read_dequant_slice`(:847)/`place_spec_as_jax_sharded`(:918): for fp4, return the **raw packed
+     bytes** (uint8, no `dequant_fp4_to_bf16`) + a sibling **scale** array. Axis-0 (out) slicing is
+     already byte/block-safe (loader:862 weight, :884 scale) — fp8's block-align dance is NOT needed.
+   - **Stop DROPPING `.scale`**: today `map_hf_name_to_jax_path` + the `<scale>` early-returns
+     (deepseek_v4.py ~:379, :1613, :1639) discard scales. Route `...wN.scale` → a real `...wN_scale`
+     JAX path so it reaches `_assign`.
+   - `_maybe_consolidate`(deepseek_v4.py:1497)/`_is_stash_leaf`(:1492): also `np.stack` the per-expert
+     scales into `w*_scale_stacked`, sharded `P('attn_dp',None,None)` (same E-shard as the weights).
+   - **Shared expert**: confirm its on-disk dtype. If it's FP8 dense (likely) keep the bf16 dequant
+     (Strategy C leaves dense bf16); the loader's `_kind_of` (:803) must NOT classify it fp4. If the
+     name contains "experts" it may misfire — check.
+   - The `target_dtype` cast (loader:993) becomes a bitcast-equivalent (uint8→uint8); ensure no
+     numeric `astype` of already-unpacked values.
+4. **Q.5 — FIRST REAL SMOKE = first gate-pass** (after `full_slice_v4_sync.sh` + clear xla_cache on
+   all 4 hosts). Does it LOAD (fit!), serve, **correct Fibonacci + md5 identical ×2 fresh engines**?
+   Establish the NEW v6e-16 md5 baseline here.
 
-The S1 gate's md5 `5bf42256` was established on **v6e-32 + bf16** and **cannot be reproduced here**
-(bf16 OOMs on v6e-16, and keeping experts fp4 changes the numerics anyway). So the bar is:
+---
+
+## <a name="GATE"></a>GATE (non-negotiable) — REDEFINED for v6e-16
+The old v6e-32 md5 `5bf42256` is **DEAD** (bf16 OOMs; fp4 changes numerics). Bar:
 - `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (visible_words ≥ 10, max_run < 5).
-- FIB decode: **correct Fibonacci (21, 34, 55, 89, 144 — deterministic/high-margin)** +
-  **N=2 md5 byte-identical across 2 fresh engines** (`python3 /tmp/s1_probe2.py 2`). The fp4 path
-  WILL set a **NEW** baseline hash — establish it once and confirm identical ×2 fresh engines.
-  Non-negotiable = **identical ×2 engines + correct Fibonacci**, NOT a specific legacy hash.
-- READ the actual decode text ("contains Paris" is a known false positive — can EOS at tok 1).
-- ⚠️ Do NOT gate on a long-tail md5 (`s1_probe2.py 20`+): it's nondeterministic at temp=0
-  (pre-existing decode all-reduce-ordering residual).
-- **Because bf16 currently can't even load on v6e-16, the first milestone — "it loads, fits,
-  serves, correct + deterministic" — IS the first real gate-pass**, not a regression check.
+- FIB decode: **correct Fibonacci (21,34,55,89,144)** + **N=2 md5 byte-identical across 2 fresh
+  engines** (`python3 /tmp/s1_probe2.py 2`). The fp4 path sets a **NEW** baseline hash — establish
+  once, confirm identical ×2 engines. Non-negotiable = **identical ×2 + correct Fibonacci**.
+- READ the actual decode text ("contains Paris" is a false positive — can EOS at tok 1).
+- Do NOT gate on a long-tail md5 (`s1_probe2.py 20`+) — nondeterministic at temp=0 (decode all-reduce).
+- **First milestone "it loads, fits, serves, correct + deterministic" IS the first gate-pass.**
 
 ---
 
-## VALIDATION TIERS (cheapest first — see CLAUDE.md "How to validate")
+## VALIDATION TIERS (cheapest first)
 1. **CPU torch oracle** (no slice): `PYTHONPATH=work/tpu-inference:work/vllm work/vllm_env/bin/python3
-   scripts/s1_cpu_repro_v4flash.py both` → "OK". Proves math/no-NaN; a quant numerics SHIFT still
-   passes (eager+jit shift together). Cannot reproduce determinism (no sharding).
-2. **TPU microbench** (`scripts/perf_microbench*`): time a kernel/op on the real mesh, no 543 GiB load.
+   scripts/s1_cpu_repro_v4flash.py both` → "OK: both eager and jit match". Proves shapes/math/no-NaN
+   + jit-safe; a quant numerics SHIFT still passes. Exercises the DENSE moe path (gmm is TPU-only).
+1b. **FP4 dequant cross-check** (no slice, seconds): `…/python3 scripts/quant_fp4_dequant_check.py`
+   → "OK …byte-identical". Proves `_dequant_fp4_experts` == host `dequant_fp4_to_bf16` bit-for-bit.
+2. **TPU microbench** (`scripts/perf_microbench*`): a kernel/op on the real mesh, no 543 GiB load.
 3. **Full smoke + the GATE** — RESERVE (≤1–2/session; cold compile 10–30 min). The fit/correctness gate.
 
 ---
 
 ## NEXT ACTION (for the session reading this)
-Implement **Strategy C** top-down from the roadmap: **Q.1 → Q.2 → Q.3 → Q.4 on the CPU oracle**
-(cheap), then **Q.5 = the first real smoke** (does it FIT + serve + correct Fibonacci + deterministic
-md5 ×2 engines?). Study `models/jax/gpt_oss.py::_load_mxfp4` + `kernels/megablox/gmm_v2.py` rhs_scale
-first — they're the blueprint. Fan out subagents AGGRESSIVELY for the audit/draft while the slice is
-idle; serialize slice access. Hand off when context grows (`scripts/quant_handoff_window.sh`).
+Do **Q.2 — the loader** (above). It's the last piece before the model can actually LOAD with experts
+kept FP4. The abstract tree + consumer are already in place and CPU-gated, so Q.2 has a fixed target:
+produce a `uint8 [E,out,in/2]` weight leaf + a `float8_e8m0fnu [E,out,in/32]` scale leaf per routed
+expert (E-sharded), and stop dropping `.scale`. Fan out subagents on the 5 edit sites (mapped above);
+the loader can only be validated by a real smoke (Q.5), so land Q.2 + Q.5 in one focused session.
+After ANY edit: `full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on all 4 hosts BEFORE smoke.
+
+⚠️ **Production load is intentionally INERT until Q.2** (tree says uint8; the loader still dequants to
+bf16 → dtype mismatch). This regresses nothing (bf16 already OOMs) and the CPU oracle is the gate for
+Q.1/consumer. Do NOT smoke before Q.2 lands.
 
 ---
 
-## INFRA STATUS / v6e-16 bringup notes (so the next session doesn't re-derive)
+## INFRA STATUS / v6e-16 (so the next session doesn't re-derive)
 - Slice `v6spoteu719`, zone `europe-west4-a`, project `prm-research`. **v6e-16, topology 4×4**,
-  16 chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16` (auto-discovered).
-- **Bootstrapped this session:** `uv` installed on all 4 hosts (head `~/.local/bin`, workers
-  `/usr/local/bin`); `~/.ssh/google_compute_engine` generated + propagated to all workers via
-  `gcloud compute tpus tpu-vm ssh`; venvs built (`setup.sh` fan-out); GCS weights mounted
-  (`gs://personal-mark-eu/vllm/hub` → `~/.cache/huggingface/hub`); `.env` written (tokens omitted —
-  weights are auth-free, `claude` uses `~/.claude` creds).
-- ⚠️ **Ray `ray.init` "version mismatch" = mark's rogue ray-2.54.1 `node` docker container poisoning
-  the GCS `CLUSTER_METADATA` — NOT a corrupt venv.** It rejoins our GCS every few seconds, stamps
-  2.54.1, then crashes — breaking `ray.init` for our 2.55.1 clients (and can Core-halt the slice).
-  **THE FIX IS THE TWO GUARDIANS, which MUST stay alive during ALL TPU work** (started this session;
-  cluster verified `ray.init OK, 16 TPU, [4,4,4,4]` only AFTER starting them):
-  - `node_guardian` occupies the `node` container name on every host (blocks mark's container at the source);
-  - `meta_guardian` re-stamps `CLUSTER_METADATA`→2.55.1 within ~0.5s.
-  Check: `ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`. Restart if dead:
+  16 chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16`. venvs + GCS weights
+  mounted; Ray healthy (16 TPU). Smoke = TP=16 (`full_slice_v4_smoke.sh`, self-guards single-instance).
+- ⚠️ **Ray "version mismatch" = mark's rogue ray-2.54.1 `node` container poisoning GCS CLUSTER_METADATA**
+  — NOT a corrupt venv. **FIX = keep BOTH guardians alive during ALL TPU work:**
+  `ps -eo pid,cmd | grep -E 'node_guard[i]an|meta_guard[i]an'`. Restart if dead:
   `INTERVAL=3 setsid bash scripts/full_slice_v4_node_guardian.sh >logs/node_guardian.log 2>&1 </dev/null &`
   and `setsid work/vllm_env/bin/python scripts/full_slice_v4_meta_guardian.py 10.164.0.15:6379 >logs/meta_guardian.log 2>&1 </dev/null &`
-  (⚠️ meta_guardian's default IP is the stale v6e-32 head — ALWAYS pass `10.164.0.15:6379`). A clean
-  ray `--reinstall --no-cache` was also done for venv hygiene but is NOT the fix.
-- To (re)start ray: `scripts/full_slice_v4_ray_restart.sh` (now verifies `0.0/16.0 TPU`).
-- To smoke: `bash scripts/full_slice_v4_smoke.sh` (TP=16; self-guards single-instance). After any
-  `.py` edit: `scripts/full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on all 4 hosts.
+  (⚠️ ALWAYS pass `10.164.0.15:6379` — meta_guardian's default IP is the stale v6e-32 head).
+- Ray (re)start: `scripts/full_slice_v4_ray_restart.sh` (verifies 16 TPU). Bootstrap: `full_slice_v4_bootstrap.sh`.

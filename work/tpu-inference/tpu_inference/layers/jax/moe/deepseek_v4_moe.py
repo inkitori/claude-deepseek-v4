@@ -29,6 +29,30 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.layers.common.quantization import (
+    MXFP4_BLOCK_SIZE, e8m0_to_fp32, u8_unpack_e2m1)
+
+
+def _dequant_fp4_experts(w_u8: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
+    """Dequantize packed-FP4 expert weights + e8m0 block scale to bf16, in-trace.
+
+    QUANT / Strategy C: the 256 routed experts ship natively as FP4 (= MXFP4,
+    bit-identical to jnp.float4_e2m1fn) and are kept COMPRESSED in HBM as packed
+    uint8 (`w_u8`, 2 e2m1/byte, low nibble first along the IN/contracting axis)
+    plus an e8m0 block scale (`scale`, float8_e8m0fnu or its uint8 bitcast, one
+    per `MXFP4_BLOCK_SIZE`=32 IN elements). This recovers bf16 weights transiently
+    per layer (~one layer's local experts — the STORED fp4 is what fits the
+    v6e-16's 512 GiB HBM).
+
+    Mirrors the trusted host-side `deepseek_v4_loader.dequant_fp4_to_bf16`
+    (codebook + e8m0=2^(b-127) + per-block broadcast), reusing the shared
+    `u8_unpack_e2m1` / `e8m0_to_fp32` primitives (also the gpt_oss MXFP4 path).
+    """
+    if scale.dtype != jnp.uint8:  # float8_e8m0fnu -> raw exponent bytes (no-op on bits)
+        scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
+    codes = u8_unpack_e2m1(w_u8).astype(jnp.float32)                   # [..., K]
+    s = jnp.repeat(e8m0_to_fp32(scale), MXFP4_BLOCK_SIZE, axis=-1)     # [..., K]
+    return (codes * s).astype(jnp.bfloat16)
 
 
 def _shard_e_first(x: jnp.ndarray) -> jnp.ndarray:
@@ -111,10 +135,16 @@ def gate_forward(
 
 @dataclass
 class ExpertParams:
+    # Routed experts are packed FP4: w* are uint8 [out, in/2] (2 e2m1/byte) and
+    # w*_scale are float8_e8m0fnu [out, in/MXFP4_BLOCK_SIZE]; dequanted to bf16 in
+    # `moe_forward`. The shared/dense expert stays bf16 [out, in] with w*_scale=None.
     w1: jnp.ndarray  # [inter_dim, dim] (gate proj)
     w2: jnp.ndarray  # [dim, inter_dim] (down proj)
     w3: jnp.ndarray  # [inter_dim, dim] (up proj)
     swiglu_limit: float
+    w1_scale: Optional[jnp.ndarray] = None  # [inter_dim, dim/block] e8m0, fp4 only
+    w2_scale: Optional[jnp.ndarray] = None  # [dim, inter_dim/block]
+    w3_scale: Optional[jnp.ndarray] = None  # [inter_dim, dim/block]
 
 
 def expert_forward(
@@ -146,10 +176,14 @@ class MoEParams:
     dim: int
     # Pre-stacked weights (built at load time); skips the per-call
     # `jnp.stack(experts[*].wN)` whose all-to-all storm OOMs HLO temp.
-    w1_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
-    w2_stacked: Optional[jnp.ndarray] = None  # [E, dim, inter]
-    w3_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim]
+    w1_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim] (or [E,inter,dim/2] uint8 fp4)
+    w2_stacked: Optional[jnp.ndarray] = None  # [E, dim, inter] (or [E,dim,inter/2] uint8 fp4)
+    w3_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim] (or [E,inter,dim/2] uint8 fp4)
     swiglu_limit: Optional[float] = None      # uniform across experts
+    # e8m0 block scales for packed-FP4 experts (None when stacked weights are bf16).
+    w1_scale_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim/block] e8m0
+    w2_scale_stacked: Optional[jnp.ndarray] = None  # [E, dim, inter/block] e8m0
+    w3_scale_stacked: Optional[jnp.ndarray] = None  # [E, inter, dim/block] e8m0
 
 
 def moe_forward(
@@ -185,6 +219,9 @@ def moe_forward(
         W1 = params.w1_stacked
         W2 = params.w2_stacked
         W3 = params.w3_stacked
+        S1 = params.w1_scale_stacked
+        S2 = params.w2_scale_stacked
+        S3 = params.w3_scale_stacked
         swiglu_limit = (params.swiglu_limit
                         if params.swiglu_limit is not None
                         else params.experts[0].swiglu_limit)
@@ -192,7 +229,21 @@ def moe_forward(
         W1 = _shard_e_first(jnp.stack([e.w1 for e in params.experts]))  # [E,i,d]
         W2 = _shard_e_first(jnp.stack([e.w2 for e in params.experts]))  # [E,d,i]
         W3 = _shard_e_first(jnp.stack([e.w3 for e in params.experts]))  # [E,i,d]
-        swiglu_limit = params.experts[0].swiglu_limit  # uniform across experts
+        e0 = params.experts[0]
+        _stk = lambda a: (jnp.stack([getattr(e, a) for e in params.experts])
+                          if getattr(e0, a) is not None else None)
+        S1, S2, S3 = _stk('w1_scale'), _stk('w2_scale'), _stk('w3_scale')
+        swiglu_limit = e0.swiglu_limit  # uniform across experts
+
+    # QUANT / Strategy C: routed experts are STORED packed-FP4 (uint8) + e8m0
+    # scale in HBM; dequant to bf16 in-trace (per-layer transient). Everything
+    # downstream (dense einsum + gmm_v2 shard_map) is byte-identical to the old
+    # bf16 path, so the S1 determinism fix is preserved exactly. No-op for the
+    # bf16 stacked path (S* is None / W* already bf16).
+    if W1.dtype == jnp.uint8:
+        W1 = _shard_e_first(_dequant_fp4_experts(W1, S1))  # [E,i,d] bf16
+        W2 = _shard_e_first(_dequant_fp4_experts(W2, S2))  # [E,d,i] bf16
+        W3 = _shard_e_first(_dequant_fp4_experts(W3, S3))  # [E,i,d] bf16
 
     # Per-(token, expert) routing weight: zero for non-top_k experts.
     # Round-tripped through `dtype` to match expert_forward's bf16 cast.

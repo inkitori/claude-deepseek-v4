@@ -77,10 +77,21 @@ def make_random_params(cfg, seed=0):
     leaves, treedef = jax.tree_util.tree_flatten(
         params_struct, is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct))
     keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
-    randomized = [
-        (jax.random.normal(k, x.shape, dtype=jnp.float32) * 0.02).astype(x.dtype)
-        for k, x in zip(keys, leaves)
-    ]
+
+    def _rand(k, x):
+        # QUANT fp4 leaves: packed-FP4 expert weights are uint8 (full-range bytes
+        # -> exercises the whole e2m1 codebook, both signs); e8m0 block scales are
+        # float8_e8m0fnu, synthesized small (bytes 118..121 -> 2^-9..2^-6) so the
+        # dequanted experts are ~0.02-magnitude (the bf16-baseline regime) and the
+        # model stays in a numerically stable, near-tie-free decode trajectory.
+        if x.dtype == jnp.uint8:
+            return jax.random.randint(k, x.shape, 0, 256, dtype=jnp.uint8)
+        if x.dtype == jnp.float8_e8m0fnu:
+            b = jax.random.randint(k, x.shape, 118, 122, dtype=jnp.uint8)
+            return jax.lax.bitcast_convert_type(b, jnp.float8_e8m0fnu)
+        return (jax.random.normal(k, x.shape, dtype=jnp.float32) * 0.02).astype(x.dtype)
+
+    randomized = [_rand(k, x) for k, x in zip(keys, leaves)]
     return jax.tree_util.tree_unflatten(treedef, randomized)
 
 

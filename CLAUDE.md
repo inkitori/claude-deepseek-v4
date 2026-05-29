@@ -7,12 +7,12 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-28):** **Infra bootstrapped & verified on `v6spoteu719` (v6e-16,
-> 4×4, 16 chips, 4 hosts).** venv on all hosts, GCS weights mounted, Ray healthy (16 TPU,
-> `ray.init` OK). The model is FP8 (dense) + FP4 (256 experts, = MXFP4); the loader dequantizes
-> all of it to bf16 (~542 GiB) which CANNOT fit 512 GiB HBM → OOM. **Goal = keep the FP4 experts
-> compressed in HBM (Strategy C); `gmm_v2` already takes a per-block `rhs_scale`.** No real-V4
-> smoke yet. Full state + roadmap + NEXT ACTION in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** Infra bootstrapped on `v6spoteu719` (v6e-16, 4×4). The model is
+> FP8 (dense) + FP4 (256 experts, =MXFP4); old loader dequantizes all to bf16 (~542 GiB) → OOM.
+> **Strategy C device side DONE + CPU-GATED:** the param tree now declares routed experts as packed
+> FP4 (uint8) + e8m0 scale and `moe_forward` dequants them to bf16 in-trace (S1-preserving). **NEXT =
+> the LOADER (Q.2): emit the FP4 leaves instead of dequantizing** — real load is inert until then.
+> Full state + roadmap + NEXT ACTION in `HANDOFF_QUANT.md`.
 
 ## Goal
 
