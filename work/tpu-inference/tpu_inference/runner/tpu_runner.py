@@ -578,7 +578,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.state)
 
-        rng_key = nnx.Rngs(jax.random.key(self.model_config.seed)).params()
+        # Compute the sampling RNG key on the HOST (CPU) so it does NOT dispatch
+        # jit__threefry_fold_in / jit_add as eager TPU programs from the racing
+        # rank-0 worker (co-located with the driver), which desyncs the SPMD
+        # launch group while the remote workers still place weights (scheckne).
+        # Mirrors the RoPE-freqs->host fix (fb54237b). Unlike that site, line 581
+        # is NOT under an active jax.set_mesh (get_model's set_mesh has exited),
+        # so default_device(cpu) genuinely pins these tiny ops to CPU. The value
+        # is byte-identical (threefry is platform-deterministic); device_array
+        # below replicates the host key onto the mesh via make_array_from_callback.
+        with jax.default_device(jax.devices("cpu")[0]):
+            rng_key = nnx.Rngs(jax.random.key(self.model_config.seed)).params()
         self.rng_params_for_sampling = device_array(self.mesh,
                                                     rng_key,
                                                     sharding=NamedSharding(
