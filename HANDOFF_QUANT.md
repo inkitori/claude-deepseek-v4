@@ -5,20 +5,24 @@
 > Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`,
 > `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29):** **LOADS + FITS; now grinding through a CHAIN of post-load
-> launch-id `scheckne` races, fixing them one HLO-diff at a time.** Root pattern (HLO-diff proven):
-> during init the DRIVER (head) finishes its work and races ahead to the next eager-TPU program
-> (compiled `num_partitions=16`) while the 3 worker actors are still running `broadcast_in_dim`
-> weight placement → head launches a different program than workers at the same launch slot →
-> `scheckne` (TensorCoreSequencer). **FIXED #1 (`fb54237b`): RoPE freqs precompute** — was eager jnp
-> under `set_mesh(mesh)` → 16-partition `jit_iota/outer/exp`; now NUMPY (host), returned uncommitted
-> (NOT device_put-cpu — create_jit_model's jit mesh rejects a CPU-committed array). Cleared the freqs
-> scheckne + a device-mismatch; load now progresses into real TPU compile (head 3→113 modules).
-> **CURRENT BLOCKER: the SAME race one step deeper** — head-only divergent modules are now
-> `jit_create_jit_model` + `jit__threefry_fold_in` + `jit_add` (the RNG `nnx.Rngs(...).params()` at
-> `tpu_runner.py:581` + create_jit_model). RNG data is seed-only/host-identical → PURE timing race,
-> no barrier exists. **NEXT = insert a `sync_global_devices` barrier BEFORE create_jit_model** (see
-> ROADMAP). Last smoke `logs/full-slice-v4-smoke-20260529T040718Z.log`; each smoke crashes ~90s (cheap).
+> **One-line status (2026-05-29):** **LOADS + FITS; post-load launch-id `scheckne` persists. BOTH
+> barrier approaches RULED OUT this session — PIVOT to the FREQS-FIX pattern: eliminate the divergent
+> eager TPU dispatches, don't try to barrier them.** Race (proven): the rank-0 worker (co-located with
+> the EngineCore driver on head .15, lowest RPC latency) finishes the collective-free load FIRST and
+> races into post-load eager programs while the 3 remote workers still place weights → launch-id
+> mismatch → `scheckne`. **LANDED precedent `fb54237b`:** RoPE freqs precompute → NUMPY (host) removed
+> the 16-partition `jit_iota/outer/exp` from the racing rank; load progressed (3→113 modules) to the
+> NEXT eager dispatch. **THIS SESSION (all reverted to baseline, CPU-clean):**
+> (1) `sync_global_devices` barrier → BECOMES the divergent 16-partition `identity_fn` collective itself
+> (crashes AT the barrier, earlier). (2) host-side `wait_at_barrier` → SILENT NO-OP:
+> `jax._src.distributed.global_state.client is None` here (no `jax.distributed.initialize()`; the TPU
+> handshake is libtpu-env-var-based) — instrumentation logged `coord=NONE`; `jax.process_count()` still
+> returns 4 so the guard passed misleadingly. ⇒ NO coord-service barrier exists. (3) PROVEN: the 4
+> workers are BYTE-IDENTICAL (no XLA non-determinism); the divergent post-load programs are
+> `jit_create_jit_model` + `jit__threefry_fold_in` + `jit_add`, ALL host-side (0 collectives), run in
+> every worker. **NEXT = apply the freqs-fix pattern to the RNG** (`nnx.Rngs(jax.random.key(seed)).params()`
+> @ `tpu_runner.py:581` → host/numpy) then create_jit_model; see ROADMAP. Last smokes:
+> `…045525Z` (HLO dump → worker-diff), `…051036Z` (barrier instrumented → coord=NONE). Crash ~60-90s (cheap).
 
 ---
 
@@ -72,49 +76,73 @@ V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, 
 
 ---
 
-## ⚠️ CURRENT BLOCKER — the SAME driver-races-workers scheckne, one step deeper
-Smoke `040718Z`: load completes (`placed=68812`), progresses into TPU compile, then `Core halted …
-scheckne` at `TensorCoreSequencer` (tpu17). HLO-diff: workers (identical to each other) show only
-weight-fill `broadcast_in_dim`+convert+`threefry_seed`; **HEAD-only divergent modules = `jit_create_jit_model`
-+ `jit__threefry_fold_in` + `jit_add`**. Agent-confirmed root cause:
-- `jit__threefry_fold_in`+`jit_add` = `nnx.Rngs(jax.random.key(seed)).params()` at **`tpu_runner.py:581`**
-  (`fold_in(key,count)` + `count+=1`), run right after `get_model` returns, NO active mesh.
-- `jit_create_jit_model` = the `@nnx.jit` at `model_loader.py:126`, called at `:274` INSIDE `get_model`.
-- RNG is **seed-only (=0), host-identical** → NOT host-divergent data; it's a **pure TIMING race** + there
-  is **NO cross-host barrier** anywhere in load/init (`sync_global_devices`/`multihost_utils` = 0 repo hits).
-  The driver (in-engine process, no Ray-RPC latency) finishes load first and launches these 16-partition
-  programs while the 3 worker actors still drain `broadcast_in_dim`.
+## ⚠️ CURRENT BLOCKER — post-load `scheckne` (barrier approach RULED OUT; pivot to freqs-fix pattern)
+On the collective-free host-gather load that LOADS + FITS: load completes (`placed=68812`, ~40s) then
+`scheckne` at `TensorCoreSequencer` (tpu17) ~60-90s in. Now well-characterized (this session's agents +
+worker-to-worker HLO diff + barrier instrumentation):
+- **Race:** the rank-0 worker (co-located with the EngineCore driver on head .15; lowest RPC latency)
+  finishes the collective-free, HLO-free `make_array_from_callback` load FIRST and races into the
+  post-load eager programs while the 3 remote workers (.8/.17/.16) still place weights → fast rank
+  launches a program the laggards don't have at the same launch slot → launch-id mismatch.
+- **Workers are BYTE-IDENTICAL** (worker-to-worker diff: .8≡.17≡.16, every module's normalized md5
+  matches) → NO XLA compiler non-determinism. ⚠️ **Diff WORKER-to-WORKER (.8/.17/.16), NOT
+  head-vs-worker:** head .15's `/tmp/hlo_dump` MIXES the EngineCore driver (few modules) + the
+  co-located rank-0 worker (full set) → the OLD head-vs-worker diffs were apples-to-oranges
+  (they mistook the driver's small dump for "head-only divergent modules").
+- **Divergent post-load programs** (on the racing rank): `jit_create_jit_model` (the `@nnx.jit` @
+  `model_loader.py:126`, called `:274` inside get_model) + `jit__threefry_fold_in` + `jit_add` (the RNG
+  `nnx.Rngs(jax.random.key(seed)).params()` @ `tpu_runner.py:581`). ALL host-side (**0 collectives, 0
+  all-reduce** — confirmed in the HLO): model-state layout + seed-only RNG. They run in ALL 4 workers
+  (identical), just at different wall-clock times. (create_jit_model + RNG run in the worker actors,
+  NOT the driver — RayDistributedExecutor dispatches `load_model` via `collective_rpc` to 4 actors.)
 
-**ROADMAP / NEXT ACTIONS (do in order):**
-1. **Insert a cross-host barrier BEFORE `create_jit_model`** so all 4 hosts finish load before any
-   launches a post-load 16-partition program. Use `from jax.experimental import multihost_utils` +
-   `multihost_utils.sync_global_devices("v4_post_load")`. ⚠️ **Placement matters:** `create_jit_model`
-   runs at `model_loader.py:274` INSIDE `get_model` — BEFORE `tpu_runner.py:581` — and workers never
-   compiled it (they died first), so it IS part of the race. A barrier at :581 (the agent's first
-   suggestion) is TOO LATE. Put it **right before `create_jit_model` (`model_loader.py` :274)** OR, to
-   stay V4-focused, at the **end of V4's `load_weights`** (deepseek_v4.py; model_loader calls
-   `model.load_weights(rng)` :273 then `create_jit_model` :274 — so end-of-load_weights == pre-jit).
-   One barrier there should serialize create_jit_model + the :581 fold_in/add in one shot (they run
-   lockstep once the hosts are synced), just as the numpy fix cleared all the freqs ops at once.
-2. **Validate:** CPU oracle (`s1_cpu_repro both`) is a single-host no-op for the barrier but confirms no
-   import/break; then smoke WITH `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`. Past ~120s with no
-   scheckne = barrier worked → into the long cold forward compile (10-30 min) → watch for
-   `Application startup complete`.
-3. **If the barrier is insufficient / a new scheckne appears:** re-run the HLO-diff (helper below) to
-   find the next head-only divergent module and repeat. Fallback for the RNG specifically: take
-   `nnx.Rngs(...).params()` (tpu_runner:581) fold_in/add off TPU (host/CPU) like the freqs fix.
-   ⚠️ Small risk the barrier collective itself diverges if hosts reach it at wildly different slots —
-   low (it's the intended rendezvous), but if so, move it earlier (before load_weights too).
-4. After it serves: **GATE** below (establish the v6e-16 baseline md5). Likely a long cold compile the
-   first time it gets past init — budget for it (`VLLM_ENGINE_READY_TIMEOUT_S=2400` already set).
+### Why BARRIERS are ruled out (both tried + REVERTED this session)
+- **Device-collective `sync_global_devices`** (`jax.experimental.multihost_utils`): compiles to a
+  16-partition `jit__identity_fn` collective that ITSELF needs lockstep launch → it BECOMES the new
+  divergent module (the fast rank launches it while laggards place weights) → crashes AT the barrier,
+  EARLIER than baseline. HLO-diff confirmed `identity_fn` as the divergent module_0012.
+- **Host-side `wait_at_barrier`** (`jax._src.distributed.global_state.client.wait_at_barrier(id, ms)` —
+  the coord-service barrier jax's OWN checkpoint mgr uses, signature verified): is a **SILENT NO-OP
+  here** — the client is `None` because this libtpu-env-var-based Ray setup never calls
+  `jax.distributed.initialize()`, so there is no coordination service. Instrumentation logged
+  `rank=0 ... PASSED ... coord=NONE`. (`jax.process_count()` returns 4 from the TPU topology, so a
+  `process_count()>1` guard passes MISLEADINGLY.) ⇒ No host-side barrier exists without first standing
+  up a coordination service. Verified-correct call (for reuse if a coord svc is set up later):
+  `from jax._src import distributed; distributed.global_state.client.wait_at_barrier("id", 600000)`.
+
+### ROADMAP / NEXT ACTIONS (do in order) — eliminate divergent dispatches, the proven lever
+1. **Apply the FREQS-FIX PATTERN to the RNG** (proven; `fb54237b` did exactly this for freqs).
+   `nnx.Rngs(jax.random.key(self.model_config.seed)).params()` @ `tpu_runner.py:581` compiles
+   `jit__threefry_fold_in`+`jit_add` on-device. The key is seed-only/host-deterministic → compute it on
+   HOST (numpy / `jax.default_device(cpu)`) and feed the result to `device_array(...)` (the `:582`
+   device_array is already host-side make_array_from_callback under Ray). Removes 2 of the 3 divergent
+   dispatches from the racing rank. Validate: CPU oracle (no-op for this, confirms no break) + smoke.
+   Each removal historically PROGRESSES to the next eager dispatch (freqs: 3→113 modules).
+2. **Then create_jit_model** (`@nnx.jit` @ `model_loader.py:126`, donate_argnums=(0,)): host-side
+   model-state realization (1492 sharding annots, 0 collectives). If removing the RNG alone doesn't get
+   past it, investigate making it NOT dispatch a divergent 16-partition program (run eagerly / outside
+   `set_mesh`, or guarantee lockstep launch). Shared infra — keep the diff minimal.
+3. **(Deprioritized) a WORKING barrier**, only if 1-2 don't suffice: (a) call `jax.distributed.initialize()`
+   early to populate `global_state.client` (RISK: conflict with the libtpu handshake / already-init
+   devices), or (b) a non-jax rendezvous (Ray `collective_rpc` barrier, or shared-FS barrier). Barriers
+   have NOT helped — try dispatch-elimination first.
+4. After it gets past create_jit_model: repeat the WORKER-to-WORKER HLO-diff for the next eager dispatch;
+   then the first real forward collective + cold compile (10-30 min, `VLLM_ENGINE_READY_TIMEOUT_S=2400`
+   already set) → **GATE** below (establish the v6e-16 baseline md5).
+
+OPEN QUESTION (does NOT block step 1): is the TPU launch-id collective-gated (only cross-core collectives
+must match) or per-program (every dispatch counts)? Evidence is mixed, BUT the freqs fix EMPIRICALLY
+worked by removing host-side eager dispatches → "eliminate the divergent dispatch from the racing rank"
+is the working lever regardless of the exact mechanism.
 
 HLO-diff helper (proven this session):
 ```
 for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude='*' \
   -e "ssh -i ~/.ssh/google_compute_engine" enyouki@10.164.0.$ip:/tmp/hlo_dump/ /tmp/hlo_cmp/h$ip/; done
-# head (15) is local: cp /tmp/hlo_dump/*.before_optimizations.txt /tmp/hlo_cmp/h15/
 # then per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
-# divergent count/signature between h15 and h8/h17/h16 = the culprit op.
+# ⚠️ COMPARE WORKER-to-WORKER: h8 vs h17 vs h16 (3 pure workers). DO NOT use h15 — its /tmp/hlo_dump
+# MIXES the EngineCore driver (few modules) + the co-located rank-0 worker, so h15-vs-workers is
+# apples-to-oranges. For content non-determinism: normalized-md5 each shared module across h8/h17/h16.
 ```
 
 ---
@@ -143,8 +171,8 @@ Old v6e-32 md5 `5bf42256` is DEAD. Bar:
 3. **Full smoke + GATE** — load completes (`placed=68812`, ~40s) then hits the create_jit_model/RNG
    `scheckne` ~90s in. Cheap to iterate the blocker (crashes ~90s). HLO-dump recipe + cross-host diff
    (helper above) is the tool: clear xla_cache+/tmp/hlo_dump on all 4, smoke with
-   `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`, then per-host `namelist` opname-multiset diff
-   (head h15 vs workers) → head-only module names = the divergent eager program.
+   `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`, then per-host opname-multiset diff WORKER-to-WORKER
+   (h8/h17/h16 — NOT h15, see helper caveat below) → divergent module = the culprit eager program.
 
 ---
 

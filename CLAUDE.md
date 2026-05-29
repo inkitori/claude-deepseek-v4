@@ -7,15 +7,17 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** **LOADS + FITS; clearing a CHAIN of post-load `scheckne` races.**
-> Root pattern (HLO-diff proven): during init the DRIVER finishes first and launches the next
-> 16-partition eager-TPU program while worker actors still run `broadcast_in_dim` weight placement →
-> launch-id mismatch. **FIXED #1 (`fb54237b`): RoPE freqs precompute → NUMPY (host)** — killed the
-> freqs scheckne + a device-mismatch; load now reaches real TPU compile (head 3→113 modules).
-> **CURRENT BLOCKER: same race deeper** — head-only `jit_create_jit_model` + `jit__threefry_fold_in`
-> + `jit_add` (RNG `nnx.Rngs().params()` @ `tpu_runner.py:581` + create_jit_model); RNG is seed-only
-> = pure timing race, NO barrier exists. **NEXT = `sync_global_devices` barrier BEFORE create_jit_model**
-> (NOT at :581 — too late). Full state + HLO-diff recipe in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** **LOADS + FITS; post-load `scheckne` persists. BARRIERS RULED OUT
+> — pivot to the freqs-fix pattern (eliminate divergent eager dispatches).** Root pattern (proven): the
+> rank-0 worker (co-located w/ the driver on .15) finishes the collective-free load FIRST and races into
+> post-load eager programs while remote workers still place weights → launch-id mismatch. **FIXED #1
+> (`fb54237b`): RoPE freqs → NUMPY (host)** removed the 16-partition freqs ops from the racing rank;
+> load progressed to the next dispatch. **THIS SESSION (reverted, CPU-clean):** `sync_global_devices`
+> BECOMES the divergent collective itself; host-side `wait_at_barrier` is a NO-OP (`distributed.global_state.client
+> is None` — no `jax.distributed.initialize()`, `coord=NONE` proven). Workers are BYTE-IDENTICAL (no XLA
+> non-det). Divergent post-load programs = host-side `jit_create_jit_model` + `jit__threefry_fold_in` +
+> `jit_add` (RNG @ `tpu_runner.py:581`). **NEXT = move the RNG to HOST/numpy like freqs**, then
+> create_jit_model. Full state + worker-to-worker HLO recipe in `HANDOFF_QUANT.md`.
 
 ## Goal
 
