@@ -58,7 +58,7 @@ def _check_leaf(name, E, out, in_):
     w, s = _mk(E, out, in_)
     rhs, scale = _fp4_rhs_and_scale(w, s)   # rhs [E,in,out] fp4 ; scale [E,in/BLK,1,out] f32
 
-    assert rhs.dtype == jnp.float4_e2m1fn, f"{name}: rhs dtype {rhs.dtype} != float4_e2m1fn"
+    assert rhs.dtype == jnp.float8_e4m3fn, f"{name}: rhs dtype {rhs.dtype} != float8_e4m3fn"
     assert rhs.shape == (E, in_, out), f"{name}: rhs shape {rhs.shape} != {(E, in_, out)}"
     assert scale.dtype == jnp.float32, f"{name}: scale dtype {scale.dtype}"
     assert scale.shape == (E, in_ // BLK, 1, out), \
@@ -115,13 +115,15 @@ def main():
                                 r3.astype(jnp.float32)))
     print(f"  W13{tuple(W13.shape)} fp4 + S13{tuple(S13.shape)} f32; gate=W1 up=W3 OK")
 
-    # [3] float4 swapaxes + layout-constraint-shaped path lowers under jit on CPU.
-    print("[3] float4 swapaxes lowers under jit (CPU):")
-    f = jax.jit(lambda w: u8_unpack_e2m1(w).swapaxes(1, 2))
+    # [3] the helper path (fp4 unpack -> fp8 cast -> swapaxes) lowers under jit on
+    # CPU. v6e Mosaic can't compile a native f4E2M1FN kernel unpack, so we cast the
+    # codes to fp8 e4m3 (lossless: e2m1 codebook subset of e4m3) -> full-byte rhs.
+    print("[3] fp4->fp8 swapaxes lowers under jit (CPU):")
+    f = jax.jit(lambda w: u8_unpack_e2m1(w).astype(jnp.float8_e4m3fn).swapaxes(1, 2))
     w_tmp, _ = _mk(E, I, H)
     out = f(w_tmp)
-    assert out.dtype == jnp.float4_e2m1fn and out.shape == (E, H, I)
-    print(f"  jit float4 swapaxes -> {out.dtype} {tuple(out.shape)} OK")
+    assert out.dtype == jnp.float8_e4m3fn and out.shape == (E, H, I)
+    print(f"  jit fp4->fp8 swapaxes -> {out.dtype} {tuple(out.shape)} OK")
 
     # [4] Shapes match gmm_v2's documented contract: rhs [group,k,n] float4,
     # rhs_scale [group, k/BLK, 1, n] f32. (gmm_v2.validate_inputs itself can't run
@@ -131,8 +133,8 @@ def main():
     for tag, (W, S, k, n) in {
             "g1(W13)": (W13[:EP], S13[:EP], H, 2 * I),
             "g2(W2)": (r2[:EP], s2[:EP], I, H)}.items():
-        assert W.dtype == jnp.float4_e2m1fn and W.shape == (EP, k, n), \
-            f"{tag}: rhs {W.dtype}{tuple(W.shape)} != float4{(EP, k, n)}"
+        assert W.dtype == jnp.float8_e4m3fn and W.shape == (EP, k, n), \
+            f"{tag}: rhs {W.dtype}{tuple(W.shape)} != float8{(EP, k, n)}"
         assert S.dtype == jnp.float32 and S.shape == (EP, k // BLK, 1, n), \
             f"{tag}: scale {S.dtype}{tuple(S.shape)} != f32{(EP, k // BLK, 1, n)}"
         assert k % BLK == 0, f"{tag}: k={k} not a multiple of block {BLK}"

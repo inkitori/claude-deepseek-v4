@@ -60,13 +60,18 @@ def _fp4_rhs_and_scale(w_u8: jnp.ndarray,
                        scale: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Pack a stored FP4 expert leaf into the (rhs, rhs_scale) gmm_v2 expects.
 
-    QUANT / Strategy C: feed the FP4 experts STRAIGHT into gmm_v2 instead of
-    dequantizing them to bf16 in-trace (that [E,I,H] bf16 materialization, ×3, is
-    the prefill CompileTimeHbmOom). `w_u8` is the packed weight `[E, out, in/2]`
+    QUANT / Strategy C: feed the FP4 experts into gmm_v2 as FP8 codes + a per-block
+    scale, instead of dequantizing to bf16 in-trace (that [E,I,H] bf16 materialization,
+    ×3, is the prefill CompileTimeHbmOom). `w_u8` is the packed weight `[E, out, in/2]`
     (2 e2m1/byte along IN); `scale` the e8m0 block scale `[E, out, in/MXFP4_BLOCK_SIZE]`.
+
+    The codes are cast FP4 -> FP8 e4m3 (the e2m1 codebook ⊂ e4m3, so LOSSLESS):
+    v6e (TPU v6) Mosaic CANNOT compile the native f4E2M1FN kernel unpack
+    (`tpu.unpack_subelements` on `vector<...xf4E2M1FN>` — fp4 MXU needs TPU v7),
+    but fp8 is full-byte and native on v6e. fp8 codes × the e8m0 rhs_scale is the
+    NATIVE MXFP4 scheme (fp8 activations × fp4 weights) and 1 byte/elem (½ of bf16).
     Returns:
-      rhs       TYPED float4_e2m1fn `[E, in, out]` = gmm `[group, k=IN, n=OUT]`;
-                gmm_v2 packs the 4-bit rhs to uint32 along k internally.
+      rhs       FP8 e4m3 `[E, in, out]` = gmm `[group, k=IN, n=OUT]`.
       rhs_scale fp32 `[E, in/MXFP4_BLOCK_SIZE, 1, out]` = `[group, num_blocks, 1, n]`,
                 consumed per-block by gmm_v2 (NOT broadcast to k).
     Mirrors process_weights/moe_weights.py:256-271 (swapaxes(1,2)+expand_dims(2));
@@ -74,7 +79,7 @@ def _fp4_rhs_and_scale(w_u8: jnp.ndarray,
     not float8_e8m0fnu). Orientation byte-checked by quant_gmm_fp4_orient_check.py."""
     if scale.dtype != jnp.uint8:  # float8_e8m0fnu -> raw exponent bytes (no-op on bits)
         scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
-    rhs = u8_unpack_e2m1(w_u8).swapaxes(1, 2)               # [E, in, out] fp4
+    rhs = u8_unpack_e2m1(w_u8).astype(jnp.float8_e4m3fn).swapaxes(1, 2)  # [E,in,out] fp8
     s = e8m0_to_fp32(scale).swapaxes(1, 2)                 # [E, in/block, out] fp32
     return rhs, jnp.expand_dims(s, 2)                      # scale -> [E, in/block, 1, out]
 
@@ -264,7 +269,7 @@ def moe_forward(
     # that [E,I,H] bf16 materialization (×W1/W2/W3) is the prefill CompileTimeHbmOom.
     # The DENSE path (CPU + replicated decode) dequants LOCALLY just before its
     # einsums (a small N=1 / CPU transient); the sharded PREFILL path feeds the FP4
-    # weights straight into gmm_v2 via rhs_scale (4-bit, no bf16 temp). The S1
+    # weights into gmm_v2 as fp8 codes + rhs_scale (1 byte, no bf16 temp). The S1
     # determinism structure (all_gather/barrier/owned-mask/psum) is untouched.
     is_fp4 = (W1.dtype == jnp.uint8)
 
@@ -329,15 +334,14 @@ def moe_forward(
         # QUANT: build the gmm rhs/scale from the packed-FP4 leaves OUTSIDE the
         # shard_map, mirroring process_weights/moe_weights.py:256-271 (the blessed
         # float4 swapaxes + layout-constraint, done at "load"). Ops touch axis 1/2
-        # only (E=axis0 stays sharded) => rank-local, no collective; the weights
-        # stay 4-bit (no bf16 temp). Only one layer's experts are live at a time.
-        r1, s1q = _fp4_rhs_and_scale(W1, S1)       # [E, dim, inter] fp4
-        r3, s3q = _fp4_rhs_and_scale(W3, S3)       # [E, dim, inter] fp4
-        W13 = jnp.concatenate([r1, r3], axis=2)    # [E, dim, 2*inter] fp4
+        # only (E=axis0 stays sharded) => rank-local, no collective; the weights are
+        # fp8 (1 byte; half of bf16). Only one layer's experts are live at a time.
+        r1, s1q = _fp4_rhs_and_scale(W1, S1)       # [E, dim, inter] fp8
+        r3, s3q = _fp4_rhs_and_scale(W3, S3)       # [E, dim, inter] fp8
+        W13 = jnp.concatenate([r1, r3], axis=2)    # [E, dim, 2*inter] fp8
         S13 = jnp.concatenate([s1q, s3q], axis=3)  # [E, dim/block, 1, 2*inter] fp32
-        W2t, S2t = _fp4_rhs_and_scale(W2, S2)      # [E, inter, dim] fp4
-        # Workaround for JAX "must have valid byte strides" on the sub-byte
-        # transpose (moe_weights.py:261).
+        W2t, S2t = _fp4_rhs_and_scale(W2, S2)      # [E, inter, dim] fp8
+        # Make the swapaxes'd rhs contiguous for gmm (mirrors moe_weights.py:261).
         W13 = with_layout_constraint(W13, Layout((0, 1, 2)))
         W2t = with_layout_constraint(W2t, Layout((0, 1, 2)))
 
@@ -357,13 +361,13 @@ def moe_forward(
             token_idx_sorted = token_idx[argsort_idx]                        # [N*top_k]
             group_sizes = jax.nn.one_hot(idx_flat, E, dtype=jnp.int32).sum(0)  # [E]
             revert_idx = jnp.argsort(argsort_idx)
-            # S24: gmm lhs in bf16 `dtype` (NOT fp32; rhs is now FP4 via rhs_scale).
+            # S24: gmm lhs in bf16 `dtype` (NOT fp32; rhs is fp8 codes + rhs_scale).
             # fp32 lhs is UNIQUE to V4 among all gmm_v2 callers (prod fused_moe_gmm
             # uses bf16) and selects an untested fp32 sublane/tile path
             # (get_sublane_tiling(lhs.dtype) gmm_v2:951, tile_m gmm_v2:860) driving the
             # partial_out_ref carry. g1(fp32) is the non-det ORIGINATOR; g2 already
             # bf16. Match the known-good prod path. (gmm_v2 auto-quantizes this bf16
-            # lhs to fp8 e4m3 for the fp8xfp4 MXU — maybe_quantize_lhs default True.)
+            # lhs to fp8 e4m3 for the fp8×fp8 MXU — maybe_quantize_lhs default True.)
             x_sorted = x_full[token_idx_sorted].astype(dtype)                # [N*top_k,dim]
             group_offset = jnp.asarray([r * EP], jnp.int32)
             # W13_l/S13_l are the pre-built FP4 rhs + per-block fp32 scale (above).
