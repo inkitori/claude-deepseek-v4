@@ -7,12 +7,13 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** Infra bootstrapped on `v6spoteu719` (v6e-16, 4×4). The model is
-> FP8 (dense) + FP4 (256 experts, =MXFP4); old loader dequantizes all to bf16 (~542 GiB) → OOM.
-> **Strategy C device side DONE + CPU-GATED:** the param tree now declares routed experts as packed
-> FP4 (uint8) + e8m0 scale and `moe_forward` dequants them to bf16 in-trace (S1-preserving). **NEXT =
-> the LOADER (Q.2): emit the FP4 leaves instead of dequantizing** — real load is inert until then.
-> Full state + roadmap + NEXT ACTION in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** **Q.2 LOADER LANDED + CPU-GATED + COMMITTED (`26318abf`)** — the
+> loader now emits FP4 experts COMPRESSED (uint8 weight + e8m0 scale leaves), no bf16 dequant. First
+> real smoke (Q.5): **FIT LOOKS GOOD (loads to 1400 tensors, ZERO OOM)** but hits a **deterministic
+> TPU `scheckne` core-halt at the first layer-0 consolidation `device_put`** (NOT loader logic — CPU
+> gates all pass; NOT OOM; NOT multi-thread ordering — `PLACE_WORKERS=1` crashes same; NOT flaky HW —
+> same assert pc on many cores). **NEXT = HLO-dump diff to find the divergent collective / try uint8
+> scales.** Full diagnosis + ranked next actions in `HANDOFF_QUANT.md`.
 
 ## Goal
 
@@ -149,6 +150,10 @@ project `prm-research`) is bootstrapped: venv on all 4 hosts, GCS weights mounte
 (16 TPU, `ray.init` verified)**. Head = `10.164.0.15`; workers (`.8`/`.17`/`.16`) auto-discover via
 `scripts/full_slice_v4_discover.sh`. ssh: `ssh enyouki@<ip> -i ~/.ssh/google_compute_engine`.
 Weights load auth-free from the GCS mount (`HF_TOKEN` intentionally unset). venv python 3.12.
+⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashing the smoke's
+APIServer before any TPU work (unrelated-looking stack). No pip in the venv (uv):
+`~/.local/bin/uv pip install --python work/vllm_env/bin/python3 'numpy==2.3.5'` on ALL 4 hosts
+(per-host venvs). Pre-smoke check: `python3 -c "import numba"` per host.
 Smoke = TP=16 (`full_slice_v4_smoke.sh`); ray = `full_slice_v4_ray_restart.sh` (verifies 16 TPU).
 ⚠️ `ray.init` "version mismatch" = mark's rogue ray-2.54.1 `node` container poisoning the GCS
 `CLUSTER_METADATA` (NOT a corrupt venv). FIX = keep BOTH guardians alive: `node_guardian` (occupies
