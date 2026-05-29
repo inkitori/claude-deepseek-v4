@@ -339,7 +339,9 @@ def moe_forward(
         # determinism lever: tokens NOT routed to a rank's experts produce a
         # deterministic 0 instead of garbage. Dispatch mirrors fused_moe_gmm.py
         # (_process_tokens_locally + moe_gmm_local), using plain-JAX gather/scatter
-        # (the ragged_* kernels fall back to exactly this) and V4's own gate.
+        # (the owned-only SparseCore ragged_* path is BLOCKED on v6e: dynamic-range
+        # compile-fail, P.13/DO-NOT-RETRY #24 — it would CRASH here, not fall back)
+        # and V4's own gate.
         EP = E // axis                       # experts per rank (v6e-16: 256//16=16)
         top_k = params.gate.top_k
 
@@ -347,7 +349,15 @@ def moe_forward(
         # shard_map, mirroring process_weights/moe_weights.py:256-271 (the blessed
         # float4 swapaxes + layout-constraint, done at "load"). Ops touch axis 1/2
         # only (E=axis0 stays sharded) => rank-local, no collective; the weights are
-        # fp8 (1 byte; half of bf16). Only one layer's experts are live at a time.
+        # fp8 (1 byte; half of bf16). STEP 2: the unpack below depends ONLY on the
+        # resident fp4 weights, so XLA hoists all 43 layers' unpacks concurrent =>
+        # ~18 GiB HBM peak (the real jit_run_model peak; tier-2 microbench
+        # perf_microbench_moe_prefill_hbm). Bundle the weights with this layer's
+        # activation in one optimization_barrier so the unpack transitively depends
+        # on flat_x (on the residual chain) and can't float above layer i-1: only
+        # ~1-2 layers' fp8 rhs live at once ("one layer at a time", now ENFORCED).
+        # BIT-IDENTICAL (barrier is identity) => GATE-safe; ~8.6 GiB freed @43 layers.
+        W1, W3, W2, flat_x = jax.lax.optimization_barrier((W1, W3, W2, flat_x))
         r1, s1q = _fp4_rhs_and_scale(W1, S1)       # [E, dim, inter] fp8
         r3, s3q = _fp4_rhs_and_scale(W3, S3)       # [E, dim, inter] fp8
         W13 = jnp.concatenate([r1, r3], axis=2)    # [E, dim, 2*inter] fp8

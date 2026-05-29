@@ -10,16 +10,16 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.15): prefill rhs-prep DUAL-RESIDENCY REFUTED on the real model — OOM (impl reverted ⇒ GATE intact).**
-> Implemented + smoked keeping experts BOTH fp4-resident (decode) + fp8-resident (prefill, skip the 225 ms/fwd in-trace
-> unpack). It LOADS — fp8 pre-build runs (44 layers), +16 GiB resident (26.29 total) fits, KV allocates, startup completes —
-> but the first request OOMs: `jit_run_model` needs ~19.56 GiB beyond resident, only 4.70 reservable ⇒ the unified forward's
-> peak can't coexist with +16 GiB resident (already near the 31.25 ceiling — same wall that blocks roadmap #4). The P.14
-> microbench mis-predicted (it sized the MoE-gmm transient 0.62 GiB, not the 19.56 program peak). Prod edits REVERTED to the
-> P.11/P.13 GATED code (md5 `3069e80b`, synced ×4 hosts); only `scripts/perf_microbench_dual_residency.py` (P.14) kept. ⇒
-> roadmap #2 TAPPED. Decode CLOSED at ~146 ms/step; prefill levers nearly exhausted (HBM is the wall). NEXT: a flag-OFF smoke's
-> baseline `jit_run_model` program-HBM disambiguates genuine-peak (dual dead, shrink the 19.56) vs fp8-input-double-count (dual
-> salvageable). GATE: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.17): prefill forward HBM-peak CRUSHED 18.34 → 1.51 GiB/chip (−92%) — GATED, LOSSLESS.**
+> A 1-line `jax.lax.optimization_barrier((W1,W3,W2,flat_x))` at `deepseek_v4_moe.py:351` ties each layer's rhs-prep FP4→fp8
+> unpack to its incoming activation, so XLA can no longer HOIST all 43 layers' unpacks concurrent (that hoist WAS the ~18 GiB
+> peak). STEP 1 first confirmed the baseline 18.34 is GENUINE in-trace transient, NOT an fp8 double-count ⇒ dual-residency
+> stays dead. Tier-2 microbench `perf_microbench_moe_prefill_hbm.py` (P.16) predicted the cap; the real model went 18.34→1.51
+> (bigger than the bench's 9.14→0.51). BIT-IDENTICAL (md5 `3069e80b` ×2 fresh engines + correct Fib + smoke_check rc=0).
+> UNBLOCKS roadmap #1 = token-sharded o-proj (was HBM-OOM at +1.25 GiB over the OLD 18.34 peak; now ~30 GiB headroom — a 1-line
+> change at `deepseek_v4_attention.py:269`). NEW: the DECODE forward (~12–20 GiB, XLA-scheduler-VARIABLE dense
+> `_dequant_fp4_experts` concurrency — the SAME hoisting on the bf16 dequant, NOT touched by the prefill barrier) is now the
+> binding HBM peak. GATE: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
