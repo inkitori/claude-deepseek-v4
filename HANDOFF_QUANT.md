@@ -1,134 +1,145 @@
 # Handoff — DeepSeek-V4-Flash QUANTIZED-WEIGHT-LOADING campaign (v6e-16)
 
-> **Phase = QUANT / FIT-ON-v6e-16.** Make `vllm serve deepseek-ai/DeepSeek-V4-Flash`
-> LOAD AND SERVE CORRECTLY on **v6e-16** by **NOT dequantizing the FP4 experts to bf16 at load**.
-> Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`,
-> `HANDOFF_S1.md`. This doc = the loop's memory.
+> **Phase = QUANT / FIT-ON-v6e-16.** Make `vllm serve deepseek-ai/DeepSeek-V4-Flash` LOAD AND SERVE
+> CORRECTLY on **v6e-16** by **NOT dequantizing the FP4 experts to bf16**. Durable slice ops +
+> pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`, `HANDOFF_S1.md`. This doc =
+> the loop's memory.
 >
-> **One-line status (2026-05-29):** **The post-load `scheckne` saga is RESOLVED** (Q.8 RNG→host +
-> Q.9 eager create_jit_model eliminated the last racing eager dispatches; the HEAD now loads + fits
-> + reaches the real forward). The wedge that appeared next was **NOT a forward bug** — py-spy proved
-> it was a **divergent weight load**: the 3 worker actors couldn't read the GCS-mounted weights (root-
-> only mount) and silently fell into the `jnp.zeros` dummy fallback while the head loaded real weights.
-> **Q.10 fixes it** (enyouki gcsfuse mount on the workers; `config.json` now readable on all 4 hosts).
-> **NEXT = run the validating smoke** — expect the FIRST cluster-wide real load into the FIRST real
-> forward; then debug whatever the genuine forward surfaces, then the GATE. Last smoke: `…055008Z`
-> (head reached forward; workers dummy-wedged — pre-Q.10).
+> **One-line status (2026-05-29):** 🎯 **MILESTONE — V4-Flash LOADS + FITS + SERVES cluster-wide.**
+> The Q.10 smoke (`logs/full-slice-v4-smoke-20260529T065043Z.log`) is the FIRST to load REAL weights on
+> ALL 4 hosts (every rank `Init model | hbm=[(9.75,31.25)×16]`, `placed 68800`, no dummy zeros) → KV
+> cache → forward compile → `Application startup complete`. The whole load/fit/serve-bringup chain WORKS
+> (Strategy C fit confirmed slice-wide, not just head). **Remaining blocker = the FORWARD COMPILE:** the
+> first `/v1/completions` → HTTP 500 → **`CompileTimeHbmOom`** — the prefill `jit(run_model)` needs
+> **37.32 GiB HBM temp vs 31.25 GiB/chip (over by 6.07 GiB)** because the MoE still **dequantizes the FP4
+> experts to bf16 IN-TRACE** (`deepseek_v4_moe.py:243-246`), materializing full bf16 `[EP,out,in]` expert
+> buffers. 37.30 GiB temp > a full 32 GiB chip ⇒ **NO config/memory-fraction escape.** **NEXT = feed FP4
+> directly to `gmm_v2` via `rhs_scale` (skip the bf16 dequant)** — the roadmap core, now proven MANDATORY.
+> Exact plan in §NEXT ACTION.
 
 ---
 
-## THE PROBLEM (one table)
-V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, codebook ≡
-`jnp.float4_e2m1fn`, e8m0 block scale, block 32)**. On-disk: routed `layers.{L}.ffn.experts.{0-255}.{w1,w2,w3}.weight`
-= **I8** packed + `.scale` = **F8_E8M0**; shared `ffn.shared_experts` = FP8 (E4M3); 43 layers +
-1 MTP, hidden=4096, moe_inter=2048. Old loader dequantized everything → ~542 GiB > 512 GiB → OOM.
+## THE PROBLEM — two HBM hurdles (LOAD solved ✅, FORWARD is the live blocker ⛔)
+V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (MXFP4: codebook ≡
+`jnp.float4_e2m1fn`, e8m0 block scale, block 32)**. On-disk routed `experts.{0-255}.{w1,w2,w3}.weight`
+= I8 (2 FP4/byte along IN), `.scale` = F8_E8M0; H(hidden)=4096, I(moe_inter)=2048, 256 experts, 43
+layers + 1 MTP.
 
-| scheme | HBM | fits v6e-16 (512 GiB)? |
-|---|---:|---|
-| bf16 (old load path) | ~542 GiB | **NO** (OOM) |
-| **fp4-experts-kept + dense bf16 (Strategy C)** | **~155 GiB** | **yes** — confirmed: `Init model | hbm=9.75/31.25 GiB/chip` |
-
----
-
-## WHAT LANDED (committed) — the loader + the load-path race fixes
-**Loader (Strategy C — keep FP4 experts compressed):** `26e4023d` declare routed experts FP4 +
-dequant-in-trace; `26318abf` emit FP4 experts compressed (uint8 weight + uint8 scale leaves, no bf16
-dequant); `580b1f83` scales as uint8; `6eb5241f` un-swallow loader exception (re-raise unless
-`V4_ALLOW_DUMMY_FALLBACK=1`); **`e1b434f8`** host-gather EVERY routed/mtp expert leaf ⇒ ZERO
-consolidation `device_put` reshards (the FIT FIX). CPU-gated throughout.
-
-**The post-load `scheckne` race — RESOLVED (the "freqs-fix pattern" = eliminate divergent eager TPU
-dispatches from the rank-0 worker that races ahead of the laggards):**
-- `fb54237b` **RoPE freqs → numpy/host** (removed the 16-partition freqs ops).
-- `0d8d57fe` **Q.8: sampling RNG key → host (CPU)** — `nnx.Rngs(jax.random.key(seed)).params()` @
-  `tpu_runner.py:581` wrapped in `with jax.default_device(cpu)` (that site is NOT under set_mesh, so
-  default_device is honored, unlike the freqs site). Killed `jit__threefry_fold_in` + `jit_add`.
-  Value byte-identical (threefry platform-deterministic; GATE samples at temp=0 = argmax = RNG-
-  independent anyway). Confirmed via HLO-module diff; blocker advanced to create_jit_model.
-- `83a18839` **Q.9: eager create_jit_model** (env `V4_EAGER_CREATE_JIT_MODEL`, default OFF in shared
-  infra, ON in the smoke). `create_jit_model` (`model_loader.py:126`, the only remaining racing
-  dispatch) is a `@nnx.jit` whose body (`nnx.state`→`nnx.update`→qwix-noop) is a no-op on the already-
-  concrete, host-gathered model AND is sharding-neutral (no `with_sharding_constraint`/
-  `get_partition_spec`), so running it eagerly hands the forward an IDENTICAL model with ZERO TPU
-  dispatch. The re-jit is only a forward PjitFunction-overhead optimization ("the created model can
-  already work"). RESULT: `jit_create_jit_model` no longer compiles, no scheckne, **`load_model`
-  completes** (`Init model | hbm=9.75/31.25`), progresses into the **real lockstep forward** (first time ever).
-
-**The divergent weight load — `ca016156` Q.10 (THE CURRENT FRONTIER):** after Q.9, the engine WEDGED
-(not a forward deadlock as first guessed — **py-spy of the 4 live workers** proved it): the head loaded
-real weights (`placed=68812`) while workers **.8/.17/.16 were stuck in `jnp.zeros` @ `deepseek_v4.py:2063`
-(dummy fallback)** because `is_local_dir` was False on them; EngineCore blocked forever in
-`collective_rpc` ray.get. ROOT (infra, longstanding, masked until Q.9 removed the scheckne): the GCS
-bucket `personal-mark-eu` (subdir `vllm/hub`) is mounted **enyouki-owned on the head** (`~/.cache/
-huggingface/hub`) but **root-only on the workers** (`/tmp/gcs/bucket`, EACCES for enyouki) → the worker
-serve proc can't read the weights. So "load completes (placed=68812)" was ALWAYS only the head. FIX =
-`scripts/full_slice_v4_mount_weights.sh` gives each worker its own enyouki gcsfuse mount at `~/.cache/
-huggingface/hub` (verified: `config.json` readable on all 4 hosts); wired as a hard-fail pre-flight in
-the smoke. **Mechanism-verified, NOT yet smoke-validated end-to-end.**
+| stage | scheme | HBM/chip | fits? |
+|---|---|---:|---|
+| LOAD | bf16 dequant-at-load (old) | ~542 GiB total | ❌ OOM |
+| LOAD | **FP4 experts kept compressed (Strategy C)** | **9.75 / 31.25** | ✅ **confirmed cluster-wide** |
+| FORWARD | FP4 → bf16 dequant IN-TRACE in MoE (current) | **37.32 temp** | ❌ > 32 GiB chip |
+| FORWARD | **FP4 fed straight to `gmm_v2` (rhs_scale)** | target ≪ | ⛔ the fix → next |
 
 ---
 
-## ⚠️ NEXT ACTION (do first) — run the validating smoke
-The slice is RESET + clean (16/16 TPU free), guardians alive, weights mounted on all 4 hosts.
-1. (if reboot happened) `scripts/full_slice_v4_mount_weights.sh` — re-mount weights (the smoke pre-flight
-   also runs it). Mounts do NOT survive a reboot.
-2. `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump bash scripts/full_slice_v4_smoke.sh` (V4_EAGER_CREATE_JIT_MODEL
-   defaults to 1 in the smoke). Watch the LOAD phase (~90s): you should now see **all 4 hosts load real
-   weights** (no `jnp.zeros` dummy fallback, no EngineCore ray.get wedge) → into the **first cluster-wide
-   real forward** (cold compile 10-30 min; `VLLM_ENGINE_READY_TIMEOUT_S=2400` already set).
-3. **The forward is the next UNKNOWN** — it was never reached with real weights on all 4 hosts. If it
-   hangs/crashes, that's a genuine forward blocker (NOT the dummy-load wedge — distinguish via py-spy:
-   `sudo env "PATH=$PATH" work/vllm_env/bin/py-spy dump --pid <PID>`; worker PIDs via
-   `ssh … 'ps -eo pid,cmd|grep RayWorker'`). For a launch-id scheckne, use the worker-to-worker HLO diff
-   (recipe below). For a hang, py-spy the 4 workers and compare stacks.
-4. On `Application startup complete` → run the **GATE** below (establish the v6e-16 baseline md5).
+## WHAT LANDED (committed)
+**LOAD = Strategy C — DONE + confirmed serving.** Loader keeps the 256 routed experts FP4-compressed
+(u8 packed weight + u8 e8m0 scale leaves; host-gathered ⇒ zero reshard collective): `26e4023d`,
+`26318abf`, `580b1f83`, `6eb5241f`, `e1b434f8`. Post-load scheckne saga RESOLVED (RoPE freqs→host
+`fb54237b`; RNG→host `0d8d57fe` Q.8; eager `create_jit_model` `83a18839` Q.9). Divergent worker
+weight-load RESOLVED (`ca016156` Q.10: enyouki gcsfuse mount on workers via
+`scripts/full_slice_v4_mount_weights.sh`). **Validated this session** by the `…065043Z` smoke: real
+weights on all 4 hosts → `Application startup complete`. The bringup/load/fit/serve chain is proven —
+do NOT re-litigate it.
 
-Optional defensive follow-up: make `load_weights` honor `V4_ALLOW_DUMMY_FALLBACK` on the
-`is_local_dir=False` route too (`deepseek_v4.py:2060`) so a future mount gap RAISES loudly instead of
-silently dummy-zeroing into a wedge.
+**FORWARD blocker root-caused (this session, no fix yet).** First real `/v1/completions` → HTTP500 →
+engine shutdown. Clean log+HLO (no py-spy needed): `JaxRuntimeError: RESOURCE_EXHAUSTED:
+CompileTimeHbmOom` in the PREFILL compile of `jit(run_model)` (`tpu_runner.py:880 _execute_model →
+model_fn`), 37.32G/31.25G, +6.07G. Dominant temps: MoE `bf16[16,2048,4096]`×8 + `bf16[16,4096,2048]`×5
+(16 = experts-per-chip, 2048/4096 = I/H) under `jit(run_model)/shard_map/transpose`; HLO shows
+`bf16[…]=bitcast(convert_element_type(u8…))` = the in-trace FP4→bf16 expert dequant. (Secondary:
+`f32[16,4096,64,32]` attention broadcast_in_dim temps.)
 
-HLO-diff helper (for a forward scheckne):
-```
-for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude='*' \
-  -e "ssh -i ~/.ssh/google_compute_engine" enyouki@10.164.0.$ip:/tmp/hlo_dump/ /tmp/hlo_cmp/h$ip/; done
-# per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
-# ⚠️ COMPARE WORKER-to-WORKER (h8/h17/h16). NOT h15 — its dump MIXES the driver + the co-located rank-0
-# worker. For content non-det: normalized-md5 each shared module across h8/h17/h16.
-```
+---
+
+## ⚠️ NEXT ACTION — feed FP4 straight to gmm_v2 (kill the in-trace bf16 dequant)
+**One change, mapped to exact lines (all under `work/tpu-inference/tpu_inference/`). MIRROR the
+CANONICAL in-repo pattern `layers/jax/moe/utils.py:205-232 gmm_fn` — it already does FP4-rhs gmm_v2.**
+(`layers/common/fused_moe_gmm.py:101` = thin wrapper. gpt_oss `_load_mxfp4` = unpack-helper blueprint
+only, NOT a gmm_v2 caller.)
+
+1. **Delete/bypass the dequant** — `layers/jax/moe/deepseek_v4_moe.py:243-246`
+   (`if W1.dtype==uint8: W1=_shard_e_first(_dequant_fp4_experts(W1,S1))`, +W2,W3). Keep W*/S* as u8.
+   `_dequant_fp4_experts` (:36-55) = `u8_unpack_e2m1(w)*repeat(e8m0_to_fp32(scale),32)→bf16` = the blow-up.
+2. **Convert the 2 prefill gmm_v2 calls in `_routed_local`** (both currently bf16 RHS + NO rhs_scale):
+   - :324-329  `W13_l = concat([W1_l.T(0,2,1), W3_l.T(0,2,1)], axis=2).astype(dtype)`;
+     `g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=…, zero_initialize=False, preferred_element_type=fp32)`.
+   - :335-338  `W2g_l = W2_l.T(0,2,1).astype(dtype)`; `g2 = gmm_v2(h, W2g_l, …)`.
+3. **gmm_v2 quantized-RHS interface** (`kernels/megablox/gmm_v2.py:1130`
+   `gmm_v2(lhs, rhs, group_sizes, rhs_scale=None, rhs_bias=None, group_offset=None, *,…)`):
+   - `rhs` = **typed `jnp.float4_e2m1fn`** array, logical `[group, k=IN, n=OUT]`. Build via
+     `u8_unpack_e2m1(w_u8)` **without** the `.astype(float32)` (= `bitcast_convert_type(u8, float4_e2m1fn)`
+     + reshape doubling IN), then transpose to `[EP, in, out]`. gmm sees 4-bit (`itemsize_bits<8`,
+     `should_bitcast`) and packs to uint32 internally — **do NOT pass packed u8.**
+   - `rhs_scale` = **plain fp32** (`e8m0_to_fp32(scale)`), shape `[group, num_blocks, 1, n]`,
+     `num_blocks=k/32`; insert the middle-`1` with `jnp.expand_dims(scale_f32, 2)` (the utils.py move).
+   - `lhs` = bf16; leave `maybe_quantize_lhs=True` (gmm auto-quantizes lhs→e4m3 for the fp4×fp8 MXU).
+4. **Layout/orientation (Agent C):** stored leaves `[E,out,in]` (w1/w3 out=I=2048 in=H=4096; w2
+   out=H=4096 in=I=2048), scale `[E,out,in/32]` blocked on IN, sharded on E(axis0)/attn_dp. Need rhs
+   `[EP, in, out]` (transpose) + scale `[EP, in/32, 1, out]`. Build W13 by concatenating the two
+   typed-fp4 arrays along OUT(n) and their scales along n; w2 separate. Replicate the `.T(0,2,1)` the
+   bf16 code already applies.
+5. **DECODE path** `:273-284` is a dense bf16 einsum over all-256 experts (also post-dequant). OOM hit
+   PREFILL first; fix prefill, re-smoke. If decode then OOMs, convert it too (gmm_v2 / quantized einsum).
+
+**S1 cautions — do NOT break (Agent A):** the `use_shard_map` prefill branch IS the S1 fix; the
+`all_gather`+`optimization_barrier` (:301-302), `_owned`-mask `jnp.where` (:351-352) before `psum`
+(:355), and `_v4_decode_replicate` (tpu_runner.py) are load-bearing. The RHS-dtype change is orthogonal
+to that STRUCTURE, but the per-block rhs_scale math (block=32, K-orientation) must match
+`_dequant_fp4_experts` exactly. **Numerics WILL shift vs bf16 → re-establish the GATE md5 baseline fresh**
+(bar = correct Fibonacci + identical ×2 engines, not a specific hash).
+
+**Validate cheap→expensive:** (1) `s1_cpu_repro_v4flash.py both` + `quant_fp4_dequant_check.py` — BUT
+gmm_v2 is Pallas/Mosaic; first confirm it runs in CPU-interpret, else the oracle only catches shape/NaN
+around it. (2) a tiny synthetic jit to shape-check the new gmm_v2 args before a smoke. (3) smoke + GATE.
+After the edit: `full_slice_v4_sync.sh` + clear `~/.cache/vllm/xla_cache/*` on all 4 + verify md5, then
+smoke. **Expect 1-2 smoke iterations to nail the orientation/scale shape.**
+
+**SLICE STATE (07:08Z):** reset, 16/16 TPU free; guardians alive; weights mounted all 4 hosts; xla_cache
+cleared; code synced (model_loader.py md5 `791b1137…`). All ephemeral — VERIFY, don't trust.
 
 ---
 
 ## <a name="GATE"></a>GATE (non-negotiable) — for v6e-16
-Old v6e-32 md5 `5bf42256` is DEAD. Bar:
+Old v6e-32 md5 `5bf42256` is DEAD. The FIRST gate-pass is pending (needs the forward to compile first).
 - `LONG_GEN_REQUIRED=1 scripts/full_slice_v4_smoke_check.sh` → rc=0 (port 18081; visible_words ≥ 10,
-  max_word_run < 5).
+  max_word_run < 5; forces a real 64-token coherent decode — NOT the "Paris" false positive).
 - FIB decode: **correct Fibonacci (21,34,55,89,144)** in a longer decode + **N=2 md5 byte-identical
-  across 2 fresh engines** via `python3 /tmp/s1_probe2.py N` (RECREATED + verified present this session;
-  prompt "Here is the start of the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13,", temp=0 seed=0, port
-  18081, auto-discovers model id; ⚠️ /tmp is ephemeral). Establish the NEW baseline hash once; confirm
-  identical ×2 engines. READ the actual text ("contains Paris" is a false positive). Do NOT gate on a
-  long-tail md5 (nondeterministic at temp=0).
+  across 2 fresh engines** via `python3 scripts/s1_probe2.py N` (now committed to the repo; prompt
+  "Here is the start of the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13,", temp=0 seed=0, port 18081,
+  auto-discovers model id). Establish the NEW baseline hash once; confirm identical ×2 engines. READ the
+  actual text. Do NOT gate on a long-tail md5 (nondeterministic at temp=0).
 
 ---
 
 ## VALIDATION TIERS (cheapest first)
 1. **CPU loader fp4 check** (~40s): `JAX_PLATFORMS=cpu PYTHONPATH=work/tpu-inference:work/vllm
-   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py`. + CPU oracle `s1_cpu_repro_v4flash.py
-   both` + `quant_fp4_dequant_check.py`. NOTE: CPU has mesh=None ⇒ host-gather/forward-compile/the
-   multihost load are NOT exercised on CPU — those need a smoke. Runner-only changes (e.g. Q.8) aren't
-   exercised by the oracle either; validate those by snippet + smoke.
+   work/vllm_env/bin/python3 scripts/quant_loader_fp4_check.py` + CPU oracle `s1_cpu_repro_v4flash.py
+   both` + `quant_fp4_dequant_check.py`. NOTE: CPU has mesh=None ⇒ host-gather/forward-compile/multihost
+   load NOT exercised; runner-only changes aren't either. gmm_v2 is a Pallas/Mosaic kernel — may be
+   interpret-only on CPU.
 2. **TPU microbench** (`scripts/perf_microbench*`).
-3. **Full smoke + GATE.** Load now ~40s/host; cold forward compile 10-30 min. HLO-dump recipe above.
+3. **Full smoke + GATE.** Load ~40s/host; cold forward compile 10-30 min. `VLLM_ENGINE_READY_TIMEOUT_S=2400`.
+
+HLO-diff helper (for a forward *scheckne* — NOT this OOM; durable for future):
+```
+for ip in 8 17 16; do rsync -az --include='*.before_optimizations.txt' --exclude='*' \
+  -e "ssh -i ~/.ssh/google_compute_engine" enyouki@10.164.0.$ip:/tmp/hlo_dump/ /tmp/hlo_cmp/h$ip/; done
+# per host: ls .../*.before_optimizations.txt | sed -E 's#.*/module_[0-9]+\.##;s#\.cl_[0-9]+.*##' | sort|uniq -c
+# ⚠️ COMPARE WORKER-to-WORKER (h8/h17/h16), NOT h15 (mixes driver + co-located rank-0 worker).
+```
 
 ---
 
 ## INFRA STATUS / v6e-16
 - Slice `v6spoteu719`, zone `europe-west4-a`, project `prm-research`. **v6e-16, topology 4×4**, 16
   chips, 4 hosts: head `10.164.0.15` + workers `10.164.0.8 / .17 / .16`. Ray healthy (16 TPU). TP=16.
-- ⚠️ **WEIGHTS MUST be readable by enyouki on ALL 4 hosts** (Q.10). The bringup mounts the GCS bucket
-  enyouki-owned only on the HEAD; the workers get a root-only mount → enyouki EACCES → silent dummy-
-  zeros load → wedge. **Run `scripts/full_slice_v4_mount_weights.sh` once per bringup** (idempotent;
-  the smoke pre-flight runs it; mounts do NOT survive reboot). Verify: `config.json` readable on .8/.17/.16.
+- ⚠️ **WEIGHTS MUST be readable by enyouki on ALL 4 hosts** (Q.10). Bringup mounts the bucket enyouki-
+  owned only on the HEAD; workers get root-only → EACCES → silent dummy-zeros load → wedge. **Run
+  `scripts/full_slice_v4_mount_weights.sh` once per bringup** (idempotent; the smoke pre-flight runs it;
+  mounts do NOT survive reboot). Verify: `config.json` readable on .8/.17/.16.
 - ⚠️ **numpy MUST be `<2.4` (pinned `2.3.5`)** — 2.4.x breaks `import numba`, crashes the APIServer.
   `~/.local/bin/uv pip install --python work/vllm_env/bin/python3 'numpy==2.3.5'` per host.
 - ⚠️ Ray "version mismatch" = mark's rogue ray container; **FIX = keep BOTH guardians alive**

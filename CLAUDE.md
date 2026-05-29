@@ -7,15 +7,14 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** **The post-load `scheckne` saga is RESOLVED** — Q.8 (sampling RNG
-> → host) + Q.9 (eager `create_jit_model`) eliminated the last racing eager dispatches; the model LOADS
-> + FITS (`hbm=9.75/31.25 GiB/chip`) and the HEAD reaches the real forward. The wedge that surfaced next
-> was a **divergent weight load** (py-spy: the 3 workers couldn't read the GCS-mounted weights → silent
-> `jnp.zeros` dummy fallback while the head loaded real weights; the bucket is enyouki-owned only on the
-> head). **Q.10 fixes it** (`scripts/full_slice_v4_mount_weights.sh` — enyouki gcsfuse mount on the
-> workers; smoke pre-flight). **NEXT = run the validating smoke** → expect the FIRST cluster-wide real
-> load into the FIRST real forward, then debug the genuine forward, then the GATE. Full state +
-> py-spy/HLO recipes in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** 🎯 **V4-Flash LOADS + FITS + SERVES cluster-wide** — the Q.10 smoke
+> loaded REAL weights on all 4 hosts (`hbm=9.75/31.25 GiB/chip` every rank, no dummy zeros) →
+> `Application startup complete`. The whole load/fit/serve-bringup chain WORKS. **Remaining blocker =
+> the FORWARD COMPILE:** first `/v1/completions` → `CompileTimeHbmOom` (prefill `jit(run_model)` needs
+> 37.32 GiB temp vs 31.25/chip, +6.07) because the MoE **dequantizes the FP4 experts to bf16 IN-TRACE**
+> (`deepseek_v4_moe.py:243-246`). 37.30 GiB temp > a full 32 GiB chip ⇒ no config escape. **NEXT = feed
+> FP4 straight to `gmm_v2` via `rhs_scale`** (kill the bf16 dequant; mirror `layers/jax/moe/utils.py:205-232`)
+> — roadmap core, now proven MANDATORY. Full state + the exact fix map in `HANDOFF_QUANT.md`.
 
 ## Goal
 
