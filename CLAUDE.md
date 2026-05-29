@@ -7,14 +7,14 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** 🎯 **V4-Flash LOADS + FITS + SERVES cluster-wide** — the Q.10 smoke
-> loaded REAL weights on all 4 hosts (`hbm=9.75/31.25 GiB/chip` every rank, no dummy zeros) →
-> `Application startup complete`. The whole load/fit/serve-bringup chain WORKS. **Remaining blocker =
-> the FORWARD COMPILE:** first `/v1/completions` → `CompileTimeHbmOom` (prefill `jit(run_model)` needs
-> 37.32 GiB temp vs 31.25/chip, +6.07) because the MoE **dequantizes the FP4 experts to bf16 IN-TRACE**
-> (`deepseek_v4_moe.py:243-246`). 37.30 GiB temp > a full 32 GiB chip ⇒ no config escape. **NEXT = feed
-> FP4 straight to `gmm_v2` via `rhs_scale`** (kill the bf16 dequant; mirror `layers/jax/moe/utils.py:205-232`)
-> — roadmap core, now proven MANDATORY. Full state + the exact fix map in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** 🎯 **MILESTONE — GATE PASSED.** V4-Flash LOADS + FITS + SERVES +
+> DECODES CORRECTLY + DETERMINISTICALLY on v6e-16 with the FP4 experts kept compressed — the campaign's
+> core goal is MET. The MoE feeds the FP4 experts to `gmm_v2` as **fp8 codes + per-block `rhs_scale`**
+> (Q.13 `0d24d6af`): the fp4 codes cast LOSSLESSLY to fp8 e4m3 (v6e Mosaic CANNOT compile the native
+> fp4 kernel unpack — fp4 MXU needs TPU v7), avoiding both the in-trace bf16 dequant OOM (Q.11) and the
+> fp4 MosaicError (Q.12). GATE ✅: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical
+> ×2 fresh engines + `smoke_check` rc=0. **NEXT = PERF (decode ~0.43 tok/s) or HARDENING** (decode-path
+> still bf16-dequants locally; larger configs untested) — fit-and-serve no longer blocks. See `HANDOFF_QUANT.md`.
 
 ## Goal
 
