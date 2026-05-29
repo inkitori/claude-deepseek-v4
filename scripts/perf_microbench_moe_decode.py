@@ -50,6 +50,12 @@ from tpu_inference.layers.jax.moe.deepseek_v4_moe import (
 from tpu_inference.layers.common.quantization import (
     MXFP4_BLOCK_SIZE, e8m0_to_fp32, u8_unpack_e2m1)
 
+# The drafted dense FP8-code in-register-dequant kernel lives beside this script.
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from perf_dense_fp8_moe_kernel import dense_fp8_moe_matvec  # noqa: E402
+
 # Real DeepSeek-V4-Flash MoE dims (config.json).
 DIM = 4096          # hidden_size
 INTER = 2048        # moe_intermediate_size
@@ -172,6 +178,36 @@ def einsum_only(x, W1, W3, W2, pew):
     return out.astype(fp32).sum(axis=1)
 
 
+def einsum_fp8w(x, W1, W3, W2, pew):
+    """KERNEL-CEILING proxy: the matmul reading FP8 weights (1 byte/elem) instead of
+    materialized bf16 (2 byte) -- the HBM read an in-register-dequant kernel achieves
+    (it streams fp8 codes + applies the e8m0 scale in VMEM; the scale array is 1/BLK
+    the size, negligible). Activation stays bf16 (the production decode operand). W*
+    are pre-cast fp8 OUTSIDE timing so the matmul genuinely reads fp8 from HBM (no
+    dequant materialization in the timed region). NOT bit-identical; timing floor."""
+    fp32, bf16 = jnp.float32, jnp.bfloat16
+    gate = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W1, preferred_element_type=fp32))
+    up = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W3, preferred_element_type=fp32))
+    h = jax.nn.silu(gate) * up
+    h = _shard_e_mid(h * _shard_e_last(pew)[..., None])
+    out = _shard_e_mid(jnp.einsum('nei,edi->ned', h.astype(bf16), W2,
+                                  preferred_element_type=fp32))
+    return out.astype(fp32).sum(axis=1)
+
+
+def einsum_fp8(x, W1, W3, W2, pew):
+    """As einsum_fp8w but the ACTIVATION is fp8 too (native fp8xfp8 MXU on v6e) -- the
+    upper bound on the fp8 win. x is pre-cast fp8 outside timing. NOT bit-identical."""
+    fp32, f8 = jnp.float32, jnp.float8_e4m3fn
+    gate = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W1, preferred_element_type=fp32))
+    up = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W3, preferred_element_type=fp32))
+    h = jax.nn.silu(gate) * up
+    h = _shard_e_mid(h * _shard_e_last(pew)[..., None])
+    out = _shard_e_mid(jnp.einsum('nei,edi->ned', h.astype(f8), W2,
+                                  preferred_element_type=fp32))
+    return out.astype(fp32).sum(axis=1)
+
+
 def fused_expert_ffn(x, W1u, W3u, W2u, S1, S3, S2, pew, mesh):
     """Proposed fuse: shard_map over 'attn_dp'; gmm_v2 dequants fp8 codes in-kernel.
     Token replicated to lhs=[E_local, dim], group_sizes=[1]*E_local (1 token/expert)."""
@@ -206,6 +242,39 @@ def fused_expert_ffn(x, W1u, W3u, W2u, S1, S3, S2, pew, mesh):
                   P(None, 'attn_dp')),
         out_specs=P(), check_vma=False,
     )(x, W1u, W3u, W2u, S1, S3, S2, pew)
+
+
+def kernel_fp8_ffn(x, W1f8, W3f8, W2f8, S1, S3, S2, pew, mesh, tile_out=256):
+    """The drafted DENSE FP8-code in-register-dequant kernel (perf_dense_fp8_moe_kernel)
+    for all three projections + silu + mask + E-sum, in a shard_map so the pallas_call
+    runs on each chip's EP=16 local experts (like FUSED). fp8 codes are pre-unpacked
+    OUTSIDE timing (the production load-time fp4->fp8 unpack; v6e can't unpack fp4
+    in-kernel). The kernel reads fp8 (1 byte) + dequants the e8m0 scale IN-REGISTER ->
+    NO bf16 weight materialized (the 1.70 ms/layer round-trip the production lean path
+    still pays). TIMING-ONLY for the down proj: the kernel takes a SHARED activation but
+    down is per-expert, so down feeds h[:,0] as a shared-x timing proxy (identical weight
+    read / FLOPs; numerically wrong -> this variant is NOT bit-checked, correctness is
+    the CPU oracle in perf_dense_fp8_moe_kernel)."""
+    fp32, bf16 = jnp.float32, jnp.bfloat16
+    EP = E // mesh.shape['attn_dp']
+
+    def _local(x_l, W1_l, W3_l, W2_l, S1_l, S3_l, S2_l, pew_l):
+        gate = dense_fp8_moe_matvec(x_l, W1_l, S1_l, tile_out=tile_out)  # [1,EP,inter]
+        up = dense_fp8_moe_matvec(x_l, W3_l, S3_l, tile_out=tile_out)
+        h = jax.nn.silu(gate) * up                       # [1,EP,inter] fp32
+        h = h * pew_l.reshape(1, EP, 1)
+        hx = h[:, 0, :].astype(bf16)                     # [1,inter] (down timing proxy)
+        out = dense_fp8_moe_matvec(hx, W2_l, S2_l, tile_out=tile_out)    # [1,EP,dim]
+        local = out.astype(fp32).sum(axis=1)             # [1,dim]
+        return jax.lax.psum(local, 'attn_dp')            # [1,dim] full E sum
+    return jax.shard_map(
+        _local, mesh=mesh,
+        in_specs=(P(), P('attn_dp', None, None), P('attn_dp', None, None),
+                  P('attn_dp', None, None), P('attn_dp', None, None),
+                  P('attn_dp', None, None), P('attn_dp', None, None),
+                  P(None, 'attn_dp')),
+        out_specs=P(), check_vma=False,
+    )(x, W1f8, W3f8, W2f8, S1, S3, S2, pew)
 
 
 def measure(f, iters, warmup=8):
@@ -244,21 +313,50 @@ def main():
         fused_f = jax.jit(lambda *args: fused_expert_ffn(*args, mesh))
         dq_f = jax.jit(dequant_only)
         es_f = jax.jit(einsum_only)
+        e8w_f = jax.jit(einsum_fp8w)
+        e8_f = jax.jit(einsum_fp8)
+        kern_f = jax.jit(lambda *aa: kernel_fp8_ffn(*aa, mesh))
         args = (x, W1u, W3u, W2u, S1, S3, S2, pew)
 
         # Pre-dequant bf16 experts ONCE (outside timing) for the einsum-only bench.
         W1b, W3b, W2b = jax.block_until_ready(dq_f(W1u, W3u, W2u, S1, S3, S2))
+        # Pre-cast fp8 experts + fp8 activation ONCE (outside timing) -> the fp8-read
+        # floor a streaming in-register-dequant kernel would hit (fp8 = 1 byte/elem).
+        f8 = jnp.float8_e4m3fn
+        cast8 = jax.jit(lambda a, b, c: (a.astype(f8), b.astype(f8), c.astype(f8)))
+        W1f, W3f, W2f = jax.block_until_ready(cast8(W1b, W3b, W2b))
+        x8 = jax.block_until_ready(jax.jit(lambda z: z.astype(f8))(x))
+        # Pre-UNPACK the fp4 codes to fp8 ONCE (outside timing) for the KERNEL variant
+        # = the production load-time fp4->fp8 unpack (lossless: e2m1 subset of e4m3).
+        unpack8 = jax.jit(lambda w: u8_unpack_e2m1(w).astype(f8))
+        W1c = jax.block_until_ready(unpack8(W1u))          # [E,inter,dim] fp8 codes
+        W3c = jax.block_until_ready(unpack8(W3u))
+        W2c = jax.block_until_ready(unpack8(W2u))          # [E,dim,inter] fp8 codes
+        kargs = (x, W1c, W3c, W2c, S1, S3, S2, pew)
 
         # BIT-IDENTITY: lean dequant must match the production dequant exactly.
         yb = np.asarray(jax.device_get(jax.block_until_ready(base_f(*args))), np.float32)
         yl = np.asarray(jax.device_get(jax.block_until_ready(lean_f(*args))), np.float32)
         max_abs = float(np.abs(yb - yl).max())
+        # fp8-weight drift (informational: gauges the md5-shift an fp8 kernel implies).
+        ye8 = np.asarray(jax.device_get(jax.block_until_ready(
+            e8w_f(x, W1f, W3f, W2f, pew))), np.float32)
+        max_abs_fp8 = float(np.abs(yb - ye8).max())
+        rel_fp8 = max_abs_fp8 / (float(np.abs(yb).max()) + 1e-9)
+        # KERNEL sanity on v6e: confirm it lowers (no Mosaic error) + emits finite output.
+        # (Not a correctness check -- down uses a shared-x timing proxy; the CPU oracle in
+        #  perf_dense_fp8_moe_kernel validated correctness at 4.1e-7 rel err.)
+        yk = np.asarray(jax.device_get(jax.block_until_ready(kern_f(*kargs))), np.float32)
+        kern_finite = bool(np.isfinite(yk).all())
 
         bmed, bmin = measure(lambda: base_f(*args), a.iters)
         lmed, lmin = measure(lambda: lean_f(*args), a.iters)
         nmed, nmin = measure(lambda: leannw_f(*args), a.iters)
         dmed, dmin = measure(lambda: dq_f(W1u, W3u, W2u, S1, S3, S2), a.iters)
         emed, emin = measure(lambda: es_f(x, W1b, W3b, W2b, pew), a.iters)
+        e8wmed, e8wmin = measure(lambda: e8w_f(x, W1f, W3f, W2f, pew), a.iters)
+        e8med, e8min = measure(lambda: e8_f(x8, W1f, W3f, W2f, pew), a.iters)
+        kmed, kmin = measure(lambda: kern_f(*kargs), a.iters)
         fmed, fmin = measure(lambda: fused_f(*args), a.iters)
 
     if p0:
@@ -272,8 +370,11 @@ def main():
         print(f"LEAN       (bf16 broadcast dequant + einsum)  : med {lmed:7.2f} ms  min {lmin:7.2f} ms  /layer")
         print(f"LEAN-noWSC (lean, no intermediate _shard_e_first): med {nmed:7.2f} ms  min {nmin:7.2f} ms  /layer")
         print(f"FUSED      (gmm_v2 fp8 codes, shard_map)      : med {fmed:7.2f} ms  min {fmin:7.2f} ms  /layer")
+        print(f"KERNEL     (dense fp8 in-reg dequant, shard_map): med {kmed:7.2f} ms  min {kmin:7.2f} ms  /layer")
         print(f"  dequant-only (current, materialize x3)      : med {dmed:7.2f} ms  min {dmin:7.2f} ms  /layer")
         print(f"  einsum-only  (matmul+mask+sum on bf16)      : med {emed:7.2f} ms  min {emin:7.2f} ms  /layer")
+        print(f"  einsum-fp8w  (fp8 weights, bf16 act)        : med {e8wmed:7.2f} ms  min {e8wmin:7.2f} ms  /layer")
+        print(f"  einsum-fp8   (fp8 weights + fp8 act)        : med {e8med:7.2f} ms  min {e8min:7.2f} ms  /layer")
         print(f"\nLEAN bit-identity vs baseline: max|Δ| = {max_abs:.3e}  ({'IDENTICAL' if max_abs==0 else 'DIFFERS'})")
         best = min(lmin, nmin)
         print(f"DECOMPOSITION: dequant {dmed:.2f} + einsum {emed:.2f} (dequant {100*dmed/(dmed+emed):.0f}% of split)")
@@ -283,6 +384,20 @@ def main():
         print(f"PROJECTED step device-compute: baseline {bmin*N_MOE_LAYERS:.0f} -> best {best*N_MOE_LAYERS:.0f} ms "
               f"(einsum-floor {emin*N_MOE_LAYERS:.0f}); other (attn/logits) unchanged.")
         print(f"HBM floor/layer: fp4-read-once {floor_fp4:.3f} ms | bf16-read-once {floor_bf16:.3f} ms")
+        # KERNEL CEILING (roadmap #1): an in-register-dequant kernel removes the bf16
+        # materialization (lean-noWSC {n}) and reads fp8 codes (1 byte) -> floor ~= the
+        # fp8-read matmul. Two wins stacked: kill materialization, halve the read.
+        print(f"\nFP8 matmul floor: einsum bf16 {emin:.2f} -> fp8w {e8wmin:.2f} ({emin/e8wmin:4.2f}x) "
+              f"| fp8+fp8act {e8min:.2f} ({emin/e8min:4.2f}x)")
+        print(f"KERNEL CEILING vs production lean-noWSC: {nmin:.2f} -> ~{e8wmin:.2f} ms/layer "
+              f"({nmin/e8wmin:4.2f}x) => MoE step ~{nmin*N_MOE_LAYERS:.0f} -> ~{e8wmin*N_MOE_LAYERS:.0f} ms")
+        print(f"fp8-weight drift vs baseline: max|Δ|={max_abs_fp8:.3e} rel={rel_fp8:.2e} "
+              f"(informational; an fp8 kernel shifts the GATE md5)")
+        # MEASURED kernel on v6e (the drafted dense fp8 in-register-dequant kernel):
+        print(f"\nKERNEL on v6e: lowers+finite={kern_finite} | {kmin:.2f} ms/layer vs "
+              f"lean-noWSC {nmin:.2f} ({nmin/kmin:4.2f}x) vs matmul-floor {emin:.2f} ({kmin/emin:4.2f}x)")
+        print(f"  => MoE step ~{nmin*N_MOE_LAYERS:.0f} -> ~{kmin*N_MOE_LAYERS:.0f} ms "
+              f"(timing-only; down=shared-x proxy; correctness=CPU oracle 4.1e-7)")
 
 
 if __name__ == "__main__":
