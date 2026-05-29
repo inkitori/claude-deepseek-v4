@@ -22,6 +22,12 @@ Run (TPU must be FREE -- `scripts/full_slice_v4_reset.sh` first; SYNC to 4 hosts
 via `scripts/full_slice_v4_sync.sh` -- mh_run runs each host's own clone):
     scripts/perf_microbench_decode.sh --sweep     # read process-0's tail
     scripts/perf_microbench_decode.sh --n-leaves 1492
+
+CAVEAT (P.4): this builds a FLAT list of leaves -- that is the POST-preflatten floor
+(cheap), NOT the real nested 1,492-leaf nnx-State the model dispatched pre-P.4 (whose
+per-dispatch flatten was ~20 ms, measured on the real dataclass tree via
+make_abstract_transformer_params). nnx-preflatten LANDED (P.4); this bench no longer
+measures a live lever. To gauge State-flatten cost, flatten the REAL tree, not a flat list.
 """
 import argparse
 import statistics

@@ -350,19 +350,36 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
+    # PERF (nnx-preflatten): `state` is a ~1.5k-leaf nnx.State wrapping a deeply
+    # nested dataclass tree; JAX re-walks it on EVERY jit dispatch (~20 ms measured),
+    # and the decode path dispatches twice per step (run_model + run_compute_logits).
+    # Flatten it ONCE and hand the bare leaf list to the jits, rebuilding the State
+    # inside the trace via the cached treedef (a one-time trace cost, not per call).
+    # `state` is constant for the model's lifetime, so memoise the leaves keyed by
+    # State identity (the RL `_sync_weights` path rebinds it -> auto-refresh).
+    _init_leaves, state_treedef = jax.tree_util.tree_flatten(state)
+    _leaf_cache = {"state": state, "leaves": _init_leaves}
+
+    def _flat_state(s):
+        if _leaf_cache["state"] is not s:
+            _leaf_cache["state"] = s
+            _leaf_cache["leaves"] = jax.tree_util.tree_flatten(s)[0]
+        return _leaf_cache["leaves"]
+
     @jax.jit(
         out_shardings=(
             kv_cache_sharding,
             hidden_states_sharding,
             hidden_states_sharding,  # aux hidden states
         ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
+        donate_argnums=2,  # 0 is graphdef, 1 is state leaves, 2 is kv_cache
         static_argnums=(
             7, 10, 11
         ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
     )
-    def run_model(graphdef, state, *args):
-        model = nnx.merge(graphdef, state)
+    def run_model(graphdef, state_leaves, *args):
+        model = nnx.merge(
+            graphdef, jax.tree_util.tree_unflatten(state_treedef, state_leaves))
         return model(*args)
 
     @jax.jit(
@@ -383,8 +400,9 @@ def get_flax_model(
         PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
 
     @jax.jit(out_shardings=(logits_sharding))
-    def run_compute_logits(graphdef, state, *args):
-        model = nnx.merge(graphdef, state)
+    def run_compute_logits(graphdef, state_leaves, *args):
+        model = nnx.merge(
+            graphdef, jax.tree_util.tree_unflatten(state_treedef, state_leaves))
         hidden_state, *_ = args
         return model.compute_logits(hidden_state)
 
@@ -410,10 +428,17 @@ def get_flax_model(
     model = nnx.merge(graphdef, state)
     precompile_vision_encoder_fn = getattr(model, "precompile_vision_encoder",
                                            None)
-    model_fn = functools.partial(
-        run_draft_model, graphdef) if is_draft_model else functools.partial(
-            run_model, graphdef)
-    compute_logits_fn = functools.partial(run_compute_logits, graphdef)
+    # The two hot decode dispatches consume pre-flattened weight leaves (see
+    # nnx-preflatten above); the draft path keeps the plain-State signature.
+    if is_draft_model:
+        model_fn = functools.partial(run_draft_model, graphdef)
+    else:
+
+        def model_fn(state, *args):
+            return run_model(graphdef, _flat_state(state), *args)
+
+    def compute_logits_fn(state, *args):
+        return run_compute_logits(graphdef, _flat_state(state), *args)
     embed_multimodal_fn = functools.partial(run_embed_multimodal, graphdef)
     embed_input_ids_fn = functools.partial(run_embed_input_ids, graphdef)
     lora_manager, model = None, None
