@@ -10,12 +10,15 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** 🏁 **PERF phase (re)opened on v6e-16.** Decode ≈ **0.43 tok/s**
-> (~2.3 s/token) is the primary target; at N=1 it is launch-/collective-/HBM-bound, NOT compute-bound.
-> ⚠️ **The decode profile in `HANDOFF_PERF.md` is STALE** — captured on v6e-32, PRE-Phase-3.1, with
-> bf16 experts; we now run v6e-16 + FP4→fp8 experts + MAX_SEQS=1, so the lever ranking has almost
-> certainly shifted — **RE-PROFILE before chasing any lever** (see `HANDOFF_PERF.md` for THE ROADMAP +
-> the ONE next action). GATE (regression, non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5
+> **One-line status (2026-05-29):** 🔬 **PROFILE DONE — decode bottleneck DECOMPOSED (see
+> `HANDOFF_PERF.md`).** Decode = **0.277 s/tok (3.6 tok/s)** (the old "0.43 tok/s / 2.3 s/token" was
+> STALE v6e-32). Per step (~277 ms) = **~129 ms JAX host dispatch** (TWO jits/step — `run_model` +
+> `run_compute_logits` — each re-parsing a big arg pytree, `ParseArguments` ≈59 ms ea) **+ ~147 ms
+> blocking `device_get`** (only **38 ms is real device compute**; ~109–169 ms is async/module
+> round-trip). Device is DENSE (99% busy). ⇒ **async-scheduling ≈2%, collective-fusion DEAD (2.2 ms),
+> on-device compute opts <7% — all DEMOTED by measurement.** NEW LEVERS: **(1) fuse `compute_logits`
+> into `run_model` + trim the jit arg pytree** (~47%, host-side) = RANK 1; **(2) multi-step on-device
+> decode** (~53%, big). GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5
 > `3069e80b` byte-identical ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
@@ -23,10 +26,11 @@
 Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the **v6e-16** slice
 (TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_PERF.md` roadmap top-down — without
 ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pinned) is the primary
-target** (~0.43 tok/s); it is launch-/collective-/HBM-bound, NOT compute-bound, so the levers are
-collectives (all-reduce), dispatch/launch overhead, the indexer `top_k`, and weight streaming —
-re-profile to confirm the ranking on the current (v6e-16 + FP4-experts) config before committing to
-one. The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+target** (0.277 s/tok). The 2026-05-29 profile MEASURED the split: per step ≈ ~129 ms JAX host
+dispatch (2 jits/step, `ParseArguments`) + ~147 ms `device_get` (only 38 ms compute). Collectives,
+HBM-streaming, indexer `top_k`, and on-device compute are all SMALL — the levers are JAX dispatch
+(fuse `run_model`+`compute_logits`, trim args) and the per-step device round-trip (multi-step decode);
+see `HANDOFF_PERF.md`. The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
 campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
 as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
 with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
