@@ -5,18 +5,17 @@
 > milestone (256 routed experts kept FP4-compressed; `MAX_SEQS=1`) is DONE and is a GIVEN — history in
 > `HANDOFF_QUANT.md`. S1 determinism history: `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29 — P.11): prefill ATTENTION-SHARDING LANDED + GATED.** P.10's #1 lever is in.
-> The replicated M=N prefill attention (16× redundant — the long-context dominator, 584 ms/fwd @N=4096) now runs
-> SHARDED over the token axis (`ShardingAxisName.ATTN_DATA`, 16-way over `attn_dp`) for PREFILL ONLY —
-> `_sparse_attn_kernel_sharded(..., shard_token_axis=True)` at `attention_prefill`. Each chip runs the kernel on
-> its 1/16 token slice (kernel 584→**44 ms/fwd** @N=4096, microbench-proven; prefill-wall −5.6/−12.1/−27.3/
-> −48.9% @N=512/1024/2048/4096), then the per-shard output is GATHERED back to REPLICATED. DECODE (M=1) UNTOUCHED
-> → replicated (S1 fix / Pitfall #5). **GATED: md5 `3069e80b` UNCHANGED ×2 fresh engines + correct Fib + smoke_
-> check rc=0** (LOSSLESS — per-query independence). ⚠️ The token-sharded-OUTPUT variant (leave o sharded → also
-> shard the o-proj) was tried first and **CompileTimeHbmOom'd +1.25G**: the cheaper sharded attention frees HBM
-> that XLA refills with MORE concurrent MoE rhs-prep weight-unpacks (20× `f8e4m3fn[16,4096,4096]`); gathering o
-> to replicated CONTAINS the change (post-attention graph byte-identical to the FIT baseline). NEXT: roadmap #2
-> (rhs-prep cut) — it ALSO drops that HBM peak, re-enabling the token-sharded-output extra win.
+> **One-line status (2026-05-29 — P.12): rhs-prep FASTER-UNPACK sub-lever REFUTED (scripts-only ⇒ GATE intact).**
+> Roadmap #2 angle (a) — beat the in-trace FP4→fp8 unpack (`u8_unpack_e2m1(w).astype(fp8)`, **4.5 ms/layer ×43 =
+> 194 ms/fwd**) with integer bit-math or a LUT — is DEAD. `perf_microbench_fp4_unpack.py` (tier-2, real dims,
+> 16-chip): XLA's NATIVE `float4_e2m1fn.astype(fp8)` is **at the VPU floor** — 3 integer formulations (int32 /
+> uint8 / closed-form) all LOSE at 0.83–0.89×, and a 16-entry fp8-LUT **gather is catastrophic (756×)** — ALL
+> bit-identical to prod (CPU + on-device). ⇒ the 194 ms/fwd rhs-prep TIME is uncompressible by rewriting the
+> unpack; the ONLY decode-neutral way to REMOVE it is **dual-residency** (fp8-resident-for-PREFILL + fp4-resident-
+> for-DECODE, so decode UNCHANGED) — but +17.1 GiB resident on top of fp4's 8.57 ⇒ ~27 GiB resident / ~4 free,
+> **HBM-MARGINAL** (needs a smoke; likely fits only short prefill). NEXT: pivot to roadmap #1 = **dispatch**
+> (80 ms/fwd @N=4096, decode-neutral, contained to `_routed_local`). P.11 (attention-sharding) remains LANDED +
+> GATED (md5 `3069e80b`); this change touched only `scripts/perf_*` (like P.6–P.10) ⇒ GATE trivially intact.
 
 ---
 
@@ -29,42 +28,46 @@
 - P.11 (prefill attention-sharding) is the first production-code change since P.5 — GATED on 2 fresh engines,
   md5 still `3069e80b` (LOSSLESS, per-query independence — CONFIRMED, not just predicted), correct Fib, smoke_
   check rc=0. P.6–P.10 changed only `scripts/perf_*`. The bit-identical md5 across this change proves intact.
+- P.12 changed only `scripts/perf_*` (new unpack bench) — no production `.py` touched ⇒ no smoke needed, the
+  P.11 GATED state (md5 `3069e80b`) is the live model code, trivially intact.
 
 ---
 
-## ⇒ NEXT ACTION — roadmap #2: cut the prefill MoE rhs-prep (225 ms/fwd) DECODE-NEUTRAL + drop its HBM peak
-P.11 landed attention-sharding but had to GATHER the attention output back to replicated (could NOT leave it
-token-sharded): the cheaper sharded attention let XLA keep ~20 concurrent MoE rhs-prep weight-unpacks live
-(20× `f8e4m3fn[16,4096,4096]` ≈ 5 GB) → CompileTimeHbmOom +1.25G. So the rhs-prep is now BOTH the top seq-
-independent TIME cost (225 ms/fwd, ~9× its HBM floor ⇒ compute-bound) AND the prefill HBM-peak driver.
+## ⇒ NEXT ACTION — roadmap #1 (re-ranked): fuse the prefill MoE DISPATCH gathers (80 ms/fwd @N=4096)
+P.12 REFUTED the faster-unpack sub-lever (above): the 194 ms/fwd rhs-prep can't be made FASTER, only ELIMINATED
+via dual-residency (HBM-marginal — parked at roadmap #2). So the top NON-HBM-risky, decode-neutral prefill lever
+is now the DISPATCH: the MoE sort + the two `[N·top_k, dim]` gathers in `_routed_local`
+(`deepseek_v4_moe.py:360-415`), **80 ms/fwd @N=4096** (grows with N: 12/18/46/80 @N=512/1024/2048/4096 —
+`perf_microbench_moe_prefill.py` `disp` ×43).
 
-  **Cut the in-trace FP4→fp8 UNPACK (`_fp4_rhs_and_scale`, `deepseek_v4_moe.py:351-358`).** Keep fp4-resident
-  (decode UNCHANGED — fp8-resident was P.9b-REFUTED, decode +1.37×). Two angles: (a) a faster in-trace unpack /
-  small Pallas unpack kernel vs the 5.24 ms/layer baseline (`perf_microbench_moe_prefill.py`); (b) REDUCE the
-  unpack's peak liveness (force fewer layers' weights unpacked at once — an `optimization_barrier` / scheduling
-  hint) so the HBM peak drops. A lower peak ALSO re-enables P.11's token-sharded-OUTPUT attention variant
-  (shards the o-proj too → extra prefill-wall win — see DO-NOT-RETRY #21). *Tier-2 microbench first (no GATE
-  risk until a real edit); then a smoke + the GATE.*
+  **Fuse the explicit `x_full[token_idx_sorted]` sorted-lhs gather (and the `g2[revert_idx]` revert gather) into
+  the gmm / a ragged scatter** so the `[N·top_k, dim]` buffer isn't materialized to HBM twice per layer.
+  PREFILL-ONLY (decode uses the dense path, NOT `_routed_local`) ⇒ decode-neutral by construction. ⚠️ S1-
+  SENSITIVE: `_routed_local` carries the owned-mask + gmm `zero_initialize` determinism fix — any reorder MUST
+  preserve "non-owned (token,slot) → deterministic 0" (S22). *Tier-2 first (`disp` is already isolated in the
+  prefill bench; extend it for the fused variant); then a smoke + the GATE.*
 
-  Then: roadmap #3 (non-MoE launch floor ~117 ms, hard — op-count↓ re-opens S1) and #4 (dispatch fuse).
+  Then: roadmap #2 (dual-residency rhs-prep KILL, if HBM allows), #3 (non-MoE launch floor, hard — op-count↓
+  re-opens S1), #4 (attention token-sharded OUTPUT, blocked on #2's HBM peak).
 
 ---
 
-## THE ROADMAP (re-ranked P.11 — attention-sharding LANDED; rhs-prep now leads, a dual time+HBM lever)
-1. **[prefill MoE — DECODE-NEUTRAL rhs-prep cut]** ← TOP / NEXT ACTION. The 225 ms/fwd FP4→fp8 UNPACK (~9× its
-   HBM floor ⇒ compute-bound) — now ALSO the prefill HBM-peak driver (the ~20 concurrent unpacks that
-   CompileTimeHbmOom'd P.11's token-sharded-output variant). Keep fp4-resident (decode unchanged). Faster
-   unpack / small Pallas kernel (vs 5.24 ms/layer, `perf_microbench_moe_prefill.py`) AND/OR cut its peak
-   liveness. *M · tier-2 first; low risk until an edit, then a smoke.*
-2. **[prefill non-MoE LAUNCH floor ~117 ms]** PROJ 42 + NORM 31 + HC 17–23 + GATE 11 + CMP 10 + IDX 5, seq-
+## THE ROADMAP (re-ranked P.12 — faster-unpack REFUTED; dispatch now leads, rhs-prep killable only via HBM gamble)
+1. **[prefill DISPATCH fuse]** ← TOP / NEXT ACTION. The MoE sort + two `[N·top_k,dim]` gathers in `_routed_local`,
+   **80 ms/fwd @N=4096** (12/18/46/80 @N=512/1024/2048/4096; `perf_microbench_moe_prefill.py` `disp`). Fuse the
+   gathers into gmm / ragged scatter. Decode-neutral (prefill-only path). *M · S1-sensitive; tier-2 first.*
+2. **[prefill MoE rhs-prep KILL — dual-residency, HBM gamble]** the 194 ms/fwd FP4→fp8 unpack can't be made
+   FASTER (P.12: XLA native convert is the VPU floor — DO-NOT-RETRY #22), only ELIMINATED by keeping fp8-resident-
+   for-PREFILL alongside fp4-resident-for-DECODE (decode UNCHANGED, so DECODE-NEUTRAL). Prize HUGE (194 ms/fwd,
+   all N) but +17.1 GiB resident on top of fp4's 8.57 ⇒ ~27 GiB resident / ~4 free ⇒ HBM-MARGINAL + a loader
+   change + tension w/ the FIT foundation. *L · needs an HBM-feasibility smoke FIRST; likely fits only short prefill.*
+3. **[prefill non-MoE LAUNCH floor ~117 ms]** PROJ 42 + NORM 31 + HC 17–23 + GATE 11 + CMP 10 + IDX 5, seq-
    INDEP, launch-bound at tiny per-chip n. Lossless cut = op-count↓ (layer scan / fuse the ~215 per-fwd
    matmuls) but that re-opens S1 (DO-NOT-RETRY #10). *M · hard.*
-3. **[prefill dispatch]** the MoE sort + two `[N·top_k,dim]` gathers, 80 ms/fwd at N=4096, grows with N.
-   Fuse the gather into gmm / ragged scatter. *M.*
 4. **[prefill attention — token-sharded OUTPUT, the P.11 DEFERRED extra]** leave o token-sharded → shard the
-   o-proj too. BLOCKED on #1 (needs the rhs-prep HBM peak down first — DO-NOT-RETRY #21). *S once #1 lands.*
-5. **[fp8-resident — REFUTED for normal serving]** P.9b: net-negative (decode +39 ms/step, break-even ~6 gen
-   tokens). Revisit ONLY for prefill-dominated (G<6). LOSSY scaled-fp8 worse. *L · parked.*
+   o-proj too. BLOCKED on #2 (needs the rhs-prep HBM peak down first — DO-NOT-RETRY #21). *S once #2 lands.*
+5. **[fp8-resident FOR ALL — REFUTED for normal serving]** P.9b: net-negative (decode +39 ms/step, break-even
+   ~6 gen tokens). NOTE: roadmap #2 is the DIFFERENT decode-neutral variant (fp4 RETAINED for decode). *L · parked.*
 6. **[decode clean profiler / 5-cleanup]** confirmatory; + Phase-5 diff-shrink: remove `_v4_nan_tripwire`
    (37 sites + def + `smoke.sh:81/116`), edit `.py`+`.sh` TOGETHER (Pitfall #0), KEEP `_linear` clamp +
    `compute_logits` nan_to_num. *S.*
@@ -102,7 +105,8 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
 18. **Q/KV/O projections + MoE gate + HC-sinkhorn are NOT the decode ~30 ms — REFUTED (P.8).** proj 4.13 + gate 0.75 + hc 2.99 = 7.87; the balance is ~24 ms launch overhead.
 19. ★ **prefill gmm-CORE as a lever — REFUTED (P.9).** gmm is 0.82–1.24× the dense fp8 MXU floor and only 23–38 ms/fwd; it's MXU-underutilized at 96–1536 rows/rank but near its practical floor. The prefill MoE cost is the rhs-prep (the FP4→fp8 UNPACK), NOT the matmul.
 20. ★ **fp8-codes-resident experts FOR ALL (prefill+decode) — REFUTED as a net win (P.9b).** Removes prefill's 225 ms/fwd rhs-prep but the decode dense path then dequants from fp8 (2× expert HBM read) → **decode +39 ms/step (106→145, 1.37×)**; break-even ~6 gen tokens ⇒ net-negative for normal serving (G≫6). Use a DECODE-NEUTRAL prefill cut instead (roadmap #2). fp8 IS lossless (CPU-confirmed); only the economics fail.
-21. **prefill attention TOKEN-SHARDED OUTPUT (leave o sharded, shard the o-proj) — CompileTimeHbmOom +1.25G (P.11).** The sharded-kernel COMPUTE win is fine (LANDED, output GATHERED to replicated), but propagating token-sharding past o into the FFN/MoE region let XLA keep ~20 concurrent rhs-prep weight-unpacks live (20× `f8e4m3fn[16,4096,4096]` ≈ 5 GB) → Used 32.50/31.25 GiB. NOT lossy, NOT wrong — purely an HBM-peak/scheduling tip. DEFERRED behind roadmap #1 (rhs-prep peak↓); revisit once the peak drops. (At MAX_LEN=256 with the gathered-output variant, baseline fits — the 6 prior FIT smokes confirm.)
+21. **prefill attention TOKEN-SHARDED OUTPUT (leave o sharded, shard the o-proj) — CompileTimeHbmOom +1.25G (P.11).** The sharded-kernel COMPUTE win is fine (LANDED, output GATHERED to replicated), but propagating token-sharding past o into the FFN/MoE region let XLA keep ~20 concurrent rhs-prep weight-unpacks live (20× `f8e4m3fn[16,4096,4096]` ≈ 5 GB) → Used 32.50/31.25 GiB. NOT lossy, NOT wrong — purely an HBM-peak/scheduling tip. DEFERRED behind roadmap #2 (rhs-prep peak↓); revisit once the peak drops. (At MAX_LEN=256 with the gathered-output variant, baseline fits — the 6 prior FIT smokes confirm.)
+22. **A faster JAX-level FP4→fp8 unpack to beat the in-trace `u8_unpack_e2m1(w).astype(fp8)` — REFUTED (P.12).** XLA's NATIVE `float4_e2m1fn.astype(fp8)` is at the VPU floor (4.5 ms/layer ×43 = 194 ms/fwd). 3 integer bit-math formulations that SKIP the float4_e2m1fn dtype (int32 / uint8 / closed-form, all bit-identical to prod on CPU+device) LOSE at 0.83–0.89×; a 16-entry fp8-LUT GATHER is catastrophic (756× — TPU small-table gather lowers pathologically). Bench: `perf_microbench_fp4_unpack.py`. ⇒ the rhs-prep TIME is removable only via dual-residency (roadmap #2), not a rewrite. (A Pallas integer-unpack kernel would reuse the SAME arithmetic that already lost — not worth it; in-kernel native f4 unpack is v7-only, DO-NOT-RETRY #8.)
 
 ---
 
@@ -117,6 +121,11 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
   Mosaic kernel ⇒ MUST be wrapped in `shard_map` (inputs replicated P() ⇒ per-rank cost). Caveat: rhs-prep
   is a standalone UPPER bound (XLA may overlap layer L+1's VPU unpack with layer L's MXU); the load-time
   lever removes it regardless of overlap.
+- ★ **`perf_microbench_fp4_unpack.py` (P.12) — FP4→fp8 unpack candidates @real dims, 16-chip EP=16:** prod (XLA
+  native `bitcast→float4_e2m1fn→.astype(fp8)`) **4.5 ms/layer** (×43 = 194 ms/fwd); intarith int32 0.89×, uint8
+  0.88×, closed-form 0.83×, 16-entry fp8-LUT gather **756× SLOWER** — ALL bit-identical to prod (CPU + on-device).
+  ⇒ the unpack is VPU-floored (DO-NOT-RETRY #22); rewriting it can't win. Run: `full_slice_v4_sync.sh` then
+  `MH_TIMEOUT=900 scripts/full_slice_v4_mh_run.sh scripts/perf_microbench_fp4_unpack.py --distributed`.
 - ★ **`perf_microbench_prefill_nonmoe.py` (16-chip; P.10) — prefill NON-MoE per-chip ms/forward:** dense
   ops seq-parallel at n=N/16 (token-sharded activation per `tpu_runner.py:1431 P(ATTN_DATA)`, replicated
   weights); ATTENTION is the Mosaic kernel REPLICATED at M=N (every chip runs the full seq — the prefill

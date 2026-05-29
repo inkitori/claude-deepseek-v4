@@ -10,16 +10,16 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.11): prefill ATTENTION-SHARDING LANDED + GATED.** P.10's #1 lever is in.
-> The replicated M=N prefill attention (16× redundant — long-context dominator, 584 ms/fwd @N=4096) now runs
-> SHARDED over the token axis (`ShardingAxisName.ATTN_DATA`, 16-way) for PREFILL ONLY
-> (`_sparse_attn_kernel_sharded(..., shard_token_axis=True)`); each chip runs the kernel on its 1/16 slice
-> (kernel 584→**44 ms/fwd** @N=4096, prefill-wall up to −48.9%), output GATHERED back to replicated. DECODE
-> (M=1) UNTOUCHED → replicated (S1 fix). GATED: md5 `3069e80b` UNCHANGED ×2 engines + correct Fib + smoke_check
-> rc=0 (LOSSLESS — per-query independence). ⚠️ Leaving o token-sharded (also shard the o-proj) CompileTimeHbm
-> Oom'd +1.25G (XLA over-overlaps the MoE rhs-prep weight-unpacks); gathering o back contains the change. Decode
-> CLOSED at ~146 ms/step. NEXT (see `HANDOFF_PERF.md`): roadmap #2 — cut the MoE rhs-prep (225 ms/fwd), which
-> ALSO drops that HBM peak. GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.12): rhs-prep FASTER-UNPACK sub-lever REFUTED (scripts-only ⇒ GATE intact).**
+> Roadmap #2 angle (a) — beat the in-trace FP4→fp8 unpack (`u8_unpack_e2m1(w).astype(fp8)`, 4.5 ms/layer ×43 =
+> 194 ms/fwd) with integer bit-math / a LUT — is DEAD: `perf_microbench_fp4_unpack.py` shows XLA's NATIVE
+> `float4_e2m1fn.astype(fp8)` is at the VPU floor (3 integer formulations all LOSE 0.83–0.89×; a 16-entry fp8-LUT
+> gather is 756× SLOWER; all bit-identical). ⇒ the 194 ms/fwd rhs-prep TIME is only REMOVABLE via dual-residency
+> (fp8-resident-for-PREFILL + fp4-resident-for-DECODE = decode-neutral, but +17.1 GiB resident ⇒ HBM-MARGINAL,
+> roadmap #2). NEXT (see `HANDOFF_PERF.md`): pivot to roadmap #1 = the prefill DISPATCH fuse (80 ms/fwd @N=4096,
+> decode-neutral, contained to `_routed_local`). P.11 (attention-sharding) remains LANDED+GATED; P.12 touched only
+> `scripts/perf_*` (like P.6–P.10) ⇒ GATE trivially intact. Decode CLOSED at ~146 ms/step. GATE (non-negotiable):
+> FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
@@ -134,10 +134,11 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   LOSSLESS FLOOR** (2.46 ms/layer): the cost is the bf16-dequant MATERIALIZATION (not the 0.78 matmul), but
   it can't be removed losslessly — every in-trace kernel loses (naive Pallas matvec 11.6, gmm 5.48) and
   bf16-resident experts don't fit (34.3>31.25 GiB). Decode operands already bf16/fp32 (PERF 3.1). Do NOT
-  re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14). **PREFILL (the active P.9 focus): the
-  sharded path's in-trace `_fp4_rhs_and_scale` (the FP4→fp8 UNPACK+swapaxes+concat, real-file :351-358) is
-  225 ms/forward, seq-indep — the dominant prefill MoE cost. fp8-resident-at-load was P.9b-REFUTED (decode
-  regresses 1.37×); the lever must be DECODE-NEUTRAL — a faster in-trace unpack (HANDOFF roadmap #2).**
+  re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14). **PREFILL: the sharded path's in-trace
+  `_fp4_rhs_and_scale` UNPACK (FP4→fp8, real-file :351-358) is 194 ms/fwd, seq-indep — the dominant prefill MoE
+  cost, but P.12 REFUTED making it FASTER (XLA's native float4→fp8 convert is the VPU floor — DO-NOT-RETRY #22);
+  removable only via dual-residency (HBM-marginal, roadmap #2). The active prefill lever is now the DISPATCH (the
+  `_routed_local` sort + two `[N·top_k,dim]` gathers, :360-415, 80 ms/fwd @N=4096 — HANDOFF roadmap #1).**
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).
