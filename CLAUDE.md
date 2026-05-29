@@ -10,27 +10,26 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** 🔬 **PROFILE DONE — decode bottleneck DECOMPOSED (see
-> `HANDOFF_PERF.md`).** Decode = **0.277 s/tok (3.6 tok/s)** (the old "0.43 tok/s / 2.3 s/token" was
-> STALE v6e-32). Per step (~277 ms) = **~129 ms JAX host dispatch** (TWO jits/step — `run_model` +
-> `run_compute_logits` — each re-parsing a big arg pytree, `ParseArguments` ≈59 ms ea) **+ ~147 ms
-> blocking `device_get`** (only **38 ms is real device compute**; ~109–169 ms is async/module
-> round-trip). Device is DENSE (99% busy). ⇒ **async-scheduling ≈2%, collective-fusion DEAD (2.2 ms),
-> on-device compute opts <7% — all DEMOTED by measurement.** NEW LEVERS: **(1) fuse `compute_logits`
-> into `run_model` + trim the jit arg pytree** (~47%, host-side) = RANK 1; **(2) multi-step on-device
-> decode** (~53%, big). GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5
-> `3069e80b` byte-identical ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.2):** ⚠️ **The P.1 "decode DECOMPOSED" profile was an ARTIFACT —
+> the bottleneck is NOT yet decomposed.** The P.1 trace captured only ONE (first) decode step under an
+> ACTIVE profiler; its "~129 ms host dispatch (2× ~59 ms `ParseArguments`)" is profiler OBSERVER EFFECT
+> — an un-profiled microbench dispatches the same 1,492-leaf sharded pytree in **0.5 ms**
+> (`scripts/perf_microbench_decode.py`). Real steady-state host dispatch is **≤~24 ms = ≤9% of the 277
+> ms/step (likely <4%) ⇒ L1 host-dispatch is DEMOTED** (was RANK 1 on a phantom). SOLID: **decode =
+> 0.277 s/tok (277 ms/step)**, non-profiled two-point fit; the remaining **≥253 ms/step (≥91%) =
+> device + Ray-aDAG round-trip, UNDECOMPOSED.** NEXT = faithfully split it (non-profiler worker timers
+> or a ≥20-step profile read at the 2nd+ step) BEFORE picking a lever. GATE (non-negotiable): FIB
+> `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
 Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the **v6e-16** slice
 (TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_PERF.md` roadmap top-down — without
 ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pinned) is the primary
-target** (0.277 s/tok). The 2026-05-29 profile MEASURED the split: per step ≈ ~129 ms JAX host
-dispatch (2 jits/step, `ParseArguments`) + ~147 ms `device_get` (only 38 ms compute). Collectives,
-HBM-streaming, indexer `top_k`, and on-device compute are all SMALL — the levers are JAX dispatch
-(fuse `run_model`+`compute_logits`, trim args) and the per-step device round-trip (multi-step decode);
-see `HANDOFF_PERF.md`. The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+target** (0.277 s/tok, 277 ms/step — non-profiled, TRUSTED). ⚠️ The per-step SPLIT is NOT known: the
+P.1 profile that "decomposed" it was an artifact (single first-step under an active profiler). Measured
+since: un-profiled host dispatch is ≤~24 ms (microbench), so ≥253 ms/step (≥91%) is device + aDAG
+round-trip — faithfully decomposing THAT is the current top task (see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
 campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
 as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
 with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
@@ -76,7 +75,10 @@ Escalate only as far up as the question needs:
    ~1 min vs a 25-45 min smoke. `scripts/perf_microbench*` exists (sparse-attn) — **EXTEND it**
    for the op you're chasing (all-reduce on 4×4, `lax.top_k` over `T`, gmm_v2 fp8 vs dense bf16).
 3. **Profiler re-capture (full smoke + profiler):** the structural op-breakdown truth.
-   Recipe in `HANDOFF_PERF.md`. Reserve.
+   Recipe in `HANDOFF_PERF.md`. Reserve. ⚠️ The profiler INFLATES host `ParseArguments` ~100×
+   (observer effect — proven P.2) and a 1-step capture is first-exec program-load, NOT steady-state:
+   capture ≥20 decode steps + read the 2nd+; device op-% is reliable, absolute host/first-step is not.
+   For an un-perturbed host-vs-device split prefer non-profiler worker wall-timers (HANDOFF NEXT ACTION).
 4. **Full smoke + the S1 GATE above:** the per-change closure gate; at most 1-2 per session.
 
 ## Slice-serving protocol (marginal slice — do this EVERY smoke)
@@ -111,7 +113,7 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
-  `compute_logits` (:2042, nan_to_num clamp :2055). Dead code: `_consolidate_moe_after_load`
+  `compute_logits` (:1992, nan_to_num clamp :2005). Dead code: `_consolidate_moe_after_load`
   (:1776). The w1/w3 host-gather load (~:1492) IS the S1 fix — do not touch.
 * `runner/tpu_runner.py::_prepare_inputs_dp` — `_v4_decode_replicate` (:1359): replicated
   decode activation (the S1 fix). Drives the ~17% collective cost (Phase 2) — but DO NOT
