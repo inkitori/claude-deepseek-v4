@@ -10,17 +10,15 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.8): the ~30 ms non-MoE balance is ATTRIBUTED — roadmap #1 CLOSED.**
-> Decode wall stays at P.5's **146 ms** (P.8 changed NO production code — a measurement commit; GATE md5
-> `3069e80b` UNCHANGED). New `--block` mode on `perf_microbench_attn_decode.py` measured every named non-MoE
-> suspect (collectives included): Q/KV/O projections **4.13**, MoE gate **0.75**, hc_pre+19-iter sinkhorn
-> **2.99** = **7.87 ms/step** (+ P.7 attn 0.6 ⇒ ~8.5 ms). The split is self-consistent: device_wait 138.9 =
-> MoE 105.8 (P.6 floor) + attn 0.6 + proj/gate/hc 7.87 + **~24 ms per-op LAUNCH overhead** (per-op floor
-> ~5 µs; ~1760 ops/step). ⇒ decode at N=1 is LAUNCH-bound, as premised; the only lossless lever for the
-> ~24 ms (op-count↓ via a layer `lax.scan`) re-opens S1, so a LARGE lossless decode win likely doesn't exist.
-> **The decode lossless frontier is exhausted-or-marginal.** NEXT = a fork (see `HANDOFF_PERF.md`): (A) a
-> clean multi-step profiler to confirm ~24 ms + decide if any op-count lever survives [recommended]; (B)
-> PIVOT to PREFILL (the untapped half); (C) the risky LOSSY scaled-fp8-resident MoE (~106→32, GATE risk).
+> **One-line status (2026-05-29 — P.9): PIVOTED to PREFILL.** Decode is CLOSED at its ~lossless floor
+> (146 ms/step, launch-bound at N=1; full attribution in `HANDOFF_PERF.md` §DECODE). Prefill was a blank
+> slate; first characterization (new `perf_microbench_moe_prefill.py`, 16-chip): **the prefill MoE is
+> DOMINATED by the in-trace FP4→fp8 rhs-prep = 225 ms/forward, SEQ-INDEPENDENT** (= the bit-UNPACK; gmm-core
+> is near its dense-fp8 floor, NOT a lever; dispatch+collective scale with N). **THE LEVER:** store fp8 CODES
+> resident at load (17.1 GiB FITS; e2m1⊂e4m3 = LOSSLESS) ⇒ removes the 225 ms (and likely drops decode MoE
+> too, einsum-fp8w 0.75/layer). DISTINCT from the old LOSSY scaled-fp8. Measurement-only ⇒ GATE md5
+> `3069e80b` UNCHANGED. NEXT (see `HANDOFF_PERF.md`): (1) decode-bench check that fp8-resident doesn't
+> regress decode's dense dequant, (2) implement fp8-resident at load [needs a smoke], (3) prefill non-MoE split.
 > GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
@@ -133,7 +131,10 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   LOSSLESS FLOOR** (2.46 ms/layer): the cost is the bf16-dequant MATERIALIZATION (not the 0.78 matmul), but
   it can't be removed losslessly — every in-trace kernel loses (naive Pallas matvec 11.6, gmm 5.48) and
   bf16-resident experts don't fit (34.3>31.25 GiB). Decode operands already bf16/fp32 (PERF 3.1). Do NOT
-  re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14).
+  re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14). **PREFILL (the active P.9 focus): the
+  sharded path's in-trace `_fp4_rhs_and_scale` (the FP4→fp8 UNPACK+swapaxes+concat, real-file :351-358) is
+  225 ms/forward, seq-indep — the dominant prefill MoE cost; the lossless lever is fp8-codes-resident at
+  load (HANDOFF roadmap #1).**
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).
