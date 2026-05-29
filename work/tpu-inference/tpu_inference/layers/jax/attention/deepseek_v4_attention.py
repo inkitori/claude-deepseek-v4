@@ -31,6 +31,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.sharding import PartitionSpec as P
 
@@ -96,9 +97,18 @@ def precompute_freqs_cis(
     factor: float,
     beta_fast: int,
     beta_slow: int,
-) -> jnp.ndarray:
-    """Returns a complex64 tensor of shape [seqlen, rope_head_dim/2]. Matches
-    the YaRN-augmented frequencies in the PyTorch reference exactly."""
+) -> np.ndarray:
+    """Returns a complex64 numpy array of shape [seqlen, rope_head_dim/2]. Matches
+    the YaRN-augmented frequencies in the PyTorch reference exactly.
+
+    Computed in NUMPY (host), NOT jnp: this is a static constant table built on the
+    eager load path (make_freqs_cis -> initialize_cache). Under the active
+    set_mesh(mesh), jnp ops here compile as a 16-partition TPU SPMD program that
+    races the SPMD weight placement on the multi-host pod and desyncs the launch
+    group (scheckne launch-id halt — confirmed via HLO diff: num_partitions=16
+    jit_iota/outer/exp on the head only). numpy emits no TPU launch; the forward jit
+    transfers the table to device (replicated, collective-free). numpy also computes
+    the float64 complex exp exactly — TPU truncates float64 to f32."""
     def find_correction_dim(num_rotations, dim, base_, max_seq_len):
         return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base_))
 
@@ -110,18 +120,18 @@ def precompute_freqs_cis(
     def linear_ramp_factor(lo, hi, dim):
         if lo == hi:
             hi += 0.001
-        lf = (jnp.arange(dim, dtype=jnp.float32) - lo) / (hi - lo)
-        return jnp.clip(lf, 0.0, 1.0)
+        lf = (np.arange(dim, dtype=np.float32) - lo) / (hi - lo)
+        return np.clip(lf, 0.0, 1.0)
 
     dim = rope_head_dim
-    freqs = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    freqs = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
     if original_seq_len > 0:
         lo, hi = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
         smooth = 1.0 - linear_ramp_factor(lo, hi, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
-    t = jnp.arange(seqlen, dtype=jnp.float32)
-    freqs_outer = jnp.outer(t, freqs)  # [seqlen, dim/2]
-    return jnp.exp(1j * freqs_outer.astype(jnp.float64)).astype(jnp.complex64)
+    t = np.arange(seqlen, dtype=np.float32)
+    freqs_outer = np.outer(t, freqs)  # [seqlen, dim/2]
+    return np.exp(1j * freqs_outer.astype(np.float64)).astype(np.complex64)
 
 
 def apply_rotary_emb(x: jnp.ndarray, freqs_cis: jnp.ndarray, inverse: bool = False) -> jnp.ndarray:

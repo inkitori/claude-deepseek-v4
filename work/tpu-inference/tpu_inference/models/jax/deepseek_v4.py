@@ -912,7 +912,17 @@ def deepseek_v4_mtp_forward(
 # ------------------------------------------------------------
 
 def make_freqs_cis(cfg: DeepseekV4Config, max_seq_len: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Pre-compute the two RoPE freq tables: SWA (plain) and compressed (YaRN)."""
+    """Pre-compute the two RoPE freq tables: SWA (plain) and compressed (YaRN).
+
+    Returns NUMPY arrays (precompute_freqs_cis is numpy — see its docstring): the
+    eager jnp path compiled as a 16-partition TPU program that raced SPMD weight
+    placement and desynced the launch group (scheckne). We return host numpy
+    *uncommitted* — NOT device_put onto CPU, since a CPU-committed array is rejected
+    by create_jit_model's jit context mesh ("Received incompatible devices …
+    platform CPU … jit's context mesh … platform TPU"). Uncommitted numpy lets the
+    create_jit_model / forward jit place the small tables replicated on the mesh as
+    part of its own lockstep SPMD program — no eager freqs launch, no device clash.
+    """
     swa = precompute_freqs_cis(
         cfg.qk_rope_head_dim, max_seq_len, 0, cfg.rope_theta,
         cfg.rope_factor, cfg.rope_beta_fast, cfg.rope_beta_slow,
