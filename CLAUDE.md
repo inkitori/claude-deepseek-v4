@@ -14,10 +14,13 @@
 > fp4 kernel unpack — fp4 MXU needs TPU v7), avoiding both the in-trace bf16 dequant OOM (Q.11) and the
 > fp4 MosaicError (Q.12). GATE ✅: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical
 > ×2 fresh engines + `smoke_check` rc=0 — re-confirmed at **MAX_LEN=4096** (full context, 16× the prior
-> 256) in Q.14 incl. a 445-tok long-prefill stress probe. **NEXT = PERF (decode ~0.43 tok/s; a SEPARATE
-> loop) or MAX_SEQS>1 (untested multi-request decode).** The decode bf16 dequant is NOT a fit risk (HBM
-> premise corrected: ~10 GiB/chip residency, ~21 GiB headroom; transient is N-independent). The quant
-> axis is essentially done — operator may `touch /tmp/quant_loop_stop` for PERF. See `HANDOFF_QUANT.md`.
+> 256) in Q.14 incl. a 445-tok long-prefill stress probe. **Q.15 tested the LAST open config, MAX_SEQS>1
+> (concurrent decode) → CONFIRMED BROKEN** (S1-class corruption: 3/4 concurrent requests silently garbage;
+> `_v4_decode_replicate` covers num_reqs==1 only — NOT a quant bug; MAX_SEQS=1 is the validated config &
+> already the pinned constraint; `scripts/quant_concurrent_probe.py` detects it). **QUANT AXIS DONE** — every
+> config gated-working or characterized-and-scoped-out. **NEXT = PERF (~0.43 tok/s) or concurrent-decode
+> determinism — BOTH SEPARATE non-quant loops; operator should `touch /tmp/quant_loop_stop`.** The decode
+> bf16 dequant is NOT a fit risk (~10 GiB/chip residency, ~21 GiB headroom; N-independent). See `HANDOFF_QUANT.md`.
 
 ## Goal
 

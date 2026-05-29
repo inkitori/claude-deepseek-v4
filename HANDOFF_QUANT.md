@@ -4,14 +4,17 @@
 > **v6e-16** by **NOT dequantizing the FP4 experts to bf16**. Durable slice ops + pitfalls: `CLAUDE.md`.
 > Prior campaigns (history): `HANDOFF_PERF.md`, `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29):** 🎯 **GATE PASSED + HARDENED. V4-Flash LOADS + FITS + SERVES +
-> DECODES CORRECTLY + DETERMINISTICALLY on v6e-16 with the FP4 experts kept compressed.** Core goal MET
-> (Q.13: FP4 experts → `gmm_v2` as **fp8 codes + per-block rhs_scale**; fp4→fp8 cast is LOSSLESS; v6e
-> Mosaic CANNOT compile the native fp4 unpack). **Q.14 (this session): re-gated at the model's FULL
-> context `MAX_LEN=4096` (16× the prior 256), incl. a 445-token long-prefill probe** that stresses the
-> compressed-expert `gmm_v2` path at large N — all green across 2 fresh engines. **NEXT = PERF (decode
-> ~0.43 tok/s; a SEPARATE loop) or MAX_SEQS>1 (untested multi-request decode).** Fit-and-serve no longer
-> blocks; the decode-path bf16 dequant is NOT a fit risk (HBM premise corrected — see §NEXT). See §NEXT.
+> **One-line status (2026-05-29):** 🎯 **GATE PASSED + HARDENED + QUANT AXIS EXHAUSTED.** V4-Flash LOADS +
+> FITS + SERVES + DECODES CORRECTLY + DETERMINISTICALLY on v6e-16 (MAX_SEQS=1) with the FP4 experts kept
+> compressed — core goal MET (Q.13: FP4 experts → `gmm_v2` as **fp8 codes + per-block rhs_scale**; fp4→fp8
+> cast LOSSLESS; v6e Mosaic CANNOT compile the native fp4 unpack), hardened at full context `MAX_LEN=4096`
+> (Q.14). **Q.15 (this session): tested the LAST open config — MAX_SEQS>1 (concurrent multi-request decode)
+> → CONFIRMED BROKEN** (S1-class uninit-HBM corruption: 3 of 4 concurrent FIB requests return GARBAGE,
+> SILENTLY — HTTP 200, no crash). **NOT a quant regression and NOT a quant fix** — it is the S1 fix's known
+> scope limit (`_v4_decode_replicate` covers num_reqs==1 only). **MAX_SEQS=1 is the validated production
+> config (and was already the pinned constraint).** Every quant-axis config is now gated-working or
+> characterized-and-scoped-out ⇒ **the quant axis is DONE. Recommend `touch /tmp/quant_loop_stop`**;
+> remaining work (PERF ~0.43 tok/s; concurrent-decode determinism) is SEPARATE non-quant loops. See §NEXT.
 
 ---
 
@@ -74,37 +77,41 @@ vs `_dequant_fp4_experts` in gmm's [g,k,n] layout) + `quant_fp4_dequant_check.py
 
 ---
 
-## <a name="NEXT"></a>⚠️ NEXT ACTION — fit-and-serve is DONE + HARDENED; the quant axis is nearly exhausted
-The blocking goal (load+fit+serve+correct on v6e-16) is COMPLETE + GATED, now at full context (4096).
+## <a name="NEXT"></a>⚠️ NEXT ACTION — quant axis EXHAUSTED; recommend stopping the loop
+Every config is now either gated-working (MAX_SEQS=1, full context) or characterized-and-scoped-out
+(MAX_SEQS>1, below). The blocking goal (load+fit+serve+correct on v6e-16) is COMPLETE + GATED + HARDENED.
 
-**HBM PREMISE CORRECTED (Q.14, was driving a wrong priority):** earlier notes feared the decode bf16
-dequant could OOM at "larger configs." That was a MISREAD — `31.25 GiB` is the per-chip **budget**, not
-the residency. Live smoke residency is **~9.8–10.2 GiB/chip** (4096 KV adds only +0.37 vs 256) ⇒ **~21
-GiB/chip headroom**. The decode dense-branch bf16 transient is **WEIGHT-ONLY and N-INDEPENDENT**: it
-dequants only the **16 LOCAL E-sharded experts**, layer-by-layer ≈ **0.75 GiB/chip/layer** (NOT all 256
-replicated, NOT activation-scaled). The dense branch is also structurally capped to N<16 (at N≥16 decode
-takes the fp8 gmm path). So it **cannot OOM at any realistic config** — converting it is PERF/cleanliness,
-**not a fit blocker**. (`deepseek_v4_moe.py` gate :290, dense bf16 dequant :300-303.)
+**Q.15 FINDING — MAX_SEQS>1 concurrent decode is BROKEN (last open question, now closed).** Tested on a
+fresh MAX_SEQS=4 / MAX_LEN=256 engine via `scripts/quant_concurrent_probe.py 4 32`: 4 IDENTICAL FIB
+requests fired concurrently genuinely CO-decoded (`Running: 4 reqs` in-log; all returned at 68.3 s vs
+7.9 s single). Result: **only 1 of 4 correct; the other 3 returned GARBAGE** (`' etc'`, `','`, `','`) —
+SILENTLY (HTTP 200, finish_reason='length', NO crash/NaN log; the `compute_logits` nan_to_num clamp masks
+it). Single request correct + byte-stable (N=2 md5 `3069e80b`; N=32 md5 `34660b8b`) BEFORE and AFTER the
+batch — **no state pollution, no wedge**. Mechanism = the exact S1 uninit-HBM corruption: `num_reqs>1` ⇒
+`_v4_decode_replicate` OFF (it gates on `num_reqs==1`, `tpu_runner.py:1385`) ⇒ activation ATTN_DATA-
+sharded across attn_dp=16; but N(=4) < 16 ⇒ MoE takes the **dense einsum** path (gmm needs N≥16,
+`deepseek_v4_moe.py:290`), which was built for a REPLICATED activation — a token-sharded N<16 activation
+feeds its implicit collective-matmul that reads uninitialised HBM for un-owned tokens. **This is the S1
+fix's deliberate scope limit, NOT a quant bug** — and `--max-num-seqs=1` was already the pinned
+production constraint for exactly this reason.
+⚠️ **PRODUCTION FOOTGUN:** serving with `--max-num-seqs>1` SILENTLY corrupts concurrent requests (no
+error surfaced). If MAX_SEQS>1 is ever enabled, add a LOUD startup guard first.
 
-Remaining options, in honest priority:
-1. **PERF — almost certainly the real next campaign (a SEPARATE loop, see `HANDOFF_PERF.md`).** Decode
-   `observed_tps≈0.43` (64 tok in ~150 s). Suspects: `--enforce-eager`, fp8 gmm, decode dense all-256
-   einsum. Cheap entry = a decode-step microbench. If the operator wants perf: `touch /tmp/quant_loop_stop`
-   and move to the perf loop. The GATE must still hold after any perf change.
-2. **MAX_SEQS>1 (the one untested quant-axis config).** Q.14 validated MAX_LEN=4096 but kept MAX_SEQS=1
-   (the S1-fixed single-request decode path). Multi-request concurrent decode (`num_reqs>1`) is a
-   DIFFERENT, untested path — `_v4_decode_replicate` only fires for single-token single-request decode
-   (`tpu_runner.py:1385`), so concurrent decode is NOT replicated and its determinism is unverified. If
-   pursuing prod-readiness, gate MAX_SEQS=4 next (expect a possible NEW determinism question, not a quant
-   regression).
-3. **Decode-path fp8 conversion (perf/cleanliness only, NOT fit).** Only worth it as a perf win, and it's
-   RISKY: option (a) gmm-for-decode collides with the S1 fix (replicated N=1 → token-axis gather →
-   Core-halt, proven ×8); a pure-JAX fp8-einsum saves NO HBM (XLA upcasts fp8 einsum operands; the large
-   operand is the N-independent weight). Cleanest route = a replicated full-256 `gmm_v2` (no group_offset,
-   no shard_map). Do NOT touch `_routed_local` (the S1 prefill shard_map, `deepseek_v4_moe.py:348-403`).
+**If concurrent decode is wanted (a SEPARATE S1/determinism workstream, NOT quant):** make the small-N
+(N<16) decode path S1-safe under num_reqs>1 — either (a) widen `_v4_decode_replicate` to replicate the
+decode activation for num_reqs>1 too (N>1 is NOT the size-1 token-axis gather Pitfall #5 warns Core-halts,
+so plausibly safe — but it touches the load-bearing S1 path; validate hard), or (b) force/pad decode to
+the gmm path (gmm zero-inits un-owned rows = the determinism lever) — but gmm-for-N=1 collides with the
+S1 replication (token-axis gather → Core-halt ×8). Either needs ≥2 cold smokes + the 2-engine determinism
+gate + re-confirming the single-request gate still passes. RISKY; out of quant scope. Validate any fix
+with `quant_concurrent_probe.py` (all-4-correct = fixed).
 
-The loop's stated job (LOAD AND SERVE CORRECTLY) is SATISFIED and hardened. Honest recommendation: the
-quant axis is essentially done — operator should likely `touch /tmp/quant_loop_stop` and switch to PERF.
+**PERF (the other separate loop, see `HANDOFF_PERF.md`):** decode `observed_tps≈0.43`. Cheap entry = a
+decode-step microbench. The GATE must still hold after any perf change.
+
+**HBM premise (durable):** `31.25 GiB` is the per-chip BUDGET, not residency. Live residency ~9.75–10.2
+GiB/chip ⇒ ~21 GiB headroom. The decode dense-branch bf16 dequant is WEIGHT-ONLY + N-INDEPENDENT (only
+the 16 LOCAL E-sharded experts, ~0.75 GiB/chip/layer) ⇒ cannot OOM at any realistic config.
 
 ---
 
@@ -114,16 +121,20 @@ quant axis is essentially done — operator should likely `touch /tmp/quant_loop
    run on CPU, it calls `get_tpu_info()` at trace time; the orient check replicates gmm's math to byte-
    verify the (rhs, rhs_scale) layout) + `quant_fp4_dequant_check.py` + `s1_cpu_repro_v4flash.py both`.
 2. **Full smoke + GATE.** Startup ~65s (cache warm); first-request prefill compile cold ~3-5 min, warm
-   seconds. `VLLM_ENGINE_READY_TIMEOUT_S=2400`. Reserve to ≤1-2/session.
+   seconds. `VLLM_ENGINE_READY_TIMEOUT_S=2400`. Reserve to ≤1-2/session. Single-request gate probe:
+   `scripts/s1_probe2.py N`. Concurrent multi-request decode: `MAX_SEQS=4 bash …smoke.sh` then
+   `scripts/quant_concurrent_probe.py K N` — verdict ALL_CONCURRENT_CORRECT (KNOWN BROKEN as of Q.15;
+   use to validate any future concurrent-decode fix).
 
 ---
 
-## SLICE STATE (08:4xZ) — VERIFY, don't trust (all ephemeral)
-- **Both Q.14 engines reset at handoff** (clean; 16.0 TPU free, lockfiles cleared). Cache now WARM for
-  BOTH MAX_LEN=256 and MAX_LEN=4096 ⇒ next smoke at either is fast. Q.14 logs:
-  `logs/full-slice-v4-smoke-20260529T082830Z.log` (eng#1), `…084305Z.log` (eng#2).
+## SLICE STATE (09:xxZ) — VERIFY, don't trust (all ephemeral)
+- **Q.15 MAX_SEQS=4 engine reset at handoff** (clean; 16.0 TPU free, lockfiles cleared). Cache now WARM
+  for MAX_LEN=256 (MAX_SEQS=1 AND =4) + MAX_LEN=4096 (MAX_SEQS=1). Q.15 log:
+  `logs/full-slice-v4-smoke-20260529T085830Z.log`.
 - Guardians alive (`node_guardian` 700703 / `meta_guardian` 700702). Weights mounted all 4 hosts.
-- NO code change this session ⇒ no sync/cache-clear done (none needed). `deepseek_v4_moe.py` md5 `9e2738f0…`.
+- **NO model code changed** (`deepseek_v4_moe.py` md5 `9e2738f0…`) ⇒ no sync/cache-clear needed. Q.15
+  added `scripts/quant_concurrent_probe.py` (head-only probe, runs vs localhost:18081 — no sync needed).
 
 ---
 
