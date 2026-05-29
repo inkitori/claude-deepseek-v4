@@ -237,14 +237,18 @@ def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale,
       attn_sink stay REPLICATED (any query may attend to any key). This removes
       the 16x-redundant M=N replicated compute that dominates long-context prefill
       (P.10). LOSSLESS: attention is independent per (b, m) query, so each token's
-      output is byte-identical regardless of how M is split. The per-shard outputs
-      are then GATHERED back to REPLICATED (matching the decode output), so the
-      post-attention graph (o-proj / hc_post / MoE) is byte-identical to the
-      unsharded baseline and the change is CONTAINED to the attention sub-step.
-      (Leaving o token-sharded was tried first — P.11 — but propagating token-
-      sharding into the HBM-tight MoE region tipped XLA's per-layer rhs-prep
-      weight-unpack scheduling +1.25G over the 31.25G budget → CompileTimeHbmOom.
-      Gathering o back keeps the unsharded MoE schedule that the FIT baseline fits.)
+      output is byte-identical regardless of how M is split. The per-shard
+      outputs STAY token-sharded: o-proj / hc_post / hc_pre / rms_norm / the MoE
+      gate all contract only the FEATURE dim (token axis is a batch dim) and carry
+      no replicated constraint, so token-sharding rides straight to the MoE
+      shard_map (in_specs already P('attn_dp', None)) — its all_gather at
+      deepseek_v4_moe.py:371 is the single re-gather point. This makes the whole
+      post-attention non-MoE graph run 1/16-sharded instead of replicated (P.10
+      lever — one fewer all-gather/layer). LOSSLESS (per-(b,m)-query independent).
+      (Leaving o token-sharded OOM'd in P.11 — propagating it into the HBM-tight
+      MoE tipped XLA's per-layer rhs-prep weight-unpack scheduling +1.25G over
+      31.25G → CompileTimeHbmOom — until P.17's optimization_barrier capped that
+      unpack hoist (prefill peak 18.34→1.51 GiB); now ~30 GiB headroom.)
 
     No mesh (CPU / interpret=True for the parity test + microbench) → call the
     kernel directly, mirroring the MoE's `mesh.empty` gate in deepseek_v4_moe.py."""
@@ -263,10 +267,11 @@ def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale,
             out_specs=P(None, td, None, None),
             check_vma=False,
         )(q, kv, attn_sink, topk_idxs)
-        # Gather the per-token-shard outputs to a REPLICATED [B,S,H,Dh] (S≥16,
-        # NOT the size-1 decode case Pitfall #5 warns about) so downstream sees
-        # the same replicated o the unsharded baseline produced.
-        return jax.lax.with_sharding_constraint(o, P())
+        # Keep the per-token-shard outputs TOKEN-SHARDED [B,S,H,Dh] (S≥16, NOT
+        # the size-1 decode case Pitfall #5 warns about) so o-proj/hc/norm/gate
+        # ride sharded to the MoE shard_map (matching its P('attn_dp', None)
+        # in_specs). HBM-safe since P.17 (the rhs-prep unpack-concurrency barrier).
+        return jax.lax.with_sharding_constraint(o, P(None, td, None, None))
     return jax.shard_map(
         functools.partial(sparse_attn_kernel, softmax_scale=softmax_scale),
         mesh=mesh,

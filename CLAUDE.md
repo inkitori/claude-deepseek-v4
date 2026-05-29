@@ -10,16 +10,17 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.17): prefill forward HBM-peak CRUSHED 18.34 → 1.51 GiB/chip (−92%) — GATED, LOSSLESS.**
-> A 1-line `jax.lax.optimization_barrier((W1,W3,W2,flat_x))` at `deepseek_v4_moe.py:351` ties each layer's rhs-prep FP4→fp8
-> unpack to its incoming activation, so XLA can no longer HOIST all 43 layers' unpacks concurrent (that hoist WAS the ~18 GiB
-> peak). STEP 1 first confirmed the baseline 18.34 is GENUINE in-trace transient, NOT an fp8 double-count ⇒ dual-residency
-> stays dead. Tier-2 microbench `perf_microbench_moe_prefill_hbm.py` (P.16) predicted the cap; the real model went 18.34→1.51
-> (bigger than the bench's 9.14→0.51). BIT-IDENTICAL (md5 `3069e80b` ×2 fresh engines + correct Fib + smoke_check rc=0).
-> UNBLOCKS roadmap #1 = token-sharded o-proj (was HBM-OOM at +1.25 GiB over the OLD 18.34 peak; now ~30 GiB headroom — a 1-line
-> change at `deepseek_v4_attention.py:269`). NEW: the DECODE forward (~12–20 GiB, XLA-scheduler-VARIABLE dense
-> `_dequant_fp4_experts` concurrency — the SAME hoisting on the bf16 dequant, NOT touched by the prefill barrier) is now the
-> binding HBM peak. GATE: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.18): prefill o-proj/hc/gate now TOKEN-SHARDED (roadmap #1 LANDED) — GATED ×2 engines, LOSSLESS, decode-neutral.**
+> A 1-line change at `deepseek_v4_attention.py:269` (`P()` → `P(None,ATTN_DATA,None,None)`) keeps the prefill sparse-attn kernel
+> output TOKEN-SHARDED instead of gathering to replicated. The post-attention non-MoE region (o-proj / hc_post / hc_pre /
+> rms_norm / MoE gate) all contracts the FEATURE dim, so token-sharding rides straight to the MoE shard_map (`in_specs` already
+> `P('attn_dp',None)`) ⇒ those ops run 1/16-SHARDED instead of REPLICATED (the P.10 lever; P.11 landed the kernel-compute half).
+> UNBLOCKED by P.17's barrier (this was DO-NOT-RETRY #21 — the +1.25G unpack-hoist OOM, now capped): prefill HBM 1.51 → 2.95 GiB
+> (+1.44 from gate/hc reshard intermediates; ~28 GiB headroom), DECODE 19.62 GiB UNCHANGED (prefill-only; decode branch :270
+> untouched). BIT-IDENTICAL (md5 `3069e80b` ×2 fresh engines + correct Fib + smoke_check rc=0). ⚠️ e2e prefill LATENCY win is
+> microbench-PROJECTED (P.10 −5.6..−48.9%), NOT yet measured e2e — profiler re-capture pending. NEXT: roadmap #2 = cap the DECODE
+> forward HBM (19.62 GiB, the binding peak — XLA-scheduler-VARIABLE dense `_dequant_fp4_experts` hoist, NOT the prefill barrier)
+> via a decode-side `optimization_barrier`, microbench-FIRST. GATE: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
@@ -113,10 +114,11 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   `shard_token_axis=True`); the indexer (`indexer_prefill` / `indexer_decode_step`, the `lax.top_k` over a
   STATIC `T`). ⚠️ P.7 REFUTED both as DECODE levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the
   indexer is NEGLIGIBLE (~0.3 ms/step) — see DO-NOT-RETRY #15,16; decode's non-MoE cost is
-  projections+gate+launch, NOT here. ★ **PREFILL (P.11 LANDED): the call passes `shard_token_axis=True` →
+  projections+gate+launch, NOT here. ★ **PREFILL (P.11+P.18 LANDED): the call passes `shard_token_axis=True` →
   SHARDS the kernel over the token axis (`ATTN_DATA`, 16-way), each chip runs its 1/16 slice (was 16×-
-  redundant M=N, 584 ms/fwd @N=4096; now 44), then GATHERS o back to replicated (the token-sharded-OUTPUT
-  variant OOM'd — DO-NOT-RETRY #21). DECODE (M=1) stays REPLICATED (S1 fix).**
+  redundant M=N, 584 ms/fwd @N=4096; now 44), and (P.18 :269) KEEPS o token-sharded so o-proj/hc/norm/gate
+  ride 1/16-sharded to the MoE shard_map (the token-sharded-OUTPUT variant OOM'd in P.11 but P.17's barrier
+  unblocked it — DO-NOT-RETRY #21; prefill HBM 1.51→2.95). DECODE (M=1) stays REPLICATED (S1 fix).**
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
