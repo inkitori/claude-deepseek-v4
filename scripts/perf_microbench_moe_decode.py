@@ -159,6 +159,39 @@ def baseline_lean_ffn(x, W1u, W3u, W2u, S1, S3, S2, pew, wsc=True):
     return out.astype(fp32).sum(axis=1)
 
 
+def _dequant_fp8_lean(codes_f8, scale):
+    """LEAN dequant from PRE-UNPACKED fp8 codes (the fp8-CODES-RESIDENT scheme): identical
+    to _dequant_fp4_lean but the e2m1->fp8 unpack is ALREADY done (at load), so this skips
+    u8_unpack_e2m1 (the bit-unpack) and reads 1-byte fp8 [E,out,in] (2x the packed-fp4 HBM).
+    Still BIT-IDENTICAL to the fp4 lean dequant (fp8 e4m3 holds the e2m1 codebook exactly)."""
+    if scale.dtype != jnp.uint8:
+        scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
+    codes = codes_f8.astype(jnp.bfloat16)                     # [..., K] bf16 (NO unpack)
+    s = e8m0_to_fp32(scale).astype(jnp.bfloat16)              # [..., K/BLK] bf16
+    K = codes.shape[-1]
+    blk = codes.reshape(*codes.shape[:-1], K // BLK, BLK)
+    return (blk * s[..., None]).reshape(*codes.shape[:-1], K)
+
+
+def lean_dequant_fp8_ffn(x, W1c, W3c, W2c, S1, S3, S2, pew):
+    """Decode dense path with fp8-CODES-RESIDENT experts: lean dequant from fp8 codes (no
+    bit-unpack, 2x HBM read vs packed fp4) + the production einsums (no wsc). Measures the
+    DECODE MoE cost IF experts were stored fp8-codes-resident -- the decode SIDE of the P.9
+    prefill rhs-prep lever (which removes 225 ms/forward from prefill). LOSSLESS, so this
+    must be bit-identical to baseline; the question its TIMING answers is whether the 2x
+    expert HBM read regresses decode vs the current packed-fp4 lean-noWSC (2.46 ms/layer)."""
+    fp32, bf16 = jnp.float32, jnp.bfloat16
+    W1 = _dequant_fp8_lean(W1c, S1)
+    W3 = _dequant_fp8_lean(W3c, S3)
+    W2 = _dequant_fp8_lean(W2c, S2)
+    gate = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W1, preferred_element_type=fp32))
+    up = _shard_e_mid(jnp.einsum('nd,eid->nei', x, W3, preferred_element_type=fp32))
+    h = jax.nn.silu(gate) * up
+    h = _shard_e_mid(h * _shard_e_last(pew)[..., None])
+    out = _shard_e_mid(jnp.einsum('nei,edi->ned', h.astype(bf16), W2.astype(bf16)))
+    return out.astype(fp32).sum(axis=1)
+
+
 def dequant_only(W1u, W3u, W2u, S1, S3, S2):
     """Isolate the FP4->bf16 dequant + bf16 materialization (no matmul)."""
     W1 = _shard_e_first(_dequant_fp4_experts(W1u, S1))
@@ -316,6 +349,7 @@ def main():
         e8w_f = jax.jit(einsum_fp8w)
         e8_f = jax.jit(einsum_fp8)
         kern_f = jax.jit(lambda *aa: kernel_fp8_ffn(*aa, mesh))
+        ldf8_f = jax.jit(lean_dequant_fp8_ffn)   # fp8-codes-resident decode (P.9 lever)
         args = (x, W1u, W3u, W2u, S1, S3, S2, pew)
 
         # Pre-dequant bf16 experts ONCE (outside timing) for the einsum-only bench.
@@ -348,10 +382,17 @@ def main():
         #  perf_dense_fp8_moe_kernel validated correctness at 4.1e-7 rel err.)
         yk = np.asarray(jax.device_get(jax.block_until_ready(kern_f(*kargs))), np.float32)
         kern_finite = bool(np.isfinite(yk).all())
+        # fp8-CODES-RESIDENT decode (P.9 lever): must be BIT-IDENTICAL to baseline (fp8
+        # holds e2m1 exactly) -- proves the lever is lossless on the decode side too.
+        yldf8 = np.asarray(jax.device_get(jax.block_until_ready(
+            ldf8_f(x, W1c, W3c, W2c, S1, S3, S2, pew))), np.float32)
+        max_abs_ldf8 = float(np.abs(yb - yldf8).max())
 
         bmed, bmin = measure(lambda: base_f(*args), a.iters)
         lmed, lmin = measure(lambda: lean_f(*args), a.iters)
         nmed, nmin = measure(lambda: leannw_f(*args), a.iters)
+        ldf8med, ldf8min = measure(
+            lambda: ldf8_f(x, W1c, W3c, W2c, S1, S3, S2, pew), a.iters)
         dmed, dmin = measure(lambda: dq_f(W1u, W3u, W2u, S1, S3, S2), a.iters)
         emed, emin = measure(lambda: es_f(x, W1b, W3b, W2b, pew), a.iters)
         e8wmed, e8wmin = measure(lambda: e8w_f(x, W1f, W3f, W2f, pew), a.iters)
@@ -368,7 +409,8 @@ def main():
         print(f"dims dim={DIM} inter={INTER} top_k={TOP_K} | backend={jax.default_backend()} devices={nd}")
         print(f"\nBASELINE   (current _dequant_fp4 + einsum)    : med {bmed:7.2f} ms  min {bmin:7.2f} ms  /layer")
         print(f"LEAN       (bf16 broadcast dequant + einsum)  : med {lmed:7.2f} ms  min {lmin:7.2f} ms  /layer")
-        print(f"LEAN-noWSC (lean, no intermediate _shard_e_first): med {nmed:7.2f} ms  min {nmin:7.2f} ms  /layer")
+        print(f"LEAN-noWSC (lean, no intermediate _shard_e_first): med {nmed:7.2f} ms  min {nmin:7.2f} ms  /layer  <- PRODUCTION")
+        print(f"LEAN-fp8res(lean dequant from fp8 codes, no unpack): med {ldf8med:7.2f} ms  min {ldf8min:7.2f} ms  /layer")
         print(f"FUSED      (gmm_v2 fp8 codes, shard_map)      : med {fmed:7.2f} ms  min {fmin:7.2f} ms  /layer")
         print(f"KERNEL     (dense fp8 in-reg dequant, shard_map): med {kmed:7.2f} ms  min {kmin:7.2f} ms  /layer")
         print(f"  dequant-only (current, materialize x3)      : med {dmed:7.2f} ms  min {dmin:7.2f} ms  /layer")
@@ -376,6 +418,12 @@ def main():
         print(f"  einsum-fp8w  (fp8 weights, bf16 act)        : med {e8wmed:7.2f} ms  min {e8wmin:7.2f} ms  /layer")
         print(f"  einsum-fp8   (fp8 weights + fp8 act)        : med {e8med:7.2f} ms  min {e8min:7.2f} ms  /layer")
         print(f"\nLEAN bit-identity vs baseline: max|Δ| = {max_abs:.3e}  ({'IDENTICAL' if max_abs==0 else 'DIFFERS'})")
+        # P.9 fp8-codes-resident DECODE side: does the 2x expert HBM read regress decode?
+        _f8v = ('NO REGRESSION' if ldf8min <= nmin * 1.05 else
+                f'REGRESSES {ldf8min/nmin:.2f}x')
+        print(f"fp8-RESIDENT decode (P.9 lever, LOSSLESS): lean-fp8 {ldf8min:.2f} vs production "
+              f"lean-noWSC {nmin:.2f} ms/layer => {_f8v}  (bit-ident max|Δ|={max_abs_ldf8:.3e}; "
+              f"MoE step {ldf8min*N_MOE_LAYERS:.0f} vs {nmin*N_MOE_LAYERS:.0f} ms)")
         best = min(lmin, nmin)
         print(f"DECOMPOSITION: dequant {dmed:.2f} + einsum {emed:.2f} (dequant {100*dmed/(dmed+emed):.0f}% of split)")
         print(f"WIN: lean/baseline {bmin/lmin:4.2f}x | lean-noWSC/baseline {bmin/nmin:4.2f}x | gmm {bmin/fmin:4.2f}x")
