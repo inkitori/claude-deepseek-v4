@@ -10,16 +10,17 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.12): rhs-prep FASTER-UNPACK sub-lever REFUTED (scripts-only ⇒ GATE intact).**
-> Roadmap #2 angle (a) — beat the in-trace FP4→fp8 unpack (`u8_unpack_e2m1(w).astype(fp8)`, 4.5 ms/layer ×43 =
-> 194 ms/fwd) with integer bit-math / a LUT — is DEAD: `perf_microbench_fp4_unpack.py` shows XLA's NATIVE
-> `float4_e2m1fn.astype(fp8)` is at the VPU floor (3 integer formulations all LOSE 0.83–0.89×; a 16-entry fp8-LUT
-> gather is 756× SLOWER; all bit-identical). ⇒ the 194 ms/fwd rhs-prep TIME is only REMOVABLE via dual-residency
-> (fp8-resident-for-PREFILL + fp4-resident-for-DECODE = decode-neutral, but +17.1 GiB resident ⇒ HBM-MARGINAL,
-> roadmap #2). NEXT (see `HANDOFF_PERF.md`): pivot to roadmap #1 = the prefill DISPATCH fuse (80 ms/fwd @N=4096,
-> decode-neutral, contained to `_routed_local`). P.11 (attention-sharding) remains LANDED+GATED; P.12 touched only
-> `scripts/perf_*` (like P.6–P.10) ⇒ GATE trivially intact. Decode CLOSED at ~146 ms/step. GATE (non-negotiable):
-> FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.13): prefill DISPATCH owned-gather lever REFUTED/BLOCKED (scripts-only ⇒ GATE intact).**
+> Fixed a DCE bug in the dispatch microbench (lumped `disp.sum()` folded the order-invariant gather→reduce) ⇒ FIRST
+> trustworthy decomposition: real dispatch = 36/40/64/95 ms/fwd @N=512/1024/2048/4096 = an UNAVOIDABLE sort (~25
+> ms/fwd, production sorts identically) + attackable GATHERS (19→70 ms/fwd, dominated by the **fp32 revert gather**,
+> 55 @N=4096). Roadmap-#1's owned-only ragged gather (16× less DMA) is BLOCKED on v6e: SparseCore IS LIVE (so V4's
+> `_routed_local:342` "ragged_* fall back" comment is STALE/WRONG — they'd CRASH) but `ragged_gather`/`ragged_scatter`
+> FAIL TO COMPILE with a dynamic `[start,end)` (SC grid derives from traced `(end-start)`, XLA can't prove tile(8)-
+> align; no `assume_multiple`, v7-targeted). Also REFUTED: 2nd-argsort→scatter inverse. ⇒ roadmap #1 TAPPED; pivot to
+> roadmap #2 (rhs-prep dual-residency HBM smoke) — 194 ms/fwd, all N. P.13 touched only `scripts/perf_*` (like
+> P.6–P.10/P.12) ⇒ GATE trivially intact; P.11 (attention-sharding) remains LANDED+GATED (md5 `3069e80b`). Decode
+> CLOSED at ~146 ms/step. GATE: FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
@@ -137,8 +138,11 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14). **PREFILL: the sharded path's in-trace
   `_fp4_rhs_and_scale` UNPACK (FP4→fp8, real-file :351-358) is 194 ms/fwd, seq-indep — the dominant prefill MoE
   cost, but P.12 REFUTED making it FASTER (XLA's native float4→fp8 convert is the VPU floor — DO-NOT-RETRY #22);
-  removable only via dual-residency (HBM-marginal, roadmap #2). The active prefill lever is now the DISPATCH (the
-  `_routed_local` sort + two `[N·top_k,dim]` gathers, :360-415, 80 ms/fwd @N=4096 — HANDOFF roadmap #1).**
+  removable only via dual-residency (HBM-marginal, NOW roadmap #1 / NEXT ACTION). The DISPATCH (`_routed_local`
+  sort + two `[N·top_k,dim]` gathers, :360-415) was characterized in P.13 = 36/40/64/95 ms/fwd @N=512/1024/2048/4096
+  (an UNAVOIDABLE sort + attackable gathers dominated by the fp32 revert); its owned-only-ragged shrink is BLOCKED on
+  v6e (DO-NOT-RETRY #23,#24) ⇒ TAPPED. ⚠️ the `_routed_local:342` comment "ragged_* fall back to plain gather" is
+  STALE — SparseCore IS LIVE here (they'd CRASH, not fall back); fix that comment when you next touch the file.**
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).

@@ -44,7 +44,11 @@ import numpy as np
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from jax.experimental.pallas import tpu as pltpu
+
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.sparse_core.ragged_gather import ragged_gather
+from tpu_inference.kernels.sparse_core.ragged_scatter import ragged_scatter
 from tpu_inference.layers.jax.moe.deepseek_v4_moe import _fp4_rhs_and_scale
 from tpu_inference.layers.common.quantization import u8_unpack_e2m1
 
@@ -152,6 +156,86 @@ def dispatch_local(x_full, idx_flat, g2_like):
     return x_sorted.astype(jnp.float32).sum() + token_hidden.sum()
 
 
+# ---- DISPATCH decomposed: the unavoidable SORT vs the attackable GATHERS ----
+# `dispatch_local` lumps 2 argsorts + 2 big [N*top_k,dim] gathers. Roadmap #1 wants
+# to FUSE the gathers (gmm_v2 can't -- it needs a pre-gathered, group-sorted lhs and
+# emits in the same order; confirmed). The production EP path (fused_moe_gmm.py)
+# instead gathers ONLY this rank's OWNED rows (M_owned=N*top_k/axis) via the SparseCore
+# `ragged_gather`/`ragged_scatter` with the owned [start,end) sorted range -- 16x less
+# DMA than V4's full plain-JAX gather. These kernels FALL BACK to full `x[indices]`
+# (ignoring start/end) when `pltpu.get_tpu_info().sparse_core is None`, so the whole
+# win hinges on SparseCore being LIVE on v6e-16. Decompose + A/B it here (tier-2).
+
+# ANTI-DCE NOTE: time these returning the ACTUAL gathered ARRAY (block_until_ready
+# forces the HBM materialization). A `.sum()` of a gathered buffer is order-invariant,
+# so XLA folds `sum(x[perm])` -> a scaled `sum(x)` and DCEs the argsort+gather entirely
+# (an earlier `.sum()` harness measured disp < its own argsort sub-piece -- bogus).
+# SHARD_MAP NOTE: the ragged_* kernels are Mosaic kernels -> MUST be inside a shard_map
+# (bare call raises NotImplementedError). All inputs/outputs replicated P() so each rank
+# runs the full per-rank op; timing = per-chip cost (mirrors `gmm_core`/`collective`).
+
+def _sm(fn, mesh, n_in):
+    return jax.shard_map(fn, mesh=mesh, in_specs=(P(),) * n_in, out_specs=P(),
+                         check_vma=False)
+
+
+def gather_full(x_full, tis):
+    """V4's CURRENT lhs gather: FULL [N*top_k,dim] plain-XLA gather (all rows; gmm reads
+    only this rank's 1/axis via group_offset, so this OVER-gathers 16x)."""
+    return x_full[tis]
+
+
+def revert_full(g2_like, rvi):
+    """V4's CURRENT revert gather: FULL [N*top_k,dim] plain-XLA gather (g2 is fp32)."""
+    return g2_like[rvi]
+
+
+def gather_owned(x_full, tis, st, en):
+    """Production EP lhs gather: SparseCore ragged_gather of ONLY the owned [st,en)
+    sorted rows (M_owned=N*top_k/axis). 16x less DMA than gather_full."""
+    return ragged_gather(x_full, tis, st, en)
+
+
+def revert_owned(g2_like, rvi, st, en):
+    """Production EP revert: SparseCore ragged_scatter of ONLY the owned rows."""
+    return ragged_scatter(g2_like, rvi, st, en)
+
+
+def sort_fwd(idx_flat, Nf):
+    """The UNAVOIDABLE forward sort: argsort by expert + the small token_idx gather.
+    Returns arrays (anti-DCE). Production does this identically -> the dispatch floor."""
+    asi = jnp.argsort(idx_flat)                                       # [N*top_k]
+    tis = jnp.arange(Nf, dtype=jnp.int32).repeat(TOP_K)[asi]
+    return asi, tis
+
+
+def inv_via_argsort(asi):
+    """V4's CURRENT inverse-permutation (revert_idx): a SECOND argsort -- O(M log M)."""
+    return jnp.argsort(asi)
+
+
+def inv_via_scatter(asi):
+    """Cheaper inverse-permutation: scatter arange -- O(M). asi is a permutation of
+    [0,M); revert_idx[asi[i]]=i. Same result as inv_via_argsort, fewer ops (S1-safe,
+    decode-neutral candidate sub-lever to shave the 2nd argsort)."""
+    M = asi.shape[0]
+    return jnp.zeros(M, jnp.int32).at[asi].set(jnp.arange(M, dtype=jnp.int32))
+
+
+def probe_sparsecore():
+    """Read pltpu.get_tpu_info().sparse_core at trace time (mirrors how ragged_gather
+    queries it). Returns the sparse_core struct (None if SparseCore is unavailable)."""
+    holder = {}
+
+    @jax.jit
+    def _p(x):
+        holder['sc'] = pltpu.get_tpu_info().sparse_core
+        return x + 1
+
+    jax.block_until_ready(_p(jnp.zeros((1,), jnp.int32)))
+    return holder.get('sc', '<unset>')
+
+
 def collective(x_sharded, mesh):
     """all_gather x[N/axis,dim]->[N,dim] (the dispatch collective) + psum[N,dim] (the
     combine collective). The two true ICI collectives of the prefill MoE shard_map."""
@@ -208,6 +292,8 @@ def main():
         disp_f = jax.jit(dispatch_local)
         coll_f = jax.jit(lambda xs: collective(xs, mesh))
         f8 = jnp.float8_e4m3fn
+        sc_info = probe_sparsecore()   # None => ragged kernels fall back to plain gather
+        rag_err = None
 
         for N in seqs:
             M = N * TOP_K                                # total (token,slot) rows
@@ -230,14 +316,50 @@ def main():
             jax.block_until_ready(floor_f(lhs_owned, W13b, W2tb))
             fl_med, fl_min = measure(lambda: floor_f(lhs_owned, W13b, W2tb), a.iters)
 
-            # dispatch (rank-local sort + gathers).
-            x_full = make_replicated((N, DIM), mesh, 500 + N)
+            # ----- DISPATCH decomposed (roadmap #1): sort vs gathers, full vs owned ----
+            # See ANTI-DCE / SHARD_MAP notes above. All in shard_map; arrays out.
+            x_full = make_replicated((N, DIM), mesh, 500 + N)            # [N,dim] bf16
             idx_flat = jax.device_put(
                 np.random.default_rng(N).integers(0, E, size=M, dtype=np.int32),
                 NamedSharding(mesh, P()))
-            g2_like = make_replicated((M, DIM), mesh, 600 + N)
-            jax.block_until_ready(disp_f(x_full, idx_flat, g2_like))
-            d_med, d_min = measure(lambda: disp_f(x_full, idx_flat, g2_like), a.iters)
+            g2_like = make_replicated((M, DIM), mesh, 600 + N, jnp.float32)  # gmm out=fp32
+            # Concrete sort order so the gather/inverse timings isolate their own op.
+            asi = jax.block_until_ready(jnp.argsort(idx_flat))          # [N*top_k]
+            tis = jax.block_until_ready(
+                jnp.arange(N, dtype=jnp.int32).repeat(TOP_K)[asi])      # sorted token ids
+            rvi = jax.block_until_ready(jnp.argsort(asi))               # revert idx
+            o_st = jax.device_put(np.asarray([0], np.int32), NamedSharding(mesh, P()))
+            o_en = jax.device_put(np.asarray([M_owned], np.int32),
+                                  NamedSharding(mesh, P()))
+            mk = lambda fn, n: jax.jit(_sm(fn, mesh, n))
+            # (a) unavoidable forward sort (argsort + arange.repeat + token gather -> tis).
+            sf = mk(lambda i: sort_fwd(i, N)[1], 1)
+            jax.block_until_ready(sf(idx_flat))
+            _, sf_min = measure(lambda: sf(idx_flat), a.iters)
+            # (b) revert-idx: V4 CURRENT 2nd-argsort vs the O(M) scatter alternative.
+            ia = mk(inv_via_argsort, 1); isc = mk(inv_via_scatter, 1)
+            jax.block_until_ready(ia(asi)); _, ia_min = measure(lambda: ia(asi), a.iters)
+            jax.block_until_ready(isc(asi)); _, isc_min = measure(lambda: isc(asi), a.iters)
+            # (c) lhs gather: FULL (V4) vs OWNED-ragged (SparseCore, prod EP).
+            gf = mk(gather_full, 2)
+            jax.block_until_ready(gf(x_full, tis))
+            _, gf_min = measure(lambda: gf(x_full, tis), a.iters)
+            # (d) revert gather: FULL (V4) vs OWNED-ragged scatter.
+            rf = mk(revert_full, 2)
+            jax.block_until_ready(rf(g2_like, rvi))
+            _, rf_min = measure(lambda: rf(g2_like, rvi), a.iters)
+            # owned ragged gather + scatter (wrapped: a kernel error must not abort).
+            go_min = ro_min = float('nan')
+            try:
+                go = mk(gather_owned, 4)
+                jax.block_until_ready(go(x_full, tis, o_st, o_en))
+                _, go_min = measure(lambda: go(x_full, tis, o_st, o_en), a.iters)
+                ro = mk(revert_owned, 4)
+                jax.block_until_ready(ro(g2_like, rvi, o_st, o_en))
+                _, ro_min = measure(lambda: ro(g2_like, rvi, o_st, o_en), a.iters)
+            except Exception as e:  # noqa: BLE001
+                rag_err = repr(e)[:300]
+            d_min = sf_min + ia_min + gf_min + rf_min   # current dispatch (reconstructed)
 
             # collective (all_gather + psum), x sharded on the token axis.
             x_sh = make_replicated((N, DIM), mesh, 700 + N)
@@ -249,6 +371,8 @@ def main():
             flop = M_owned * 2 * (DIM * 2 * INTER + INTER * DIM)
             rows.append(dict(N=N, M_owned=M_owned, per_expert=per_expert,
                              gmm=g_min, floor=fl_min, disp=d_min, coll=c_min,
+                             sf=sf_min, ia=ia_min, isc=isc_min,
+                             gf=gf_min, go=go_min, rf=rf_min, ro=ro_min,
                              gmm_tf=flop / g_min / 1e9, floor_tf=flop / fl_min / 1e9))
 
     if p0:
@@ -279,6 +403,37 @@ def main():
         print(f"\nREAD: gmm/floor ratio -> grouping/sort/per-block-scale overhead vs the "
               f"dense fp8 MXU floor. disp (the [N*top_k,dim] gathers) = the old '48% "
               f"copy' suspect. rhs-prep is the SEQ-INDEPENDENT lossless lever.")
+
+        # ---- DISPATCH decomposition (roadmap #1: shrink gathers + cheaper revert) ----
+        print(f"\n=== DISPATCH decomposition (roadmap #1) ===")
+        print(f"SparseCore on this slice: {sc_info}")
+        print(f"  (None => ragged_* FALL BACK to full x[indices], ignoring start/end => "
+              f"no owned win. LIVE => the owned-only DMA path is available.)")
+        if rag_err:
+            print(f"  !! ragged kernel raised (gathOwn/revtOwn are NaN): {rag_err}")
+        print(f"\n{'seq_N':>6} {'sortFwd':>8} {'invArg':>8} {'invScat':>8} {'gathFu':>8} "
+              f"{'gathOwn':>8} {'revtFu':>8} {'revtOwn':>8}  (min ms/layer, /rank)")
+        for r in rows:
+            print(f"{r['N']:>6} {r['sf']:>8.3f} {r['ia']:>8.3f} {r['isc']:>8.3f} "
+                  f"{r['gf']:>8.3f} {r['go']:>8.3f} {r['rf']:>8.3f} {r['ro']:>8.3f}")
+        print(f"\nPROJECTED dispatch ms/forward (x{L}) -- swap GATHERS->owned-ragged "
+              f"and/or 2nd-argsort->scatter:")
+        for r in rows:
+            cur = (r['sf'] + r['ia'] + r['gf'] + r['rf']) * L
+            own = (r['sf'] + r['ia'] + r['go'] + r['ro']) * L
+            own_sc = (r['sf'] + r['isc'] + r['go'] + r['ro']) * L
+            print(f"  N={r['N']:>5}: current {cur:6.1f} | +owned-gathers {own:6.1f} | "
+                  f"+owned+scatter-inv {own_sc:6.1f} ms  (gathers "
+                  f"{(r['gf']+r['rf'])*L:5.1f}->{(r['go']+r['ro'])*L:5.1f}; "
+                  f"inv {r['ia']*L:.1f}->{r['isc']*L:.1f})")
+        print(f"\nREAD: sortFwd+invArg = the UNAVOIDABLE sort floor (production sorts too). "
+              f"attackable = gathFu+revtFu (revtFu, the fp32 revert, dominates). "
+              f"FINDINGS (P.13): SparseCore is LIVE but ragged_gather/scatter (the owned-only "
+              f"16x-DMA path, gathOwn/revtOwn) FAIL TO COMPILE here -- the SC kernel grid is "
+              f"derived from the DYNAMIC (end-start), which XLA can't prove tile(8)-aligned; "
+              f"the kernels lack assume_multiple (v7-only) => owned-gather BLOCKED on v6e w/o "
+              f"an upstream patch. invScat>=invArg => the 2nd-argsort->scatter sub-lever is "
+              f"also a NO (scatter loses to argsort here).")
 
 
 if __name__ == "__main__":
