@@ -26,6 +26,7 @@ from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
@@ -53,6 +54,29 @@ def _dequant_fp4_experts(w_u8: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
     codes = u8_unpack_e2m1(w_u8).astype(jnp.float32)                   # [..., K]
     s = jnp.repeat(e8m0_to_fp32(scale), MXFP4_BLOCK_SIZE, axis=-1)     # [..., K]
     return (codes * s).astype(jnp.bfloat16)
+
+
+def _fp4_rhs_and_scale(w_u8: jnp.ndarray,
+                       scale: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Pack a stored FP4 expert leaf into the (rhs, rhs_scale) gmm_v2 expects.
+
+    QUANT / Strategy C: feed the FP4 experts STRAIGHT into gmm_v2 instead of
+    dequantizing them to bf16 in-trace (that [E,I,H] bf16 materialization, ×3, is
+    the prefill CompileTimeHbmOom). `w_u8` is the packed weight `[E, out, in/2]`
+    (2 e2m1/byte along IN); `scale` the e8m0 block scale `[E, out, in/MXFP4_BLOCK_SIZE]`.
+    Returns:
+      rhs       TYPED float4_e2m1fn `[E, in, out]` = gmm `[group, k=IN, n=OUT]`;
+                gmm_v2 packs the 4-bit rhs to uint32 along k internally.
+      rhs_scale fp32 `[E, in/MXFP4_BLOCK_SIZE, 1, out]` = `[group, num_blocks, 1, n]`,
+                consumed per-block by gmm_v2 (NOT broadcast to k).
+    Mirrors process_weights/moe_weights.py:256-271 (swapaxes(1,2)+expand_dims(2));
+    the e8m0->fp32 uses 2^(b-127) (V4 stores the scale as raw uint8 exponent bytes,
+    not float8_e8m0fnu). Orientation byte-checked by quant_gmm_fp4_orient_check.py."""
+    if scale.dtype != jnp.uint8:  # float8_e8m0fnu -> raw exponent bytes (no-op on bits)
+        scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
+    rhs = u8_unpack_e2m1(w_u8).swapaxes(1, 2)               # [E, in, out] fp4
+    s = e8m0_to_fp32(scale).swapaxes(1, 2)                 # [E, in/block, out] fp32
+    return rhs, jnp.expand_dims(s, 2)                      # scale -> [E, in/block, 1, out]
 
 
 def _shard_e_first(x: jnp.ndarray) -> jnp.ndarray:
@@ -235,15 +259,14 @@ def moe_forward(
         S1, S2, S3 = _stk('w1_scale'), _stk('w2_scale'), _stk('w3_scale')
         swiglu_limit = e0.swiglu_limit  # uniform across experts
 
-    # QUANT / Strategy C: routed experts are STORED packed-FP4 (uint8) + e8m0
-    # scale in HBM; dequant to bf16 in-trace (per-layer transient). Everything
-    # downstream (dense einsum + gmm_v2 shard_map) is byte-identical to the old
-    # bf16 path, so the S1 determinism fix is preserved exactly. No-op for the
-    # bf16 stacked path (S* is None / W* already bf16).
-    if W1.dtype == jnp.uint8:
-        W1 = _shard_e_first(_dequant_fp4_experts(W1, S1))  # [E,i,d] bf16
-        W2 = _shard_e_first(_dequant_fp4_experts(W2, S2))  # [E,d,i] bf16
-        W3 = _shard_e_first(_dequant_fp4_experts(W3, S3))  # [E,i,d] bf16
+    # QUANT / Strategy C: the routed experts are STORED packed-FP4 (uint8 packed
+    # weight + uint8 e8m0 block scale) in HBM. We do NOT dequant to bf16 up front:
+    # that [E,I,H] bf16 materialization (×W1/W2/W3) is the prefill CompileTimeHbmOom.
+    # The DENSE path (CPU + replicated decode) dequants LOCALLY just before its
+    # einsums (a small N=1 / CPU transient); the sharded PREFILL path feeds the FP4
+    # weights straight into gmm_v2 via rhs_scale (4-bit, no bf16 temp). The S1
+    # determinism structure (all_gather/barrier/owned-mask/psum) is untouched.
+    is_fp4 = (W1.dtype == jnp.uint8)
 
     # Per-(token, expert) routing weight: zero for non-top_k experts.
     # Round-tripped through `dtype` to match expert_forward's bf16 cast.
@@ -266,10 +289,16 @@ def moe_forward(
         per_expert_weight = _shard_e_last(per_expert_weight)
 
     if not use_shard_map:
-        # Dense einsum path (CPU/no-mesh + replicated decode). bf16 operands
-        # (half the W1/W3 HBM streaming + native bf16 MXU vs the emulated fp32
-        # path), fp32 accumulate/output so silu/swiglu stay fp32 — matches the
-        # prefill gmm_v2 path (preferred_element_type=fp32, S24). PERF 3.1.
+        # Dense einsum path (CPU/no-mesh + replicated decode). FP4 experts are
+        # dequanted to bf16 LOCALLY here (a small N=1 / CPU transient), NOT before
+        # the path split — keeping the [E,I,H] bf16 blow-up out of the prefill trace.
+        if is_fp4:
+            W1 = _shard_e_first(_dequant_fp4_experts(W1, S1))  # [E,i,d] bf16
+            W2 = _shard_e_first(_dequant_fp4_experts(W2, S2))  # [E,d,i] bf16
+            W3 = _shard_e_first(_dequant_fp4_experts(W3, S3))  # [E,i,d] bf16
+        # bf16 operands (half the W1/W3 HBM streaming + native bf16 MXU vs the
+        # emulated fp32 path), fp32 accumulate/output so silu/swiglu stay fp32 —
+        # matches the prefill gmm_v2 path (preferred_element_type=fp32, S24). PERF 3.1.
         gate_NEi = _shard_e_mid(
             jnp.einsum('nd,eid->nei', flat_x, W1, preferred_element_type=fp32))
         up_NEi = _shard_e_mid(
@@ -294,10 +323,25 @@ def moe_forward(
         # deterministic 0 instead of garbage. Dispatch mirrors fused_moe_gmm.py
         # (_process_tokens_locally + moe_gmm_local), using plain-JAX gather/scatter
         # (the ragged_* kernels fall back to exactly this) and V4's own gate.
-        EP = E // axis                       # experts per rank (256 // 32 = 8)
+        EP = E // axis                       # experts per rank (v6e-16: 256//16=16)
         top_k = params.gate.top_k
 
-        def _routed_local(x_l, w_l, idx_l, W1_l, W3_l, W2_l):
+        # QUANT: build the gmm rhs/scale from the packed-FP4 leaves OUTSIDE the
+        # shard_map, mirroring process_weights/moe_weights.py:256-271 (the blessed
+        # float4 swapaxes + layout-constraint, done at "load"). Ops touch axis 1/2
+        # only (E=axis0 stays sharded) => rank-local, no collective; the weights
+        # stay 4-bit (no bf16 temp). Only one layer's experts are live at a time.
+        r1, s1q = _fp4_rhs_and_scale(W1, S1)       # [E, dim, inter] fp4
+        r3, s3q = _fp4_rhs_and_scale(W3, S3)       # [E, dim, inter] fp4
+        W13 = jnp.concatenate([r1, r3], axis=2)    # [E, dim, 2*inter] fp4
+        S13 = jnp.concatenate([s1q, s3q], axis=3)  # [E, dim/block, 1, 2*inter] fp32
+        W2t, S2t = _fp4_rhs_and_scale(W2, S2)      # [E, inter, dim] fp4
+        # Workaround for JAX "must have valid byte strides" on the sub-byte
+        # transpose (moe_weights.py:261).
+        W13 = with_layout_constraint(W13, Layout((0, 1, 2)))
+        W2t = with_layout_constraint(W2t, Layout((0, 1, 2)))
+
+        def _routed_local(x_l, w_l, idx_l, W13_l, W2t_l, S13_l, S2t_l):
             x_full = jax.lax.all_gather(x_l, 'attn_dp', axis=0, tiled=True)   # [N,dim]
             x_full = jax.lax.optimization_barrier(x_full)
             w_full = jax.lax.all_gather(w_l, 'attn_dp', axis=0, tiled=True)   # [N,top_k]
@@ -313,28 +357,26 @@ def moe_forward(
             token_idx_sorted = token_idx[argsort_idx]                        # [N*top_k]
             group_sizes = jax.nn.one_hot(idx_flat, E, dtype=jnp.int32).sum(0)  # [E]
             revert_idx = jnp.argsort(argsort_idx)
-            # S24: gmm lhs/rhs in bf16 `dtype` (NOT fp32). fp32 lhs is UNIQUE to V4
-            # among all gmm_v2 callers (prod fused_moe_gmm uses bf16) and selects an
-            # untested fp32 sublane/tile path (get_sublane_tiling(lhs.dtype) gmm_v2:951,
-            # tile_m gmm_v2:860) that drives the partial_out_ref carry. g1(fp32) is the
-            # non-det ORIGINATOR; g2 already bf16. Match the known-good prod path.
+            # S24: gmm lhs in bf16 `dtype` (NOT fp32; rhs is now FP4 via rhs_scale).
+            # fp32 lhs is UNIQUE to V4 among all gmm_v2 callers (prod fused_moe_gmm
+            # uses bf16) and selects an untested fp32 sublane/tile path
+            # (get_sublane_tiling(lhs.dtype) gmm_v2:951, tile_m gmm_v2:860) driving the
+            # partial_out_ref carry. g1(fp32) is the non-det ORIGINATOR; g2 already
+            # bf16. Match the known-good prod path. (gmm_v2 auto-quantizes this bf16
+            # lhs to fp8 e4m3 for the fp8xfp4 MXU — maybe_quantize_lhs default True.)
             x_sorted = x_full[token_idx_sorted].astype(dtype)                # [N*top_k,dim]
             group_offset = jnp.asarray([r * EP], jnp.int32)
-            # Local weights -> gmm rhs [EP,k,n]; transpose is rank-local (no comm).
-            W13_l = jnp.concatenate(
-                [W1_l.transpose(0, 2, 1), W3_l.transpose(0, 2, 1)],
-                axis=2).astype(dtype)                         # [EP, dim, 2*inter]
-            g1 = gmm_v2(x_sorted, W13_l, group_sizes, group_offset=group_offset,
-                        zero_initialize=False,
+            # W13_l/S13_l are the pre-built FP4 rhs + per-block fp32 scale (above).
+            g1 = gmm_v2(x_sorted, W13_l, group_sizes, rhs_scale=S13_l,
+                        group_offset=group_offset, zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, 2*inter]
             gate, up = jnp.split(g1, 2, axis=-1)
             if swiglu_limit > 0:
                 up = jnp.clip(up, -swiglu_limit, swiglu_limit)
                 gate = jnp.minimum(gate, swiglu_limit)
             h = (jax.nn.silu(gate) * up).astype(dtype)        # [N*top_k, inter]
-            W2g_l = W2_l.transpose(0, 2, 1).astype(dtype)     # [EP, inter, dim]
-            g2 = gmm_v2(h, W2g_l, group_sizes, group_offset=group_offset,
-                        zero_initialize=False,
+            g2 = gmm_v2(h, W2t_l, group_sizes, rhs_scale=S2t_l,
+                        group_offset=group_offset, zero_initialize=False,
                         preferred_element_type=fp32)          # [N*top_k, dim]
             # Revert to (token, slot) order. Each (token,slot) has exactly one
             # expert, owned by exactly one rank, so weight-combine + psum must give
@@ -370,9 +412,9 @@ def moe_forward(
             _routed_local, mesh=mesh,
             in_specs=(P('attn_dp', None), P('attn_dp', None), P('attn_dp', None),
                       P('attn_dp', None, None), P('attn_dp', None, None),
-                      P('attn_dp', None, None)),
+                      P('attn_dp', None, None, None), P('attn_dp', None, None, None)),
             out_specs=P('attn_dp', None), check_vma=False,
-        )(flat_x_sm, weights_sm, indices_sm, W1, W3, W2)     # [N, dim] fp32 routed sum
+        )(flat_x_sm, weights_sm, indices_sm, W13, W2t, S13, S2t)  # [N,dim] fp32 routed sum
     shared = expert_forward(flat_x, None, params.shared_expert)
     y = y + shared.astype(fp32)
     # NOTE: the S22 owned-expert mask inside _routed_local IS the "idle-rank mask
