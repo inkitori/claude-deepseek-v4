@@ -14,7 +14,9 @@
 
 import functools
 import logging
+import os
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -814,6 +816,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
         intermediate_tensors: Optional[JaxIntermediateTensors] = None,
     ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
+        # [V4DT] Host-side decode timers (perf instrumentation, host-only).
+        # Pure time.perf_counter() reads gated on V4_DECODE_TIMERS; no effect
+        # on traced/jitted computation. When unset, _dt_t is None (no-op).
+        self._dt_t = {"enter": time.perf_counter()} if os.getenv(
+            "V4_DECODE_TIMERS") else None
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
         if not scheduler_output.total_num_scheduled_tokens:
@@ -862,6 +869,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # leave the mebedding job inside the forward pass
         input_ids, inputs_embeds = self._get_input_ids_embeds(
             input_ids, mm_embeds, is_mm_embed)
+        if self._dt_t is not None:
+            self._dt_t["ntok"] = int(input_ids.shape[0])
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
         # TODO: make _get_input_ids_embeds within this context
@@ -890,6 +899,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+            if self._dt_t is not None:
+                self._dt_t["fwd_dispatched"] = time.perf_counter()
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -922,6 +933,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 hidden_states,
                 lora_metadata,
             )
+            if self._dt_t is not None:
+                self._dt_t["logits_dispatched"] = time.perf_counter()
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -951,6 +964,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        # [V4DT] getattr defensive: _execute_model is skipped on empty-scheduler
+        # steps, so _dt_t may be stale/None. Host-only timer read.
+        if getattr(self, "_dt_t", None) is not None:
+            self._dt_t["sample_enter"] = time.perf_counter()
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
                 self.input_batch.num_reqs, self.max_num_reqs)
@@ -1090,7 +1107,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return async_model_runner_output
 
         if spec_decode_metadata is None:
+            if getattr(self, "_dt_t", None) is not None:
+                self._dt_t["sample_dispatched"] = time.perf_counter()
             next_tokens = np.asarray(jax.device_get(next_tokens))
+            if getattr(self, "_dt_t", None) is not None:
+                self._dt_t["device_done"] = time.perf_counter()
             # Map tokens back to the pre-dp shuffling order
             if logits_indices_selector is not None:
                 next_tokens = next_tokens[logits_indices_selector]
@@ -1141,6 +1162,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output,
                     input_ids,
                 )
+
+        # [V4DT] Emit the per-step host/device split once on the sync decode
+        # path (the async branch returns earlier; the guard fires only when the
+        # sync device_get ran). Host-only print, no effect on computation.
+        if getattr(self, "_dt_t", None) is not None and "device_done" in self._dt_t:
+            d = self._dt_t
+            now = time.perf_counter()
+
+            def _ms(a, b):
+                return (d[b] - d[a]) * 1e3 if a in d and b in d else float("nan")
+
+            print(
+                f"[V4DT] ntok={d.get('ntok', -1)} fwd_disp={_ms('enter', 'fwd_dispatched'):.1f} "
+                f"logits_disp={_ms('fwd_dispatched', 'logits_dispatched'):.1f} "
+                f"samp_disp={_ms('sample_enter', 'sample_dispatched'):.1f} "
+                f"device_wait={_ms('sample_dispatched', 'device_done'):.1f} "
+                f"post={(now - d['device_done']) * 1e3:.1f} wall={(now - d['enter']) * 1e3:.1f}",
+                flush=True)
+            self._dt_t = None
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,

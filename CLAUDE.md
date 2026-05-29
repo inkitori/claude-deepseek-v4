@@ -10,26 +10,26 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.2):** ⚠️ **The P.1 "decode DECOMPOSED" profile was an ARTIFACT —
-> the bottleneck is NOT yet decomposed.** The P.1 trace captured only ONE (first) decode step under an
-> ACTIVE profiler; its "~129 ms host dispatch (2× ~59 ms `ParseArguments`)" is profiler OBSERVER EFFECT
-> — an un-profiled microbench dispatches the same 1,492-leaf sharded pytree in **0.5 ms**
-> (`scripts/perf_microbench_decode.py`). Real steady-state host dispatch is **≤~24 ms = ≤9% of the 277
-> ms/step (likely <4%) ⇒ L1 host-dispatch is DEMOTED** (was RANK 1 on a phantom). SOLID: **decode =
-> 0.277 s/tok (277 ms/step)**, non-profiled two-point fit; the remaining **≥253 ms/step (≥91%) =
-> device + Ray-aDAG round-trip, UNDECOMPOSED.** NEXT = faithfully split it (non-profiler worker timers
-> or a ≥20-step profile read at the 2nd+ step) BEFORE picking a lever. GATE (non-negotiable): FIB
-> `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.3): decode per-step FAITHFULLY decomposed.** Non-profiler worker
+> timers (the new env-gated `V4_DECODE_TIMERS=1`, committed) split the **277 ms/step decode wall:
+> device_wait ~183 ms (66%) + host-dispatch ~56 ms (20%) + Ray-aDAG round-trip/scheduler ~38 ms (14%)**.
+> This OVERTURNS P.2: host dispatch is NOT a ≤4% phantom — it's a real ~20% (the 2 jit dispatches each
+> re-walk the ~1,492-leaf nnx-`State` pytree, ~28 ms each; the microbench under-estimated). The DOMINANT
+> bucket is device execution (66%), UN-ATTRIBUTED on the decode path (P.1's "48% copy/transpose" is
+> PREFILL, not decode). **NEXT = implement nnx-preflatten (the MEASURED ~20% host-dispatch lever,
+> low-risk); then a DECODE-ONLY device-op breakdown for the 183 ms bucket** — see `HANDOFF_PERF.md`. GATE
+> (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` byte-identical ×2 fresh
+> engines + `smoke_check` rc=0.
 
 ## Goal
 
 Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the **v6e-16** slice
 (TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_PERF.md` roadmap top-down — without
 ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pinned) is the primary
-target** (0.277 s/tok, 277 ms/step — non-profiled, TRUSTED). ⚠️ The per-step SPLIT is NOT known: the
-P.1 profile that "decomposed" it was an artifact (single first-step under an active profiler). Measured
-since: un-profiled host dispatch is ≤~24 ms (microbench), so ≥253 ms/step (≥91%) is device + aDAG
-round-trip — faithfully decomposing THAT is the current top task (see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+target** (0.277 s/tok, 277 ms/step — non-profiled, TRUSTED). The per-step SPLIT is now MEASURED (P.3,
+non-profiler worker timers): device_wait ~183 ms (66%) + host-dispatch ~56 ms (20%) + aDAG round-trip
+~38 ms (14%). NEXT = nnx-preflatten (the MEASURED ~20% host lever), then a decode-only device-op
+breakdown for the 183 ms bucket (see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
 campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
 as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
 with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
@@ -123,7 +123,8 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 * `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense decode path (:217, bf16-dequants the
   16 local FP4 experts per step) vs sharded `gmm_v2` prefill path (:233, FP4 codes → fp8 +
   `rhs_scale`, the QUANT fix); the `use_shard_map` gate (:211) is the chat-wedge trigger (Phase 4.1).
-  ~10% of decode — SECONDARY despite 97% of FLOPs (HBM-bound weight streaming at N=1).
+  Decode device-share UN-ATTRIBUTED (P.3 — pending the decode-only device-op breakdown; P.1's "~10%"
+  was prefill-conflated). Decode path already bf16/fp32-optimized (PERF 3.1). HBM-bound weight stream at N=1.
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).

@@ -85,6 +85,11 @@ export V4_DECODE_NAN_TRIPWIRE="${V4_DECODE_NAN_TRIPWIRE:-0}"
 # model_loader defaults it OFF (shared infra). See model_loader.py:_get_nnx_model.
 export V4_EAGER_CREATE_JIT_MODEL="${V4_EAGER_CREATE_JIT_MODEL:-1}"
 
+# V4_DECODE_TIMERS=1 emits a per-decode-step host/device wall-time split
+# ([V4DT] lines in the log) from the worker decode path. Host-only perf
+# instrumentation; default off = byte-identical behavior. Pure pass-through.
+export V4_DECODE_TIMERS="${V4_DECODE_TIMERS:-}"
+
 # Don't inherit parent-shell XLA_FLAGS (stale value SIGSEGVs workers; see
 # CLAUDE.md pitfall #4). Opt-in via V4_XLA_FLAGS.
 export XLA_FLAGS="${V4_XLA_FLAGS:-}"
@@ -113,7 +118,7 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 # Forward these to Ray workers (vLLM only carries over a curated env-var
 # set by default; non-VLLM_/HF_ vars need explicit opt-in).
 existing_extra="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
-new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,V4_EAGER_CREATE_JIT_MODEL,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+new_extra="V4_LOADER_PREFETCH_WORKERS,V4_LOADER_SLICE_AWARE,V4_LOADER_PLACE_WORKERS,V4_DECODE_NAN_TRIPWIRE,V4_EAGER_CREATE_JIT_MODEL,V4_DECODE_TIMERS,XLA_FLAGS,RAY_CGRAPH_get_timeout,JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
 if [ -n "$existing_extra" ]; then
     export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${existing_extra},${new_extra}"
 else
