@@ -7,13 +7,15 @@
 > campaigns are history (not the goal): PERFORMANCE (`HANDOFF_PERF.md`), S1 decode determinism
 > (`HANDOFF_S1.md` / `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29):** **THE FULL MODEL NOW LOADS + FITS** (`e1b434f8`). Host-gathering
-> ALL routed expert leaves (w1/w2/w3 + scales) killed the layer-0 consolidation `device_put`
-> collectives that core-halted every prior smoke → load completes (`placed=68812, host_gather_groups=264,
-> 233s, ZERO scheckne`). **NEW BLOCKER: a SECOND `scheckne` ~4 min later in the POST-LOAD FORWARD
-> compile** (not consolidation). **NEXT = retry once (rule out flaky init), then HLO-dump the post-load
-> compile + diff across hosts; suspect a host-divergent forward branch.** Full state + the HLO-diff
-> recipe in `HANDOFF_QUANT.md`.
+> **One-line status (2026-05-29):** **LOADS + FITS; clearing a CHAIN of post-load `scheckne` races.**
+> Root pattern (HLO-diff proven): during init the DRIVER finishes first and launches the next
+> 16-partition eager-TPU program while worker actors still run `broadcast_in_dim` weight placement →
+> launch-id mismatch. **FIXED #1 (`fb54237b`): RoPE freqs precompute → NUMPY (host)** — killed the
+> freqs scheckne + a device-mismatch; load now reaches real TPU compile (head 3→113 modules).
+> **CURRENT BLOCKER: same race deeper** — head-only `jit_create_jit_model` + `jit__threefry_fold_in`
+> + `jit_add` (RNG `nnx.Rngs().params()` @ `tpu_runner.py:581` + create_jit_model); RNG is seed-only
+> = pure timing race, NO barrier exists. **NEXT = `sync_global_devices` barrier BEFORE create_jit_model**
+> (NOT at :581 — too late). Full state + HLO-diff recipe in `HANDOFF_QUANT.md`.
 
 ## Goal
 

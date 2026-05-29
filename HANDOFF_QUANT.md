@@ -5,15 +5,20 @@
 > Durable slice ops + pitfalls: `CLAUDE.md`. Prior campaigns (history): `HANDOFF_PERF.md`,
 > `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29):** **THE FULL MODEL NOW LOADS + FITS.** Host-gathering ALL routed
-> expert leaves (commit `e1b434f8`) eliminated the layer-0 consolidation `device_put` collectives
-> that core-halted every prior smoke — load completes: **`placed=68812 skipped=0 elapsed=233.1s,
-> host_gather_groups=264`, ZERO scheckne during load.** **NEW BLOCKER: a SECOND, distinct `scheckne`
-> launch-id halt fires ~4 min later during POST-LOAD FORWARD/warmup COMPILE** (log
-> `logs/full-slice-v4-smoke-20260529T025539Z.log`). Same assertion pc, now in the forward path, not
-> consolidation. **NEXT = confirm it's deterministic (1 retry; runbook says init can be flaky), then
-> HLO-dump the post-load compile + diff across the 4 hosts** (the technique that nailed the
-> consolidation), prime suspect = a host-divergent forward program (env-gated trace-time branch?).
+> **One-line status (2026-05-29):** **LOADS + FITS; now grinding through a CHAIN of post-load
+> launch-id `scheckne` races, fixing them one HLO-diff at a time.** Root pattern (HLO-diff proven):
+> during init the DRIVER (head) finishes its work and races ahead to the next eager-TPU program
+> (compiled `num_partitions=16`) while the 3 worker actors are still running `broadcast_in_dim`
+> weight placement → head launches a different program than workers at the same launch slot →
+> `scheckne` (TensorCoreSequencer). **FIXED #1 (`fb54237b`): RoPE freqs precompute** — was eager jnp
+> under `set_mesh(mesh)` → 16-partition `jit_iota/outer/exp`; now NUMPY (host), returned uncommitted
+> (NOT device_put-cpu — create_jit_model's jit mesh rejects a CPU-committed array). Cleared the freqs
+> scheckne + a device-mismatch; load now progresses into real TPU compile (head 3→113 modules).
+> **CURRENT BLOCKER: the SAME race one step deeper** — head-only divergent modules are now
+> `jit_create_jit_model` + `jit__threefry_fold_in` + `jit_add` (the RNG `nnx.Rngs(...).params()` at
+> `tpu_runner.py:581` + create_jit_model). RNG data is seed-only/host-identical → PURE timing race,
+> no barrier exists. **NEXT = insert a `sync_global_devices` barrier BEFORE create_jit_model** (see
+> ROADMAP). Last smoke `logs/full-slice-v4-smoke-20260529T040718Z.log`; each smoke crashes ~90s (cheap).
 
 ---
 
@@ -56,31 +61,52 @@ V4-Flash ships natively quantized: dense=FP8, 256 routed experts=**FP4 (=MXFP4, 
 
 ---
 
-## ⚠️ THE NEW BLOCKER — SECOND scheckne in the POST-LOAD FORWARD COMPILE
-Smoke `025539Z`: load done at 02:56:14 (`placed=68812 … host_gather_groups=264`). Then ~4 min of
-forward/warmup jit compiles (`jit_broadcast_in_dim` fingerprints, `jit_exp/multiply/outer/iota`,
-`make_freqs_cis`-looking ops). At 03:00:16 → **`Core halted … scheckne` at `TensorCoreSequencer:1:0xba`**
-(SAME pc as the consolidation halt) → worker on `.17`/`.8` dies (`SLICE_FAILURE_SW_INJECT_ERROR` →
-SYSTEM_ERROR "connection error code 2"). Engine init fails. This is a DISTINCT divergence from the
-(now-fixed) consolidation — it's in the forward path, post-load.
+- **`fb54237b` FIX #1 (RoPE freqs):** HLO-diff (head h15 vs workers h8/17/16) proved the post-load
+  scheckne was the eager freqs precompute: under `set_mesh(mesh)` `precompute_freqs_cis`'s jnp
+  arange/outer/exp compiled `num_partitions=16` (`jit_iota/outer/exp/power`, `T(1024)` tiling) and the
+  driver launched them while workers still ran `broadcast_in_dim` weight fills. `jax.default_device(cpu)`
+  was a NO-OP (set_mesh overrides it — dump byte-identical, still 16-partition). FIX = `precompute_freqs_cis`
+  now NUMPY (host; also honors the float64 complex-exp TPU truncates); `make_freqs_cis` returns the numpy
+  UNCOMMITTED (device_put-cpu is rejected by create_jit_model's jit mesh: "Received incompatible devices").
+  CPU oracle OK ×2; smoke: freqs ops GONE from head, load → real TPU compile (head 3→113 modules).
+
+---
+
+## ⚠️ CURRENT BLOCKER — the SAME driver-races-workers scheckne, one step deeper
+Smoke `040718Z`: load completes (`placed=68812`), progresses into TPU compile, then `Core halted …
+scheckne` at `TensorCoreSequencer` (tpu17). HLO-diff: workers (identical to each other) show only
+weight-fill `broadcast_in_dim`+convert+`threefry_seed`; **HEAD-only divergent modules = `jit_create_jit_model`
++ `jit__threefry_fold_in` + `jit_add`**. Agent-confirmed root cause:
+- `jit__threefry_fold_in`+`jit_add` = `nnx.Rngs(jax.random.key(seed)).params()` at **`tpu_runner.py:581`**
+  (`fold_in(key,count)` + `count+=1`), run right after `get_model` returns, NO active mesh.
+- `jit_create_jit_model` = the `@nnx.jit` at `model_loader.py:126`, called at `:274` INSIDE `get_model`.
+- RNG is **seed-only (=0), host-identical** → NOT host-divergent data; it's a **pure TIMING race** + there
+  is **NO cross-host barrier** anywhere in load/init (`sync_global_devices`/`multihost_utils` = 0 repo hits).
+  The driver (in-engine process, no Ray-RPC latency) finishes load first and launches these 16-partition
+  programs while the 3 worker actors still drain `broadcast_in_dim`.
 
 **ROADMAP / NEXT ACTIONS (do in order):**
-1. **Re-smoke once, plain.** The runbook notes init is sometimes a flaky worker SYSTEM_ERROR "just
-   retry". This crash is a `scheckne` (looks deterministic, like the consolidation), but confirm: if a
-   clean retry reaches `Application startup complete`, it was flaky → go straight to the GATE.
-2. **If deterministic → HLO-dump the POST-LOAD compile + diff across the 4 hosts** (the decisive
-   technique that nailed consolidation). `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump` (validates clean;
-   propagates to workers via ray env), clear xla_cache+/tmp/hlo_dump on all 4 first. After crash:
-   rsync each host's `/tmp/hlo_dump/*optimizations.txt` to head, compare the module **opname multiset
-   + ENTRY signatures** head-vs-worker (helper recipe below). The op that differs across hosts is the
-   divergence.
-3. **Prime suspect = a host-divergent FORWARD program.** The forward is SPMD-jitted so it SHOULD be
-   identical; a launch-id split usually means a **trace-time host-dependent branch**. Check (CLAUDE.md
-   pitfall #0): any env-var read or `process_index`/device-ownership branch reached during forward
-   trace. Specifically: `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — the `use_shard_map` gate
-   (~:211) choosing dense-all-256 (decode) vs sharded `gmm_v2` (prefill), and the in-trace
-   `_dequant_fp4_experts` (uint8+e8m0→bf16) over the E-sharded experts. Also `make_freqs_cis`.
-4. After it serves: **GATE** below (establish the v6e-16 baseline md5).
+1. **Insert a cross-host barrier BEFORE `create_jit_model`** so all 4 hosts finish load before any
+   launches a post-load 16-partition program. Use `from jax.experimental import multihost_utils` +
+   `multihost_utils.sync_global_devices("v4_post_load")`. ⚠️ **Placement matters:** `create_jit_model`
+   runs at `model_loader.py:274` INSIDE `get_model` — BEFORE `tpu_runner.py:581` — and workers never
+   compiled it (they died first), so it IS part of the race. A barrier at :581 (the agent's first
+   suggestion) is TOO LATE. Put it **right before `create_jit_model` (`model_loader.py` :274)** OR, to
+   stay V4-focused, at the **end of V4's `load_weights`** (deepseek_v4.py; model_loader calls
+   `model.load_weights(rng)` :273 then `create_jit_model` :274 — so end-of-load_weights == pre-jit).
+   One barrier there should serialize create_jit_model + the :581 fold_in/add in one shot (they run
+   lockstep once the hosts are synced), just as the numpy fix cleared all the freqs ops at once.
+2. **Validate:** CPU oracle (`s1_cpu_repro both`) is a single-host no-op for the barrier but confirms no
+   import/break; then smoke WITH `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`. Past ~120s with no
+   scheckne = barrier worked → into the long cold forward compile (10-30 min) → watch for
+   `Application startup complete`.
+3. **If the barrier is insufficient / a new scheckne appears:** re-run the HLO-diff (helper below) to
+   find the next head-only divergent module and repeat. Fallback for the RNG specifically: take
+   `nnx.Rngs(...).params()` (tpu_runner:581) fold_in/add off TPU (host/CPU) like the freqs fix.
+   ⚠️ Small risk the barrier collective itself diverges if hosts reach it at wildly different slots —
+   low (it's the intended rendezvous), but if so, move it earlier (before load_weights too).
+4. After it serves: **GATE** below (establish the v6e-16 baseline md5). Likely a long cold compile the
+   first time it gets past init — budget for it (`VLLM_ENGINE_READY_TIMEOUT_S=2400` already set).
 
 HLO-diff helper (proven this session):
 ```
@@ -114,8 +140,11 @@ Old v6e-32 md5 `5bf42256` is DEAD. Bar:
    `scripts/quant_fp4_dequant_check.py` (max|Δ|=0). NOTE: CPU has mesh=None ⇒ consolidation/host-gather
    is SKIPPED, so CPU CANNOT validate the host-gather or forward-compile paths — those need a smoke.
 2. **TPU microbench** (`scripts/perf_microbench*`).
-3. **Full smoke + GATE** — now reaches `placed=68812` (~233s load) then the forward-compile crash
-   ~4 min later. Cheap to iterate the forward-compile blocker (crashes ~5-6 min in).
+3. **Full smoke + GATE** — load completes (`placed=68812`, ~40s) then hits the create_jit_model/RNG
+   `scheckne` ~90s in. Cheap to iterate the blocker (crashes ~90s). HLO-dump recipe + cross-host diff
+   (helper above) is the tool: clear xla_cache+/tmp/hlo_dump on all 4, smoke with
+   `V4_XLA_FLAGS=--xla_dump_to=/tmp/hlo_dump`, then per-host `namelist` opname-multiset diff
+   (head h15 vs workers) → head-only module names = the divergent eager program.
 
 ---
 
