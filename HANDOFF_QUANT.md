@@ -97,6 +97,13 @@ production constraint for exactly this reason.
 ⚠️ **PRODUCTION FOOTGUN:** serving with `--max-num-seqs>1` SILENTLY corrupts concurrent requests (no
 error surfaced). If MAX_SEQS>1 is ever enabled, add a LOUD startup guard first.
 
+**IF THE LOOP KEEPS RUNNING** (operator hasn't `touch`ed the stop file): the stop decision is the
+operator's — don't touch it yourself, and don't spin re-confirming "done". The ONE bounded, in-scope,
+low-risk task the finding leaves = **add that guard**: a startup WARNING (NOT a hard error — keep the
+future fix experimentable) when `scheduler_config.max_num_seqs > 1` for V4-Flash, in the V4 loader /
+platform init. A few lines; needs sync + 1 smoke to confirm startup is unaffected at MAX_SEQS=1 and the
+warning fires at >1. Everything else (the concurrent-decode fix, PERF) is a SEPARATE non-quant loop.
+
 **If concurrent decode is wanted (a SEPARATE S1/determinism workstream, NOT quant):** make the small-N
 (N<16) decode path S1-safe under num_reqs>1 — either (a) widen `_v4_decode_replicate` to replicate the
 decode activation for num_reqs>1 too (N>1 is NOT the size-1 token-axis gather Pitfall #5 warns Core-halts,
