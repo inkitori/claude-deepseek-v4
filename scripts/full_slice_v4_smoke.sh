@@ -59,6 +59,16 @@ export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
+# Pre-flight: the V4-Flash weights MUST be readable by enyouki on EVERY host, else
+# the worker actors silently dummy-fallback to jnp.zeros and the engine wedges (the
+# bringup mounts the GCS bucket enyouki-owned only on the head; workers get a
+# root-only mount). Idempotent; hard-fail rather than burn a 10-30 min smoke on a
+# guaranteed wedge. See full_slice_v4_mount_weights.sh for the full diagnosis.
+if ! "$REPO_ROOT/scripts/full_slice_v4_mount_weights.sh"; then
+    echo "[smoke] FATAL: weights not readable by enyouki on all hosts (would wedge in dummy-zeros). Fix mounts first." >&2
+    exit 4
+fi
+
 # tpu-inference: required for V4's `enable_dp_attention=true` topology.
 export NEW_MODEL_DESIGN=1
 
