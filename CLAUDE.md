@@ -10,15 +10,15 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.9): PIVOTED to PREFILL.** Decode is CLOSED at its ~lossless floor
-> (146 ms/step, launch-bound at N=1; full attribution in `HANDOFF_PERF.md` §DECODE). Prefill was a blank
-> slate; first characterization (new `perf_microbench_moe_prefill.py`, 16-chip): **the prefill MoE is
-> DOMINATED by the in-trace FP4→fp8 rhs-prep = 225 ms/forward, SEQ-INDEPENDENT** (= the bit-UNPACK; gmm-core
-> is near its dense-fp8 floor, NOT a lever; dispatch+collective scale with N). The obvious lever (fp8-codes-
-> resident at load) was **P.9b-REFUTED**: it removes the 225 ms but REGRESSES decode 1.37× (2× expert HBM
-> read; break-even ~6 gen tokens ⇒ net-negative for normal serving). ⇒ the rhs-prep cut must be **DECODE-
-> NEUTRAL**. Measurement-only ⇒ GATE md5 `3069e80b` UNCHANGED. NEXT (see `HANDOFF_PERF.md`): (1) prefill
-> non-MoE split [cheap, first], (2) a decode-neutral faster in-trace unpack, (3) the N-scaling dispatch.
+> **One-line status (2026-05-29 — P.10): PREFILL non-MoE split DONE → a NEW #1 lever.** Decode is CLOSED at
+> its ~lossless floor (146 ms/step, launch-bound at N=1; `HANDOFF_PERF.md` §DECODE). Prefill MoE was
+> characterized P.9 (rhs-prep FP4→fp8 unpack = 225 ms/fwd, seq-indep — the top SHORT-context lever; fp8-
+> resident P.9b-REFUTED as net-negative for decode). P.10 (new `perf_microbench_prefill_nonmoe.py`, 16-chip)
+> splits the rest: a seq-INDEP launch-bound non-MoE floor ≈117 ms (proj/norm/hc/gate) + **ATTENTION run
+> REPLICATED at M=N on EVERY chip (16× redundant), which DOMINATES long context (584 ms/fwd at N=4096)**. ⇒
+> **NEW #1 LEVER: shard prefill attention over the token axis** — microbench-PROVEN feasible, cuts the
+> prefill wall up to **48.9%** at N=4096, DECODE-NEUTRAL + LOSSLESS. Measurement-only ⇒ GATE md5 `3069e80b`
+> UNCHANGED. NEXT (see `HANDOFF_PERF.md`): implement the attention-sharding path (needs a smoke + GATE).
 > GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
@@ -111,9 +111,11 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 * `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (:173 pure-JAX ref / Mosaic kernel via
   `_sparse_attn_kernel_sharded` :219) + call sites (decode :857, prefill :950); the indexer
   (`indexer_prefill` :366 / `indexer_decode_step` :607, the `lax.top_k` :659 over a STATIC `T`). ⚠️ P.7
-  REFUTED both as decode levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the indexer is NEGLIGIBLE
-  (~0.3 ms/step) — see DO-NOT-RETRY #15,16. Attention is HEALTHY/correct AND fast; the non-MoE cost is the
-  projections+gate+launch overhead, NOT here. compressor; seed-from-prefill.
+  REFUTED both as DECODE levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the indexer is NEGLIGIBLE
+  (~0.3 ms/step) — see DO-NOT-RETRY #15,16; decode's non-MoE cost is projections+gate+launch, NOT here.
+  ★ **PREFILL is the OPPOSITE story (P.10): `_sparse_attn_kernel_sharded` (:219) runs the kernel REPLICATED
+  at M=N on EVERY chip (16× redundant — the docstring's known inefficiency), so attention DOMINATES long-
+  context prefill (584 ms/fwd at N=4096). Sharding it over the token axis = roadmap #1 (`HANDOFF_PERF.md`).**
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;
