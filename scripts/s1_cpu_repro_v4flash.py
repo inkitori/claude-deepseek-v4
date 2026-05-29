@@ -74,24 +74,32 @@ def make_v4_flash_truncated_cfg(n_layers=4, n_experts=8):
 
 def make_random_params(cfg, seed=0):
     params_struct = make_abstract_transformer_params(cfg)
-    leaves, treedef = jax.tree_util.tree_flatten(
+    leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(
         params_struct, is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct))
-    keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
+    keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves_with_path))
 
-    def _rand(k, x):
+    def _is_scale_leaf(path) -> bool:
+        # The e8m0 block-scale leaves are now stored as uint8 (same dtype as the
+        # packed-FP4 weights), so disambiguate by NAME, not dtype: their attribute
+        # ends in "_scale" (w1_scale / w2_scale / w3_scale).
+        for p in path:
+            name = getattr(p, "name", None) or getattr(p, "key", None)
+            if isinstance(name, str) and name.endswith("_scale"):
+                return True
+        return False
+
+    def _rand(k, path, x):
         # QUANT fp4 leaves: packed-FP4 expert weights are uint8 (full-range bytes
-        # -> exercises the whole e2m1 codebook, both signs); e8m0 block scales are
-        # float8_e8m0fnu, synthesized small (bytes 118..121 -> 2^-9..2^-6) so the
-        # dequanted experts are ~0.02-magnitude (the bf16-baseline regime) and the
-        # model stays in a numerically stable, near-tie-free decode trajectory.
+        # -> exercises the whole e2m1 codebook, both signs); the e8m0 block scales
+        # are ALSO uint8 now, synthesized small (bytes 118..121 -> 2^-9..2^-6) so
+        # the dequanted experts are ~0.02-magnitude (the bf16-baseline regime) and
+        # the model stays in a numerically stable, near-tie-free decode trajectory.
         if x.dtype == jnp.uint8:
-            return jax.random.randint(k, x.shape, 0, 256, dtype=jnp.uint8)
-        if x.dtype == jnp.float8_e8m0fnu:
-            b = jax.random.randint(k, x.shape, 118, 122, dtype=jnp.uint8)
-            return jax.lax.bitcast_convert_type(b, jnp.float8_e8m0fnu)
+            lo, hi = (118, 122) if _is_scale_leaf(path) else (0, 256)
+            return jax.random.randint(k, x.shape, lo, hi, dtype=jnp.uint8)
         return (jax.random.normal(k, x.shape, dtype=jnp.float32) * 0.02).astype(x.dtype)
 
-    randomized = [_rand(k, x) for k, x in zip(keys, leaves)]
+    randomized = [_rand(k, path, x) for k, (path, x) in zip(keys, leaves_with_path)]
     return jax.tree_util.tree_unflatten(treedef, randomized)
 
 

@@ -888,8 +888,12 @@ def read_dequant_slice(
 
     if spec.kind == "e8m0":
         # Strategy C: raw e8m0 block-scale leaf for an FP4 expert — kept
-        # compressed (no dequant). `w` is the sliced `.scale` tensor.
-        return w
+        # compressed (no dequant). Return the raw exponent BYTES as uint8
+        # (gpt_oss MXFP4 convention) so the placed leaf is uint8, not the
+        # ml_dtypes e8m0 view; storing e8m0 on-device is the ONLY e8m0 array
+        # in the codebase and core-halts the reshard collective. `e8m0_to_fp32`
+        # reads the byte directly. `w` is the sliced `.scale` tensor.
+        return w.view(torch.uint8)
 
     if spec.kind == "fp8":
         # Scale is [out/block, in/block] — we need rows

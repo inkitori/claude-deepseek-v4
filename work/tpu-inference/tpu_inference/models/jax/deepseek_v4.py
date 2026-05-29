@@ -1023,15 +1023,15 @@ def make_abstract_moe_params(cfg: DeepseekV4Config, layer_id: int) -> MoEParams:
     # dequanted to bf16 in `moe_forward`. The SHARED/dense expert stays bf16
     # (it's tiny; dense weights remain bf16 in Strategy C).
     H, I, blk = cfg.hidden_size, cfg.moe_intermediate_size, MXFP4_BLOCK_SIZE
-    u8, e8m0 = jnp.uint8, jnp.float8_e8m0fnu
+    u8 = jnp.uint8
     routed_template = lambda: ExpertParams(
         w1=_shape_struct((I, H // 2), u8),   # gate: [inter, dim/2] packed fp4
         w2=_shape_struct((H, I // 2), u8),   # down: [dim, inter/2]
         w3=_shape_struct((I, H // 2), u8),   # up:   [inter, dim/2]
         swiglu_limit=cfg.swiglu_limit,
-        w1_scale=_shape_struct((I, H // blk), e8m0),  # e8m0 [inter, dim/block]
-        w2_scale=_shape_struct((H, I // blk), e8m0),  # e8m0 [dim, inter/block]
-        w3_scale=_shape_struct((I, H // blk), e8m0),
+        w1_scale=_shape_struct((I, H // blk), u8),  # e8m0-as-u8 [inter, dim/block]
+        w2_scale=_shape_struct((H, I // blk), u8),  # e8m0-as-u8 [dim, inter/block]
+        w3_scale=_shape_struct((I, H // blk), u8),
     )
     shared_template = lambda: ExpertParams(
         w1=_shape_struct((I, H), bf16),

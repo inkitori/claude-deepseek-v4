@@ -127,8 +127,8 @@ def main():
         s = read_dequant_slice(ss, 0, out_dim)
         if w.dtype != torch.uint8:
             _fail(f"{ws.hf_name}: weight dtype {w.dtype} != uint8 (still dequanting?)")
-        if s.dtype != torch.float8_e8m0fnu:
-            _fail(f"{sn}: scale dtype {s.dtype} != float8_e8m0fnu")
+        if s.dtype != torch.uint8:
+            _fail(f"{sn}: scale dtype {s.dtype} != uint8 (raw e8m0 bytes)")
         in_packed = w.shape[1]
         in_logical = 2 * in_packed
         if s.shape != (out_dim, in_logical // fp4_block):
@@ -142,20 +142,21 @@ def main():
         if spath != wpath + "_scale":
             _fail(f"scale {sn!r} mapped to {spath!r}, expected {wpath + '_scale'!r}")
 
-        # placement (mesh=None) must PRESERVE dtypes (the E1 bitcast fix).
+        # placement (mesh=None) must PRESERVE dtypes — scales are now raw uint8
+        # exponent bytes (gpt_oss MXFP4 convention), not the ml_dtypes e8m0 view.
         warr = place_spec_as_jax_sharded(ws, jnp.uint8, (out_dim, in_packed), None)
         sarr = place_spec_as_jax_sharded(
-            ss, jnp.float8_e8m0fnu, (out_dim, in_logical // fp4_block), None)
+            ss, jnp.uint8, (out_dim, in_logical // fp4_block), None)
         if warr.dtype != jnp.uint8:
             _fail(f"{ws.hf_name}: placed weight dtype {warr.dtype} != uint8")
-        if sarr.dtype != jnp.float8_e8m0fnu:
-            _fail(f"{sn}: placed scale dtype {sarr.dtype} != float8_e8m0fnu "
-                  f"(numeric astype corrupted the e8m0 bits?)")
+        if sarr.dtype != jnp.uint8:
+            _fail(f"{sn}: placed scale dtype {sarr.dtype} != uint8 "
+                  f"(numeric astype corrupted the e8m0 bytes?)")
 
         # dequant the emitted leaves via the shared MXFP4 primitives (the same
         # ones _dequant_fp4_experts uses) at the fixture block, compare to GT.
         w_u8 = jnp.asarray(_to_np(w))
-        s_u8 = jax.lax.bitcast_convert_type(jnp.asarray(_to_np(s)), jnp.uint8)
+        s_u8 = jnp.asarray(_to_np(s))  # scale is already raw uint8 e8m0 bytes
         codes = u8_unpack_e2m1(w_u8).astype(jnp.float32)
         sc = jnp.repeat(e8m0_to_fp32(s_u8), fp4_block, axis=-1)
         deq = (codes * sc).astype(jnp.bfloat16)
