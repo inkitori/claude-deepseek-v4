@@ -10,26 +10,27 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.4): nnx-preflatten LANDED + GATED.** The two hot decode jits no
-> longer re-walk the 1,492-leaf nnx-`State` per dispatch (flatten ONCE at load, pass bare leaves,
-> rebuild via cached `treedef` inside the trace; `model_loader.py:353-441`). **Host-dispatch 56→8 ms/step**
-> (fwd_disp 30.7→6.7, logits_disp 25.15→1.2); **worker decode wall 239→216 ms (−9.5%)**, 2-pt driver fit
-> **277→220 ms/step (−20.6%)**. Only ~half converts to wall (device_wait 183→208: host dispatch was
-> partly OVERLAPPED with device exec). **NEXT = DECODE-ONLY device-op breakdown of the ~208 ms
-> device_wait** (now ~96% of the wall); first-principles points at the dense MoE path dequanting all 16
-> local FP4 experts to bf16 IN-TRACE per token (~10× HBM amplifier over the ~5.5 ms FP4-once floor) — fuse
-> the dequant into the matmul. See `HANDOFF_PERF.md`. GATE (non-negotiable): FIB
-> `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.5): lean-dequant + wsc-drop LANDED + GATED → decode wall 216→146 ms
+> (−33%).** A microbench (`scripts/perf_microbench_moe_decode.py`, real dims on the live 16-chip mesh)
+> CONFIRMED the bottleneck + REFUTED the gmm-fuse: at N=1 the dense MoE expert-FFN is ~100% of decode
+> device compute, the matmul is only 0.79 ms/layer (NOT MXU-starved), and 89% of the cost is the FP4→bf16
+> dequant MATERIALIZATION (gmm_v2 LOSES it, 0.78×). The WIN (both BIT-IDENTICAL): (a) lean bf16 dequant
+> (broadcast-multiply over the 32-block, no `jnp.repeat`); (b) drop the intermediate `_shard_e_first` on
+> the dequanted weight (a dequant→matmul fusion barrier) — `deepseek_v4_moe.py:37,300-308`. V4_DECODE_TIMERS:
+> device_wait 208→139, wall 216→146. **NEXT = close the MoE toward its 34 ms matmul-floor** (in-register
+> dequant kernel / top-k selection; ~106 ms = 76% of device_wait remains) — see `HANDOFF_PERF.md`. GATE
+> (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
 Cut prefill + decode wall-time for `vllm serve deepseek-ai/DeepSeek-V4-Flash` on the **v6e-16** slice
 (TP=16, 4 hosts × 4 chips, topology 4×4), driving the `HANDOFF_PERF.md` roadmap top-down — without
 ever regressing the correctness GATE below. **Decode at N=1 (`MAX_SEQS=1` is pinned) is the primary
-target** (now ~220 ms/step / 0.22 s/tok after P.4 preflatten, down from 277 — non-profiled, TRUSTED).
-The per-step SPLIT (P.4, worker timers): device_wait ~208 ms + host-dispatch ~8 ms (was 56) + aDAG.
-NEXT = a DECODE-ONLY device-op breakdown of the ~208 ms device_wait, then fuse the MoE FP4→bf16 dequant
-into the matmul (the in-trace dequant of all 16 local experts is the ~10× HBM amplifier; see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
+target** (now ~146 ms/step / 0.146 s/tok after P.5 lean-dequant; 277 → 220 → 146 — V4_DECODE_TIMERS, TRUSTED).
+The per-step SPLIT (P.5, worker timers): device_wait ~139 ms + host-dispatch ~8 ms + aDAG; the MoE
+expert-FFN is ~106 ms (76% of device_wait) with a 34 ms matmul-floor. NEXT = close the MoE toward that
+floor (in-register dequant kernel / top-k selection; the bf16-dequant MATERIALIZATION is the cost, NOT the
+matmul — gmm_v2 for the dense N=1 path is REFUTED; see `HANDOFF_PERF.md`). The model already loads + fits + serves correctly with the FP4 experts kept compressed (QUANT
 campaign — DONE; that path is a GIVEN, do not rebuild it). Shrink the diff vs upstream `tpu-inference`
 as you go; V4 should read like `qwen3.py` / `deepseek_v3.py`, EXCEPT the loader/MoE/seed paths fused
 with the S1 fix (do not "make idiomatic" — see §Phase 5 in `HANDOFF_PERF.md`).
@@ -120,12 +121,13 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   remove; mind pitfall #5.
 * `models/jax/deepseek_v4_loader.py::pick_partition_spec` (:497) — weight sharding heuristic;
   flipping contracting→output dim is the Phase-2 all-reduce win.
-* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense decode path (:217, bf16-dequants the
-  16 local FP4 experts per step) vs sharded `gmm_v2` prefill path (:233, FP4 codes → fp8 +
-  `rhs_scale`, the QUANT fix); the `use_shard_map` gate (:211) is the chat-wedge trigger (Phase 4.1).
-  **This dense path (:296-318, in-trace bf16-dequant of ALL 16 local FP4 experts/token) is the DOMINANT
-  ~183 ms decode device cost** (P.4 first-principles: ~10× HBM amplifier over the ~5.5 ms FP4-once floor)
-  — the roadmap-#1 fuse-dequant-into-matmul lever. Decode operands already bf16/fp32 (PERF 3.1).
+* `layers/jax/moe/deepseek_v4_moe.py::moe_forward` — dense decode path (:217, LEAN bf16-dequants the
+  16 local FP4 experts per step, `_dequant_fp4_experts:37`) vs sharded `gmm_v2` prefill path (:233, FP4
+  codes → fp8 + `rhs_scale`, the QUANT fix); the `use_shard_map` gate (:211) is the chat-wedge trigger.
+  **This dense path (:300-308) is the dominant decode device cost — ~106 ms after P.5** (was ~183; lean
+  bf16 dequant + dropped the `_shard_e_first` fusion barrier = 1.74×, BIT-IDENTICAL). The cost is the
+  bf16-dequant MATERIALIZATION, NOT the matmul (0.79 ms/layer floor); gmm_v2 for the dense N=1 path is
+  REFUTED (0.78×). Decode operands already bf16/fp32 (PERF 3.1).
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).

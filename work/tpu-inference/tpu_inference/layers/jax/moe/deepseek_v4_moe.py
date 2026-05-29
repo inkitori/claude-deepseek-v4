@@ -51,9 +51,16 @@ def _dequant_fp4_experts(w_u8: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
     """
     if scale.dtype != jnp.uint8:  # float8_e8m0fnu -> raw exponent bytes (no-op on bits)
         scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
-    codes = u8_unpack_e2m1(w_u8).astype(jnp.float32)                   # [..., K]
-    s = jnp.repeat(e8m0_to_fp32(scale), MXFP4_BLOCK_SIZE, axis=-1)     # [..., K]
-    return (codes * s).astype(jnp.bfloat16)
+    # bf16 throughout + a broadcast-multiply over the 32-wide block (NOT jnp.repeat,
+    # which materializes a full-size fp32 scale): fp4 codes and the power-of-2 e8m0
+    # scale are both EXACT in bf16, so this is BIT-IDENTICAL to the old fp32 path but far
+    # leaner elementwise -> XLA fuses more of it into the matmul operand load (PERF: the
+    # decode dense path is HBM-bound on this dequant materialization, 89% of its cost).
+    codes = u8_unpack_e2m1(w_u8).astype(jnp.bfloat16)                 # [..., K] bf16
+    s = e8m0_to_fp32(scale).astype(jnp.bfloat16)                      # [..., K/blk] bf16
+    K = codes.shape[-1]
+    blk = codes.reshape(*codes.shape[:-1], K // MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE)
+    return (blk * s[..., None]).reshape(*codes.shape[:-1], K)         # [..., K] bf16
 
 
 def _fp4_rhs_and_scale(w_u8: jnp.ndarray,
@@ -298,9 +305,14 @@ def moe_forward(
         # dequanted to bf16 LOCALLY here (a small N=1 / CPU transient), NOT before
         # the path split — keeping the [E,I,H] bf16 blow-up out of the prefill trace.
         if is_fp4:
-            W1 = _shard_e_first(_dequant_fp4_experts(W1, S1))  # [E,i,d] bf16
-            W2 = _shard_e_first(_dequant_fp4_experts(W2, S2))  # [E,d,i] bf16
-            W3 = _shard_e_first(_dequant_fp4_experts(W3, S3))  # [E,i,d] bf16
+            # No intermediate _shard_e_first here: the uint8 inputs are already E-sharded
+            # (elementwise dequant preserves it) and that wsc was a dequant->matmul FUSION
+            # BARRIER. Dropping it (value-preserving) lets XLA fuse the FP4->bf16 unpack
+            # into the einsum operand load -- microbench 1.74x on the MoE path, BIT-
+            # IDENTICAL. Do NOT re-add the wsc (it re-serializes dequant then matmul).
+            W1 = _dequant_fp4_experts(W1, S1)  # [E,i,d] bf16
+            W2 = _dequant_fp4_experts(W2, S2)  # [E,d,i] bf16
+            W3 = _dequant_fp4_experts(W3, S3)  # [E,i,d] bf16
         # bf16 operands (half the W1/W3 HBM streaming + native bf16 MXU vs the
         # emulated fp32 path), fp32 accumulate/output so silu/swiglu stay fp32 —
         # matches the prefill gmm_v2 path (preferred_element_type=fp32, S24). PERF 3.1.
