@@ -1490,10 +1490,14 @@ def _build_class():
             import numpy as _np
             from jax.sharding import NamedSharding, PartitionSpec as _P
             from tpu_inference.layers.jax.moe.deepseek_v4_moe import MoEParams as _MoEParams
+            # `(?:_scale)?` so the e8m0 block-scale leaves (FP4 experts,
+            # Strategy C) consolidate into `wN_scale_stacked` via the same
+            # device-reshard as wN. `_is_stash_leaf` still matches only w1/w3
+            # (group 3 exact), so scales skip the host-gather (tiny, axis-0).
             _expert_path_re = _re.compile(
-                r'^layers\[(\d+)\]\.moe\.experts\[(\d+)\]\.(w[123])$')
+                r'^layers\[(\d+)\]\.moe\.experts\[(\d+)\]\.(w[123](?:_scale)?)$')
             _mtp_expert_path_re = _re.compile(
-                r'^mtp\[(\d+)\]\.block\.moe\.experts\[(\d+)\]\.(w[123])$')
+                r'^mtp\[(\d+)\]\.block\.moe\.experts\[(\d+)\]\.(w[123](?:_scale)?)$')
             _expert_group_lock = _threading.Lock()
             _expert_group_counter: Dict[Tuple[str, int, str], int] = {}
             _consolidated_groups: set = set()
@@ -1627,7 +1631,7 @@ def _build_class():
                 expert leaves (consumed by host-gather consolidation), else
                 None."""
                 jax_path = map_hf_name_to_jax_path(spec.hf_name)
-                if jax_path is None or jax_path.endswith("<scale>"):
+                if jax_path is None:
                     return (None, None, spec.hf_name, None)
                 leaf = path_to_leaf.get(jax_path)
                 if leaf is None:
@@ -1653,7 +1657,7 @@ def _build_class():
                 w1/w3 fall back to the device-side reshard here."""
                 hf_name, torch_t = item
                 jax_path = map_hf_name_to_jax_path(hf_name)
-                if jax_path is None or jax_path.endswith("<scale>"):
+                if jax_path is None:
                     return (None, None, hf_name, None)
                 leaf = path_to_leaf.get(jax_path)
                 if leaf is None:
@@ -2060,17 +2064,18 @@ def map_hf_name_to_jax_path(name: str) -> Optional[str]:
     """Returns the JAX param-tree path string for an HF parameter name, or
     None if no rule matches.
 
-    Names ending in `.scale` (FP4/FP8 quantization scales) return the path of
-    the corresponding `.weight` plus a ".scale" suffix — the caller must
-    dequantize using the scale and then place the dequantized array at the
-    base path. (Dequantization itself happens in
-    `deepseek_v4_loader.dequant_fp4_to_bf16` / `dequant_fp8_to_bf16`.)
+    Names ending in `.scale` map to the corresponding weight path with a
+    `_scale` suffix (e.g. `...experts.5.w1.scale` -> `...experts[5].w1_scale`).
+    For FP4 experts (Strategy C) that leaf is real and the e8m0 scale lands
+    there. For FP8 dense weights the `_scale` leaf does NOT exist in the
+    abstract tree (the scale is folded to bf16 inside read_dequant_slice), so
+    the placement worker skips it (leaf lookup returns None).
     """
     base = name
     suffix = ""
     if name.endswith(".scale"):
         base = name[:-len(".scale")] + ".weight"
-        suffix = "<scale>"
+        suffix = "_scale"
     for pat, path in _HF_TO_JAX_RULES:
         m = pat.match(base)
         if m:

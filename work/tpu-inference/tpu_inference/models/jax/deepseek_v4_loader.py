@@ -452,10 +452,11 @@ def _torch_to_numpy_preserve(t: torch.Tensor) -> np.ndarray:
         import ml_dtypes
         return t.view(torch.uint8).numpy().view(ml_dtypes.float8_e4m3fn)
     if t.dtype == torch.float8_e8m0fnu:
-        # ml_dtypes doesn't carry e8m0fnu. We don't yield raw e8m0 tensors
-        # to the caller (they're consumed via `dequant_weight` -> bf16) so
-        # this branch is only here for paranoia / debug. Return uint8.
-        return t.view(torch.uint8).numpy()
+        # FP4 experts (Strategy C) keep their e8m0 block scale as a real leaf.
+        # Bitcast (NOT a numeric cast) to the ml_dtypes equivalent so the
+        # caller's `.astype(target)` is a no-op and the byte pattern survives.
+        import ml_dtypes
+        return t.view(torch.uint8).numpy().view(ml_dtypes.float8_e8m0fnu)
     return t.numpy()
 
 
@@ -808,7 +809,9 @@ def iter_v4_safetensors_specs(
         # safetensors dtype strings: "F8_E4M3" / "I8" / "BF16" / "F32" etc.
         if "F8_E4M3" in str(d):
             return "fp8"
-        if str(d) == "I8" and "experts" in name:
+        # `.experts.<int>.` is the routed-expert discriminator; the bare
+        # substring "experts" would also catch the FP8 `shared_experts`.
+        if str(d) == "I8" and ".experts." in name:
             return "fp4"
         return "bf16"
 
@@ -842,6 +845,21 @@ def iter_v4_safetensors_specs(
             fp8_block=qc["fp8_block"],
             fp4_block=qc["fp4_block"],
         )
+        if kind == "fp4":
+            # Strategy C: keep the routed experts compressed. The weight spec
+            # above now emits raw packed uint8 (no dequant); emit the e8m0
+            # block scale as its OWN leaf (`...wN.scale` -> `...wN_scale`) so
+            # moe_forward can dequant in-trace. (fp8 dense stays fused: its
+            # scale is read inside read_dequant_slice and folded to bf16.)
+            yield V4WeightSpec(
+                hf_name=scale_key,
+                shard_path=scale_shard_path,
+                kind="e8m0",
+                scale_key=None,
+                scale_shard_path=None,
+                fp8_block=qc["fp8_block"],
+                fp4_block=qc["fp4_block"],
+            )
 
 
 def read_dequant_slice(
@@ -849,7 +867,11 @@ def read_dequant_slice(
     row_start: int,
     row_stop: int,
 ) -> torch.Tensor:
-    """Read+dequant rows [row_start:row_stop] of a V4 weight to bf16.
+    """Read rows [row_start:row_stop] of a V4 weight.
+
+    bf16/fp8 weights are dequantized to bf16. FP4 experts (Strategy C) are
+    kept compressed: `kind=="fp4"` returns raw packed uint8 and `kind=="e8m0"`
+    returns the raw e8m0 block scale (each a separate leaf; dequant in-trace).
 
     For axis-0 (out-axis) sharding this is the cheap path: the safetensors
     library mmaps each shard, so the kernel only faults in the byte range
@@ -863,6 +885,11 @@ def read_dequant_slice(
 
     if spec.kind in ("bf16", "raw"):
         return dequant_weight(w, None, spec.kind)
+
+    if spec.kind == "e8m0":
+        # Strategy C: raw e8m0 block-scale leaf for an FP4 expert — kept
+        # compressed (no dequant). `w` is the sliced `.scale` tensor.
+        return w
 
     if spec.kind == "fp8":
         # Scale is [out/block, in/block] — we need rows
@@ -879,11 +906,11 @@ def read_dequant_slice(
             w, s, "fp8", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
 
     if spec.kind == "fp4":
-        # Scale is [out, in/fp4_block] — straightforward axis-0 slice.
-        sf = _get_safe_open(spec.scale_shard_path)
-        s = sf.get_slice(spec.scale_key)[row_start:row_stop, :]
-        return dequant_weight(
-            w, s, "fp4", fp8_block=spec.fp8_block, fp4_block=spec.fp4_block)
+        # Strategy C: keep the routed experts compressed. Emit the raw packed
+        # bytes (2 e2m1 per byte along IN, low nibble first) as uint8; the
+        # e8m0 scale is a sibling leaf (kind="e8m0") and moe_forward dequants
+        # in-trace, byte-identically to the old host dequant_fp4_to_bf16.
+        return w.view(torch.uint8)
 
     raise ValueError(f"unknown kind {spec.kind!r}")
 
