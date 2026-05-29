@@ -15,8 +15,11 @@
 > (the `[N·top_k,dim]` argsort+gathers = the old "48% copy", CONFIRMED) + collective SCALE with N (80+50 ms
 > at N=4096). Projected prefill MoE: 275 (N=512) → 393 ms (N=4096). **THE LEVER:** rhs-prep is removable
 > LOSSLESSLY by storing the fp8 CODES resident at load (17.1 GiB/chip FITS; e2m1⊂e4m3) — DISTINCT from
-> roadmap #4's LOSSY scaled-fp8. Likely a DOUBLE win (re-opens decode's einsum-fp8w floor, P.6 0.75/layer ⇒
-> ~106→32 ms) pending decode-bench validation. Measurement-only commit ⇒ **GATE md5 `3069e80b` UNCHANGED.**
+> roadmap #4's LOSSY scaled-fp8. **P.9b REFUTED the "double win":** the decode dense path with fp8-resident
+> experts REGRESSES **1.37×** (106→145 ms MoE/step) from the 2× expert HBM read — break-even vs the 225 ms
+> prefill saving is ~6 generated tokens, so fp8-resident-for-ALL is NET-NEGATIVE for normal serving. ⇒ the
+> rhs-prep lever must be **DECODE-NEUTRAL** (a faster in-trace unpack keeping fp4-resident, or the N-scaling
+> dispatch). fp8-codes losslessness confirmed on CPU. Measurement-only ⇒ **GATE md5 `3069e80b` UNCHANGED.**
 
 ---
 
@@ -32,45 +35,45 @@
 
 ---
 
-## ⇒ NEXT ACTION — validate the fp8-codes-resident lever CHEAP-FIRST, then implement at load
-P.9 found the prefill MoE's dominant cost is the in-trace FP4→fp8 rhs-prep (225 ms/forward, seq-indep),
-removable LOSSLESSLY by storing fp8 codes resident at load. Before the risky load-path change, confirm
-it's a clean win at the cheapest tier, in this order:
+## ⇒ NEXT ACTION — fp8-resident is REFUTED (P.9b); complete the prefill split, then find a DECODE-NEUTRAL rhs-prep cut
+P.9 found the prefill MoE's dominant cost is the in-trace FP4→fp8 rhs-prep (225 ms/forward, seq-indep, =
+the bit-UNPACK). The obvious lever (fp8-codes-resident at load) was P.9b-REFUTED as a NET win: it regresses
+decode 1.37× (the 2× expert HBM read; break-even ~6 gen tokens → net-negative for normal serving). So the
+rhs-prep cut must be DECODE-NEUTRAL. Cheapest-first:
 
-  **(1) DECODE-side check [cheap, tier-2, ~2 min].** fp8-resident means decode's dense N=1 path
-  (`moe_forward` :300-330, `_dequant_fp4_experts`→bf16) would dequant from **fp8** (17.1 GiB, 2× the fp4
-  HBM read, but NO bit-unpack) instead of fp4. Does that regress or improve decode? Add a `lean-dequant-
-  from-fp8` variant to `perf_microbench_moe_decode.py` (lean dequant but codes pre-cast fp8 not packed-fp4)
-  and compare to the production fp4 lean-noWSC (2.46 ms/layer). P.6 `einsum-fp8w`=0.75 hints the *direct*
-  fp8 read floor is great, but that needs a kernel (gmm loses at N=1, DO-NOT-RETRY #1) — so the realistic
-  decode path is fp8→bf16 lean dequant. **If decode is neutral-or-better, fp8-resident is a clean DOUBLE
-  win.** *S · risk low.*
+  **(1) Complete the prefill NON-MoE split [cheap, tier-2, do FIRST].** MoE is characterized (275–393 ms/
+  fwd) but attention-prefill / sinkhorn / projections / gate are NOT — we don't yet know the FULL prefill
+  wall or MoE's share of it, so we can't rank prefill levers. Extend `perf_microbench_attn_decode.py` to
+  prefill shapes (the `prefill_csa/hca/swa` presets already exist in `perf_microbench_sparse_attn.py:48-55`)
+  + add the 19-iter sinkhorn at [S,·] + projections at [S,dim]. *M · risk low.* ← do this first.
 
-  **(2) Implement load-time fp8-codes-resident [the big prefill win].** Pre-unpack+swapaxes+concat the FP4
-  codes to fp8 W13/W2t (+ keep e8m0 scales) ONCE at load; `moe_forward`'s prefill path reads the pre-built
-  rhs (skip `_fp4_rhs_and_scale` :351-358) → removes ~225 ms/forward. Touches the loader (the w1/w3
-  host-gather IS the S1 fix — careful, do NOT alter the all_gather/barrier/owned-mask/psum determinism
-  structure). LOSSLESS ⇒ GATE md5 should HOLD — but this is a load-path change, so it NEEDS a full smoke +
-  the GATE. *M · risk MED (load path + a required smoke).*
+  **(2) A DECODE-NEUTRAL rhs-prep cut [the prefill MoE lever, if the split confirms MoE is top].** The
+  225 ms is the FP4→fp8 UNPACK (~5.3 ms/layer ≈ 9× its ~0.6 ms HBM floor ⇒ COMPUTE-bound, likely a slow
+  `u8_unpack_e2m1` path). Keep experts fp4-resident (decode unchanged) and make the in-trace unpack cheaper:
+  microbench a tighter unpack/swapaxes (or a small Pallas unpack kernel) vs the 5.3 ms baseline in
+  `perf_microbench_moe_prefill.py`. *M · risk low (tier-2 first; no GATE risk until a real edit).*
 
-  **(3) Complete the prefill NON-MoE split [parallel, cheap].** MoE is characterized; attention-prefill /
-  sinkhorn / projections / gate are NOT — so we don't yet know MoE's share of the FULL prefill wall.
-  Extend `perf_microbench_attn_decode.py` to prefill shapes (the `prefill_csa/hca/swa` presets already
-  exist in `perf_microbench_sparse_attn.py:48-55`); add the sinkhorn at [S,·]. *M · risk low.*
+  **(3) The N-scaling prefill DISPATCH [long-context lever].** The sort + two `[N·top_k,dim]` gathers are
+  80 ms/fwd at N=4096 and grow with context. Fuse the gather into gmm / use a ragged scatter. *M.*
+
+  **(Side, before trusting any fp8-on-v6e numerics) resolve the P.9b bit-check anomaly:** `u8_unpack_e2m1(w)
+  .astype(f8).astype(bf16)` vs `.astype(bf16)` was max|Δ|=5.2e5 on TPU but 0 on CPU — likely the v6e float4→
+  f8 cast (DO-NOT-RETRY #8). One small slice probe isolates it. Doesn't change the P.9b timing conclusion.
 
 ---
 
-## THE ROADMAP (re-ranked P.9 — PREFILL is now the active half; decode is CLOSED at its floor)
-1. **[prefill MoE — the big LOSSLESS lever]** NEXT ACTION (1)+(2): validate then implement fp8-codes-
-   resident → removes the 225 ms/forward rhs-prep (prefill MoE 275→~50 / 393→~168 ms) and likely also
-   drops decode MoE (~106→32, einsum-fp8w). *M · risk MED.* ← TOP.
-2. **[prefill full split]** NEXT ACTION (3): characterize prefill attention/sinkhorn/projections to find
-   the next prefill stage after MoE. *M · risk low.*
-3. **[prefill dispatch]** The sort + two `[N·top_k,dim]` gathers scale with N (80 ms/fwd at N=4096) — a
-   long-context lever (fuse the gather into gmm / ragged dispatch). Secondary. *M.*
-4. **[MoE scaled-fp8-resident — LOSSY variant]** roadmap-#4-old: bake `code×scale→fp8` (vs #1's lossless
-   codes-only). Only if #1's lossless form doesn't fit or decode needs the *direct* fp8 read. LOSSY (rel
-   ~3e-3/layer → likely breaks GATE). *L · risk HIGH — a gamble, superseded by #1's lossless framing.*
+## THE ROADMAP (re-ranked P.9b — PREFILL is the active half; decode is CLOSED at its floor)
+1. **[prefill full split]** NEXT ACTION (1): characterize prefill attention / sinkhorn / projections / gate
+   at [S,·] shapes to find the FULL prefill wall + MoE's share — we can't rank prefill levers without it.
+   *M · risk low.* ← TOP (cheap, unblocks the rest).
+2. **[prefill MoE — DECODE-NEUTRAL rhs-prep cut]** NEXT ACTION (2): the 225 ms/fwd rhs-prep is the FP4→fp8
+   UNPACK (~9× its HBM floor ⇒ compute-bound). Keep fp4-resident (decode unchanged); make the in-trace
+   unpack cheaper (tighter unpack/swapaxes or a Pallas unpack kernel). *M · risk low.*
+3. **[prefill dispatch]** NEXT ACTION (3): the sort + two `[N·top_k,dim]` gathers scale with N (80 ms/fwd
+   at N=4096) — a long-context lever (fuse the gather into gmm / ragged scatter). *M.*
+4. **[fp8-resident — REFUTED for normal serving]** P.9b: net-negative (decode +39 ms/step, break-even ~6
+   gen tokens). Revisit ONLY for prefill-dominated (G<6) workloads, or if a decode-NEUTRAL fp8 read appears
+   (gmm loses at N=1, DO-NOT-RETRY #1). The LOSSY scaled-fp8 variant (bake code×scale) is worse still. *L · parked.*
 5. **[decode clean profiler]** old fork (A): a steady multi-step decode profiler to confirm the ~24 ms
    launch overhead directly + settle the ~700-copy question. Confirmatory only; decode is near-floor. *M.*
 6. **[5-cleanup]** Phase 5 diff-shrink — remove `_v4_nan_tripwire` (37 sites + def + `smoke.sh:81/116`).
@@ -108,6 +111,7 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
 17. **`compute_logits` head_w vocab sharding — ALREADY column-sharded 16-way (P.7).** No replicated-2.1GB lever.
 18. **Q/KV/O projections + MoE gate + HC-sinkhorn are NOT the decode ~30 ms — REFUTED (P.8).** proj 4.13 + gate 0.75 + hc 2.99 = 7.87; the balance is ~24 ms launch overhead.
 19. ★ **prefill gmm-CORE as a lever — REFUTED (P.9).** gmm is 0.82–1.24× the dense fp8 MXU floor and only 23–38 ms/fwd; it's MXU-underutilized at 96–1536 rows/rank but near its practical floor. The prefill MoE cost is the rhs-prep (the FP4→fp8 UNPACK), NOT the matmul.
+20. ★ **fp8-codes-resident experts FOR ALL (prefill+decode) — REFUTED as a net win (P.9b).** Removes prefill's 225 ms/fwd rhs-prep but the decode dense path then dequants from fp8 (2× expert HBM read) → **decode +39 ms/step (106→145, 1.37×)**; break-even ~6 gen tokens ⇒ net-negative for normal serving (G≫6). Use a DECODE-NEUTRAL prefill cut instead (roadmap #2). fp8 IS lossless (CPU-confirmed); only the economics fail.
 
 ---
 
@@ -128,7 +132,11 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
   owned-mask/combine/psum]. gmm `lhs[M,dim]@rhs[EP,k,n]`, `group_sizes[E]` balanced summing to lhs rows.
 - **Decode per-step split (P.5, V4_DECODE_TIMERS):** device_wait 138.9 / wall 145.6 ms; MoE ~106 (76%).
   `perf_microbench_moe_decode.py` (lean-noWSC 2.46 = production /layer; einsum-fp8w 0.75 = the fp8-read
-  floor) + `perf_microbench_attn_decode.py` (`--block`) are the decode tiers. (Full numbers: git P.5–P.8.)
+  floor; ★ P.9b `lean-fp8res` 3.38 = fp8-codes-resident dequant, 1.37× REGRESSION from the 2× read) +
+  `perf_microbench_attn_decode.py` (`--block`) are the decode tiers. (Full numbers: git P.5–P.8.)
+- ★ **fp8-codes losslessness (P.9b, CPU-confirmed):** `u8_unpack_e2m1(w).astype(f8_e4m3).astype(bf16)` ==
+  `.astype(bf16)` (max|Δ|=0) — e2m1⊂e4m3. ⚠️ on TPU the same check was 5.2e5 (unresolved; likely the v6e
+  float4→f8 cast, DO-NOT-RETRY #8) — resolve before trusting fp8-on-v6e numerics; it doesn't change P.9b timing.
 - **HBM:** fp4 experts 8.57 GiB/chip (×43); fp8 codes resident = 17.1 GiB (FITS, ~21 free); bf16-resident
   34.3 (does NOT fit). N=1 decode HBM floor ~5.5 ms/step.
 - **CPU torch oracle** `scripts/s1_cpu_repro_v4flash.py both` = Tier-1 math/NaN check (a bit-identical change keeps "OK both match").

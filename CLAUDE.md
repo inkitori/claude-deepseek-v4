@@ -14,11 +14,11 @@
 > (146 ms/step, launch-bound at N=1; full attribution in `HANDOFF_PERF.md` §DECODE). Prefill was a blank
 > slate; first characterization (new `perf_microbench_moe_prefill.py`, 16-chip): **the prefill MoE is
 > DOMINATED by the in-trace FP4→fp8 rhs-prep = 225 ms/forward, SEQ-INDEPENDENT** (= the bit-UNPACK; gmm-core
-> is near its dense-fp8 floor, NOT a lever; dispatch+collective scale with N). **THE LEVER:** store fp8 CODES
-> resident at load (17.1 GiB FITS; e2m1⊂e4m3 = LOSSLESS) ⇒ removes the 225 ms (and likely drops decode MoE
-> too, einsum-fp8w 0.75/layer). DISTINCT from the old LOSSY scaled-fp8. Measurement-only ⇒ GATE md5
-> `3069e80b` UNCHANGED. NEXT (see `HANDOFF_PERF.md`): (1) decode-bench check that fp8-resident doesn't
-> regress decode's dense dequant, (2) implement fp8-resident at load [needs a smoke], (3) prefill non-MoE split.
+> is near its dense-fp8 floor, NOT a lever; dispatch+collective scale with N). The obvious lever (fp8-codes-
+> resident at load) was **P.9b-REFUTED**: it removes the 225 ms but REGRESSES decode 1.37× (2× expert HBM
+> read; break-even ~6 gen tokens ⇒ net-negative for normal serving). ⇒ the rhs-prep cut must be **DECODE-
+> NEUTRAL**. Measurement-only ⇒ GATE md5 `3069e80b` UNCHANGED. NEXT (see `HANDOFF_PERF.md`): (1) prefill
+> non-MoE split [cheap, first], (2) a decode-neutral faster in-trace unpack, (3) the N-scaling dispatch.
 > GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
@@ -133,8 +133,8 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
   bf16-resident experts don't fit (34.3>31.25 GiB). Decode operands already bf16/fp32 (PERF 3.1). Do NOT
   re-attempt a decode MoE kernel (HANDOFF DO-NOT-RETRY #12–14). **PREFILL (the active P.9 focus): the
   sharded path's in-trace `_fp4_rhs_and_scale` (the FP4→fp8 UNPACK+swapaxes+concat, real-file :351-358) is
-  225 ms/forward, seq-indep — the dominant prefill MoE cost; the lossless lever is fp8-codes-resident at
-  load (HANDOFF roadmap #1).**
+  225 ms/forward, seq-indep — the dominant prefill MoE cost. fp8-resident-at-load was P.9b-REFUTED (decode
+  regresses 1.37×); the lever must be DECODE-NEUTRAL — a faster in-trace unpack (HANDOFF roadmap #2).**
 * `models/common/model_loader.py` — `donate_argnums`, V4 `kv_cache_sharding=P()`, registry.
 * Kernel templates: `kernels/flash_attention/kernel.py`, `kernels/mla/v2/kernel.py`. Oracle:
   `tests/models/jax/_deepseek_v4_reference/kernel_stubs.py:60` (`sparse_attn_torch`).
