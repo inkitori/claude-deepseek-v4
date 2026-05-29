@@ -10,16 +10,16 @@
 > `HANDOFF_QUANT.md`). Other prior campaigns: S1 decode determinism (`HANDOFF_S1.md` /
 > `CLAUDE.full.md`). Per-iteration narrative goes in **commit messages**.
 >
-> **One-line status (2026-05-29 — P.10): PREFILL non-MoE split DONE → a NEW #1 lever.** Decode is CLOSED at
-> its ~lossless floor (146 ms/step, launch-bound at N=1; `HANDOFF_PERF.md` §DECODE). Prefill MoE was
-> characterized P.9 (rhs-prep FP4→fp8 unpack = 225 ms/fwd, seq-indep — the top SHORT-context lever; fp8-
-> resident P.9b-REFUTED as net-negative for decode). P.10 (new `perf_microbench_prefill_nonmoe.py`, 16-chip)
-> splits the rest: a seq-INDEP launch-bound non-MoE floor ≈117 ms (proj/norm/hc/gate) + **ATTENTION run
-> REPLICATED at M=N on EVERY chip (16× redundant), which DOMINATES long context (584 ms/fwd at N=4096)**. ⇒
-> **NEW #1 LEVER: shard prefill attention over the token axis** — microbench-PROVEN feasible, cuts the
-> prefill wall up to **48.9%** at N=4096, DECODE-NEUTRAL + LOSSLESS. Measurement-only ⇒ GATE md5 `3069e80b`
-> UNCHANGED. NEXT (see `HANDOFF_PERF.md`): implement the attention-sharding path (needs a smoke + GATE).
-> GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
+> **One-line status (2026-05-29 — P.11): prefill ATTENTION-SHARDING LANDED + GATED.** P.10's #1 lever is in.
+> The replicated M=N prefill attention (16× redundant — long-context dominator, 584 ms/fwd @N=4096) now runs
+> SHARDED over the token axis (`ShardingAxisName.ATTN_DATA`, 16-way) for PREFILL ONLY
+> (`_sparse_attn_kernel_sharded(..., shard_token_axis=True)`); each chip runs the kernel on its 1/16 slice
+> (kernel 584→**44 ms/fwd** @N=4096, prefill-wall up to −48.9%), output GATHERED back to replicated. DECODE
+> (M=1) UNTOUCHED → replicated (S1 fix). GATED: md5 `3069e80b` UNCHANGED ×2 engines + correct Fib + smoke_check
+> rc=0 (LOSSLESS — per-query independence). ⚠️ Leaving o token-sharded (also shard the o-proj) CompileTimeHbm
+> Oom'd +1.25G (XLA over-overlaps the MoE rhs-prep weight-unpacks); gathering o back contains the change. Decode
+> CLOSED at ~146 ms/step. NEXT (see `HANDOFF_PERF.md`): roadmap #2 — cut the MoE rhs-prep (225 ms/fwd), which
+> ALSO drops that HBM peak. GATE (non-negotiable): FIB `21,34,55,89,144,233,377,610` + N=2 md5 `3069e80b` ×2 fresh engines + `smoke_check` rc=0.
 
 ## Goal
 
@@ -108,14 +108,15 @@ loop prompt if dead — never `pkill` a pattern your own command line contains).
 
 ## Plumbing (read before touching — perf priority order)
 
-* `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (:173 pure-JAX ref / Mosaic kernel via
-  `_sparse_attn_kernel_sharded` :219) + call sites (decode :857, prefill :950); the indexer
-  (`indexer_prefill` :366 / `indexer_decode_step` :607, the `lax.top_k` :659 over a STATIC `T`). ⚠️ P.7
-  REFUTED both as DECODE levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the indexer is NEGLIGIBLE
-  (~0.3 ms/step) — see DO-NOT-RETRY #15,16; decode's non-MoE cost is projections+gate+launch, NOT here.
-  ★ **PREFILL is the OPPOSITE story (P.10): `_sparse_attn_kernel_sharded` (:219) runs the kernel REPLICATED
-  at M=N on EVERY chip (16× redundant — the docstring's known inefficiency), so attention DOMINATES long-
-  context prefill (584 ms/fwd at N=4096). Sharding it over the token axis = roadmap #1 (`HANDOFF_PERF.md`).**
+* `layers/jax/attention/deepseek_v4_attention.py` — `sparse_attn` (pure-JAX ref / Mosaic kernel via
+  `_sparse_attn_kernel_sharded` :220) + call sites (decode :888 REPLICATED, prefill :981
+  `shard_token_axis=True`); the indexer (`indexer_prefill` / `indexer_decode_step`, the `lax.top_k` over a
+  STATIC `T`). ⚠️ P.7 REFUTED both as DECODE levers: the Mosaic kernel is OPTIMAL (5× > pure-JAX) + the
+  indexer is NEGLIGIBLE (~0.3 ms/step) — see DO-NOT-RETRY #15,16; decode's non-MoE cost is
+  projections+gate+launch, NOT here. ★ **PREFILL (P.11 LANDED): the call passes `shard_token_axis=True` →
+  SHARDS the kernel over the token axis (`ATTN_DATA`, 16-way), each chip runs its 1/16 slice (was 16×-
+  redundant M=N, 584 ms/fwd @N=4096; now 44), then GATHERS o back to replicated (the token-sharded-OUTPUT
+  variant OOM'd — DO-NOT-RETRY #21). DECODE (M=1) stays REPLICATED (S1 fix).**
 * `models/jax/deepseek_v4.py` — `deepseek_v4_run_with_decode_state` (decode entry);
   `transformer_body_forward` (:851) vs `transformer_body_init_state_to_buffer` (:854) = the
   DUPLICATE prefill body (Phase 0.1); `block_forward`/`block_decode_step`; `hc_pre`/`hc_post`;

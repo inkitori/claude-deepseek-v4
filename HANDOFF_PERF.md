@@ -5,18 +5,18 @@
 > milestone (256 routed experts kept FP4-compressed; `MAX_SEQS=1`) is DONE and is a GIVEN — history in
 > `HANDOFF_QUANT.md`. S1 determinism history: `HANDOFF_S1.md`. This doc = the loop's memory.
 >
-> **One-line status (2026-05-29 — P.10): PREFILL non-MoE split DONE → a NEW #1 lever found.** New
-> `perf_microbench_prefill_nonmoe.py` (16-chip) characterizes the WHOLE non-MoE prefill at the REAL sharding
-> (dense ops token/seq-parallel at n=N/16; ATTENTION all-gathered to REPLICATED at M=N — the Mosaic kernel
-> can't auto-partition). Two halves: (a) a SEQ-INDEPENDENT non-MoE floor ≈ **117 ms/fwd** (PROJ 42 + NORM 31
-> + HC 17–23 + GATE 11 + CMP 10 + IDX 5), LAUNCH-bound at the tiny per-chip token counts (the prefill analog
-> of decode's launch floor); and (b) **ATTENTION, which runs REPLICATED at M=N on EVERY chip (16× redundant)
-> and DOMINATES long context: 33/69/197/584 ms at N=512/1024/2048/4096.** non-MoE share of the prefill device
-> wall = 35→64% as context grows (MoE 275→393). **THE NEW #1 LEVER:** shard the prefill attention over the
-> token axis (the kernel docstring's OWN "future optimization"). MICROBENCH-PROVEN feasible + the payoff: attn
-> 584→**44 ms** at N=4096, cutting the TOTAL prefill wall by **5.6 / 12.1 / 27.3 / 48.9%** at N=512/1024/2048/
-> 4096. DECODE-NEUTRAL (decode is M=1, stays replicated — the S1 fix path) + LOSSLESS (per-query independence).
-> Measurement-only ⇒ **GATE md5 `3069e80b` UNCHANGED.**
+> **One-line status (2026-05-29 — P.11): prefill ATTENTION-SHARDING LANDED + GATED.** P.10's #1 lever is in.
+> The replicated M=N prefill attention (16× redundant — the long-context dominator, 584 ms/fwd @N=4096) now runs
+> SHARDED over the token axis (`ShardingAxisName.ATTN_DATA`, 16-way over `attn_dp`) for PREFILL ONLY —
+> `_sparse_attn_kernel_sharded(..., shard_token_axis=True)` at `attention_prefill`. Each chip runs the kernel on
+> its 1/16 token slice (kernel 584→**44 ms/fwd** @N=4096, microbench-proven; prefill-wall −5.6/−12.1/−27.3/
+> −48.9% @N=512/1024/2048/4096), then the per-shard output is GATHERED back to REPLICATED. DECODE (M=1) UNTOUCHED
+> → replicated (S1 fix / Pitfall #5). **GATED: md5 `3069e80b` UNCHANGED ×2 fresh engines + correct Fib + smoke_
+> check rc=0** (LOSSLESS — per-query independence). ⚠️ The token-sharded-OUTPUT variant (leave o sharded → also
+> shard the o-proj) was tried first and **CompileTimeHbmOom'd +1.25G**: the cheaper sharded attention frees HBM
+> that XLA refills with MORE concurrent MoE rhs-prep weight-unpacks (20× `f8e4m3fn[16,4096,4096]`); gathering o
+> to replicated CONTAINS the change (post-attention graph byte-identical to the FIT baseline). NEXT: roadmap #2
+> (rhs-prep cut) — it ALSO drops that HBM peak, re-enabling the token-sharded-output extra win.
 
 ---
 
@@ -26,61 +26,48 @@
 - A numerics-changing fix MAY shift the md5 → re-establish a NEW ref + confirm identical ×2 engines +
   correct Fib. Do NOT gate on the long-tail md5 (`s1_probe2.py 100` → `ab07ecbb` is NON-deterministic at
   temp=0 by design). **`MAX_SEQS=1` is PINNED** (concurrent decode S1-broken).
-- P.6–P.10 changed NO production code (only `scripts/perf_*`) ⇒ md5 still `3069e80b`, no smoke needed. The
-  last GATE pass (P.5, bit-identical lean-dequant) stands. The roadmap-#1 attention-sharding change is
-  LOSSLESS (per-query independence) ⇒ md5 SHOULD be unchanged — verify with a smoke before claiming it.
+- P.11 (prefill attention-sharding) is the first production-code change since P.5 — GATED on 2 fresh engines,
+  md5 still `3069e80b` (LOSSLESS, per-query independence — CONFIRMED, not just predicted), correct Fib, smoke_
+  check rc=0. P.6–P.10 changed only `scripts/perf_*`. The bit-identical md5 across this change proves intact.
 
 ---
 
-## ⇒ NEXT ACTION — implement the prefill ATTENTION-SHARDING lever (new #1; cuts the prefill wall up to 48.9%)
-The P.10 split found prefill attention runs REPLICATED at M=N on every chip (the Mosaic kernel can't be
-auto-partitioned, so prefill all-gathers the activation to replicated — `deepseek_v4_attention.py:219-245`
-docstring). At long context this DOMINATES (584 ms/fwd at N=4096, > the whole MoE). The microbench PROVED
-the kernel runs correctly sharded over the query/token axis (M), cutting attn 584→44 ms (N=4096) and the
-total prefill wall by up to 48.9% — and it's the docstring's OWN intended optimization.
+## ⇒ NEXT ACTION — roadmap #2: cut the prefill MoE rhs-prep (225 ms/fwd) DECODE-NEUTRAL + drop its HBM peak
+P.11 landed attention-sharding but had to GATHER the attention output back to replicated (could NOT leave it
+token-sharded): the cheaper sharded attention let XLA keep ~20 concurrent MoE rhs-prep weight-unpacks live
+(20× `f8e4m3fn[16,4096,4096]` ≈ 5 GB) → CompileTimeHbmOom +1.25G. So the rhs-prep is now BOTH the top seq-
+independent TIME cost (225 ms/fwd, ~9× its HBM floor ⇒ compute-bound) AND the prefill HBM-peak driver.
 
-  **Implement a TOKEN-SHARDED prefill attention path.** At the prefill call site (`attention_prefill`
-  :950), run the kernel under a shard_map that SHARDS the query axis over `attn_dp` instead of the
-  replicated map. Proven-working specs (microbench `attn_kernel_sharded`):
-    in_specs=(P(None,'attn_dp',None,None),  # q   [B,M,H,D]  sharded on M
-              P(),                           # kv  [B,Nk,D]   REPLICATED (all keys needed)
-              P(),                           # attn_sink [H]
-              P(None,'attn_dp',None)),       # topk_idxs [B,M,K] sharded on M
-    out_specs=P(None,'attn_dp',None,None)    # o  [B,M,H,D]  sharded on M
-  ⚠️ DO NOT touch `_sparse_attn_kernel_sharded` itself — DECODE goes through it at M=1 and MUST stay
-  REPLICATED (the S1 fix / Pitfall #5; M=1 can't shard 16-way). Add a PREFILL-ONLY sharded variant (or gate
-  on M>1). Wire it so q/topk arrive sharded on the prefill token axis and o stays sharded (the o-proj +
-  downstream MoE then run on the chip's token slice; the MoE already all_gathers). Also resolve the small
-  cross-shard key reach: kv stays REPLICATED (each chip needs all keys), so the only added collective is a
-  small kv all-gather — and sharding REMOVES the large q all-gather, so the real win ≥ the measured compute.
-  *Risk MED-HIGH: touches the S1-sensitive sharding → REQUIRES a full smoke + the GATE (FIB + N=2 md5
-  `3069e80b` ×2 fresh engines + smoke_check). Lossless ⇒ md5 SHOULD be unchanged — verify.* Highest-EV
-  prefill change on the board (per-N saved: 24/58/177/540 ms at N=512/1024/2048/4096).
+  **Cut the in-trace FP4→fp8 UNPACK (`_fp4_rhs_and_scale`, `deepseek_v4_moe.py:351-358`).** Keep fp4-resident
+  (decode UNCHANGED — fp8-resident was P.9b-REFUTED, decode +1.37×). Two angles: (a) a faster in-trace unpack /
+  small Pallas unpack kernel vs the 5.24 ms/layer baseline (`perf_microbench_moe_prefill.py`); (b) REDUCE the
+  unpack's peak liveness (force fewer layers' weights unpacked at once — an `optimization_barrier` / scheduling
+  hint) so the HBM peak drops. A lower peak ALSO re-enables P.11's token-sharded-OUTPUT attention variant
+  (shards the o-proj too → extra prefill-wall win — see DO-NOT-RETRY #21). *Tier-2 microbench first (no GATE
+  risk until a real edit); then a smoke + the GATE.*
 
-  Then (seq-indep, short-context): the MoE rhs-prep (225 ms/fwd) DECODE-NEUTRAL faster unpack (roadmap #2),
-  and the launch-bound non-MoE floor (roadmap #3, hard — op-count↓ re-opens S1).
+  Then: roadmap #3 (non-MoE launch floor ~117 ms, hard — op-count↓ re-opens S1) and #4 (dispatch fuse).
 
 ---
 
-## THE ROADMAP (re-ranked P.10 — prefill: attention-sharding now leads at long context; decode CLOSED)
-1. **[prefill ATTENTION-SHARDING]** NEXT ACTION: shard the replicated M=N prefill attention over the token
-   axis. Cuts the prefill wall 5.6/12.1/27.3/48.9% at N=512/1024/2048/4096. Microbench-proven feasible,
-   decode-neutral, lossless. *MED-HIGH risk (S1-sensitive sharding; needs a smoke). TOP EV.* ← TOP.
-2. **[prefill MoE — DECODE-NEUTRAL rhs-prep cut]** the 225 ms/fwd FP4→fp8 UNPACK (~9× its HBM floor ⇒
-   compute-bound). The top SEQ-INDEPENDENT cost (dominant at SHORT prefill). Keep fp4-resident (decode
-   unchanged); faster in-trace unpack / small Pallas unpack kernel vs the 5.3 ms/layer baseline in
-   `perf_microbench_moe_prefill.py`. *M · risk low (tier-2 first; no GATE risk until a real edit).*
-3. **[prefill non-MoE LAUNCH floor ~117 ms]** PROJ 42 + NORM 31 + HC 17–23 + GATE 11 + CMP 10 + IDX 5, seq-
-   INDEP, launch-bound at tiny per-chip n (decode's launch story, in prefill). Lossless cut = op-count↓
-   (layer scan / fuse the ~215 per-fwd matmuls) but that re-opens S1 (DO-NOT-RETRY #10). *M · hard.*
-4. **[prefill dispatch]** the MoE sort + two `[N·top_k,dim]` gathers, 80 ms/fwd at N=4096, grows with N.
+## THE ROADMAP (re-ranked P.11 — attention-sharding LANDED; rhs-prep now leads, a dual time+HBM lever)
+1. **[prefill MoE — DECODE-NEUTRAL rhs-prep cut]** ← TOP / NEXT ACTION. The 225 ms/fwd FP4→fp8 UNPACK (~9× its
+   HBM floor ⇒ compute-bound) — now ALSO the prefill HBM-peak driver (the ~20 concurrent unpacks that
+   CompileTimeHbmOom'd P.11's token-sharded-output variant). Keep fp4-resident (decode unchanged). Faster
+   unpack / small Pallas kernel (vs 5.24 ms/layer, `perf_microbench_moe_prefill.py`) AND/OR cut its peak
+   liveness. *M · tier-2 first; low risk until an edit, then a smoke.*
+2. **[prefill non-MoE LAUNCH floor ~117 ms]** PROJ 42 + NORM 31 + HC 17–23 + GATE 11 + CMP 10 + IDX 5, seq-
+   INDEP, launch-bound at tiny per-chip n. Lossless cut = op-count↓ (layer scan / fuse the ~215 per-fwd
+   matmuls) but that re-opens S1 (DO-NOT-RETRY #10). *M · hard.*
+3. **[prefill dispatch]** the MoE sort + two `[N·top_k,dim]` gathers, 80 ms/fwd at N=4096, grows with N.
    Fuse the gather into gmm / ragged scatter. *M.*
-5. **[fp8-resident — REFUTED for normal serving]** P.9b: net-negative (decode +39 ms/step, break-even ~6
-   gen tokens). Revisit ONLY for prefill-dominated (G<6) workloads. The LOSSY scaled-fp8 variant is worse
-   still. *L · parked.*
-6. **[decode clean profiler / 5-cleanup]** confirmatory (decode near-floor); + Phase-5 diff-shrink: remove
-   `_v4_nan_tripwire` (37 sites + def + `smoke.sh:81/116`), edit `.py`+`.sh` TOGETHER (Pitfall #0), KEEP
-   `_linear` clamp + `compute_logits` nan_to_num. *S.*
+4. **[prefill attention — token-sharded OUTPUT, the P.11 DEFERRED extra]** leave o token-sharded → shard the
+   o-proj too. BLOCKED on #1 (needs the rhs-prep HBM peak down first — DO-NOT-RETRY #21). *S once #1 lands.*
+5. **[fp8-resident — REFUTED for normal serving]** P.9b: net-negative (decode +39 ms/step, break-even ~6 gen
+   tokens). Revisit ONLY for prefill-dominated (G<6). LOSSY scaled-fp8 worse. *L · parked.*
+6. **[decode clean profiler / 5-cleanup]** confirmatory; + Phase-5 diff-shrink: remove `_v4_nan_tripwire`
+   (37 sites + def + `smoke.sh:81/116`), edit `.py`+`.sh` TOGETHER (Pitfall #0), KEEP `_linear` clamp +
+   `compute_logits` nan_to_num. *S.*
 
 ---
 
@@ -115,6 +102,7 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
 18. **Q/KV/O projections + MoE gate + HC-sinkhorn are NOT the decode ~30 ms — REFUTED (P.8).** proj 4.13 + gate 0.75 + hc 2.99 = 7.87; the balance is ~24 ms launch overhead.
 19. ★ **prefill gmm-CORE as a lever — REFUTED (P.9).** gmm is 0.82–1.24× the dense fp8 MXU floor and only 23–38 ms/fwd; it's MXU-underutilized at 96–1536 rows/rank but near its practical floor. The prefill MoE cost is the rhs-prep (the FP4→fp8 UNPACK), NOT the matmul.
 20. ★ **fp8-codes-resident experts FOR ALL (prefill+decode) — REFUTED as a net win (P.9b).** Removes prefill's 225 ms/fwd rhs-prep but the decode dense path then dequants from fp8 (2× expert HBM read) → **decode +39 ms/step (106→145, 1.37×)**; break-even ~6 gen tokens ⇒ net-negative for normal serving (G≫6). Use a DECODE-NEUTRAL prefill cut instead (roadmap #2). fp8 IS lossless (CPU-confirmed); only the economics fail.
+21. **prefill attention TOKEN-SHARDED OUTPUT (leave o sharded, shard the o-proj) — CompileTimeHbmOom +1.25G (P.11).** The sharded-kernel COMPUTE win is fine (LANDED, output GATHERED to replicated), but propagating token-sharding past o into the FFN/MoE region let XLA keep ~20 concurrent rhs-prep weight-unpacks live (20× `f8e4m3fn[16,4096,4096]` ≈ 5 GB) → Used 32.50/31.25 GiB. NOT lossy, NOT wrong — purely an HBM-peak/scheduling tip. DEFERRED behind roadmap #1 (rhs-prep peak↓); revisit once the peak drops. (At MAX_LEN=256 with the gathered-output variant, baseline fits — the 6 prior FIT smokes confirm.)
 
 ---
 
@@ -140,6 +128,8 @@ prefill pivot (above) is where the EV is. Decode DO-NOT-RETRY items #1,#10–18 
   attn → 9/12/20/**44** ms ⇒ prefill wall **−5.6/−12.1/−27.3/−48.9%**. Run: `full_slice_v4_sync.sh` then
   `MH_TIMEOUT=900 scripts/full_slice_v4_mh_run.sh scripts/perf_microbench_prefill_nonmoe.py --distributed`.
   CAVEATS: NORM ×4 = upper bd; the lever saving is a LOWER bd (it also removes the large q all-gather).
+  → **LANDED P.11** (the kernel-compute win; output GATHERED to replicated to dodge the rhs-prep HBM-OOM —
+  DO-NOT-RETRY #21). GATED md5 `3069e80b` unchanged ×2 engines. The o-proj-sharding extra is deferred to #1.
 - **PREFILL MoE path = `deepseek_v4_moe.py:331-433` `_routed_local`** (use_shard_map when N≥axis): rhs-prep
   (:351-358) → shard_map[all_gather x → argsort by expert → gather `x_sorted[N·top_k,dim]` → 2× `gmm_v2`
   over this rank's EP=16 experts via `group_offset=[r·EP]`, fp8 codes + per-block fp32 rhs_scale → revert/

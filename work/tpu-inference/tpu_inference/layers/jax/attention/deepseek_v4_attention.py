@@ -36,6 +36,7 @@ from jax import lax
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.sparse_attn import sparse_attn_kernel
+from tpu_inference.layers.common.sharding import ShardingAxisName
 
 
 _V4_DECODE_NAN_TRIPWIRE = os.environ.get("V4_DECODE_NAN_TRIPWIRE", "0") == "1"
@@ -216,26 +217,56 @@ def sparse_attn(
     return out.astype(q.dtype)
 
 
-def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale):
+def _sparse_attn_kernel_sharded(q, kv, attn_sink, topk_idxs, softmax_scale,
+                                shard_token_axis: bool = False):
     """Run the fused `sparse_attn_kernel` (a Mosaic custom call) under shard_map.
 
     A Pallas/Mosaic kernel cannot be auto-partitioned by XLA's SPMD partitioner
     ("Mosaic kernels cannot be automatically partitioned. Please wrap the call in
     a shard_map."), so it must execute inside a shard_map whenever the model runs
-    on a real mesh. The kernel is independent per (b, m) query, so a fully-
-    REPLICATED map — every device runs the whole kernel on the full inputs — is
-    correct: decode activations are already replicated (the _v4_decode_replicate
-    S1 fix), so this is also OPTIMAL there; prefill inputs are all-gathered to
-    replicated first (a cost only at large prefill — a future optimization is to
-    shard the map over the prefill token axis). No mesh (CPU / interpret=True for
-    the parity test + microbench) → call the kernel directly, mirroring the MoE's
-    `mesh.empty` gate in deepseek_v4_moe.py."""
+    on a real mesh. The kernel is independent per (b, m) query, so the map's
+    layout is chosen per call site:
+
+    - DECODE (`shard_token_axis=False`, the default): a fully-REPLICATED map —
+      every device runs the whole kernel on the full inputs. Decode activations
+      are already replicated (the `_v4_decode_replicate` S1 fix) and M=1 cannot
+      be sharded 16-way (Pitfall #5), so replicated is both correct AND optimal.
+    - PREFILL (`shard_token_axis=True`): SHARD the query/token axis (M=S) over
+      `ShardingAxisName.ATTN_DATA` — the same axis the prefill activation already
+      rides, so q/topk_idxs arrive sharded with no extra gather; kv + the per-head
+      attn_sink stay REPLICATED (any query may attend to any key). This removes
+      the 16x-redundant M=N replicated compute that dominates long-context prefill
+      (P.10). LOSSLESS: attention is independent per (b, m) query, so each token's
+      output is byte-identical regardless of how M is split. The per-shard outputs
+      are then GATHERED back to REPLICATED (matching the decode output), so the
+      post-attention graph (o-proj / hc_post / MoE) is byte-identical to the
+      unsharded baseline and the change is CONTAINED to the attention sub-step.
+      (Leaving o token-sharded was tried first — P.11 — but propagating token-
+      sharding into the HBM-tight MoE region tipped XLA's per-layer rhs-prep
+      weight-unpack scheduling +1.25G over the 31.25G budget → CompileTimeHbmOom.
+      Gathering o back keeps the unsharded MoE schedule that the FIT baseline fits.)
+
+    No mesh (CPU / interpret=True for the parity test + microbench) → call the
+    kernel directly, mirroring the MoE's `mesh.empty` gate in deepseek_v4_moe.py."""
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         # No real mesh (CPU/interpret oracle): the Mosaic kernel is interpret-
         # only on CPU → use the math-identical pure-JAX ref (parity-proven by
         # test_kernel_matches_jax_sparse_attn). TPU path (below) is unchanged.
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+    if shard_token_axis:
+        td = ShardingAxisName.ATTN_DATA  # ('data','attn_dp','attn_dp_expert') → 16-way
+        o = jax.shard_map(
+            functools.partial(sparse_attn_kernel, softmax_scale=softmax_scale),
+            mesh=mesh,
+            in_specs=(P(None, td, None, None), P(), P(), P(None, td, None)),
+            out_specs=P(None, td, None, None),
+            check_vma=False,
+        )(q, kv, attn_sink, topk_idxs)
+        # Gather the per-token-shard outputs to a REPLICATED [B,S,H,Dh] (S≥16,
+        # NOT the size-1 decode case Pitfall #5 warns about) so downstream sees
+        # the same replicated o the unsharded baseline produced.
+        return jax.lax.with_sharding_constraint(o, P())
     return jax.shard_map(
         functools.partial(sparse_attn_kernel, softmax_scale=softmax_scale),
         mesh=mesh,
@@ -947,7 +978,8 @@ def attention_prefill(
     else:
         kv_full = kv
 
-    o = _sparse_attn_kernel_sharded(q, kv_full, params.attn_sink, topk_idxs, params.softmax_scale)
+    o = _sparse_attn_kernel_sharded(q, kv_full, params.attn_sink, topk_idxs,
+                                    params.softmax_scale, shard_token_axis=True)
 
     # inverse RoPE on rope dims of o
     o = splice_rope(o, rd, fc, inverse=True)
